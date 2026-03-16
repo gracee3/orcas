@@ -2,7 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::collaboration::{
-    Assignment, Decision, DecisionType, Report, WorkUnit, Worker, WorkerSession, Workstream,
+    Assignment, AssignmentStatus, Decision, DecisionType, Report, ReportConfidence,
+    ReportDisposition, ReportParseResult, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
+    Workstream, WorkstreamStatus,
 };
 use crate::events::ConnectionState;
 
@@ -129,7 +131,17 @@ pub struct StateSnapshot {
     pub session: SessionState,
     pub threads: Vec<ThreadSummary>,
     pub active_thread: Option<ThreadView>,
+    pub collaboration: CollaborationSnapshot,
     pub recent_events: Vec<EventSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CollaborationSnapshot {
+    pub workstreams: Vec<WorkstreamSummary>,
+    pub work_units: Vec<WorkUnitSummary>,
+    pub assignments: Vec<AssignmentSummary>,
+    pub reports: Vec<ReportSummary>,
+    pub decisions: Vec<DecisionSummary>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -197,9 +209,102 @@ pub enum DaemonEvent {
         item_id: String,
         delta: String,
     },
+    WorkstreamLifecycle {
+        action: CollaborationLifecycleAction,
+        workstream: WorkstreamSummary,
+    },
+    WorkUnitLifecycle {
+        action: CollaborationLifecycleAction,
+        work_unit: WorkUnitSummary,
+    },
+    AssignmentLifecycle {
+        action: AssignmentLifecycleAction,
+        assignment: AssignmentSummary,
+    },
+    ReportRecorded {
+        report: ReportSummary,
+    },
+    DecisionApplied {
+        decision: DecisionSummary,
+    },
     Warning {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationLifecycleAction {
+    Created,
+    Updated,
+    Completed,
+    Escalated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentLifecycleAction {
+    Created,
+    Started,
+    Reported,
+    Closed,
+    Interrupted,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkstreamSummary {
+    pub id: String,
+    pub title: String,
+    pub status: WorkstreamStatus,
+    pub priority: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkUnitSummary {
+    pub id: String,
+    pub workstream_id: String,
+    pub title: String,
+    pub status: WorkUnitStatus,
+    pub dependency_count: usize,
+    pub current_assignment_id: Option<String>,
+    pub latest_report_id: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignmentSummary {
+    pub id: String,
+    pub work_unit_id: String,
+    pub worker_id: String,
+    pub worker_session_id: String,
+    pub status: AssignmentStatus,
+    pub attempt_number: u32,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportSummary {
+    pub id: String,
+    pub work_unit_id: String,
+    pub assignment_id: String,
+    pub worker_id: String,
+    pub disposition: ReportDisposition,
+    pub summary: String,
+    pub confidence: ReportConfidence,
+    pub parse_result: ReportParseResult,
+    pub needs_supervisor_review: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionSummary {
+    pub id: String,
+    pub work_unit_id: String,
+    pub report_id: Option<String>,
+    pub decision_type: DecisionType,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

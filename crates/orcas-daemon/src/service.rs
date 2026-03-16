@@ -29,7 +29,7 @@ use orcas_core::{
     AppConfig, AppPaths, Assignment, AssignmentStatus, CodexConnectionMode, CollaborationState,
     ConnectionState, Decision, DecisionType, EventEnvelope, JsonSessionStore, OrcasError,
     OrcasEvent, OrcasResult, OrcasSessionStore, Report, ReportConfidence, ReportDisposition,
-    ReportParseStatus, ThreadMetadata, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
+    ReportParseResult, ThreadMetadata, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
     WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, Workstream,
     WorkstreamStatus,
 };
@@ -89,7 +89,14 @@ struct ParsedWorkerReport {
     questions: Vec<String>,
     recommended_next_actions: Vec<String>,
     confidence: ReportConfidence,
-    parse_status: ReportParseStatus,
+    parse_result: ReportParseResult,
+    needs_supervisor_review: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedAssignment {
+    assignment: Assignment,
+    created_new: bool,
 }
 
 #[derive(Debug, Clone, Eq)]
@@ -836,6 +843,8 @@ impl OrcasDaemonService {
             workstream
         };
         self.persist_collaboration_state().await?;
+        self.emit_workstream_lifecycle(ipc::CollaborationLifecycleAction::Created, &workstream)
+            .await;
         Ok(ipc::WorkstreamCreateResponse { workstream })
     }
 
@@ -894,7 +903,7 @@ impl OrcasDaemonService {
         &self,
         params: ipc::WorkunitCreateRequest,
     ) -> OrcasResult<ipc::WorkunitCreateResponse> {
-        let work_unit = {
+        let (work_unit, workstream) = {
             let now = Utc::now();
             let mut state = self.state.write().await;
             if !state
@@ -945,9 +954,21 @@ impl OrcasDaemonService {
                 workstream.updated_at = now;
             }
             Self::refresh_workstream_statuses(&mut state.collaboration);
-            work_unit
+            let workstream = state
+                .collaboration
+                .workstreams
+                .get(&params.workstream_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown workstream `{}`", params.workstream_id))
+                })?;
+            (work_unit, workstream)
         };
         self.persist_collaboration_state().await?;
+        self.emit_work_unit_lifecycle(ipc::CollaborationLifecycleAction::Created, &work_unit)
+            .await;
+        self.emit_workstream_lifecycle(ipc::CollaborationLifecycleAction::Updated, &workstream)
+            .await;
         Ok(ipc::WorkunitCreateResponse { work_unit })
     }
 
@@ -1041,7 +1062,17 @@ impl OrcasDaemonService {
     ) -> OrcasResult<ipc::AssignmentStartResponse> {
         let session_model = params.model.clone();
         let session_cwd = params.cwd.clone();
-        let (assignment_id, worker_id, worker_session_id) = self.prepare_assignment(params).await?;
+        let prepared = self.prepare_assignment(params).await?;
+        let assignment_id = prepared.assignment.id.clone();
+        let worker_id = prepared.assignment.worker_id.clone();
+        let worker_session_id = prepared.assignment.worker_session_id.clone();
+        if prepared.created_new {
+            self.emit_assignment_lifecycle(
+                ipc::AssignmentLifecycleAction::Created,
+                &prepared.assignment,
+            )
+            .await;
+        }
         let worker_session = self
             .ensure_worker_session_thread(&worker_session_id, session_model, session_cwd)
             .await?;
@@ -1071,7 +1102,7 @@ impl OrcasDaemonService {
             })
             .await?;
 
-        {
+        let (started_assignment, started_work_unit) = {
             let now = Utc::now();
             let mut state = self.state.write().await;
             let work_unit_id = state
@@ -1104,8 +1135,35 @@ impl OrcasDaemonService {
                 work_unit.status = WorkUnitStatus::Running;
                 work_unit.updated_at = now;
             }
-        }
+            let started_assignment = state
+                .collaboration
+                .assignments
+                .get(&assignment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
+                })?;
+            let started_work_unit = state
+                .collaboration
+                .work_units
+                .get(&work_unit_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`"))
+                })?;
+            (started_assignment, started_work_unit)
+        };
         self.persist_collaboration_state().await?;
+        self.emit_assignment_lifecycle(
+            ipc::AssignmentLifecycleAction::Started,
+            &started_assignment,
+        )
+        .await;
+        self.emit_work_unit_lifecycle(
+            ipc::CollaborationLifecycleAction::Updated,
+            &started_work_unit,
+        )
+        .await;
 
         let turn_state = self
             .wait_for_turn_terminal(&thread_id, &turn.turn_id)
@@ -1115,7 +1173,7 @@ impl OrcasDaemonService {
             .await
             .unwrap_or_default();
         let parsed_report = Self::parse_worker_report(&raw_output);
-        let report = {
+        let (report, assignment_after_report, work_unit_after_report) = {
             let now = Utc::now();
             let mut state = self.state.write().await;
             let assignment = state
@@ -1148,7 +1206,8 @@ impl OrcasDaemonService {
                 recommended_next_actions: parsed_report.recommended_next_actions,
                 confidence: parsed_report.confidence,
                 raw_output,
-                parse_status: parsed_report.parse_status,
+                parse_result: parsed_report.parse_result,
+                needs_supervisor_review: parsed_report.needs_supervisor_review,
                 created_at: now,
             };
             state
@@ -1186,9 +1245,39 @@ impl OrcasDaemonService {
                 session.updated_at = now;
             }
             Self::refresh_workstream_statuses(&mut state.collaboration);
-            report
+            let assignment_after_report = state
+                .collaboration
+                .assignments
+                .get(&assignment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
+                })?;
+            let work_unit_after_report = state
+                .collaboration
+                .work_units
+                .get(&work_unit_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`"))
+                })?;
+            (report, assignment_after_report, work_unit_after_report)
         };
         self.persist_collaboration_state().await?;
+        self.emit_report_recorded(&report).await;
+        let assignment_event_action = match assignment_after_report.status {
+            AssignmentStatus::Interrupted => ipc::AssignmentLifecycleAction::Interrupted,
+            AssignmentStatus::Lost => ipc::AssignmentLifecycleAction::Failed,
+            AssignmentStatus::AwaitingDecision => ipc::AssignmentLifecycleAction::Reported,
+            _ => ipc::AssignmentLifecycleAction::Reported,
+        };
+        self.emit_assignment_lifecycle(assignment_event_action, &assignment_after_report)
+            .await;
+        self.emit_work_unit_lifecycle(
+            ipc::CollaborationLifecycleAction::Updated,
+            &work_unit_after_report,
+        )
+        .await;
 
         let (assignment, worker, worker_session) = {
             let state = self.state.read().await;
@@ -1317,10 +1406,10 @@ impl OrcasDaemonService {
         &self,
         params: ipc::DecisionApplyRequest,
     ) -> OrcasResult<ipc::DecisionApplyResponse> {
-        let response = {
+        let (response, closed_assignment, work_unit_event, workstream_event) = {
             let now = Utc::now();
             let mut state = self.state.write().await;
-            let work_unit = state
+            let prior_work_unit = state
                 .collaboration
                 .work_units
                 .get(&params.work_unit_id)
@@ -1328,18 +1417,21 @@ impl OrcasDaemonService {
                 .ok_or_else(|| {
                     OrcasError::Protocol(format!("unknown work unit `{}`", params.work_unit_id))
                 })?;
-            let current_assignment_id = work_unit.current_assignment_id.clone();
-            if let Some(assignment_id) = current_assignment_id.as_ref()
+            let current_assignment_id = prior_work_unit.current_assignment_id.clone();
+            let closed_assignment = if let Some(assignment_id) = current_assignment_id.as_ref()
                 && let Some(assignment) = state.collaboration.assignments.get_mut(assignment_id)
             {
                 assignment.status = AssignmentStatus::Closed;
                 assignment.updated_at = now;
-            }
+                Some(assignment.clone())
+            } else {
+                None
+            };
 
             let report_id = params
                 .report_id
                 .clone()
-                .or(work_unit.latest_report_id.clone());
+                .or(prior_work_unit.latest_report_id.clone());
             let decision = Decision {
                 id: Self::new_object_id("decision"),
                 work_unit_id: params.work_unit_id.clone(),
@@ -1448,13 +1540,59 @@ impl OrcasDaemonService {
                 .ok_or_else(|| {
                     OrcasError::Protocol(format!("unknown work unit `{}`", params.work_unit_id))
                 })?;
-            ipc::DecisionApplyResponse {
-                decision,
-                work_unit,
-                next_assignment,
-            }
+            let workstream = state
+                .collaboration
+                .workstreams
+                .get(&work_unit.workstream_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "unknown workstream `{}`",
+                        work_unit.workstream_id
+                    ))
+                })?;
+            let work_unit_action = if work_unit.status == WorkUnitStatus::Completed {
+                ipc::CollaborationLifecycleAction::Completed
+            } else if work_unit.status == WorkUnitStatus::NeedsHuman {
+                ipc::CollaborationLifecycleAction::Escalated
+            } else {
+                ipc::CollaborationLifecycleAction::Updated
+            };
+            let workstream_action = if workstream.status == WorkstreamStatus::Completed {
+                ipc::CollaborationLifecycleAction::Completed
+            } else if workstream.status == WorkstreamStatus::Blocked {
+                ipc::CollaborationLifecycleAction::Escalated
+            } else {
+                ipc::CollaborationLifecycleAction::Updated
+            };
+            (
+                ipc::DecisionApplyResponse {
+                    decision,
+                    work_unit: work_unit.clone(),
+                    next_assignment,
+                },
+                closed_assignment,
+                (work_unit_action, work_unit),
+                (workstream_action, workstream),
+            )
         };
         self.persist_collaboration_state().await?;
+        if let Some(assignment) = closed_assignment.as_ref() {
+            self.emit_assignment_lifecycle(ipc::AssignmentLifecycleAction::Closed, assignment)
+                .await;
+        }
+        self.emit_decision_applied(&response.decision).await;
+        self.emit_work_unit_lifecycle(work_unit_event.0, &work_unit_event.1)
+            .await;
+        self.emit_workstream_lifecycle(workstream_event.0, &workstream_event.1)
+            .await;
+        if let Some(next_assignment) = response.next_assignment.as_ref() {
+            self.emit_assignment_lifecycle(
+                ipc::AssignmentLifecycleAction::Created,
+                next_assignment,
+            )
+            .await;
+        }
         Ok(response)
     }
 
@@ -1509,7 +1647,7 @@ impl OrcasDaemonService {
     async fn prepare_assignment(
         &self,
         params: ipc::AssignmentStartRequest,
-    ) -> OrcasResult<(String, String, String)> {
+    ) -> OrcasResult<PreparedAssignment> {
         let outcome = {
             let now = Utc::now();
             let mut state = self.state.write().await;
@@ -1522,10 +1660,7 @@ impl OrcasDaemonService {
                     OrcasError::Protocol(format!("unknown work unit `{}`", params.work_unit_id))
                 })?;
 
-            if matches!(
-                work_unit.status,
-                WorkUnitStatus::Completed | WorkUnitStatus::NeedsHuman
-            ) {
+            if work_unit.status != WorkUnitStatus::Ready {
                 return Err(OrcasError::Protocol(format!(
                     "work unit `{}` is not startable in status `{:?}`",
                     params.work_unit_id, work_unit.status
@@ -1538,17 +1673,51 @@ impl OrcasDaemonService {
                 )));
             }
 
-            if let Some(assignment_id) = work_unit.current_assignment_id.clone()
-                && let Some(assignment) = state.collaboration.assignments.get(&assignment_id)
-                && matches!(assignment.status, AssignmentStatus::Created)
-            {
-                return Ok((
-                    assignment.id.clone(),
-                    assignment.worker_id.clone(),
-                    assignment.worker_session_id.clone(),
-                ));
+            let pending_assignments = state
+                .collaboration
+                .assignments
+                .values()
+                .filter(|assignment| {
+                    assignment.work_unit_id == params.work_unit_id
+                        && assignment.status == AssignmentStatus::Created
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if pending_assignments.len() > 1 {
+                return Err(OrcasError::Protocol(format!(
+                    "work unit `{}` has multiple unexecuted pending assignments",
+                    params.work_unit_id
+                )));
+            }
+            if let Some(pending_assignment) = pending_assignments.first() {
+                let latest_assignment_id = state
+                    .collaboration
+                    .assignments
+                    .values()
+                    .filter(|assignment| assignment.work_unit_id == params.work_unit_id)
+                    .max_by(|left, right| {
+                        left.attempt_number
+                            .cmp(&right.attempt_number)
+                            .then_with(|| left.created_at.cmp(&right.created_at))
+                    })
+                    .map(|assignment| assignment.id.clone());
+                if work_unit.current_assignment_id.as_deref()
+                    == Some(pending_assignment.id.as_str())
+                    && latest_assignment_id.as_deref() == Some(pending_assignment.id.as_str())
+                {
+                    return Ok(PreparedAssignment {
+                        assignment: pending_assignment.clone(),
+                        created_new: false,
+                    });
+                }
+                return Err(OrcasError::Protocol(format!(
+                    "work unit `{}` has an unexecuted pending assignment that is not the current latest successor",
+                    params.work_unit_id
+                )));
             }
 
+            // Reusing a worker session is allowed, but the assignment remains the execution-bearing
+            // protocol object. A new execution segment always gets its own explicit assignment id.
             let worker_session_id = Self::ensure_worker_and_session_records(
                 &mut state.collaboration,
                 &params.worker_id,
@@ -1586,11 +1755,10 @@ impl OrcasDaemonService {
                 work_unit.status = WorkUnitStatus::Ready;
                 work_unit.updated_at = now;
             }
-            (
-                assignment.id,
-                assignment.worker_id,
-                assignment.worker_session_id,
-            )
+            PreparedAssignment {
+                assignment,
+                created_new: true,
+            }
         };
         self.persist_collaboration_state().await?;
         Ok(outcome)
@@ -1602,6 +1770,9 @@ impl OrcasDaemonService {
         model: Option<String>,
         cwd: Option<String>,
     ) -> OrcasResult<WorkerSession> {
+        // Worker sessions may be reused across assignments, but that reuse only preserves the
+        // runtime thread anchor. It does not carry hidden workflow continuity; each assignment
+        // still records its own explicit worker_session binding and executes as a distinct step.
         let existing = self
             .state
             .read()
@@ -1708,12 +1879,63 @@ impl OrcasDaemonService {
         self.store.save(&stored).await
     }
 
+    async fn emit_workstream_lifecycle(
+        &self,
+        action: ipc::CollaborationLifecycleAction,
+        workstream: &Workstream,
+    ) {
+        self.emit(ipc::DaemonEvent::WorkstreamLifecycle {
+            action,
+            workstream: Self::workstream_summary(workstream),
+        })
+        .await;
+    }
+
+    async fn emit_work_unit_lifecycle(
+        &self,
+        action: ipc::CollaborationLifecycleAction,
+        work_unit: &WorkUnit,
+    ) {
+        self.emit(ipc::DaemonEvent::WorkUnitLifecycle {
+            action,
+            work_unit: Self::work_unit_summary(work_unit),
+        })
+        .await;
+    }
+
+    async fn emit_assignment_lifecycle(
+        &self,
+        action: ipc::AssignmentLifecycleAction,
+        assignment: &Assignment,
+    ) {
+        self.emit(ipc::DaemonEvent::AssignmentLifecycle {
+            action,
+            assignment: Self::assignment_summary(assignment),
+        })
+        .await;
+    }
+
+    async fn emit_report_recorded(&self, report: &Report) {
+        self.emit(ipc::DaemonEvent::ReportRecorded {
+            report: Self::report_summary(report),
+        })
+        .await;
+    }
+
+    async fn emit_decision_applied(&self, decision: &Decision) {
+        self.emit(ipc::DaemonEvent::DecisionApplied {
+            decision: Self::decision_summary(decision),
+        })
+        .await;
+    }
+
     async fn snapshot(&self) -> OrcasResult<ipc::StateSnapshot> {
         let daemon = self.daemon_status().await?;
         let state = self.state.read().await;
         let threads = Self::scoped_thread_summaries(&state.threads);
         let active_thread = Self::focus_thread_view(&state, &threads);
         let session = state.session.clone();
+        let collaboration = Self::collaboration_snapshot(&state.collaboration);
         drop(state);
 
         Ok(ipc::StateSnapshot {
@@ -1721,12 +1943,144 @@ impl OrcasDaemonService {
             session,
             threads,
             active_thread,
+            collaboration,
             recent_events: self.recent_events.lock().await.iter().cloned().collect(),
         })
     }
 
     fn new_object_id(prefix: &str) -> String {
         format!("{prefix}-{}", Uuid::new_v4().simple())
+    }
+
+    fn collaboration_snapshot(collaboration: &CollaborationState) -> ipc::CollaborationSnapshot {
+        let mut workstreams = collaboration
+            .workstreams
+            .values()
+            .map(Self::workstream_summary)
+            .collect::<Vec<_>>();
+        workstreams.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut work_units = collaboration
+            .work_units
+            .values()
+            .map(Self::work_unit_summary)
+            .collect::<Vec<_>>();
+        work_units.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut assignments = collaboration
+            .assignments
+            .values()
+            .filter(|assignment| assignment.status != AssignmentStatus::Closed)
+            .map(Self::assignment_summary)
+            .collect::<Vec<_>>();
+        assignments.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut reports = collaboration
+            .reports
+            .values()
+            .map(Self::report_summary)
+            .collect::<Vec<_>>();
+        reports.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut decisions = collaboration
+            .decisions
+            .values()
+            .map(Self::decision_summary)
+            .collect::<Vec<_>>();
+        decisions.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        ipc::CollaborationSnapshot {
+            workstreams,
+            work_units,
+            assignments,
+            reports,
+            decisions,
+        }
+    }
+
+    fn workstream_summary(workstream: &Workstream) -> ipc::WorkstreamSummary {
+        ipc::WorkstreamSummary {
+            id: workstream.id.clone(),
+            title: workstream.title.clone(),
+            status: workstream.status,
+            priority: workstream.priority.clone(),
+            updated_at: workstream.updated_at,
+        }
+    }
+
+    fn work_unit_summary(work_unit: &WorkUnit) -> ipc::WorkUnitSummary {
+        ipc::WorkUnitSummary {
+            id: work_unit.id.clone(),
+            workstream_id: work_unit.workstream_id.clone(),
+            title: work_unit.title.clone(),
+            status: work_unit.status,
+            dependency_count: work_unit.dependencies.len(),
+            current_assignment_id: work_unit.current_assignment_id.clone(),
+            latest_report_id: work_unit.latest_report_id.clone(),
+            updated_at: work_unit.updated_at,
+        }
+    }
+
+    fn assignment_summary(assignment: &Assignment) -> ipc::AssignmentSummary {
+        ipc::AssignmentSummary {
+            id: assignment.id.clone(),
+            work_unit_id: assignment.work_unit_id.clone(),
+            worker_id: assignment.worker_id.clone(),
+            worker_session_id: assignment.worker_session_id.clone(),
+            status: assignment.status,
+            attempt_number: assignment.attempt_number,
+            updated_at: assignment.updated_at,
+        }
+    }
+
+    fn report_summary(report: &Report) -> ipc::ReportSummary {
+        ipc::ReportSummary {
+            id: report.id.clone(),
+            work_unit_id: report.work_unit_id.clone(),
+            assignment_id: report.assignment_id.clone(),
+            worker_id: report.worker_id.clone(),
+            disposition: report.disposition,
+            summary: report.summary.clone(),
+            confidence: report.confidence,
+            parse_result: report.parse_result,
+            needs_supervisor_review: report.needs_supervisor_review,
+            created_at: report.created_at,
+        }
+    }
+
+    fn decision_summary(decision: &Decision) -> ipc::DecisionSummary {
+        ipc::DecisionSummary {
+            id: decision.id.clone(),
+            work_unit_id: decision.work_unit_id.clone(),
+            report_id: decision.report_id.clone(),
+            decision_type: decision.decision_type,
+            created_at: decision.created_at,
+        }
     }
 
     fn ensure_worker_and_session_records(
@@ -1795,15 +2149,16 @@ Assignment instructions:\n\
     fn parse_worker_report(raw_output: &str) -> ParsedWorkerReport {
         let fallback = || {
             ParsedWorkerReport {
-            disposition: ReportDisposition::Unknown,
-            summary: "Worker output retained for supervisor review because the structured report was incomplete or ambiguous.".to_string(),
-            findings: Vec::new(),
-            blockers: Vec::new(),
-            questions: Vec::new(),
-            recommended_next_actions: Vec::new(),
-            confidence: ReportConfidence::Unknown,
-            parse_status: ReportParseStatus::NeedsSupervisorReview,
-        }
+                disposition: ReportDisposition::Unknown,
+                summary: "Worker output retained for supervisor review because the structured report was invalid or incomplete.".to_string(),
+                findings: Vec::new(),
+                blockers: Vec::new(),
+                questions: Vec::new(),
+                recommended_next_actions: Vec::new(),
+                confidence: ReportConfidence::Unknown,
+                parse_result: ReportParseResult::Invalid,
+                needs_supervisor_review: true,
+            }
         };
 
         let Some((prefix, after_begin)) = raw_output.split_once("ORCAS_REPORT_BEGIN") else {
@@ -1823,14 +2178,15 @@ Assignment instructions:\n\
         let disposition = Self::parse_report_disposition(&payload.disposition);
         let confidence = Self::parse_report_confidence(&payload.confidence);
         let has_review_noise = !prefix.trim().is_empty() || !suffix.trim().is_empty();
-        let parse_status = if has_review_noise
-            || payload.summary.trim().is_empty()
+        let parse_result = if payload.summary.trim().is_empty()
             || disposition == ReportDisposition::Unknown
             || confidence == ReportConfidence::Unknown
         {
-            ReportParseStatus::NeedsSupervisorReview
+            ReportParseResult::Invalid
+        } else if has_review_noise {
+            ReportParseResult::Ambiguous
         } else {
-            ReportParseStatus::Parsed
+            ReportParseResult::Parsed
         };
 
         ParsedWorkerReport {
@@ -1845,7 +2201,8 @@ Assignment instructions:\n\
             questions: payload.questions,
             recommended_next_actions: payload.recommended_next_actions,
             confidence,
-            parse_status,
+            needs_supervisor_review: parse_result != ReportParseResult::Parsed,
+            parse_result,
         }
     }
 
@@ -2534,6 +2891,36 @@ Assignment instructions:\n\
                 Some(thread_id.clone()),
                 Some(turn_id.clone()),
             ),
+            ipc::DaemonEvent::WorkstreamLifecycle { action, workstream } => (
+                "workstream",
+                format!("workstream {} {:?}", workstream.id, action),
+                None,
+                None,
+            ),
+            ipc::DaemonEvent::WorkUnitLifecycle { action, work_unit } => (
+                "work_unit",
+                format!("work_unit {} {:?}", work_unit.id, action),
+                None,
+                None,
+            ),
+            ipc::DaemonEvent::AssignmentLifecycle { action, assignment } => (
+                "assignment",
+                format!("assignment {} {:?}", assignment.id, action),
+                None,
+                None,
+            ),
+            ipc::DaemonEvent::ReportRecorded { report } => (
+                "report",
+                format!("report {} {:?}", report.id, report.parse_result),
+                None,
+                None,
+            ),
+            ipc::DaemonEvent::DecisionApplied { decision } => (
+                "decision",
+                format!("decision {} {:?}", decision.id, decision.decision_type),
+                None,
+                None,
+            ),
             ipc::DaemonEvent::Warning { message } => ("warning", message.clone(), None, None),
         };
 
@@ -3102,9 +3489,9 @@ mod tests {
         CodexClient, LocalCodexDaemonManager, RejectingApprovalRouter, WebSocketTransport,
     };
     use orcas_core::{
-        AppConfig, AppPaths, AssignmentStatus, DecisionType, JsonSessionStore, OrcasSessionStore,
-        Report, ReportConfidence, ReportDisposition, ReportParseStatus, WorkUnitStatus,
-        WorkerStatus, WorkstreamStatus, ipc,
+        AppConfig, AppPaths, Assignment, AssignmentStatus, DecisionType, JsonSessionStore,
+        OrcasSessionStore, Report, ReportConfidence, ReportDisposition, ReportParseResult,
+        WorkUnitStatus, WorkerStatus, WorkstreamStatus, ipc,
     };
 
     fn sample_thread(id: &str, scope: &str, updated_at: i64) -> ipc::ThreadView {
@@ -3330,7 +3717,8 @@ ORCAS_REPORT_END"#;
         let parsed = OrcasDaemonService::parse_worker_report(raw);
         assert_eq!(parsed.disposition, ReportDisposition::Completed);
         assert_eq!(parsed.confidence, ReportConfidence::High);
-        assert_eq!(parsed.parse_status, ReportParseStatus::Parsed);
+        assert_eq!(parsed.parse_result, ReportParseResult::Parsed);
+        assert!(!parsed.needs_supervisor_review);
         assert_eq!(parsed.findings, vec!["root cause isolated".to_string()]);
     }
 
@@ -3351,10 +3739,15 @@ ORCAS_REPORT_END"#;
 
         let parsed = OrcasDaemonService::parse_worker_report(raw);
         assert_eq!(parsed.disposition, ReportDisposition::Completed);
-        assert_eq!(
-            parsed.parse_status,
-            ReportParseStatus::NeedsSupervisorReview
-        );
+        assert_eq!(parsed.parse_result, ReportParseResult::Ambiguous);
+        assert!(parsed.needs_supervisor_review);
+    }
+
+    #[test]
+    fn parse_worker_report_invalid_output_requires_review_and_preserves_invalid_result() {
+        let parsed = OrcasDaemonService::parse_worker_report("no structured report here");
+        assert_eq!(parsed.parse_result, ReportParseResult::Invalid);
+        assert!(parsed.needs_supervisor_review);
     }
 
     #[tokio::test]
@@ -3389,6 +3782,37 @@ ORCAS_REPORT_END"#;
     }
 
     #[tokio::test]
+    async fn snapshot_includes_collaboration_summaries_after_creation() {
+        let service = test_service().await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Snapshot".to_string(),
+                objective: "Verify snapshot".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: "Inspect".to_string(),
+                task_statement: "Inspect snapshot".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+
+        let snapshot = service.snapshot().await.expect("snapshot");
+        assert_eq!(snapshot.collaboration.workstreams.len(), 1);
+        assert_eq!(snapshot.collaboration.work_units.len(), 1);
+        assert_eq!(snapshot.collaboration.assignments.len(), 0);
+        assert_eq!(snapshot.collaboration.workstreams[0].id, workstream.id);
+        assert_eq!(snapshot.collaboration.work_units[0].id, work_unit.id);
+    }
+
+    #[tokio::test]
     async fn prepare_assignment_binds_worker_to_worker_session() {
         let service = test_service().await;
         let workstream = service
@@ -3411,7 +3835,71 @@ ORCAS_REPORT_END"#;
             .expect("workunit")
             .work_unit;
 
-        let (assignment_id, worker_id, worker_session_id) = service
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-a".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Inspect the reconnect path".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment");
+        let assignment_id = prepared.assignment.id.clone();
+        let worker_id = prepared.assignment.worker_id.clone();
+        let worker_session_id = prepared.assignment.worker_session_id.clone();
+
+        let state = service.state.read().await;
+        let assignment = &state.collaboration.assignments[&assignment_id];
+        assert_eq!(assignment.worker_id, worker_id);
+        assert_eq!(assignment.worker_session_id, worker_session_id);
+        assert_eq!(assignment.status, AssignmentStatus::Created);
+        assert!(prepared.created_new);
+        assert_eq!(
+            state.collaboration.workers[&worker_id].status,
+            WorkerStatus::Idle
+        );
+        assert_eq!(
+            state.collaboration.worker_sessions[&worker_session_id].worker_id,
+            worker_id
+        );
+    }
+
+    #[tokio::test]
+    async fn assignment_start_reuses_only_unexecuted_latest_pending_assignment() {
+        let service = test_service().await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Reconnect".to_string(),
+                objective: "Fix regression".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id,
+                title: "Inspect streaming".to_string(),
+                task_statement: "Inspect the current streaming path".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let first = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-a".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Inspect the reconnect path".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment");
+        let second = service
             .prepare_assignment(ipc::AssignmentStartRequest {
                 work_unit_id: work_unit.id.clone(),
                 worker_id: "worker-a".to_string(),
@@ -3423,18 +3911,143 @@ ORCAS_REPORT_END"#;
             .await
             .expect("assignment");
 
-        let state = service.state.read().await;
-        let assignment = &state.collaboration.assignments[&assignment_id];
-        assert_eq!(assignment.worker_id, worker_id);
-        assert_eq!(assignment.worker_session_id, worker_session_id);
-        assert_eq!(assignment.status, AssignmentStatus::Created);
-        assert_eq!(
-            state.collaboration.workers[&worker_id].status,
-            WorkerStatus::Idle
+        assert_eq!(first.assignment.id, second.assignment.id);
+        assert!(!second.created_new);
+    }
+
+    #[tokio::test]
+    async fn assignment_start_does_not_reopen_reported_assignment() {
+        let service = test_service().await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Reconnect".to_string(),
+                objective: "Fix regression".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id,
+                title: "Inspect streaming".to_string(),
+                task_statement: "Inspect the current streaming path".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-a".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Inspect the reconnect path".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment");
+        {
+            let mut state = service.state.write().await;
+            state
+                .collaboration
+                .assignments
+                .get_mut(&prepared.assignment.id)
+                .unwrap()
+                .status = AssignmentStatus::AwaitingDecision;
+            state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .unwrap()
+                .status = WorkUnitStatus::AwaitingDecision;
+        }
+
+        let error = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-a".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Inspect the reconnect path".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect_err("must not reopen assignment before decision");
+        assert!(
+            error
+                .to_string()
+                .contains("is not startable in status `AwaitingDecision`")
         );
-        assert_eq!(
-            state.collaboration.worker_sessions[&worker_session_id].worker_id,
-            worker_id
+    }
+
+    #[tokio::test]
+    async fn assignment_start_rejects_multiple_pending_assignments() {
+        let service = test_service().await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Reconnect".to_string(),
+                objective: "Fix regression".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id,
+                title: "Inspect streaming".to_string(),
+                task_statement: "Inspect the current streaming path".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let first = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-a".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Inspect the reconnect path".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment");
+        {
+            let mut state = service.state.write().await;
+            let duplicate_assignment = Assignment {
+                id: "assignment-dup".to_string(),
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-a".to_string(),
+                worker_session_id: first.assignment.worker_session_id.clone(),
+                instructions: "duplicate".to_string(),
+                status: AssignmentStatus::Created,
+                attempt_number: first.assignment.attempt_number + 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            state
+                .collaboration
+                .assignments
+                .insert(duplicate_assignment.id.clone(), duplicate_assignment);
+        }
+        let error = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-a".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Inspect the reconnect path".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect_err("multiple pending assignments must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("multiple unexecuted pending assignments")
         );
     }
 
@@ -3460,7 +4073,7 @@ ORCAS_REPORT_END"#;
             .await
             .expect("workunit")
             .work_unit;
-        let (assignment_id, worker_id, worker_session_id) = service
+        let prepared = service
             .prepare_assignment(ipc::AssignmentStartRequest {
                 work_unit_id: work_unit.id.clone(),
                 worker_id: "worker-a".to_string(),
@@ -3471,6 +4084,9 @@ ORCAS_REPORT_END"#;
             })
             .await
             .expect("assignment");
+        let assignment_id = prepared.assignment.id.clone();
+        let worker_id = prepared.assignment.worker_id.clone();
+        let worker_session_id = prepared.assignment.worker_session_id.clone();
         let report = {
             let now = Utc::now();
             let mut state = service.state.write().await;
@@ -3499,7 +4115,8 @@ ORCAS_REPORT_END"#;
                 recommended_next_actions: vec!["continue".to_string()],
                 confidence: ReportConfidence::High,
                 raw_output: "raw".to_string(),
-                parse_status: ReportParseStatus::Parsed,
+                parse_result: ReportParseResult::Parsed,
+                needs_supervisor_review: false,
                 created_at: now,
             };
             state
@@ -3552,6 +4169,10 @@ ORCAS_REPORT_END"#;
             state.collaboration.work_units[&work_unit.id].status,
             WorkUnitStatus::Ready
         );
+        assert_eq!(
+            state.collaboration.assignments[&next_assignment.id].worker_session_id,
+            worker_session_id
+        );
     }
 
     #[tokio::test]
@@ -3596,5 +4217,212 @@ ORCAS_REPORT_END"#;
             state.collaboration.workstreams[&workstream.id].status,
             WorkstreamStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_reflects_assignment_report_and_decision_transitions() {
+        let service = test_service().await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Reconnect".to_string(),
+                objective: "Fix regression".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id,
+                title: "Inspect streaming".to_string(),
+                task_statement: "Inspect the current streaming path".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-a".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Inspect the reconnect path".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment");
+        let report = {
+            let now = Utc::now();
+            let mut state = service.state.write().await;
+            state
+                .collaboration
+                .assignments
+                .get_mut(&prepared.assignment.id)
+                .unwrap()
+                .status = AssignmentStatus::AwaitingDecision;
+            state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .unwrap()
+                .status = WorkUnitStatus::AwaitingDecision;
+            let report = Report {
+                id: "report-snapshot".to_string(),
+                work_unit_id: work_unit.id.clone(),
+                assignment_id: prepared.assignment.id.clone(),
+                worker_id: prepared.assignment.worker_id.clone(),
+                disposition: ReportDisposition::Completed,
+                summary: "done".to_string(),
+                findings: Vec::new(),
+                blockers: Vec::new(),
+                questions: Vec::new(),
+                recommended_next_actions: Vec::new(),
+                confidence: ReportConfidence::High,
+                raw_output: "raw".to_string(),
+                parse_result: ReportParseResult::Ambiguous,
+                needs_supervisor_review: true,
+                created_at: now,
+            };
+            state
+                .collaboration
+                .reports
+                .insert(report.id.clone(), report.clone());
+            state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .unwrap()
+                .latest_report_id = Some(report.id.clone());
+            report
+        };
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist");
+        let mid_snapshot = service.snapshot().await.expect("snapshot");
+        assert_eq!(mid_snapshot.collaboration.assignments.len(), 1);
+        assert_eq!(mid_snapshot.collaboration.reports.len(), 1);
+        assert_eq!(
+            mid_snapshot.collaboration.reports[0].parse_result,
+            ReportParseResult::Ambiguous
+        );
+        assert!(mid_snapshot.collaboration.reports[0].needs_supervisor_review);
+
+        let _ = service
+            .decision_apply(ipc::DecisionApplyRequest {
+                work_unit_id: work_unit.id.clone(),
+                report_id: Some(report.id),
+                decision_type: DecisionType::MarkComplete,
+                rationale: "done".to_string(),
+                instructions: None,
+                worker_id: None,
+                worker_kind: None,
+            })
+            .await
+            .expect("decision");
+        let final_snapshot = service.snapshot().await.expect("snapshot");
+        assert!(final_snapshot.collaboration.assignments.is_empty());
+        assert_eq!(final_snapshot.collaboration.decisions.len(), 1);
+        assert_eq!(
+            final_snapshot.collaboration.work_units[0].status,
+            WorkUnitStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_emits_collaboration_lifecycle_events() {
+        let service = test_service().await;
+        let mut events = service.event_tx.subscribe();
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Reconnect".to_string(),
+                objective: "Fix regression".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id,
+                title: "Inspect streaming".to_string(),
+                task_statement: "Inspect the current streaming path".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-a".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Inspect the reconnect path".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment");
+        service
+            .emit_assignment_lifecycle(
+                ipc::AssignmentLifecycleAction::Created,
+                &prepared.assignment,
+            )
+            .await;
+        let report = Report {
+            id: "report-event".to_string(),
+            work_unit_id: work_unit.id.clone(),
+            assignment_id: prepared.assignment.id.clone(),
+            worker_id: prepared.assignment.worker_id.clone(),
+            disposition: ReportDisposition::Completed,
+            summary: "done".to_string(),
+            findings: Vec::new(),
+            blockers: Vec::new(),
+            questions: Vec::new(),
+            recommended_next_actions: Vec::new(),
+            confidence: ReportConfidence::High,
+            raw_output: "raw".to_string(),
+            parse_result: ReportParseResult::Parsed,
+            needs_supervisor_review: false,
+            created_at: Utc::now(),
+        };
+        service.emit_report_recorded(&report).await;
+        let _ = service
+            .decision_apply(ipc::DecisionApplyRequest {
+                work_unit_id: work_unit.id.clone(),
+                report_id: None,
+                decision_type: DecisionType::EscalateToHuman,
+                rationale: "need review".to_string(),
+                instructions: None,
+                worker_id: None,
+                worker_kind: None,
+            })
+            .await;
+
+        let mut saw_workstream = false;
+        let mut saw_work_unit = false;
+        let mut saw_assignment = false;
+        let mut saw_report = false;
+        let mut saw_decision = false;
+        for _ in 0..8 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event");
+            match event.event {
+                ipc::DaemonEvent::WorkstreamLifecycle { .. } => saw_workstream = true,
+                ipc::DaemonEvent::WorkUnitLifecycle { .. } => saw_work_unit = true,
+                ipc::DaemonEvent::AssignmentLifecycle { .. } => saw_assignment = true,
+                ipc::DaemonEvent::ReportRecorded { .. } => saw_report = true,
+                ipc::DaemonEvent::DecisionApplied { .. } => saw_decision = true,
+                _ => {}
+            }
+        }
+        assert!(saw_workstream);
+        assert!(saw_work_unit);
+        assert!(saw_assignment);
+        assert!(saw_report);
+        assert!(saw_decision);
     }
 }

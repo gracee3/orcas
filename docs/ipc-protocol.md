@@ -61,6 +61,11 @@ Current event kinds:
 - turn updated
 - item updated
 - output delta
+- workstream lifecycle
+- work unit lifecycle
+- assignment lifecycle
+- report recorded
+- decision applied
 - warning
 
 ## Snapshots
@@ -81,6 +86,7 @@ Current snapshot content:
 - active session state
 - known scoped thread summaries
 - one active/focused thread view when available
+- collaboration summaries for workstreams, work units, active or pending assignments, reports, and decisions
 - recent event ring buffer
 
 Additional query helpers now include:
@@ -148,6 +154,9 @@ Current collaboration loop semantics:
 - worker execution is Codex-backed, but the report is stored as an Orcas-owned object
 - `decision/apply` records the supervisor decision explicitly
 - `continue` and `redirect` create a new pending assignment for the same work unit rather than mutating one assignment forever
+- `assignment/start` may reuse only the latest unexecuted pending assignment for that work unit
+- worker-session reuse preserves the runtime thread anchor only; it does not imply hidden continuity between assignments
+- reports expose `parse_result` separately from `needs_supervisor_review`, while always preserving raw output
 
 ## Design Rules
 

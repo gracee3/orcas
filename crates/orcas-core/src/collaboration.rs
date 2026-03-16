@@ -172,10 +172,11 @@ pub enum ReportConfidence {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum ReportParseStatus {
-    #[default]
+pub enum ReportParseResult {
     Parsed,
-    NeedsSupervisorReview,
+    Ambiguous,
+    #[default]
+    Invalid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,7 +200,9 @@ pub struct Report {
     pub confidence: ReportConfidence,
     pub raw_output: String,
     #[serde(default)]
-    pub parse_status: ReportParseStatus,
+    pub parse_result: ReportParseResult,
+    #[serde(default)]
+    pub needs_supervisor_review: bool,
     pub created_at: DateTime<Utc>,
 }
 

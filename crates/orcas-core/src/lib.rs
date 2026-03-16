@@ -10,7 +10,7 @@ pub mod store;
 
 pub use collaboration::{
     Assignment, AssignmentStatus, CollaborationState, Decision, DecisionType, Report,
-    ReportConfidence, ReportDisposition, ReportParseStatus, WorkUnit, WorkUnitStatus, Worker,
+    ReportConfidence, ReportDisposition, ReportParseResult, WorkUnit, WorkUnitStatus, Worker,
     WorkerSession, WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus,
     Workstream, WorkstreamStatus,
 };

@@ -157,6 +157,8 @@ This document defines the main lifecycle cuts and protocol invariants for Orcas 
 - an assignment is an execution attempt, not the whole life of a work unit
 - `continue` creates a new execution segment and a new assignment for the same work unit after supervisor review; it does not leave one assignment open indefinitely
 - retrying or redirecting creates a new assignment even if the worker session is reused
+- `assignment/start` may only reuse the latest unexecuted pending assignment for that work unit
+- `assignment/start` must not reopen reported, closed, interrupted, or lost assignments
 
 ## Worker And Worker Session Lifecycle
 

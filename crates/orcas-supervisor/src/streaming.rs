@@ -718,6 +718,7 @@ mod tests {
                 turn_in_flight: active,
             }],
             active_thread: None,
+            collaboration: ipc::CollaborationSnapshot::default(),
             recent_events: Vec::new(),
         }
     }

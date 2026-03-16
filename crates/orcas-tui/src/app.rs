@@ -97,6 +97,7 @@ pub enum UiEvent {
         item_id: String,
         delta: String,
     },
+    Ignored,
     Warning(String),
     Error(String),
 }
@@ -130,6 +131,11 @@ impl UiEvent {
                 item_id,
                 delta,
             },
+            ipc::DaemonEvent::WorkstreamLifecycle { .. }
+            | ipc::DaemonEvent::WorkUnitLifecycle { .. }
+            | ipc::DaemonEvent::AssignmentLifecycle { .. }
+            | ipc::DaemonEvent::ReportRecorded { .. }
+            | ipc::DaemonEvent::DecisionApplied { .. } => Self::Ignored,
             ipc::DaemonEvent::Warning { message } => Self::Warning(message),
         }
     }
@@ -400,6 +406,7 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
                 item.text.get_or_insert_with(String::new).push_str(&delta);
             }
         }
+        UiEvent::Ignored => {}
         UiEvent::Warning(message) => {
             state.banner = Some(StatusBanner {
                 level: BannerLevel::Warning,
@@ -590,6 +597,7 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
     let timestamp = chrono::Utc::now();
     let (kind, message, thread_id, turn_id) = match event {
         UiEvent::SnapshotLoaded(_) => return None,
+        UiEvent::Ignored => return None,
         UiEvent::ReconnectScheduled { attempt, .. } => (
             "reconnect",
             format!("scheduled reconnect attempt {attempt}"),

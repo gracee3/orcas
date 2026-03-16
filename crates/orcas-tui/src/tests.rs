@@ -95,6 +95,7 @@ fn sample_snapshot() -> ipc::StateSnapshot {
             sample_thread_summary("thread-2", "later", 150),
         ],
         active_thread: Some(sample_thread_view("thread-1", "hello", "world")),
+        collaboration: ipc::CollaborationSnapshot::default(),
         recent_events: vec![ipc::EventSummary {
             timestamp: Utc::now(),
             kind: "thread".to_string(),

@@ -88,6 +88,12 @@ Recommended v1 mapping:
 - one worker may reuse the same thread across multiple assignments
 - supervisor redirects or retries may continue in the same thread if the session remains valid
 
+Important semantic rule:
+
+- session reuse preserves the runtime thread anchor only
+- each `Assignment` still records its own explicit `worker_session_id`
+- reusing a worker session does not imply hidden continuity of workflow execution
+
 This gives the worker continuity of local context while keeping assignment boundaries explicit at the Orcas layer.
 
 ## Mapping To Codex Turns
@@ -97,7 +103,7 @@ Codex turns are execution segments inside a worker session.
 Recommended v1 mapping:
 
 - one assignment normally begins with one `turn/start`
-- an assignment may span multiple turns if the supervisor explicitly issues `continue` on the same assignment
+- `continue` creates a new assignment and a new execution segment for the same work unit
 - only one active turn per worker session at a time in v1
 
 That means the important identity is:

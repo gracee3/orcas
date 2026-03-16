@@ -238,6 +238,15 @@ IPC event notifications are now Orcas-owned daemon events rather than raw upstre
 - upstream status changes
 - session/active turn changes
 - thread summary updates
+- workstream/work-unit lifecycle updates
+- assignment lifecycle updates
+- report-recorded and decision-applied updates
+
+Collaboration reporting semantics are now explicit too:
+
+- raw worker output is always retained
+- report parsing exposes `parse_result` plus `needs_supervisor_review`
+- ambiguous output is not silently upgraded into a fully parsed report
 - turn updates
 - item updates
 - streamed output deltas

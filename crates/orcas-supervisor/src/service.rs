@@ -442,7 +442,11 @@ impl SupervisorService {
             println!("thread_id: {thread_id}");
         }
         println!("report_id: {}", response.report.id);
-        println!("report_parse_status: {:?}", response.report.parse_status);
+        println!("report_parse_result: {:?}", response.report.parse_result);
+        println!(
+            "report_needs_supervisor_review: {}",
+            response.report.needs_supervisor_review
+        );
         println!("report_disposition: {:?}", response.report.disposition);
         println!("report_summary: {}", response.report.summary);
         Ok(())
@@ -463,7 +467,11 @@ impl SupervisorService {
         println!("worker_session_id: {}", response.worker_session.id);
         if let Some(report) = response.report.as_ref() {
             println!("report_id: {}", report.id);
-            println!("report_parse_status: {:?}", report.parse_status);
+            println!("report_parse_result: {:?}", report.parse_result);
+            println!(
+                "report_needs_supervisor_review: {}",
+                report.needs_supervisor_review
+            );
         }
         Ok(())
     }
@@ -479,7 +487,11 @@ impl SupervisorService {
         println!("work_unit_id: {}", response.report.work_unit_id);
         println!("assignment_id: {}", response.report.assignment_id);
         println!("disposition: {:?}", response.report.disposition);
-        println!("parse_status: {:?}", response.report.parse_status);
+        println!("parse_result: {:?}", response.report.parse_result);
+        println!(
+            "needs_supervisor_review: {}",
+            response.report.needs_supervisor_review
+        );
         println!("confidence: {:?}", response.report.confidence);
         println!("summary: {}", response.report.summary);
         println!("findings: {}", response.report.findings.len());
@@ -501,8 +513,12 @@ impl SupervisorService {
             .await?;
         for report in response.reports {
             println!(
-                "{}\t{:?}\t{:?}\t{}",
-                report.id, report.disposition, report.parse_status, report.summary
+                "{}\t{:?}\t{:?}\treview={}\t{}",
+                report.id,
+                report.disposition,
+                report.parse_result,
+                report.needs_supervisor_review,
+                report.summary
             );
         }
         Ok(())
