@@ -11,11 +11,15 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 orcas-daemon = { path = "../orcas-daemon" }
 orcas-core = { path = "../orcas-core" }
 tokio.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
 
 [lints]
 workspace = true

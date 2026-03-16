@@ -148,7 +148,20 @@ The status view is Orcas-owned and intentionally small.
 
 ## Frontend Expectations During Restart
 
-Supervisor commands reconnect per invocation, so they tolerate daemon restart naturally.
+Supervisor commands now split into two behaviors:
+
+- one-shot admin requests reconnect per invocation and keep retry logic short
+- streaming prompt/turn flows use a supervisor-side session helper with bounded reconnect
+
+For streaming supervisor commands, the recovery model is:
+
+1. detect daemon disconnect
+2. reconnect to the Orcas IPC socket with bounded backoff
+3. fetch `state/get`
+4. fetch `thread/get` for the active thread when available
+5. decide whether the stream can honestly resume, whether only terminal snapshot state can be recovered, or whether the stream must be reported as interrupted
+
+This is intentionally snapshot-first. Orcas does not claim uninterrupted upstream Codex execution after daemon replacement unless the refreshed Orcas state proves the turn is still live.
 
 The TUI now:
 

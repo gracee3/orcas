@@ -1,4 +1,3 @@
-use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,13 +5,15 @@ use std::time::Duration;
 use anyhow::{Error, Result};
 use tokio::time::sleep;
 
-use orcas_core::{
-    AppConfig, AppPaths, ThreadReadRequest, ThreadResumeRequest, ThreadStartRequest,
-    TurnStartRequest, ipc,
-};
+use orcas_core::{AppConfig, AppPaths, ThreadReadRequest, ThreadResumeRequest, ThreadStartRequest};
 use orcas_daemon::{
-    EventSubscription, OrcasDaemonLaunch, OrcasDaemonProcessManager, OrcasIpcClient,
-    OrcasRuntimeOverrides, apply_runtime_overrides,
+    OrcasDaemonLaunch, OrcasDaemonProcessManager, OrcasIpcClient, OrcasRuntimeOverrides,
+    apply_runtime_overrides,
+};
+
+use crate::streaming::{
+    ConsoleReporter, OrcasSupervisorStreamingBackend, RetryPolicy, StreamReporter,
+    StreamingCommandRunner,
 };
 
 pub use orcas_daemon::OrcasRuntimeOverrides as RuntimeOverrides;
@@ -257,20 +258,11 @@ impl SupervisorService {
     }
 
     pub async fn prompt(&self, thread_id: &str, text: &str) -> Result<String> {
-        let client = self.ready_client().await?;
-        client
-            .thread_resume(&ThreadResumeRequest {
-                thread_id: thread_id.to_string(),
-                cwd: self
-                    .config
-                    .defaults
-                    .cwd
-                    .clone()
-                    .map(|path| path.display().to_string()),
-                model: self.config.defaults.model.clone(),
-            })
+        let mut reporter = ConsoleReporter;
+        self.resume_thread_for_streaming(thread_id, &mut reporter)
             .await?;
-        self.send_turn(client, thread_id, text).await
+        self.run_streaming_turn(thread_id, text, &mut reporter)
+            .await
     }
 
     pub async fn quickstart(
@@ -279,89 +271,106 @@ impl SupervisorService {
         model: Option<String>,
         text: &str,
     ) -> Result<()> {
-        let client = self.ready_client().await?;
-        let thread = client
-            .thread_start(&ThreadStartRequest {
-                cwd: cwd
-                    .or_else(|| self.config.defaults.cwd.clone())
-                    .map(|path| path.display().to_string()),
-                model: model.or_else(|| self.config.defaults.model.clone()),
-                ephemeral: false,
-            })
+        let mut reporter = ConsoleReporter;
+        let cwd = cwd.or_else(|| self.config.defaults.cwd.clone());
+        let model = model.or_else(|| self.config.defaults.model.clone());
+        let thread_id = self
+            .start_thread_for_streaming(cwd, model, &mut reporter)
             .await?;
         let final_text = self
-            .send_turn(Arc::clone(&client), &thread.thread.id, text)
+            .run_streaming_turn(&thread_id, text, &mut reporter)
             .await?;
-        println!("\nthread_id: {}", thread.thread.id);
+        println!("\nthread_id: {thread_id}");
         println!("final_text_len: {}", final_text.len());
         Ok(())
     }
 
-    async fn send_turn(
+    async fn resume_thread_for_streaming(
         &self,
-        client: Arc<OrcasIpcClient>,
         thread_id: &str,
-        text: &str,
-    ) -> Result<String> {
-        let (mut events, _) = client.subscribe_events(false).await?;
-        let response = client
-            .turn_start(&TurnStartRequest {
-                thread_id: thread_id.to_string(),
-                text: text.to_string(),
-                cwd: None,
-                model: None,
-            })
-            .await?;
-        self.stream_turn(thread_id, &response.turn_id, &mut events)
-            .await
-    }
+        reporter: &mut dyn StreamReporter,
+    ) -> Result<()> {
+        let retry_policy = RetryPolicy::default();
+        let request = ThreadResumeRequest {
+            thread_id: thread_id.to_string(),
+            cwd: self
+                .config
+                .defaults
+                .cwd
+                .clone()
+                .map(|path| path.display().to_string()),
+            model: self.config.defaults.model.clone(),
+        };
+        let mut delay = retry_policy.base_delay;
 
-    async fn stream_turn(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        events: &mut EventSubscription,
-    ) -> Result<String> {
-        let mut buffer = String::new();
-        loop {
-            match events.recv().await {
-                Ok(envelope) => match envelope.event {
-                    ipc::DaemonEvent::OutputDelta {
-                        thread_id: event_thread_id,
-                        turn_id: event_turn_id,
-                        delta,
-                        ..
-                    } if event_thread_id == thread_id && event_turn_id == turn_id => {
-                        print!("{delta}");
-                        io::stdout().flush().ok();
-                        buffer.push_str(&delta);
+        for attempt in 1..=retry_policy.max_attempts {
+            let client = self.ready_client().await?;
+            match client.thread_resume(&request).await {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    if attempt == retry_policy.max_attempts {
+                        reporter.status(
+                            "[daemon connection was lost while resuming the thread; resume could not be confirmed]",
+                        );
+                        return Err(error.into());
                     }
-                    ipc::DaemonEvent::TurnUpdated {
-                        thread_id: event_thread_id,
-                        turn,
-                    } if event_thread_id == thread_id
-                        && turn.id == turn_id
-                        && matches!(
-                            turn.status.as_str(),
-                            "completed" | "failed" | "cancelled" | "interrupted"
-                        ) =>
-                    {
-                        println!("\n[turn completed: {}]", turn.status);
-                        return Ok(buffer);
-                    }
-                    ipc::DaemonEvent::Warning { message } => {
-                        eprintln!("warning: {message}");
-                    }
-                    _ => {}
-                },
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    eprintln!("warning: event stream lagged, skipped {skipped} events");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    anyhow::bail!("event stream closed before turn completed");
+
+                    reporter.status(&format!(
+                        "[daemon connection was lost while resuming the thread; retrying ({attempt}/{})]",
+                        retry_policy.max_attempts
+                    ));
+                    sleep(delay).await;
+                    delay = (delay * 2).min(retry_policy.max_delay);
                 }
             }
         }
+
+        Ok(())
+    }
+
+    async fn start_thread_for_streaming(
+        &self,
+        cwd: Option<PathBuf>,
+        model: Option<String>,
+        reporter: &mut dyn StreamReporter,
+    ) -> Result<String> {
+        let client = self.ready_client().await?;
+        let thread = match client
+            .thread_start(&ThreadStartRequest {
+                cwd: cwd.map(|path| path.display().to_string()),
+                model,
+                ephemeral: false,
+            })
+            .await
+        {
+            Ok(thread) => thread,
+            Err(error) => {
+                reporter.status(
+                    "[daemon connection was lost while creating the thread; thread creation could not be confirmed]",
+                );
+                return Err(error.into());
+            }
+        };
+        Ok(thread.thread.id)
+    }
+
+    async fn run_streaming_turn(
+        &self,
+        thread_id: &str,
+        text: &str,
+        reporter: &mut dyn StreamReporter,
+    ) -> Result<String> {
+        let backend =
+            OrcasSupervisorStreamingBackend::new(self.paths.clone(), &self.config, &self.overrides);
+        let runner = StreamingCommandRunner::new(backend, RetryPolicy::default());
+        let outcome = runner.run_turn(thread_id, text, reporter).await?;
+        if matches!(
+            outcome.state,
+            crate::streaming::StreamOutcomeState::Interrupted
+        ) {
+            println!("[stream state: interrupted]");
+        }
+        Ok(outcome.final_text)
     }
 
     async fn ready_client(&self) -> Result<Arc<OrcasIpcClient>> {

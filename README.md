@@ -49,6 +49,7 @@ Implemented now:
 - graceful daemon stop over IPC
 - runtime metadata file next to the socket for PID/build inspection
 - supervisor CLI routed through the daemon
+- supervisor prompt and quickstart flows now use a session-aware streaming helper with bounded reconnect and snapshot-first recovery
 - TUI reducer/runtime/view-model split routed through the daemon with automatic reconnect/resubscribe
 - headless TUI test harness with fake backend
 - lightweight JSON/TOML config and thread metadata persistence, including recent output snippets
@@ -220,7 +221,8 @@ IPC event notifications are now Orcas-owned daemon events rather than raw upstre
 - `threads/list` is still broad, although `threads/list_scoped` and `state/get` now prefer Orcas-relevant threads
 - TUI is intentionally minimal; the architecture and tests matter more than UI breadth in this pass
 - Orcas IPC is intentionally narrow and may evolve
-- supervisor retry behavior during daemon replacement is intentionally short-lived and pragmatic rather than fully session-aware
+- supervisor one-shot commands still use short-lived retry behavior rather than long-lived session management
+- supervisor streaming continuity is intentionally honest: Orcas can recover the local session view after daemon replacement, but it does not claim uninterrupted upstream Codex execution if the live turn was cut
 
 ## Validation Completed In This Pass
 
@@ -229,6 +231,7 @@ Validated locally against `/home/emmy/git/codex/codex-rs/target/debug/codex`:
 - `cargo fmt --check`
 - `cargo check`
 - `cargo test`
+- focused supervisor streaming-helper tests for reconnect, resubscribe, and honest interruption reporting
 - `orcas supervisor daemon start`
 - `orcas supervisor daemon status`
 - `orcas supervisor daemon restart`
@@ -243,9 +246,11 @@ Validated locally against `/home/emmy/git/codex/codex-rs/target/debug/codex`:
 - killing the daemon to leave a stale socket/metadata pair, then recovering with `supervisor daemon start`
 - killing the TUI did not kill `orcasd`
 - supervisor commands continued working after the TUI disconnected
+- a live `supervisor prompt` run survived daemon replacement far enough to report bounded retry during `thread_resume` instead of failing immediately with a raw transport error
+- supervisor streaming recovery is validated primarily through controlled fake-daemon tests because end-to-end upstream turn completion remains gated on Codex availability
 
 Note: the previous quickstart path is currently blocked by the local Codex upstream returning `426 Upgrade Required` from its remote responses websocket. The Orcas daemon/TUI path validates cleanly, but end-to-end turn completion still depends on upstream Codex availability.
 
 ## Next Step
 
-Broaden the Orcas-owned control plane beyond lifecycle hardening into richer daemon-side session workflows: tighter thread scoping, better active-turn recovery, and more explicit frontend reconnect/resubscribe behavior.
+Broaden the Orcas-owned control plane beyond current recovery hardening into richer daemon-side session workflows: tighter thread scoping, stronger active-turn continuity signals, and more explicit supervisor/TUI resume surfaces.

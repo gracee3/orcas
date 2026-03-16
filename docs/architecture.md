@@ -67,7 +67,9 @@ Thin operational CLI client:
 
 - starts or reuses `orcasd`
 - sends narrow IPC requests
-- streams turn output from Orcas IPC events
+- keeps one-shot admin commands simple and short-lived
+- uses a small session-aware streaming helper for prompt/turn flows
+- streams turn output from Orcas IPC events with bounded reconnect
 - no longer owns a direct Codex client
 
 ## `orcas-tui`
@@ -156,6 +158,14 @@ The reconnect path now follows the same rule:
 
 Missed state is recovered from the snapshot, not inferred from event gaps alone.
 
+Supervisor streaming commands follow the same snapshot-first rule, but with stricter user-facing semantics:
+
+- if the daemon disappears mid-stream, the supervisor reconnects with bounded backoff
+- once reconnected, it re-anchors on `state/get` plus `thread/get`
+- if the target turn still exists or is still marked active, the supervisor re-subscribes
+- if the target turn is only recoverable as terminal snapshot state, the supervisor reports that explicitly and prints the recovered suffix
+- if continuity cannot be proven, the command exits as interrupted instead of implying uninterrupted upstream execution
+
 Current daemon event types include:
 
 - upstream status changes
@@ -198,6 +208,7 @@ Most TUI tests assert on state and view-model projections. Render validation is 
 
 - `threads/list` is still broader than the scoped frontend snapshot
 - one-shot supervisor retry logic is intentionally shallow and command-scoped
+- supervisor streaming recovery is local-session aware, not upstream-turn durable
 - no dedicated approval UX
 - no auth or multi-user model
 - no browser bridge yet
