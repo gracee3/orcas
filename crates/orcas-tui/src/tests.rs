@@ -1,9 +1,12 @@
 use chrono::Utc;
 
-use crate::app::{BannerLevel, DaemonConnectionPhase, UserAction};
+use crate::app::{BannerLevel, DaemonConnectionPhase, NavigationFocus, UserAction};
 use crate::backend::BackendCommand;
 use crate::test_harness::AppHarness;
-use orcas_core::{ConnectionState, ipc};
+use orcas_core::{
+    AssignmentStatus, ConnectionState, DecisionType, ReportConfidence, ReportDisposition,
+    ReportParseResult, WorkUnitStatus, WorkstreamStatus, ipc,
+};
 
 fn sample_thread_summary(id: &str, preview: &str, updated_at: i64) -> ipc::ThreadSummary {
     ipc::ThreadSummary {
@@ -61,6 +64,115 @@ fn sample_turn_state(
     }
 }
 
+fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
+    ipc::CollaborationSnapshot {
+        workstreams: vec![
+            ipc::WorkstreamSummary {
+                id: "ws-1".to_string(),
+                title: "Collaboration hardening".to_string(),
+                objective: "Harden collaboration snapshot semantics.".to_string(),
+                status: WorkstreamStatus::Active,
+                priority: "high".to_string(),
+                updated_at: Utc::now(),
+            },
+            ipc::WorkstreamSummary {
+                id: "ws-2".to_string(),
+                title: "Deferred work".to_string(),
+                objective: "Hold future scope.".to_string(),
+                status: WorkstreamStatus::Blocked,
+                priority: "low".to_string(),
+                updated_at: Utc::now(),
+            },
+        ],
+        work_units: vec![
+            ipc::WorkUnitSummary {
+                id: "wu-1".to_string(),
+                workstream_id: "ws-1".to_string(),
+                title: "Snapshot wiring".to_string(),
+                status: WorkUnitStatus::AwaitingDecision,
+                dependency_count: 0,
+                current_assignment_id: Some("assignment-2".to_string()),
+                latest_report_id: Some("report-2".to_string()),
+                updated_at: Utc::now(),
+            },
+            ipc::WorkUnitSummary {
+                id: "wu-2".to_string(),
+                workstream_id: "ws-1".to_string(),
+                title: "Event wiring".to_string(),
+                status: WorkUnitStatus::Ready,
+                dependency_count: 1,
+                current_assignment_id: Some("assignment-3".to_string()),
+                latest_report_id: Some("report-3".to_string()),
+                updated_at: Utc::now(),
+            },
+            ipc::WorkUnitSummary {
+                id: "wu-3".to_string(),
+                workstream_id: "ws-2".to_string(),
+                title: "Out of scope".to_string(),
+                status: WorkUnitStatus::Blocked,
+                dependency_count: 2,
+                current_assignment_id: None,
+                latest_report_id: None,
+                updated_at: Utc::now(),
+            },
+        ],
+        assignments: vec![
+            ipc::AssignmentSummary {
+                id: "assignment-2".to_string(),
+                work_unit_id: "wu-1".to_string(),
+                worker_id: "worker-a".to_string(),
+                worker_session_id: "session-1".to_string(),
+                status: AssignmentStatus::AwaitingDecision,
+                attempt_number: 2,
+                updated_at: Utc::now(),
+            },
+            ipc::AssignmentSummary {
+                id: "assignment-3".to_string(),
+                work_unit_id: "wu-2".to_string(),
+                worker_id: "worker-a".to_string(),
+                worker_session_id: "session-1".to_string(),
+                status: AssignmentStatus::Created,
+                attempt_number: 3,
+                updated_at: Utc::now(),
+            },
+        ],
+        reports: vec![
+            ipc::ReportSummary {
+                id: "report-2".to_string(),
+                work_unit_id: "wu-1".to_string(),
+                assignment_id: "assignment-2".to_string(),
+                worker_id: "worker-a".to_string(),
+                disposition: ReportDisposition::Partial,
+                summary: "Snapshot path is implemented, review is required.".to_string(),
+                confidence: ReportConfidence::Medium,
+                parse_result: ReportParseResult::Ambiguous,
+                needs_supervisor_review: true,
+                created_at: Utc::now(),
+            },
+            ipc::ReportSummary {
+                id: "report-3".to_string(),
+                work_unit_id: "wu-2".to_string(),
+                assignment_id: "assignment-3".to_string(),
+                worker_id: "worker-a".to_string(),
+                disposition: ReportDisposition::Completed,
+                summary: "Clean report for event wiring.".to_string(),
+                confidence: ReportConfidence::High,
+                parse_result: ReportParseResult::Parsed,
+                needs_supervisor_review: false,
+                created_at: Utc::now(),
+            },
+        ],
+        decisions: vec![ipc::DecisionSummary {
+            id: "decision-1".to_string(),
+            work_unit_id: "wu-1".to_string(),
+            report_id: Some("report-2".to_string()),
+            decision_type: DecisionType::Continue,
+            rationale: "Need one more bounded pass.".to_string(),
+            created_at: Utc::now(),
+        }],
+    }
+}
+
 fn sample_snapshot() -> ipc::StateSnapshot {
     ipc::StateSnapshot {
         daemon: ipc::DaemonStatusResponse {
@@ -95,7 +207,7 @@ fn sample_snapshot() -> ipc::StateSnapshot {
             sample_thread_summary("thread-2", "later", 150),
         ],
         active_thread: Some(sample_thread_view("thread-1", "hello", "world")),
-        collaboration: ipc::CollaborationSnapshot::default(),
+        collaboration: sample_collaboration_snapshot(),
         recent_events: vec![ipc::EventSummary {
             timestamp: Utc::now(),
             kind: "thread".to_string(),
@@ -111,11 +223,16 @@ async fn initial_snapshot_load_populates_state() {
     let harness = AppHarness::new(sample_snapshot()).await.unwrap();
     let connection = harness.connection_vm();
     let threads = harness.thread_list_vm();
+    let workstreams = harness.workstream_list_vm();
+    let work_units = harness.work_unit_list_vm();
 
     assert_eq!(connection.daemon_phase, DaemonConnectionPhase::Connected);
     assert_eq!(connection.upstream_status, "connected");
     assert_eq!(threads.rows.len(), 2);
     assert!(threads.rows[0].selected);
+    assert_eq!(workstreams.rows.len(), 2);
+    assert!(workstreams.rows[0].selected);
+    assert_eq!(work_units.rows.len(), 2);
 }
 
 #[tokio::test]
@@ -310,6 +427,27 @@ async fn reconnect_recovers_with_snapshot_then_resubscribe() {
     recovered.threads = vec![sample_thread_summary("thread-2", "recovered", 300)];
     recovered.session.active_thread_id = Some("thread-2".to_string());
     recovered.active_thread = Some(sample_thread_view("thread-2", "recovered", "after restart"));
+    recovered.collaboration.workstreams = vec![ipc::WorkstreamSummary {
+        id: "ws-9".to_string(),
+        title: "Recovered collaboration".to_string(),
+        objective: "Reload collaboration snapshot.".to_string(),
+        status: WorkstreamStatus::Active,
+        priority: "high".to_string(),
+        updated_at: Utc::now(),
+    }];
+    recovered.collaboration.work_units = vec![ipc::WorkUnitSummary {
+        id: "wu-9".to_string(),
+        workstream_id: "ws-9".to_string(),
+        title: "Recovered unit".to_string(),
+        status: WorkUnitStatus::Ready,
+        dependency_count: 0,
+        current_assignment_id: None,
+        latest_report_id: None,
+        updated_at: Utc::now(),
+    }];
+    recovered.collaboration.assignments = Vec::new();
+    recovered.collaboration.reports = Vec::new();
+    recovered.collaboration.decisions = Vec::new();
     harness.replace_snapshot(recovered).await;
 
     harness.disconnect_events().await;
@@ -327,15 +465,271 @@ async fn reconnect_recovers_with_snapshot_then_resubscribe() {
 
     let connection = harness.connection_vm();
     let detail = harness.thread_detail_vm();
+    let workstreams = harness.workstream_list_vm();
+    let work_units = harness.work_unit_list_vm();
     assert_eq!(connection.daemon_phase, DaemonConnectionPhase::Connected);
     assert_eq!(harness.snapshot_requests().await, 2);
     assert_eq!(harness.subscribe_requests().await, 2);
     assert_eq!(harness.thread_list_vm().rows.len(), 1);
     assert!(detail.title.contains("thread-2"));
+    assert_eq!(workstreams.rows.len(), 1);
+    assert_eq!(workstreams.rows[0].title, "Recovered collaboration");
+    assert_eq!(work_units.rows.len(), 1);
+    assert_eq!(work_units.rows[0].title, "Recovered unit");
     assert!(
         detail
             .lines
             .iter()
             .any(|line| line.contains("after restart"))
     );
+}
+
+#[tokio::test]
+async fn collaboration_snapshot_drives_rendering() {
+    let harness = AppHarness::new(sample_snapshot()).await.unwrap();
+
+    let workstream_detail = harness.workstream_detail_vm();
+    let work_units = harness.work_unit_list_vm();
+    let assignments = harness.assignment_list_vm();
+    let detail = harness.collaboration_detail_vm();
+
+    assert!(
+        workstream_detail
+            .lines
+            .iter()
+            .any(|line| line.contains("Harden collaboration snapshot semantics."))
+    );
+    assert!(
+        work_units
+            .rows
+            .iter()
+            .any(|row| row.title == "Snapshot wiring" && row.needs_supervisor_review)
+    );
+    assert!(
+        assignments
+            .rows
+            .iter()
+            .any(|row| row.id == "assignment-2" && row.worker_session_id == "session-1")
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("parse_result: ambiguous"))
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("decision_rationale: Need one more bounded pass."))
+    );
+}
+
+#[tokio::test]
+async fn collaboration_events_refresh_summaries_incrementally() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness
+        .inject_event(ipc::DaemonEventEnvelope::new(
+            ipc::DaemonEvent::WorkstreamLifecycle {
+                action: ipc::CollaborationLifecycleAction::Created,
+                workstream: ipc::WorkstreamSummary {
+                    id: "ws-3".to_string(),
+                    title: "Fresh stream".to_string(),
+                    objective: "Add new read-only surface.".to_string(),
+                    status: WorkstreamStatus::Active,
+                    priority: "medium".to_string(),
+                    updated_at: Utc::now(),
+                },
+            },
+        ))
+        .await
+        .unwrap();
+    harness
+        .inject_event(ipc::DaemonEventEnvelope::new(
+            ipc::DaemonEvent::WorkUnitLifecycle {
+                action: ipc::CollaborationLifecycleAction::Created,
+                work_unit: ipc::WorkUnitSummary {
+                    id: "wu-4".to_string(),
+                    workstream_id: "ws-3".to_string(),
+                    title: "Render panel".to_string(),
+                    status: WorkUnitStatus::Running,
+                    dependency_count: 0,
+                    current_assignment_id: Some("assignment-4".to_string()),
+                    latest_report_id: Some("report-4".to_string()),
+                    updated_at: Utc::now(),
+                },
+            },
+        ))
+        .await
+        .unwrap();
+    harness
+        .inject_event(ipc::DaemonEventEnvelope::new(
+            ipc::DaemonEvent::AssignmentLifecycle {
+                action: ipc::AssignmentLifecycleAction::Started,
+                assignment: ipc::AssignmentSummary {
+                    id: "assignment-4".to_string(),
+                    work_unit_id: "wu-4".to_string(),
+                    worker_id: "worker-b".to_string(),
+                    worker_session_id: "session-4".to_string(),
+                    status: AssignmentStatus::Running,
+                    attempt_number: 1,
+                    updated_at: Utc::now(),
+                },
+            },
+        ))
+        .await
+        .unwrap();
+    harness
+        .inject_event(ipc::DaemonEventEnvelope::new(
+            ipc::DaemonEvent::ReportRecorded {
+                report: ipc::ReportSummary {
+                    id: "report-4".to_string(),
+                    work_unit_id: "wu-4".to_string(),
+                    assignment_id: "assignment-4".to_string(),
+                    worker_id: "worker-b".to_string(),
+                    disposition: ReportDisposition::Completed,
+                    summary: "Panel rendering is visible.".to_string(),
+                    confidence: ReportConfidence::High,
+                    parse_result: ReportParseResult::Parsed,
+                    needs_supervisor_review: false,
+                    created_at: Utc::now(),
+                },
+            },
+        ))
+        .await
+        .unwrap();
+    harness
+        .inject_event(ipc::DaemonEventEnvelope::new(
+            ipc::DaemonEvent::DecisionApplied {
+                decision: ipc::DecisionSummary {
+                    id: "decision-4".to_string(),
+                    work_unit_id: "wu-4".to_string(),
+                    report_id: Some("report-4".to_string()),
+                    decision_type: DecisionType::MarkComplete,
+                    rationale: "Read-only visibility is good enough.".to_string(),
+                    created_at: Utc::now(),
+                },
+            },
+        ))
+        .await
+        .unwrap();
+
+    harness.dispatch(UserAction::CycleFocus).await;
+    for _ in 0..3 {
+        if harness
+            .workstream_detail_vm()
+            .title
+            .contains("Fresh stream")
+        {
+            break;
+        }
+        harness.dispatch(UserAction::SelectPreviousInFocus).await;
+    }
+
+    let workstreams = harness.workstream_list_vm();
+    let work_units = harness.work_unit_list_vm();
+    let assignments = harness.assignment_list_vm();
+    let detail = harness.collaboration_detail_vm();
+
+    assert!(
+        workstreams
+            .rows
+            .iter()
+            .any(|row| row.title == "Fresh stream")
+    );
+    assert!(
+        harness
+            .workstream_detail_vm()
+            .title
+            .contains("Fresh stream")
+    );
+    assert!(
+        work_units
+            .rows
+            .iter()
+            .any(|row| { row.title == "Render panel" && row.latest_decision == "mark_complete" })
+    );
+    assert!(
+        assignments
+            .rows
+            .iter()
+            .any(|row| row.id == "assignment-4" && row.worker_id == "worker-b")
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("decision_rationale: Read-only visibility is good enough."))
+    );
+}
+
+#[tokio::test]
+async fn parse_result_and_supervisor_review_display_are_distinct() {
+    let harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    let work_units = harness.work_unit_list_vm();
+    let detail = harness.collaboration_detail_vm();
+
+    assert!(work_units.rows.iter().any(|row| {
+        row.title == "Snapshot wiring"
+            && row.latest_report_parse_result == "ambiguous"
+            && row.needs_supervisor_review
+    }));
+    assert!(work_units.rows.iter().any(|row| {
+        row.title == "Event wiring"
+            && row.latest_report_parse_result == "parsed"
+            && !row.needs_supervisor_review
+    }));
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("parse_result: ambiguous"))
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("needs_supervisor_review: true"))
+    );
+}
+
+#[tokio::test]
+async fn reused_worker_session_does_not_imply_same_assignment_continuity() {
+    let harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    let assignments = harness.assignment_list_vm();
+    let detail = harness.collaboration_detail_vm();
+
+    assert!(
+        assignments
+            .rows
+            .iter()
+            .any(|row| { row.id == "assignment-2" && row.worker_session_id == "session-1" })
+    );
+    assert!(
+        assignments
+            .rows
+            .iter()
+            .any(|row| { row.id == "assignment-3" && row.worker_session_id == "session-1" })
+    );
+    assert!(detail.lines.iter().any(|line| {
+        line.contains(
+            "assignment: assignment-2 [awaiting_decision] worker=worker-a session=session-1",
+        )
+    }));
+}
+
+#[tokio::test]
+async fn focus_switches_collaboration_navigation_without_overwriting_thread_state() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness.dispatch(UserAction::CycleFocus).await;
+    harness.dispatch(UserAction::SelectNextInFocus).await;
+    harness.dispatch(UserAction::CycleFocus).await;
+
+    let status = harness.collaboration_status_vm();
+    let detail = harness.workstream_detail_vm();
+    let threads = harness.thread_list_vm();
+
+    assert_eq!(status.focus, NavigationFocus::WorkUnits);
+    assert!(detail.title.contains("Deferred work"));
+    assert!(threads.rows[0].selected);
 }

@@ -77,8 +77,9 @@ async fn handle_key(runtime: &mut AppRuntime<OrcasDaemonBackend>, code: KeyCode)
             KeyCode::Char('q') => return true,
             KeyCode::Char('r') => Some(UserAction::Refresh),
             KeyCode::Char('?') => Some(UserAction::ToggleHelp),
-            KeyCode::Char('j') | KeyCode::Down => Some(UserAction::SelectNextThread),
-            KeyCode::Char('k') | KeyCode::Up => Some(UserAction::SelectPreviousThread),
+            KeyCode::Tab => Some(UserAction::CycleFocus),
+            KeyCode::Char('j') | KeyCode::Down => Some(UserAction::SelectNextInFocus),
+            KeyCode::Char('k') | KeyCode::Up => Some(UserAction::SelectPreviousInFocus),
             KeyCode::Char('i') => Some(UserAction::EnterPromptMode),
             _ => None,
         }

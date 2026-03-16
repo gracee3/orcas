@@ -256,6 +256,7 @@ pub enum AssignmentLifecycleAction {
 pub struct WorkstreamSummary {
     pub id: String,
     pub title: String,
+    pub objective: String,
     pub status: WorkstreamStatus,
     pub priority: String,
     pub updated_at: DateTime<Utc>,
@@ -304,6 +305,7 @@ pub struct DecisionSummary {
     pub work_unit_id: String,
     pub report_id: Option<String>,
     pub decision_type: DecisionType,
+    pub rationale: String,
     pub created_at: DateTime<Utc>,
 }
 

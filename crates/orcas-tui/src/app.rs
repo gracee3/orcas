@@ -5,6 +5,14 @@ use orcas_core::{ConnectionState, ipc};
 const MAX_LOG_ENTRIES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NavigationFocus {
+    #[default]
+    Threads,
+    Workstreams,
+    WorkUnits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DaemonConnectionPhase {
     #[default]
     Disconnected,
@@ -18,10 +26,14 @@ pub struct AppState {
     pub daemon_phase: DaemonConnectionPhase,
     pub reconnect_attempt: u32,
     pub session: ipc::SessionState,
+    pub collaboration: ipc::CollaborationSnapshot,
     pub threads: Vec<ipc::ThreadSummary>,
     pub thread_details: HashMap<String, ipc::ThreadView>,
     pub turn_states: HashMap<String, ipc::TurnStateView>,
     pub selected_thread_id: Option<String>,
+    pub selected_workstream_id: Option<String>,
+    pub selected_work_unit_id: Option<String>,
+    pub navigation_focus: NavigationFocus,
     pub recent_events: VecDeque<ipc::EventSummary>,
     pub prompt_input: String,
     pub prompt_mode: bool,
@@ -54,6 +66,9 @@ pub enum Action {
 pub enum UserAction {
     Refresh,
     ToggleHelp,
+    CycleFocus,
+    SelectNextInFocus,
+    SelectPreviousInFocus,
     SelectNextThread,
     SelectPreviousThread,
     SelectThread(String),
@@ -82,6 +97,20 @@ pub enum UiEvent {
     UpstreamChanged(ConnectionState),
     SessionChanged(ipc::SessionState),
     ThreadUpdated(ipc::ThreadSummary),
+    WorkstreamLifecycle {
+        action: ipc::CollaborationLifecycleAction,
+        workstream: ipc::WorkstreamSummary,
+    },
+    WorkUnitLifecycle {
+        action: ipc::CollaborationLifecycleAction,
+        work_unit: ipc::WorkUnitSummary,
+    },
+    AssignmentLifecycle {
+        action: ipc::AssignmentLifecycleAction,
+        assignment: ipc::AssignmentSummary,
+    },
+    ReportRecorded(ipc::ReportSummary),
+    DecisionApplied(ipc::DecisionSummary),
     TurnUpdated {
         thread_id: String,
         turn: ipc::TurnView,
@@ -108,6 +137,17 @@ impl UiEvent {
             ipc::DaemonEvent::UpstreamStatusChanged { upstream } => Self::UpstreamChanged(upstream),
             ipc::DaemonEvent::SessionChanged { session } => Self::SessionChanged(session),
             ipc::DaemonEvent::ThreadUpdated { thread } => Self::ThreadUpdated(thread),
+            ipc::DaemonEvent::WorkstreamLifecycle { action, workstream } => {
+                Self::WorkstreamLifecycle { action, workstream }
+            }
+            ipc::DaemonEvent::WorkUnitLifecycle { action, work_unit } => {
+                Self::WorkUnitLifecycle { action, work_unit }
+            }
+            ipc::DaemonEvent::AssignmentLifecycle { action, assignment } => {
+                Self::AssignmentLifecycle { action, assignment }
+            }
+            ipc::DaemonEvent::ReportRecorded { report } => Self::ReportRecorded(report),
+            ipc::DaemonEvent::DecisionApplied { decision } => Self::DecisionApplied(decision),
             ipc::DaemonEvent::TurnUpdated { thread_id, turn } => {
                 Self::TurnUpdated { thread_id, turn }
             }
@@ -131,11 +171,6 @@ impl UiEvent {
                 item_id,
                 delta,
             },
-            ipc::DaemonEvent::WorkstreamLifecycle { .. }
-            | ipc::DaemonEvent::WorkUnitLifecycle { .. }
-            | ipc::DaemonEvent::AssignmentLifecycle { .. }
-            | ipc::DaemonEvent::ReportRecorded { .. }
-            | ipc::DaemonEvent::DecisionApplied { .. } => Self::Ignored,
             ipc::DaemonEvent::Warning { message } => Self::Warning(message),
         }
     }
@@ -167,6 +202,16 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
             state.show_help = !state.show_help;
             Vec::new()
         }
+        UserAction::CycleFocus => {
+            state.navigation_focus = match state.navigation_focus {
+                NavigationFocus::Threads => NavigationFocus::Workstreams,
+                NavigationFocus::Workstreams => NavigationFocus::WorkUnits,
+                NavigationFocus::WorkUnits => NavigationFocus::Threads,
+            };
+            Vec::new()
+        }
+        UserAction::SelectNextInFocus => select_relative_in_focus(state, 1),
+        UserAction::SelectPreviousInFocus => select_relative_in_focus(state, -1),
         UserAction::SelectNextThread => select_relative_thread(state, 1),
         UserAction::SelectPreviousThread => select_relative_thread(state, -1),
         UserAction::SelectThread(thread_id) => select_thread(state, thread_id),
@@ -230,6 +275,7 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             state.reconnect_attempt = 0;
             state.daemon = Some(snapshot.daemon);
             state.session = snapshot.session;
+            state.collaboration = snapshot.collaboration;
             state.threads = snapshot.threads;
             state.thread_details.clear();
             state.turn_states.clear();
@@ -263,6 +309,7 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             {
                 effects.push(Effect::LoadThread { thread_id });
             }
+            reconcile_collaboration_selection(state);
             effects.push(Effect::LoadActiveTurns);
             state.banner = None;
         }
@@ -365,6 +412,23 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
                 effects.push(Effect::LoadThread { thread_id });
             }
         }
+        UiEvent::WorkstreamLifecycle { workstream, .. } => {
+            upsert_workstream_summary(&mut state.collaboration.workstreams, workstream);
+            reconcile_collaboration_selection(state);
+        }
+        UiEvent::WorkUnitLifecycle { work_unit, .. } => {
+            upsert_work_unit_summary(&mut state.collaboration.work_units, work_unit);
+            reconcile_collaboration_selection(state);
+        }
+        UiEvent::AssignmentLifecycle { assignment, .. } => {
+            upsert_assignment_summary(&mut state.collaboration.assignments, assignment);
+        }
+        UiEvent::ReportRecorded(report) => {
+            upsert_report_summary(&mut state.collaboration.reports, report);
+        }
+        UiEvent::DecisionApplied(decision) => {
+            upsert_decision_summary(&mut state.collaboration.decisions, decision);
+        }
         UiEvent::TurnUpdated { thread_id, turn } => {
             ensure_thread_detail(state, &thread_id);
             if let Some(detail) = state.thread_details.get_mut(&thread_id) {
@@ -454,6 +518,135 @@ fn select_thread(state: &mut AppState, thread_id: String) -> Vec<Effect> {
     } else {
         vec![Effect::LoadThread { thread_id }]
     }
+}
+
+fn select_relative_in_focus(state: &mut AppState, delta: isize) -> Vec<Effect> {
+    match state.navigation_focus {
+        NavigationFocus::Threads => select_relative_thread(state, delta),
+        NavigationFocus::Workstreams => {
+            select_relative_workstream(state, delta);
+            Vec::new()
+        }
+        NavigationFocus::WorkUnits => {
+            select_relative_work_unit(state, delta);
+            Vec::new()
+        }
+    }
+}
+
+fn select_relative_workstream(state: &mut AppState, delta: isize) {
+    if state.collaboration.workstreams.is_empty() {
+        state.selected_workstream_id = None;
+        state.selected_work_unit_id = None;
+        return;
+    }
+    let current_index = state
+        .selected_workstream_id
+        .as_ref()
+        .and_then(|workstream_id| {
+            state
+                .collaboration
+                .workstreams
+                .iter()
+                .position(|workstream| workstream.id == *workstream_id)
+        })
+        .unwrap_or(0);
+    let next_index = if delta.is_negative() {
+        current_index.saturating_sub(delta.unsigned_abs())
+    } else {
+        (current_index + delta as usize)
+            .min(state.collaboration.workstreams.len().saturating_sub(1))
+    };
+    state.selected_workstream_id = Some(state.collaboration.workstreams[next_index].id.clone());
+    state.selected_work_unit_id =
+        first_work_unit_for_selected_workstream(state).map(|work_unit| work_unit.id.clone());
+}
+
+fn select_relative_work_unit(state: &mut AppState, delta: isize) {
+    let work_units = work_units_for_selected_workstream(state);
+    if work_units.is_empty() {
+        state.selected_work_unit_id = None;
+        return;
+    }
+    let current_index = state
+        .selected_work_unit_id
+        .as_ref()
+        .and_then(|work_unit_id| {
+            work_units
+                .iter()
+                .position(|work_unit| work_unit.id == *work_unit_id)
+        })
+        .unwrap_or(0);
+    let next_index = if delta.is_negative() {
+        current_index.saturating_sub(delta.unsigned_abs())
+    } else {
+        (current_index + delta as usize).min(work_units.len().saturating_sub(1))
+    };
+    state.selected_work_unit_id = Some(work_units[next_index].id.clone());
+}
+
+fn reconcile_collaboration_selection(state: &mut AppState) {
+    if state.collaboration.workstreams.is_empty() {
+        state.selected_workstream_id = None;
+        state.selected_work_unit_id = None;
+        return;
+    }
+
+    let selected_workstream_exists =
+        state
+            .selected_workstream_id
+            .as_ref()
+            .is_some_and(|workstream_id| {
+                state
+                    .collaboration
+                    .workstreams
+                    .iter()
+                    .any(|workstream| workstream.id == *workstream_id)
+            });
+    if !selected_workstream_exists {
+        state.selected_workstream_id = state
+            .collaboration
+            .workstreams
+            .first()
+            .map(|workstream| workstream.id.clone());
+    }
+
+    let selected_work_units = work_units_for_selected_workstream(state);
+    if selected_work_units.is_empty() {
+        state.selected_work_unit_id = None;
+        return;
+    }
+
+    let selected_work_unit_exists =
+        state
+            .selected_work_unit_id
+            .as_ref()
+            .is_some_and(|work_unit_id| {
+                selected_work_units
+                    .iter()
+                    .any(|work_unit| work_unit.id == *work_unit_id)
+            });
+    if !selected_work_unit_exists {
+        state.selected_work_unit_id = selected_work_units
+            .first()
+            .map(|work_unit| work_unit.id.clone());
+    }
+}
+
+fn first_work_unit_for_selected_workstream(state: &AppState) -> Option<&ipc::WorkUnitSummary> {
+    work_units_for_selected_workstream(state).into_iter().next()
+}
+
+fn work_units_for_selected_workstream(state: &AppState) -> Vec<&ipc::WorkUnitSummary> {
+    let Some(workstream_id) = state.selected_workstream_id.as_ref() else {
+        return Vec::new();
+    };
+    state
+        .collaboration
+        .work_units
+        .iter()
+        .filter(|work_unit| work_unit.workstream_id == *workstream_id)
+        .collect()
 }
 
 fn ensure_thread_detail(state: &mut AppState, thread_id: &str) {
@@ -586,6 +779,100 @@ fn upsert_thread_summary(threads: &mut Vec<ipc::ThreadSummary>, summary: ipc::Th
     });
 }
 
+fn upsert_workstream_summary(
+    workstreams: &mut Vec<ipc::WorkstreamSummary>,
+    summary: ipc::WorkstreamSummary,
+) {
+    if let Some(existing) = workstreams
+        .iter_mut()
+        .find(|workstream| workstream.id == summary.id)
+    {
+        *existing = summary;
+    } else {
+        workstreams.push(summary);
+    }
+    workstreams.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+fn upsert_work_unit_summary(
+    work_units: &mut Vec<ipc::WorkUnitSummary>,
+    summary: ipc::WorkUnitSummary,
+) {
+    if let Some(existing) = work_units
+        .iter_mut()
+        .find(|work_unit| work_unit.id == summary.id)
+    {
+        *existing = summary;
+    } else {
+        work_units.push(summary);
+    }
+    work_units.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+fn upsert_assignment_summary(
+    assignments: &mut Vec<ipc::AssignmentSummary>,
+    summary: ipc::AssignmentSummary,
+) {
+    if let Some(existing) = assignments
+        .iter_mut()
+        .find(|assignment| assignment.id == summary.id)
+    {
+        *existing = summary;
+    } else {
+        assignments.push(summary);
+    }
+    assignments.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+fn upsert_report_summary(reports: &mut Vec<ipc::ReportSummary>, summary: ipc::ReportSummary) {
+    if let Some(existing) = reports.iter_mut().find(|report| report.id == summary.id) {
+        *existing = summary;
+    } else {
+        reports.push(summary);
+    }
+    reports.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+fn upsert_decision_summary(
+    decisions: &mut Vec<ipc::DecisionSummary>,
+    summary: ipc::DecisionSummary,
+) {
+    if let Some(existing) = decisions
+        .iter_mut()
+        .find(|decision| decision.id == summary.id)
+    {
+        *existing = summary;
+    } else {
+        decisions.push(summary);
+    }
+    decisions.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
 fn push_event_summary(state: &mut AppState, summary: ipc::EventSummary) {
     if state.recent_events.len() >= MAX_LOG_ENTRIES {
         state.recent_events.pop_front();
@@ -654,6 +941,48 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
             Some(thread.id.clone()),
             None,
         ),
+        UiEvent::WorkstreamLifecycle { action, workstream } => (
+            "workstream",
+            format!(
+                "workstream {} {}",
+                workstream.id,
+                collaboration_action_label(*action)
+            ),
+            None,
+            None,
+        ),
+        UiEvent::WorkUnitLifecycle { action, work_unit } => (
+            "work_unit",
+            format!(
+                "work unit {} {}",
+                work_unit.id,
+                collaboration_action_label(*action)
+            ),
+            None,
+            None,
+        ),
+        UiEvent::AssignmentLifecycle { action, assignment } => (
+            "assignment",
+            format!(
+                "assignment {} {}",
+                assignment.id,
+                assignment_action_label(*action)
+            ),
+            None,
+            None,
+        ),
+        UiEvent::ReportRecorded(report) => (
+            "report",
+            format!("report {} {:?}", report.id, report.parse_result),
+            None,
+            None,
+        ),
+        UiEvent::DecisionApplied(decision) => (
+            "decision",
+            format!("decision {} {:?}", decision.id, decision.decision_type),
+            None,
+            None,
+        ),
         UiEvent::TurnUpdated { thread_id, turn } => (
             "turn",
             format!("turn {} {}", turn.id, turn.status),
@@ -685,4 +1014,24 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
         thread_id,
         turn_id,
     })
+}
+
+fn collaboration_action_label(action: ipc::CollaborationLifecycleAction) -> &'static str {
+    match action {
+        ipc::CollaborationLifecycleAction::Created => "created",
+        ipc::CollaborationLifecycleAction::Updated => "updated",
+        ipc::CollaborationLifecycleAction::Completed => "completed",
+        ipc::CollaborationLifecycleAction::Escalated => "escalated",
+    }
+}
+
+fn assignment_action_label(action: ipc::AssignmentLifecycleAction) -> &'static str {
+    match action {
+        ipc::AssignmentLifecycleAction::Created => "created",
+        ipc::AssignmentLifecycleAction::Started => "started",
+        ipc::AssignmentLifecycleAction::Reported => "reported",
+        ipc::AssignmentLifecycleAction::Closed => "closed",
+        ipc::AssignmentLifecycleAction::Interrupted => "interrupted",
+        ipc::AssignmentLifecycleAction::Failed => "failed",
+    }
 }

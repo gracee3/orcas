@@ -107,4 +107,28 @@ impl AppHarness {
     pub fn thread_detail_vm(&self) -> view_model::ThreadDetailViewModel {
         view_model::thread_detail(self.runtime.state())
     }
+
+    pub fn workstream_list_vm(&self) -> view_model::WorkstreamListViewModel {
+        view_model::workstream_list(self.runtime.state())
+    }
+
+    pub fn workstream_detail_vm(&self) -> view_model::WorkstreamDetailViewModel {
+        view_model::workstream_detail(self.runtime.state())
+    }
+
+    pub fn work_unit_list_vm(&self) -> view_model::WorkUnitListViewModel {
+        view_model::work_unit_list(self.runtime.state())
+    }
+
+    pub fn assignment_list_vm(&self) -> view_model::AssignmentListViewModel {
+        view_model::assignment_list(self.runtime.state())
+    }
+
+    pub fn collaboration_detail_vm(&self) -> view_model::CollaborationDetailViewModel {
+        view_model::collaboration_detail(self.runtime.state())
+    }
+
+    pub fn collaboration_status_vm(&self) -> view_model::CollaborationStatusViewModel {
+        view_model::collaboration_status(self.runtime.state())
+    }
 }

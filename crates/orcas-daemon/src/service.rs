@@ -2027,6 +2027,7 @@ impl OrcasDaemonService {
         ipc::WorkstreamSummary {
             id: workstream.id.clone(),
             title: workstream.title.clone(),
+            objective: workstream.objective.clone(),
             status: workstream.status,
             priority: workstream.priority.clone(),
             updated_at: workstream.updated_at,
@@ -2079,6 +2080,7 @@ impl OrcasDaemonService {
             work_unit_id: decision.work_unit_id.clone(),
             report_id: decision.report_id.clone(),
             decision_type: decision.decision_type,
+            rationale: decision.rationale.clone(),
             created_at: decision.created_at,
         }
     }
