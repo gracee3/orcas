@@ -1,6 +1,6 @@
 use chrono::Utc;
 
-use crate::app::{BannerLevel, UserAction};
+use crate::app::{BannerLevel, DaemonConnectionPhase, UserAction};
 use crate::backend::BackendCommand;
 use crate::test_harness::AppHarness;
 use orcas_core::{ConnectionState, ipc};
@@ -89,6 +89,7 @@ async fn initial_snapshot_load_populates_state() {
     let connection = harness.connection_vm();
     let threads = harness.thread_list_vm();
 
+    assert_eq!(connection.daemon_phase, DaemonConnectionPhase::Connected);
     assert_eq!(connection.upstream_status, "connected");
     assert_eq!(threads.rows.len(), 2);
     assert!(threads.rows[0].selected);
@@ -230,6 +231,47 @@ async fn backend_failure_surfaces_in_banner_state() {
     harness.dispatch(UserAction::Refresh).await;
 
     let banner = harness.state().banner.clone().unwrap();
-    assert_eq!(banner.level, BannerLevel::Error);
-    assert!(banner.message.contains("snapshot failed"));
+    assert_eq!(banner.level, BannerLevel::Warning);
+    assert!(banner.message.contains("Reconnecting"));
+    assert_eq!(
+        harness.state().daemon_phase,
+        DaemonConnectionPhase::Reconnecting
+    );
+}
+
+#[tokio::test]
+async fn reconnect_recovers_with_snapshot_then_resubscribe() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    let mut recovered = sample_snapshot();
+    recovered.threads = vec![sample_thread_summary("thread-2", "recovered", 300)];
+    recovered.session.active_thread_id = Some("thread-2".to_string());
+    recovered.active_thread = Some(sample_thread_view("thread-2", "recovered", "after restart"));
+    harness.replace_snapshot(recovered).await;
+
+    harness.disconnect_events().await;
+    harness.process().await;
+
+    assert_eq!(
+        harness.state().daemon_phase,
+        DaemonConnectionPhase::Reconnecting
+    );
+    assert_eq!(harness.snapshot_requests().await, 1);
+    assert_eq!(harness.subscribe_requests().await, 1);
+
+    harness.force_reconnect_now();
+    harness.process().await;
+
+    let connection = harness.connection_vm();
+    let detail = harness.thread_detail_vm();
+    assert_eq!(connection.daemon_phase, DaemonConnectionPhase::Connected);
+    assert_eq!(harness.snapshot_requests().await, 2);
+    assert_eq!(harness.subscribe_requests().await, 2);
+    assert_eq!(harness.thread_list_vm().rows.len(), 1);
+    assert!(detail.title.contains("thread-2"));
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("after restart"))
+    );
 }

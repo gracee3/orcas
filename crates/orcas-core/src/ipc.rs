@@ -6,6 +6,7 @@ use crate::events::ConnectionState;
 pub mod methods {
     pub const DAEMON_STATUS: &str = "daemon/status";
     pub const DAEMON_CONNECT: &str = "daemon/connect";
+    pub const DAEMON_STOP: &str = "daemon/stop";
     pub const DAEMON_DISCONNECT: &str = "daemon/disconnect";
     pub const STATE_GET: &str = "state/get";
     pub const SESSION_GET_ACTIVE: &str = "session/get_active";
@@ -63,6 +64,14 @@ pub struct DaemonConnectRequest {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConnectResponse {
     pub status: DaemonStatusResponse,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DaemonStopRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonStopResponse {
+    pub stopping: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

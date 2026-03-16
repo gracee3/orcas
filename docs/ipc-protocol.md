@@ -14,6 +14,7 @@ Current methods:
 
 - `daemon/status`
 - `daemon/connect`
+- `daemon/stop`
 - `state/get`
 - `session/get_active`
 - `models/list`
@@ -51,6 +52,14 @@ Current event kinds:
 ## Snapshots
 
 Frontends should now bootstrap with `state/get`, then switch to `events/subscribe` for live updates. `events/subscribe` can still return an initial snapshot when requested.
+
+Reconnect uses the same ordering:
+
+1. reconnect IPC transport
+2. fetch `state/get`
+3. recreate `events/subscribe`
+
+This is the canonical recovery path.
 
 Current snapshot content:
 
@@ -90,6 +99,7 @@ Current thread summaries also include Orcas-owned frontend fields:
 - keep method names stable and narrow
 - prefer Orcas-owned summaries/views over mirroring the full upstream schema
 - let frontends query daemon-owned live state rather than reconstructing everything from stream noise
+- treat subscriptions as invalid after disconnect and recreate them after snapshot recovery
 - add new methods incrementally as Orcas service needs become clear
 
 ## Backpressure Behavior

@@ -65,6 +65,7 @@ enum DaemonCommand {
     Start,
     Status,
     Restart,
+    Stop,
 }
 
 #[derive(Debug, Subcommand)]
@@ -149,6 +150,7 @@ async fn main() -> Result<()> {
                 DaemonCommand::Start => service.daemon_start(overrides.force_spawn).await?,
                 DaemonCommand::Status => service.daemon_status().await?,
                 DaemonCommand::Restart => service.daemon_restart().await?,
+                DaemonCommand::Stop => service.daemon_stop().await?,
             },
             SupervisorCommand::Models { command } => match command {
                 ModelsCommand::List => service.models_list().await?,

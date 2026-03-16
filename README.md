@@ -12,7 +12,9 @@ Current shape:
 - Orcas keeps its own narrow IPC and protocol layers instead of depending on Codex workspace crates
 - `orcasd` now exposes a live snapshot/query layer for frontend bootstrap
 - `orcasd` now writes runtime metadata next to the socket and reports build fingerprints for lifecycle debugging
+- `orcasd` now supports graceful shutdown over IPC
 - `orcas-tui` is now driven by a canonical reducer/runtime with headless tests
+- `orcas-tui` now reconnects automatically with snapshot-first rebootstrap after daemon replacement
 
 This pass establishes the broker/service boundary. It is not the full product yet.
 
@@ -44,9 +46,10 @@ Implemented now:
 - event subscription and fanout to multiple local clients
 - Orcas-owned live state snapshot/query surface for frontends
 - version-aware daemon status and explicit restart support
+- graceful daemon stop over IPC
 - runtime metadata file next to the socket for PID/build inspection
 - supervisor CLI routed through the daemon
-- TUI reducer/runtime/view-model split routed through the daemon
+- TUI reducer/runtime/view-model split routed through the daemon with automatic reconnect/resubscribe
 - headless TUI test harness with fake backend
 - lightweight JSON/TOML config and thread metadata persistence, including recent output snippets
 
@@ -117,6 +120,7 @@ cargo run -p orcas-supervisor -- supervisor doctor
 cargo run -p orcas-supervisor -- supervisor daemon start
 cargo run -p orcas-supervisor -- supervisor daemon status
 cargo run -p orcas-supervisor -- supervisor daemon restart
+cargo run -p orcas-supervisor -- supervisor daemon stop
 ```
 
 List models through `orcasd`:
@@ -182,6 +186,7 @@ Orcas IPC currently exposes:
 
 - `daemon/status`
 - `daemon/connect`
+- `daemon/stop`
 - `state/get`
 - `session/get_active`
 - `models/list`
@@ -215,7 +220,7 @@ IPC event notifications are now Orcas-owned daemon events rather than raw upstre
 - `threads/list` is still broad, although `threads/list_scoped` and `state/get` now prefer Orcas-relevant threads
 - TUI is intentionally minimal; the architecture and tests matter more than UI breadth in this pass
 - Orcas IPC is intentionally narrow and may evolve
-- TUI reconnect is refresh-driven after daemon restarts; it surfaces disconnect state cleanly but does not yet do a full automatic resubscribe loop in the background
+- supervisor retry behavior during daemon replacement is intentionally short-lived and pragmatic rather than fully session-aware
 
 ## Validation Completed In This Pass
 
@@ -227,9 +232,12 @@ Validated locally against `/home/emmy/git/codex/codex-rs/target/debug/codex`:
 - `orcas supervisor daemon start`
 - `orcas supervisor daemon status`
 - `orcas supervisor daemon restart`
+- `orcas supervisor daemon stop`
 - `orcas supervisor models list`
 - `orcas supervisor threads list`
 - direct `state/get` over the UDS socket
+- graceful `daemon/stop` IPC via a real `orcasd` process and cleanup of socket/metadata artifacts
+- TUI left running across `daemon stop` and `daemon start`, then exited cleanly after the daemon returned
 - TUI attached to the same live daemon and exited cleanly
 - restarting a legacy daemon without runtime metadata and replacing it with the current build
 - killing the daemon to leave a stale socket/metadata pair, then recovering with `supervisor daemon start`

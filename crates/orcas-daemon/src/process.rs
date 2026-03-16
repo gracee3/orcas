@@ -184,6 +184,20 @@ impl OrcasDaemonProcessManager {
         self.spawn_background().await
     }
 
+    pub async fn stop(&self) -> OrcasResult<OrcasDaemonSocketStatus> {
+        let status = self.status().await?;
+        if status.running {
+            if status.daemon_status.is_some() {
+                self.request_graceful_stop().await?;
+            } else {
+                self.stop_process(&status).await?;
+            }
+        } else {
+            self.cleanup_stale_runtime().await?;
+        }
+        self.wait_for_stop().await
+    }
+
     pub async fn spawn_background(&self) -> OrcasResult<OrcasDaemonSocketStatus> {
         self.paths.ensure().await?;
         self.cleanup_stale_runtime().await?;
@@ -280,6 +294,29 @@ impl OrcasDaemonProcessManager {
             tokio::fs::remove_file(&self.paths.daemon_metadata_file).await?;
         }
         Ok(())
+    }
+
+    async fn request_graceful_stop(&self) -> OrcasResult<()> {
+        let client = OrcasIpcClient::connect(&self.paths).await?;
+        let _ = client.daemon_stop().await?;
+        Ok(())
+    }
+
+    async fn wait_for_stop(&self) -> OrcasResult<OrcasDaemonSocketStatus> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let status = self.status().await?;
+            if !status.running {
+                self.cleanup_stale_runtime().await?;
+                return self.status().await;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        Err(OrcasError::Transport(format!(
+            "timed out waiting for Orcas daemon at {} to stop",
+            self.paths.socket_file.display()
+        )))
     }
 
     async fn resolve_daemon_binary(&self, build_if_needed: bool) -> OrcasResult<PathBuf> {

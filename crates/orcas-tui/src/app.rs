@@ -4,9 +4,19 @@ use orcas_core::{ConnectionState, ipc};
 
 const MAX_LOG_ENTRIES: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DaemonConnectionPhase {
+    #[default]
+    Disconnected,
+    Reconnecting,
+    Connected,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
     pub daemon: Option<ipc::DaemonStatusResponse>,
+    pub daemon_phase: DaemonConnectionPhase,
+    pub reconnect_attempt: u32,
     pub session: ipc::SessionState,
     pub threads: Vec<ipc::ThreadSummary>,
     pub thread_details: HashMap<String, ipc::ThreadView>,
@@ -56,6 +66,11 @@ pub enum UserAction {
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     SnapshotLoaded(ipc::StateSnapshot),
+    ReconnectScheduled {
+        attempt: u32,
+        delay_ms: u64,
+    },
+    ConnectionLost(String),
     ThreadLoaded(ipc::ThreadView),
     PromptStarted {
         thread_id: String,
@@ -119,15 +134,16 @@ impl UiEvent {
 
 #[derive(Debug, Clone)]
 pub enum Effect {
-    SubscribeEvents,
     RefreshSnapshot,
+    SubscribeEvents,
+    ScheduleReconnect,
     LoadThread { thread_id: String },
     SubmitPrompt { thread_id: String, text: String },
 }
 
 pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     match action {
-        Action::Start => vec![Effect::SubscribeEvents, Effect::RefreshSnapshot],
+        Action::Start => vec![Effect::RefreshSnapshot],
         Action::User(user_action) => reduce_user_action(state, user_action),
         Action::Event(event) => reduce_event(state, event),
     }
@@ -199,10 +215,15 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
 
     match event {
         UiEvent::SnapshotLoaded(snapshot) => {
+            state.daemon_phase = DaemonConnectionPhase::Connected;
+            state.reconnect_attempt = 0;
             state.daemon = Some(snapshot.daemon);
             state.session = snapshot.session;
             state.threads = snapshot.threads;
+            state.thread_details.clear();
             state.recent_events = snapshot.recent_events.into_iter().collect();
+            state.selected_thread_id = None;
+            state.prompt_in_flight = !state.session.active_turns.is_empty();
             if let Some(thread) = snapshot.active_thread {
                 state.selected_thread_id = Some(thread.summary.id.clone());
                 state
@@ -222,6 +243,29 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
                 effects.push(Effect::LoadThread { thread_id });
             }
             state.banner = None;
+        }
+        UiEvent::ReconnectScheduled { attempt, delay_ms } => {
+            state.daemon_phase = DaemonConnectionPhase::Reconnecting;
+            state.reconnect_attempt = attempt;
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Warning,
+                message: format!(
+                    "Daemon unavailable. Reconnecting in {delay_ms}ms (attempt {attempt})."
+                ),
+            });
+        }
+        UiEvent::ConnectionLost(message) => {
+            state.daemon_phase = DaemonConnectionPhase::Reconnecting;
+            state.prompt_in_flight = false;
+            if let Some(daemon) = state.daemon.as_mut() {
+                daemon.upstream.status = "disconnected".to_string();
+                daemon.upstream.detail = Some(message.clone());
+            }
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Warning,
+                message: format!("Daemon unavailable: {message}"),
+            });
+            effects.push(Effect::ScheduleReconnect);
         }
         UiEvent::ThreadLoaded(thread) => {
             let thread_id = thread.summary.id.clone();
@@ -317,10 +361,6 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::Error(message) => {
             state.prompt_in_flight = false;
-            if let Some(daemon) = state.daemon.as_mut() {
-                daemon.upstream.status = "disconnected".to_string();
-                daemon.upstream.detail = Some(message.clone());
-            }
             state.banner = Some(StatusBanner {
                 level: BannerLevel::Error,
                 message,
@@ -481,6 +521,13 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
     let timestamp = chrono::Utc::now();
     let (kind, message, thread_id, turn_id) = match event {
         UiEvent::SnapshotLoaded(_) => return None,
+        UiEvent::ReconnectScheduled { attempt, .. } => (
+            "reconnect",
+            format!("scheduled reconnect attempt {attempt}"),
+            None,
+            None,
+        ),
+        UiEvent::ConnectionLost(message) => ("disconnect", message.clone(), None, None),
         UiEvent::ThreadLoaded(thread) => (
             "thread",
             format!("loaded thread {}", thread.summary.id),

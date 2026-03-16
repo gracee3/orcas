@@ -8,7 +8,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc};
+use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 
 use orcas_codex::types;
@@ -69,6 +70,7 @@ pub struct OrcasDaemonService {
     connect_gate: Mutex<()>,
     event_tx: broadcast::Sender<ipc::DaemonEventEnvelope>,
     client_count: AtomicUsize,
+    shutdown: Notify,
 }
 
 impl OrcasDaemonService {
@@ -102,6 +104,7 @@ impl OrcasDaemonService {
             connect_gate: Mutex::new(()),
             event_tx,
             client_count: AtomicUsize::new(0),
+            shutdown: Notify::new(),
         });
 
         service.initialize_state().await?;
@@ -141,6 +144,9 @@ impl OrcasDaemonService {
                     if let Err(error) = signal {
                         warn!(%error, "failed to listen for shutdown signal");
                     }
+                    break;
+                }
+                _ = self.shutdown.notified() => {
                     break;
                 }
             }
@@ -286,6 +292,17 @@ impl OrcasDaemonService {
         outbound: mpsc::Sender<String>,
         subscription_task: &mut Option<tokio::task::JoinHandle<()>>,
     ) -> OrcasResult<()> {
+        if request.method == ipc::methods::DAEMON_STOP {
+            let response = serde_json::to_value(self.daemon_stop().await?)?;
+            Self::send_response(&outbound, request.id, response).await?;
+            let service = Arc::clone(self);
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                service.shutdown.notify_waiters();
+            });
+            return Ok(());
+        }
+
         let result = match request.method.as_str() {
             ipc::methods::DAEMON_STATUS => serde_json::to_value(self.daemon_status().await?)?,
             ipc::methods::DAEMON_CONNECT => serde_json::to_value(self.daemon_connect().await?)?,
@@ -379,6 +396,10 @@ impl OrcasDaemonService {
         Ok(ipc::DaemonConnectResponse {
             status: self.daemon_status().await?,
         })
+    }
+
+    async fn daemon_stop(&self) -> OrcasResult<ipc::DaemonStopResponse> {
+        Ok(ipc::DaemonStopResponse { stopping: true })
     }
 
     async fn state_get(&self) -> OrcasResult<ipc::StateGetResponse> {

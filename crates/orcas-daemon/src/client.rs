@@ -56,6 +56,14 @@ impl OrcasIpcClient {
         .await
     }
 
+    pub async fn daemon_stop(&self) -> OrcasResult<ipc::DaemonStopResponse> {
+        self.request(
+            ipc::methods::DAEMON_STOP,
+            &ipc::DaemonStopRequest::default(),
+        )
+        .await
+    }
+
     pub async fn state_get(&self) -> OrcasResult<ipc::StateGetResponse> {
         self.request(ipc::methods::STATE_GET, &ipc::StateGetRequest::default())
             .await

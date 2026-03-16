@@ -1,8 +1,10 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Error, Result};
+use tokio::time::sleep;
 
 use orcas_core::{
     AppConfig, AppPaths, ThreadReadRequest, ThreadResumeRequest, ThreadStartRequest,
@@ -135,6 +137,25 @@ impl SupervisorService {
         println!("daemon_version: {}", status.runtime.version);
         println!("daemon_fingerprint: {}", status.runtime.build_fingerprint);
         println!("daemon_binary: {}", status.runtime.binary_path);
+        Ok(())
+    }
+
+    pub async fn daemon_stop(&self) -> Result<()> {
+        let before = self.daemon.status().await?;
+        let after = self.daemon.stop().await?;
+        println!("socket: {}", before.socket_path.display());
+        println!("metadata: {}", before.metadata_path.display());
+        println!("running: {}", after.running);
+        println!("socket_exists: {}", after.socket_exists);
+        println!("stale_socket: {}", after.stale_socket);
+        println!("stale_metadata: {}", after.stale_metadata);
+        if before.running {
+            println!("stopped: true");
+        } else if before.stale_socket || before.stale_metadata {
+            println!("cleaned_stale_runtime: true");
+        } else {
+            println!("daemon_already_stopped: true");
+        }
         Ok(())
     }
 
@@ -344,24 +365,49 @@ impl SupervisorService {
     }
 
     async fn ready_client(&self) -> Result<Arc<OrcasIpcClient>> {
-        let client = self
-            .connect_client(if self.overrides.force_spawn {
-                OrcasDaemonLaunch::Always
-            } else {
-                OrcasDaemonLaunch::IfNeeded
-            })
-            .await?;
-        client
-            .daemon_connect()
-            .await
-            .context("connect Orcas daemon to Codex")?;
-        Ok(client)
+        let launch = if self.overrides.force_spawn {
+            OrcasDaemonLaunch::Always
+        } else {
+            OrcasDaemonLaunch::IfNeeded
+        };
+        let mut last_error: Option<Error> = None;
+        let mut delay = Duration::from_millis(100);
+
+        for _ in 0..5 {
+            let client = self.connect_client(launch).await?;
+            match client.daemon_connect().await {
+                Ok(_) => return Ok(client),
+                Err(error) => {
+                    last_error = Some(Error::new(error).context("connect Orcas daemon to Codex"));
+                    sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(800));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| Error::msg("connect Orcas daemon to Codex")))
     }
 
     async fn connect_client(&self, launch: OrcasDaemonLaunch) -> Result<Arc<OrcasIpcClient>> {
-        self.daemon.ensure_running(launch).await?;
-        OrcasIpcClient::connect(&self.paths)
-            .await
-            .context("connect to Orcas daemon")
+        let mut last_error: Option<Error> = None;
+        let mut delay = Duration::from_millis(100);
+
+        for _ in 0..5 {
+            match self.daemon.ensure_running(launch).await {
+                Ok(_) => match OrcasIpcClient::connect(&self.paths).await {
+                    Ok(client) => return Ok(client),
+                    Err(error) => {
+                        last_error = Some(Error::new(error).context("connect to Orcas daemon"));
+                    }
+                },
+                Err(error) => {
+                    last_error = Some(Error::new(error));
+                }
+            }
+            sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_millis(800));
+        }
+
+        Err(last_error.unwrap_or_else(|| Error::msg("connect to Orcas daemon")))
     }
 }

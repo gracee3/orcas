@@ -1,12 +1,14 @@
-use crate::app::{AppState, BannerLevel};
+use crate::app::{AppState, BannerLevel, DaemonConnectionPhase};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionStatusViewModel {
     pub socket_path: String,
+    pub daemon_phase: DaemonConnectionPhase,
     pub upstream_status: String,
     pub upstream_detail: Option<String>,
     pub client_count: usize,
     pub known_threads: usize,
+    pub reconnect_attempt: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,12 +54,14 @@ pub fn connection_status(state: &AppState) -> ConnectionStatusViewModel {
         socket_path: daemon
             .map(|status| status.socket_path.clone())
             .unwrap_or_else(|| "unavailable".to_string()),
+        daemon_phase: state.daemon_phase,
         upstream_status: daemon
             .map(|status| status.upstream.status.clone())
             .unwrap_or_else(|| "disconnected".to_string()),
         upstream_detail: daemon.and_then(|status| status.upstream.detail.clone()),
         client_count: daemon.map_or(0, |status| status.client_count),
         known_threads: daemon.map_or(state.threads.len(), |status| status.known_threads),
+        reconnect_attempt: state.reconnect_attempt,
     }
 }
 

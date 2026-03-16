@@ -58,9 +58,7 @@ impl OrcasDaemonBackend {
     }
 
     async fn connect_client(&self) -> Result<Arc<OrcasIpcClient>> {
-        self.daemon
-            .ensure_running(OrcasDaemonLaunch::IfNeeded)
-            .await?;
+        self.daemon.ensure_running(OrcasDaemonLaunch::Never).await?;
         let client = OrcasIpcClient::connect(&self.paths).await?;
         client.daemon_connect().await?;
         let mut guard = self.client.lock().await;
@@ -169,8 +167,11 @@ struct FakeBackendState {
     threads: HashMap<String, ipc::ThreadView>,
     next_submit_id: usize,
     fail_snapshot: Option<String>,
+    fail_subscribe: Option<String>,
     fail_next_command: Option<String>,
     recorded_commands: Vec<BackendCommand>,
+    snapshot_requests: usize,
+    subscribe_requests: usize,
     event_tx: Option<mpsc::Sender<ipc::DaemonEventEnvelope>>,
 }
 
@@ -188,8 +189,11 @@ impl FakeBackend {
                 threads,
                 next_submit_id: 1,
                 fail_snapshot: None,
+                fail_subscribe: None,
                 fail_next_command: None,
                 recorded_commands: Vec::new(),
+                snapshot_requests: 0,
+                subscribe_requests: 0,
                 event_tx: None,
             })),
         }
@@ -215,6 +219,10 @@ impl FakeBackend {
         self.inner.lock().await.fail_next_command = Some(message.into());
     }
 
+    pub async fn fail_subscribe_once(&self, message: impl Into<String>) {
+        self.inner.lock().await.fail_subscribe = Some(message.into());
+    }
+
     pub async fn inject_event(&self, event: ipc::DaemonEventEnvelope) -> Result<()> {
         let tx = self
             .inner
@@ -230,12 +238,25 @@ impl FakeBackend {
     pub async fn recorded_commands(&self) -> Vec<BackendCommand> {
         self.inner.lock().await.recorded_commands.clone()
     }
+
+    pub async fn snapshot_requests(&self) -> usize {
+        self.inner.lock().await.snapshot_requests
+    }
+
+    pub async fn subscribe_requests(&self) -> usize {
+        self.inner.lock().await.subscribe_requests
+    }
+
+    pub async fn disconnect_events(&self) {
+        self.inner.lock().await.event_tx = None;
+    }
 }
 
 #[async_trait]
 impl TuiBackend for FakeBackend {
     async fn get_snapshot(&self) -> Result<ipc::StateSnapshot> {
         let mut guard = self.inner.lock().await;
+        guard.snapshot_requests += 1;
         if let Some(message) = guard.fail_snapshot.take() {
             return Err(anyhow!(message));
         }
@@ -243,8 +264,13 @@ impl TuiBackend for FakeBackend {
     }
 
     async fn subscribe_events(&self) -> Result<mpsc::Receiver<ipc::DaemonEventEnvelope>> {
+        let mut guard = self.inner.lock().await;
+        guard.subscribe_requests += 1;
+        if let Some(message) = guard.fail_subscribe.take() {
+            return Err(anyhow!(message));
+        }
         let (tx, rx) = mpsc::channel(256);
-        self.inner.lock().await.event_tx = Some(tx);
+        guard.event_tx = Some(tx);
         Ok(rx)
     }
 

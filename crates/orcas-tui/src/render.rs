@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::app::{AppState, BannerLevel};
+use crate::app::{AppState, BannerLevel, DaemonConnectionPhase};
 use crate::view_model;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
@@ -36,8 +36,15 @@ fn render_status(state: &AppState) -> Paragraph<'static> {
         Line::styled("Orcas TUI", Style::default().add_modifier(Modifier::BOLD)),
         Line::from(format!("socket: {}", status.socket_path)),
         Line::from(format!(
-            "upstream: {}  clients: {}  threads: {}",
-            status.upstream_status, status.client_count, status.known_threads
+            "daemon: {}  upstream: {}  clients: {}  threads: {}",
+            match status.daemon_phase {
+                DaemonConnectionPhase::Connected => "connected",
+                DaemonConnectionPhase::Reconnecting => "reconnecting",
+                DaemonConnectionPhase::Disconnected => "disconnected",
+            },
+            status.upstream_status,
+            status.client_count,
+            status.known_threads
         )),
     ];
 

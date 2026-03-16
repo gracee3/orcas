@@ -36,8 +36,20 @@ impl AppHarness {
         Ok(())
     }
 
+    pub async fn process(&mut self) {
+        self.runtime.process_all().await;
+    }
+
+    pub fn force_reconnect_now(&mut self) {
+        self.runtime.force_reconnect_now();
+    }
+
     pub async fn set_thread(&self, thread: ipc::ThreadView) {
         self.backend.set_thread(thread).await;
+    }
+
+    pub async fn replace_snapshot(&self, snapshot: ipc::StateSnapshot) {
+        self.backend.replace_snapshot(snapshot).await;
     }
 
     pub async fn fail_next_command(&self, message: impl Into<String>) {
@@ -48,8 +60,24 @@ impl AppHarness {
         self.backend.fail_snapshot_once(message).await;
     }
 
+    pub async fn fail_subscribe_once(&self, message: impl Into<String>) {
+        self.backend.fail_subscribe_once(message).await;
+    }
+
+    pub async fn disconnect_events(&self) {
+        self.backend.disconnect_events().await;
+    }
+
     pub async fn recorded_commands(&self) -> Vec<BackendCommand> {
         self.backend.recorded_commands().await
+    }
+
+    pub async fn snapshot_requests(&self) -> usize {
+        self.backend.snapshot_requests().await
+    }
+
+    pub async fn subscribe_requests(&self) -> usize {
+        self.backend.subscribe_requests().await
     }
 
     pub fn thread_list_vm(&self) -> view_model::ThreadListViewModel {

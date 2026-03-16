@@ -55,6 +55,7 @@ Shared local orchestration service:
 - live Orcas-owned state/query snapshots
 - recent-event snapshotting
 - daemon runtime metadata and build fingerprint reporting
+- graceful daemon shutdown over IPC
 - daemon status reporting
 - shared IPC client/process manager used by frontends
 
@@ -147,6 +148,14 @@ The current frontend bootstrap path is:
 
 This avoids forcing every client to reconstruct frontend state from raw streaming events and broad upstream thread lists.
 
+The reconnect path now follows the same rule:
+
+1. reconnect transport
+2. `state/get`
+3. recreate `events/subscribe`
+
+Missed state is recovered from the snapshot, not inferred from event gaps alone.
+
 Current daemon event types include:
 
 - upstream status changes
@@ -188,7 +197,7 @@ Most TUI tests assert on state and view-model projections. Render validation is 
 ## Current Rough Edges
 
 - `threads/list` is still broader than the scoped frontend snapshot
-- TUI reconnect after daemon restart is refresh-driven rather than fully automatic
+- one-shot supervisor retry logic is intentionally shallow and command-scoped
 - no dedicated approval UX
 - no auth or multi-user model
 - no browser bridge yet

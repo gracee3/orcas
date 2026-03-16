@@ -47,6 +47,7 @@ The current process manager:
 - waits for the UDS socket to become reachable
 
 `supervisor daemon restart` is now a first-class workflow. It intentionally replaces the active daemon instead of silently reusing it.
+`supervisor daemon stop` now uses a real Orcas IPC shutdown path instead of an external kill.
 
 ## Socket Behavior
 
@@ -73,6 +74,20 @@ Daemon restart behavior:
 - stop the old daemon
 - clean stale socket/metadata files
 - start the new daemon and wait for the socket to become reachable
+
+Daemon stop behavior:
+
+- accept `daemon/stop` over Orcas IPC
+- send a successful response
+- stop accepting new work
+- exit the daemon process
+- remove the socket and runtime metadata on shutdown
+
+Current policy is simple and explicit:
+
+- shutdown is immediate
+- connected clients observe disconnect
+- there is no graceful drain of in-flight client work yet
 
 ## Event Fanout
 
@@ -137,8 +152,9 @@ Supervisor commands reconnect per invocation, so they tolerate daemon restart na
 
 The TUI now:
 
-- shows a disconnected/error banner when the daemon event stream dies
-- marks upstream state as disconnected on backend failure
-- can recover by refreshing, which fetches a fresh snapshot and resubscribes to events
+- shows disconnected/reconnecting state when the daemon event stream dies or IPC calls fail
+- retries connection with bounded backoff
+- reboots from a fresh `state/get` snapshot
+- recreates `events/subscribe` after snapshot recovery
 
-This is intentionally explicit. Full background reconnect is deferred.
+Recovery is intentionally snapshot-first. The TUI does not try to infer missed daemon state only from event gaps.
