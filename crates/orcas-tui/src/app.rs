@@ -33,6 +33,7 @@ pub struct AppState {
     pub selected_thread_id: Option<String>,
     pub selected_workstream_id: Option<String>,
     pub selected_work_unit_id: Option<String>,
+    pub work_unit_details: HashMap<String, ipc::WorkunitGetResponse>,
     pub navigation_focus: NavigationFocus,
     pub recent_events: VecDeque<ipc::EventSummary>,
     pub prompt_input: String,
@@ -111,6 +112,7 @@ pub enum UiEvent {
     },
     ReportRecorded(ipc::ReportSummary),
     DecisionApplied(ipc::DecisionSummary),
+    WorkUnitDetailLoaded(ipc::WorkunitGetResponse),
     TurnUpdated {
         thread_id: String,
         turn: ipc::TurnView,
@@ -184,6 +186,7 @@ pub enum Effect {
     LoadActiveTurns,
     LoadThread { thread_id: String },
     LoadTurnState { thread_id: String, turn_id: String },
+    LoadWorkUnitDetail { work_unit_id: String },
     SubmitPrompt { thread_id: String, text: String },
 }
 
@@ -279,6 +282,7 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             state.threads = snapshot.threads;
             state.thread_details.clear();
             state.turn_states.clear();
+            state.work_unit_details.clear();
             state.recent_events = snapshot.recent_events.into_iter().collect();
             state.selected_thread_id = None;
             state.prompt_in_flight = false;
@@ -310,6 +314,7 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
                 effects.push(Effect::LoadThread { thread_id });
             }
             reconcile_collaboration_selection(state);
+            effects.extend(load_selected_work_unit_detail_if_needed(state));
             effects.push(Effect::LoadActiveTurns);
             state.banner = None;
         }
@@ -415,19 +420,46 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
         UiEvent::WorkstreamLifecycle { workstream, .. } => {
             upsert_workstream_summary(&mut state.collaboration.workstreams, workstream);
             reconcile_collaboration_selection(state);
+            effects.extend(load_selected_work_unit_detail_if_needed(state));
         }
         UiEvent::WorkUnitLifecycle { work_unit, .. } => {
+            let selected = state.selected_work_unit_id.as_deref() == Some(work_unit.id.as_str());
             upsert_work_unit_summary(&mut state.collaboration.work_units, work_unit);
             reconcile_collaboration_selection(state);
+            if selected {
+                effects.extend(load_selected_work_unit_detail(state));
+            } else {
+                effects.extend(load_selected_work_unit_detail_if_needed(state));
+            }
         }
         UiEvent::AssignmentLifecycle { assignment, .. } => {
+            let selected =
+                state.selected_work_unit_id.as_deref() == Some(assignment.work_unit_id.as_str());
             upsert_assignment_summary(&mut state.collaboration.assignments, assignment);
+            if selected {
+                effects.extend(load_selected_work_unit_detail(state));
+            }
         }
         UiEvent::ReportRecorded(report) => {
+            let selected =
+                state.selected_work_unit_id.as_deref() == Some(report.work_unit_id.as_str());
             upsert_report_summary(&mut state.collaboration.reports, report);
+            if selected {
+                effects.extend(load_selected_work_unit_detail(state));
+            }
         }
         UiEvent::DecisionApplied(decision) => {
+            let selected =
+                state.selected_work_unit_id.as_deref() == Some(decision.work_unit_id.as_str());
             upsert_decision_summary(&mut state.collaboration.decisions, decision);
+            if selected {
+                effects.extend(load_selected_work_unit_detail(state));
+            }
+        }
+        UiEvent::WorkUnitDetailLoaded(detail) => {
+            state
+                .work_unit_details
+                .insert(detail.work_unit.id.clone(), detail);
         }
         UiEvent::TurnUpdated { thread_id, turn } => {
             ensure_thread_detail(state, &thread_id);
@@ -523,22 +555,16 @@ fn select_thread(state: &mut AppState, thread_id: String) -> Vec<Effect> {
 fn select_relative_in_focus(state: &mut AppState, delta: isize) -> Vec<Effect> {
     match state.navigation_focus {
         NavigationFocus::Threads => select_relative_thread(state, delta),
-        NavigationFocus::Workstreams => {
-            select_relative_workstream(state, delta);
-            Vec::new()
-        }
-        NavigationFocus::WorkUnits => {
-            select_relative_work_unit(state, delta);
-            Vec::new()
-        }
+        NavigationFocus::Workstreams => select_relative_workstream(state, delta),
+        NavigationFocus::WorkUnits => select_relative_work_unit(state, delta),
     }
 }
 
-fn select_relative_workstream(state: &mut AppState, delta: isize) {
+fn select_relative_workstream(state: &mut AppState, delta: isize) -> Vec<Effect> {
     if state.collaboration.workstreams.is_empty() {
         state.selected_workstream_id = None;
         state.selected_work_unit_id = None;
-        return;
+        return Vec::new();
     }
     let current_index = state
         .selected_workstream_id
@@ -560,13 +586,14 @@ fn select_relative_workstream(state: &mut AppState, delta: isize) {
     state.selected_workstream_id = Some(state.collaboration.workstreams[next_index].id.clone());
     state.selected_work_unit_id =
         first_work_unit_for_selected_workstream(state).map(|work_unit| work_unit.id.clone());
+    load_selected_work_unit_detail_if_needed(state)
 }
 
-fn select_relative_work_unit(state: &mut AppState, delta: isize) {
+fn select_relative_work_unit(state: &mut AppState, delta: isize) -> Vec<Effect> {
     let work_units = work_units_for_selected_workstream(state);
     if work_units.is_empty() {
         state.selected_work_unit_id = None;
-        return;
+        return Vec::new();
     }
     let current_index = state
         .selected_work_unit_id
@@ -583,6 +610,7 @@ fn select_relative_work_unit(state: &mut AppState, delta: isize) {
         (current_index + delta as usize).min(work_units.len().saturating_sub(1))
     };
     state.selected_work_unit_id = Some(work_units[next_index].id.clone());
+    load_selected_work_unit_detail_if_needed(state)
 }
 
 fn reconcile_collaboration_selection(state: &mut AppState) {
@@ -646,6 +674,26 @@ fn work_units_for_selected_workstream(state: &AppState) -> Vec<&ipc::WorkUnitSum
         .work_units
         .iter()
         .filter(|work_unit| work_unit.workstream_id == *workstream_id)
+        .collect()
+}
+
+fn load_selected_work_unit_detail_if_needed(state: &AppState) -> Vec<Effect> {
+    let Some(work_unit_id) = state.selected_work_unit_id.clone() else {
+        return Vec::new();
+    };
+    if state.work_unit_details.contains_key(&work_unit_id) {
+        Vec::new()
+    } else {
+        vec![Effect::LoadWorkUnitDetail { work_unit_id }]
+    }
+}
+
+fn load_selected_work_unit_detail(state: &AppState) -> Vec<Effect> {
+    state
+        .selected_work_unit_id
+        .clone()
+        .map(|work_unit_id| Effect::LoadWorkUnitDetail { work_unit_id })
+        .into_iter()
         .collect()
 }
 
@@ -884,6 +932,7 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
     let timestamp = chrono::Utc::now();
     let (kind, message, thread_id, turn_id) = match event {
         UiEvent::SnapshotLoaded(_) => return None,
+        UiEvent::WorkUnitDetailLoaded(_) => return None,
         UiEvent::Ignored => return None,
         UiEvent::ReconnectScheduled { attempt, .. } => (
             "reconnect",

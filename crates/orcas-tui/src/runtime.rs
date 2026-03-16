@@ -233,6 +233,35 @@ impl<B: TuiBackend> AppRuntime<B> {
                     }
                 }
             }
+            Effect::LoadWorkUnitDetail { work_unit_id } => {
+                match self
+                    .backend
+                    .execute(BackendCommand::GetWorkUnit {
+                        work_unit_id: work_unit_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(BackendCommandResult::WorkUnit(detail)) => {
+                        self.dispatch(Action::Event(UiEvent::WorkUnitDetailLoaded(detail)));
+                    }
+                    Ok(other) => {
+                        self.dispatch(Action::Event(UiEvent::Error(format!(
+                            "unexpected work-unit response: {other:?}"
+                        ))));
+                    }
+                    Err(error) => {
+                        if Self::is_disconnect_error(&error) {
+                            self.dispatch(Action::Event(UiEvent::ConnectionLost(format!(
+                                "work unit load failed for {work_unit_id}: {error}"
+                            ))));
+                        } else {
+                            self.dispatch(Action::Event(UiEvent::Error(format!(
+                                "work unit load failed for {work_unit_id}: {error}"
+                            ))));
+                        }
+                    }
+                }
+            }
             Effect::SubmitPrompt { thread_id, text } => {
                 match self
                     .backend

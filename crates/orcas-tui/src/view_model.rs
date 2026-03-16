@@ -119,6 +119,12 @@ pub struct CollaborationDetailViewModel {
     pub lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollaborationHistoryViewModel {
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
 pub fn connection_status(state: &AppState) -> ConnectionStatusViewModel {
     let daemon = state.daemon.as_ref();
     ConnectionStatusViewModel {
@@ -172,7 +178,7 @@ pub fn thread_list(state: &AppState) -> ThreadListViewModel {
                 id: thread.id.clone(),
                 status: thread_status_label(state, thread),
                 turn_badge: thread_turn_badge(state, &thread.id),
-                preview: thread.preview.replace('\n', " "),
+                preview: abbreviate(&thread.preview.replace('\n', " "), 24),
                 selected: state.selected_thread_id.as_deref() == Some(thread.id.as_str()),
             })
             .collect(),
@@ -201,7 +207,7 @@ pub fn workstream_list(state: &AppState) -> WorkstreamListViewModel {
                     .count();
                 WorkstreamRowViewModel {
                     id: workstream.id.clone(),
-                    title: workstream.title.clone(),
+                    title: abbreviate(&workstream.title, 24),
                     status: collaboration_status_label(workstream.status),
                     counts: format!("units={} review={review_count}", work_units.len()),
                     selected: state.selected_workstream_id.as_deref()
@@ -372,11 +378,12 @@ pub fn work_unit_list(state: &AppState) -> WorkUnitListViewModel {
                 let latest_decision = latest_decision_for_work_unit(state, &work_unit.id);
                 WorkUnitRowViewModel {
                     id: work_unit.id.clone(),
-                    title: work_unit.title.clone(),
+                    title: abbreviate(&work_unit.title, 24),
                     status: work_unit_status_label(work_unit.status),
                     current_assignment: work_unit
                         .current_assignment_id
                         .clone()
+                        .map(|id| short_id(&id))
                         .unwrap_or_else(|| "-".to_string()),
                     latest_report_parse_result: latest_report
                         .map(|report| report_parse_result_label(report.parse_result).to_string())
@@ -422,16 +429,17 @@ pub fn assignment_list(state: &AppState) -> AssignmentListViewModel {
                 ) && workstream_work_units.contains(&assignment.work_unit_id.as_str())
             })
             .map(|assignment| AssignmentRowViewModel {
-                id: assignment.id.clone(),
+                id: short_id(&assignment.id),
                 work_unit_title: state
                     .collaboration
                     .work_units
                     .iter()
                     .find(|work_unit| work_unit.id == assignment.work_unit_id)
                     .map(|work_unit| work_unit.title.clone())
-                    .unwrap_or_else(|| assignment.work_unit_id.clone()),
-                worker_id: assignment.worker_id.clone(),
-                worker_session_id: assignment.worker_session_id.clone(),
+                    .map(|title| abbreviate(&title, 18))
+                    .unwrap_or_else(|| short_id(&assignment.work_unit_id)),
+                worker_id: abbreviate(&assignment.worker_id, 12),
+                worker_session_id: short_id(&assignment.worker_session_id),
                 status: assignment_status_label(assignment.status),
             })
             .collect(),
@@ -489,7 +497,10 @@ pub fn collaboration_detail(state: &AppState) -> CollaborationDetailViewModel {
 
     if let Some(report) = latest_report {
         lines.push(format!("report: {}", report.id));
-        lines.push(format!("report_summary: {}", compact_line(&report.summary)));
+        lines.push(format!(
+            "report_summary: {}",
+            abbreviate(&compact_line(&report.summary), 84)
+        ));
         lines.push(format!(
             "parse_result: {}",
             report_parse_result_label(report.parse_result)
@@ -515,7 +526,7 @@ pub fn collaboration_detail(state: &AppState) -> CollaborationDetailViewModel {
         ));
         lines.push(format!(
             "decision_rationale: {}",
-            compact_line(&decision.rationale)
+            abbreviate(&compact_line(&decision.rationale), 84)
         ));
     } else {
         lines.push("decision: -".to_string());
@@ -523,6 +534,98 @@ pub fn collaboration_detail(state: &AppState) -> CollaborationDetailViewModel {
 
     CollaborationDetailViewModel {
         title: format!("Work Unit {}", work_unit.id),
+        lines,
+    }
+}
+
+pub fn collaboration_history(state: &AppState) -> CollaborationHistoryViewModel {
+    let Some(work_unit_id) = state.selected_work_unit_id.as_ref() else {
+        return CollaborationHistoryViewModel {
+            title: "History".to_string(),
+            lines: vec!["No work unit selected.".to_string()],
+        };
+    };
+    let Some(detail) = state.work_unit_details.get(work_unit_id) else {
+        return CollaborationHistoryViewModel {
+            title: format!("History {}", short_id(work_unit_id)),
+            lines: vec!["Loading history...".to_string()],
+        };
+    };
+
+    let mut lines = Vec::new();
+    lines.push("Assignments".to_string());
+    if detail.assignments.is_empty() {
+        lines.push("  none".to_string());
+    } else {
+        for assignment in detail.assignments.iter().rev().take(6) {
+            let current = if detail.work_unit.current_assignment_id.as_deref()
+                == Some(assignment.id.as_str())
+            {
+                " current"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "  {} [{}] attempt={} worker={} session={}{} @ {}",
+                short_id(&assignment.id),
+                assignment_status_label(assignment.status),
+                assignment.attempt_number,
+                abbreviate(&assignment.worker_id, 12),
+                short_id(&assignment.worker_session_id),
+                current,
+                timestamp_label(assignment.updated_at)
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Reports".to_string());
+    if detail.reports.is_empty() {
+        lines.push("  none".to_string());
+    } else {
+        for report in detail.reports.iter().rev().take(6) {
+            let review = if report.needs_supervisor_review {
+                " review=true"
+            } else {
+                " review=false"
+            };
+            lines.push(format!(
+                "  {} [{} {}{}] conf={} @ {}",
+                short_id(&report.id),
+                report_disposition_label(report.disposition),
+                report_parse_result_label(report.parse_result),
+                review,
+                report_confidence_label(report.confidence),
+                timestamp_label(report.created_at)
+            ));
+            lines.push(format!(
+                "    {}",
+                abbreviate(&compact_line(&report.summary), 88)
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Decisions".to_string());
+    if detail.decisions.is_empty() {
+        lines.push("  none".to_string());
+    } else {
+        for decision in detail.decisions.iter().rev().take(6) {
+            lines.push(format!(
+                "  {} [{}] @ {}",
+                short_id(&decision.id),
+                decision_type_label(decision.decision_type),
+                timestamp_label(decision.created_at)
+            ));
+            lines.push(format!(
+                "    {}",
+                abbreviate(&compact_line(&decision.rationale), 88)
+            ));
+        }
+    }
+
+    CollaborationHistoryViewModel {
+        title: format!("History {}", abbreviate(&detail.work_unit.title, 24)),
         lines,
     }
 }
@@ -591,6 +694,32 @@ fn latest_decision_for_work_unit<'a>(
 
 fn compact_line(text: &str) -> String {
     text.replace('\n', " ")
+}
+
+fn abbreviate(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let truncated = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    format!("{truncated}…")
+}
+
+fn short_id(id: &str) -> String {
+    if id.len() <= 18 {
+        id.to_string()
+    } else {
+        format!("{}…", &id[..18])
+    }
+}
+
+fn timestamp_label(timestamp: chrono::DateTime<chrono::Utc>) -> String {
+    timestamp.format("%H:%M:%S").to_string()
 }
 
 fn collaboration_status_label(status: WorkstreamStatus) -> String {

@@ -8,6 +8,7 @@ use crate::app::{AppState, BannerLevel, DaemonConnectionPhase, NavigationFocus};
 use crate::view_model;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
+    let compact = frame.area().width < 150 || frame.area().height < 40;
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -32,21 +33,50 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(7),
-            Constraint::Length(9),
+            Constraint::Length(if compact { 8 } else { 7 }),
+            Constraint::Length(if compact { 10 } else { 9 }),
             Constraint::Min(8),
         ])
         .split(main[1]);
 
     let collaboration_top = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(34), Constraint::Min(30)])
+        .direction(if compact {
+            Direction::Vertical
+        } else {
+            Direction::Horizontal
+        })
+        .constraints(if compact {
+            vec![Constraint::Length(4), Constraint::Min(4)]
+        } else {
+            vec![Constraint::Length(34), Constraint::Min(30)]
+        })
         .split(collaboration[1]);
 
     let collaboration_middle = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .direction(if compact {
+            Direction::Vertical
+        } else {
+            Direction::Horizontal
+        })
+        .constraints(if compact {
+            vec![Constraint::Length(5), Constraint::Min(4)]
+        } else {
+            vec![Constraint::Percentage(60), Constraint::Percentage(40)]
+        })
         .split(collaboration[2]);
+
+    let collaboration_bottom = Layout::default()
+        .direction(if compact {
+            Direction::Vertical
+        } else {
+            Direction::Horizontal
+        })
+        .constraints(if compact {
+            vec![Constraint::Length(8), Constraint::Min(8)]
+        } else {
+            vec![Constraint::Percentage(44), Constraint::Percentage(56)]
+        })
+        .split(collaboration[3]);
 
     frame.render_widget(render_status(state), layout[0]);
     frame.render_widget(render_threads(state), thread_panels[0]);
@@ -56,7 +86,8 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     frame.render_widget(render_workstream_detail(state), collaboration_top[1]);
     frame.render_widget(render_work_units(state), collaboration_middle[0]);
     frame.render_widget(render_assignments(state), collaboration_middle[1]);
-    frame.render_widget(render_collaboration_detail(state), collaboration[3]);
+    frame.render_widget(render_collaboration_detail(state), collaboration_bottom[0]);
+    frame.render_widget(render_collaboration_history(state), collaboration_bottom[1]);
     frame.render_widget(render_event_log(state), layout[2]);
     frame.render_widget(render_prompt(state), layout[3]);
 }
@@ -93,11 +124,11 @@ fn render_status(state: &AppState) -> Paragraph<'static> {
         ));
     } else if state.show_help {
         lines.push(Line::from(
-            "keys: q quit, r refresh, tab focus, j/k move, i prompt, enter send",
+            "keys: q quit, r refresh, tab cycles panels, j/k move selected panel, i prompt",
         ));
     } else {
         lines.push(Line::from(
-            "keys: q quit, r refresh, tab focus, j/k move, i prompt, ? help",
+            "keys: q quit, r refresh, tab cycles panels, j/k move selected panel, ? help",
         ));
     }
 
@@ -147,7 +178,7 @@ fn render_collaboration_status(state: &AppState) -> Paragraph<'static> {
         NavigationFocus::WorkUnits => "work_units",
     };
     Paragraph::new(Text::from(vec![Line::from(format!(
-        "focus={}  workstreams={}  work_units={}  active_assignments={}  review={}",
+        "focus={}  ws={}  wu={}  active={}  review={}  history=selected work unit",
         focus,
         status.workstream_count,
         status.work_unit_count,
@@ -207,7 +238,7 @@ fn render_work_units(state: &AppState) -> Paragraph<'static> {
                     ""
                 };
                 Line::from(format!(
-                    "{prefix} {} [{}] assign={} parse={}{} decision={}",
+                    "{prefix} {} [{}] a={} parse={}{} decision={}",
                     row.title,
                     row.status,
                     row.current_assignment,
@@ -250,6 +281,15 @@ fn render_collaboration_detail(state: &AppState) -> Paragraph<'static> {
     ))
     .block(Block::default().title(detail.title).borders(Borders::ALL))
     .wrap(Wrap { trim: true })
+}
+
+fn render_collaboration_history(state: &AppState) -> Paragraph<'static> {
+    let detail = view_model::collaboration_history(state);
+    Paragraph::new(Text::from(
+        detail.lines.into_iter().map(Line::from).collect::<Vec<_>>(),
+    ))
+    .block(Block::default().title(detail.title).borders(Borders::ALL))
+    .wrap(Wrap { trim: false })
 }
 
 fn render_event_log(state: &AppState) -> Paragraph<'static> {

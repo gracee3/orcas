@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, mpsc};
 
-use orcas_core::{AppPaths, ipc};
+use orcas_core::{AppPaths, Assignment, Decision, Report, WorkUnit, ipc};
 use orcas_daemon::{
     OrcasDaemonLaunch, OrcasDaemonProcessManager, OrcasIpcClient, OrcasRuntimeOverrides,
 };
@@ -14,6 +14,7 @@ use orcas_daemon::{
 pub enum BackendCommand {
     GetThread { thread_id: String },
     GetTurn { thread_id: String, turn_id: String },
+    GetWorkUnit { work_unit_id: String },
     GetActiveTurns,
     SubmitPrompt { thread_id: String, text: String },
 }
@@ -23,6 +24,7 @@ pub enum BackendCommandResult {
     Snapshot(ipc::StateSnapshot),
     Thread(ipc::ThreadView),
     Turn(ipc::TurnAttachResponse),
+    WorkUnit(ipc::WorkunitGetResponse),
     ActiveTurns(Vec<ipc::TurnStateView>),
     PromptStarted { thread_id: String, turn_id: String },
 }
@@ -148,6 +150,11 @@ impl OrcasDaemonBackend {
                     .turn_attach(&ipc::TurnAttachRequest { thread_id, turn_id })
                     .await?,
             )),
+            BackendCommand::GetWorkUnit { work_unit_id } => Ok(BackendCommandResult::WorkUnit(
+                client
+                    .workunit_get(&ipc::WorkunitGetRequest { work_unit_id })
+                    .await?,
+            )),
             BackendCommand::GetActiveTurns => Ok(BackendCommandResult::ActiveTurns(
                 client.turns_list_active().await?.turns,
             )),
@@ -178,6 +185,7 @@ struct FakeBackendState {
     snapshot: ipc::StateSnapshot,
     threads: HashMap<String, ipc::ThreadView>,
     turns: HashMap<(String, String), ipc::TurnAttachResponse>,
+    work_unit_details: HashMap<String, ipc::WorkunitGetResponse>,
     active_turns: Vec<ipc::TurnStateView>,
     next_submit_id: usize,
     fail_snapshot: Option<String>,
@@ -205,6 +213,7 @@ impl FakeBackend {
             .collect();
         Self {
             inner: Arc::new(Mutex::new(FakeBackendState {
+                work_unit_details: workunit_details_from_snapshot(&snapshot),
                 snapshot,
                 threads,
                 turns: HashMap::new(),
@@ -237,8 +246,17 @@ impl FakeBackend {
             .map(turn_state_from_active_turn)
             .collect();
         let mut guard = self.inner.lock().await;
+        guard.work_unit_details = workunit_details_from_snapshot(&snapshot);
         guard.snapshot = snapshot;
         guard.active_turns = active_turns;
+    }
+
+    pub async fn set_workunit_detail(&self, detail: ipc::WorkunitGetResponse) {
+        self.inner
+            .lock()
+            .await
+            .work_unit_details
+            .insert(detail.work_unit.id.clone(), detail);
     }
 
     pub async fn set_turn(&self, response: ipc::TurnAttachResponse) {
@@ -393,6 +411,12 @@ impl TuiBackend for FakeBackend {
                         ),
                     }),
             )),
+            BackendCommand::GetWorkUnit { work_unit_id } => guard
+                .work_unit_details
+                .get(&work_unit_id)
+                .cloned()
+                .map(BackendCommandResult::WorkUnit)
+                .ok_or_else(|| anyhow!("unknown work unit `{work_unit_id}`")),
             BackendCommand::GetActiveTurns => Ok(BackendCommandResult::ActiveTurns(
                 guard.active_turns.clone(),
             )),
@@ -441,4 +465,87 @@ fn turn_state_from_active_turn(turn: &ipc::ActiveTurn) -> ipc::TurnStateView {
         updated_at: turn.updated_at,
         error_message: None,
     }
+}
+
+fn workunit_details_from_snapshot(
+    snapshot: &ipc::StateSnapshot,
+) -> HashMap<String, ipc::WorkunitGetResponse> {
+    let mut details = HashMap::new();
+    for work_unit in &snapshot.collaboration.work_units {
+        let assignments = snapshot
+            .collaboration
+            .assignments
+            .iter()
+            .filter(|assignment| assignment.work_unit_id == work_unit.id)
+            .map(|assignment| Assignment {
+                id: assignment.id.clone(),
+                work_unit_id: assignment.work_unit_id.clone(),
+                worker_id: assignment.worker_id.clone(),
+                worker_session_id: assignment.worker_session_id.clone(),
+                instructions: String::new(),
+                status: assignment.status,
+                attempt_number: assignment.attempt_number,
+                created_at: assignment.updated_at,
+                updated_at: assignment.updated_at,
+            })
+            .collect::<Vec<_>>();
+        let reports = snapshot
+            .collaboration
+            .reports
+            .iter()
+            .filter(|report| report.work_unit_id == work_unit.id)
+            .map(|report| Report {
+                id: report.id.clone(),
+                work_unit_id: report.work_unit_id.clone(),
+                assignment_id: report.assignment_id.clone(),
+                worker_id: report.worker_id.clone(),
+                disposition: report.disposition,
+                summary: report.summary.clone(),
+                findings: Vec::new(),
+                blockers: Vec::new(),
+                questions: Vec::new(),
+                recommended_next_actions: Vec::new(),
+                confidence: report.confidence,
+                raw_output: String::new(),
+                parse_result: report.parse_result,
+                needs_supervisor_review: report.needs_supervisor_review,
+                created_at: report.created_at,
+            })
+            .collect::<Vec<_>>();
+        let decisions = snapshot
+            .collaboration
+            .decisions
+            .iter()
+            .filter(|decision| decision.work_unit_id == work_unit.id)
+            .map(|decision| Decision {
+                id: decision.id.clone(),
+                work_unit_id: decision.work_unit_id.clone(),
+                report_id: decision.report_id.clone(),
+                decision_type: decision.decision_type,
+                rationale: decision.rationale.clone(),
+                created_at: decision.created_at,
+            })
+            .collect::<Vec<_>>();
+        details.insert(
+            work_unit.id.clone(),
+            ipc::WorkunitGetResponse {
+                work_unit: WorkUnit {
+                    id: work_unit.id.clone(),
+                    workstream_id: work_unit.workstream_id.clone(),
+                    title: work_unit.title.clone(),
+                    task_statement: String::new(),
+                    status: work_unit.status,
+                    dependencies: Vec::new(),
+                    latest_report_id: work_unit.latest_report_id.clone(),
+                    current_assignment_id: work_unit.current_assignment_id.clone(),
+                    created_at: work_unit.updated_at,
+                    updated_at: work_unit.updated_at,
+                },
+                assignments,
+                reports,
+                decisions,
+            },
+        );
+    }
+    details
 }

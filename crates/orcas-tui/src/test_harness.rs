@@ -56,6 +56,10 @@ impl AppHarness {
         self.backend.set_active_turns(turns).await;
     }
 
+    pub async fn set_workunit_detail(&self, detail: ipc::WorkunitGetResponse) {
+        self.backend.set_workunit_detail(detail).await;
+    }
+
     pub async fn replace_snapshot(&self, snapshot: ipc::StateSnapshot) {
         self.backend.replace_snapshot(snapshot).await;
     }
@@ -130,5 +134,9 @@ impl AppHarness {
 
     pub fn collaboration_status_vm(&self) -> view_model::CollaborationStatusViewModel {
         view_model::collaboration_status(self.runtime.state())
+    }
+
+    pub fn collaboration_history_vm(&self) -> view_model::CollaborationHistoryViewModel {
+        view_model::collaboration_history(self.runtime.state())
     }
 }
