@@ -96,6 +96,7 @@ pub enum Action {
 pub enum UserAction {
     Refresh,
     LoadModels,
+    StartDaemon,
     StopDaemon,
     ToggleHelp,
     CycleView,
@@ -125,6 +126,9 @@ pub enum UiEvent {
     ActiveTurnsLoaded(Vec<ipc::TurnStateView>),
     TurnStateLoaded(ipc::TurnAttachResponse),
     ModelsLoaded(Vec<ipc::ModelSummary>),
+    DaemonStarted {
+        connected: bool,
+    },
     DaemonStopped {
         stopping: bool,
     },
@@ -240,6 +244,7 @@ pub enum Effect {
     LoadWorkUnitDetail { work_unit_id: String },
     SubmitPrompt { thread_id: String, text: String },
     LoadModels,
+    StartDaemon,
     StopDaemon,
 }
 
@@ -264,6 +269,10 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
         UserAction::StopDaemon => {
             state.confirming_daemon_stop = true;
             vec![Effect::StopDaemon]
+        }
+        UserAction::StartDaemon => {
+            state.confirming_daemon_stop = true;
+            vec![Effect::StartDaemon]
         }
         UserAction::ToggleHelp => {
             state.show_help = !state.show_help;
@@ -426,6 +435,21 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
         UiEvent::ModelsLoaded(models) => {
             state.daemon_models = models;
             state.confirming_daemon_stop = false;
+        }
+        UiEvent::DaemonStarted { connected } => {
+            state.confirming_daemon_stop = false;
+            state.banner = Some(StatusBanner {
+                level: if connected {
+                    BannerLevel::Info
+                } else {
+                    BannerLevel::Warning
+                },
+                message: if connected {
+                    "Daemon start requested.".to_string()
+                } else {
+                    "Daemon start was not accepted.".to_string()
+                },
+            });
         }
         UiEvent::DaemonStopped { stopping } => {
             state.confirming_daemon_stop = false;
@@ -1079,6 +1103,7 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
             Some(turn_id.clone()),
         ),
         UiEvent::ModelsLoaded(_) => return None,
+        UiEvent::DaemonStarted { .. } => return None,
         UiEvent::DaemonStopped { .. } => return None,
         UiEvent::UpstreamChanged(upstream) => (
             "upstream",

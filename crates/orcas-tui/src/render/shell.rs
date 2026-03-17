@@ -57,12 +57,12 @@ pub(super) fn render_footer(state: &AppState) -> Paragraph<'static> {
         lines.push(Line::from(help_navigation_line(state.current_view)));
     } else {
         lines.push(Line::from(format!(
-            "keys: 1/2/3/4 views  tab next  m refresh models  x stop daemon  {}  r refresh  ? help  q quit",
+            "keys: 1/2/3/4 views  tab next  {}  r refresh  ? help  q quit",
             match state.current_view {
                 TopLevelView::Overview => "j/k no-op",
                 TopLevelView::Threads => "j/k threads",
                 TopLevelView::Collaboration => "j/k selection  h/l list focus",
-                TopLevelView::Supervisor => "m refresh models  x stop daemon",
+                TopLevelView::Supervisor => "m refresh models  s start daemon  x stop daemon",
             }
         )));
     }
@@ -107,7 +107,7 @@ fn help_navigation_line(view: TopLevelView) -> &'static str {
             "nav: j/k move selected list  h/l switch workstreams/work_units  r refresh  ? help  q quit"
         }
         TopLevelView::Supervisor => {
-            "nav: m reload models  x request daemon stop  r refresh  ? help  q quit"
+            "nav: m reload models  s start daemon  x request daemon stop  r refresh  ? help  q quit"
         }
     }
 }

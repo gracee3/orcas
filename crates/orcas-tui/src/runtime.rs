@@ -283,6 +283,27 @@ impl<B: TuiBackend> AppRuntime<B> {
                     }
                 }
             },
+            Effect::StartDaemon => match self.backend.execute(BackendCommand::StartDaemon).await {
+                Ok(BackendCommandResult::DaemonStarted { connected }) => {
+                    self.dispatch(Action::Event(UiEvent::DaemonStarted { connected }));
+                }
+                Ok(other) => {
+                    self.dispatch(Action::Event(UiEvent::Error(format!(
+                        "unexpected start daemon response: {other:?}"
+                    ))));
+                }
+                Err(error) => {
+                    if Self::is_disconnect_error(&error) {
+                        self.dispatch(Action::Event(UiEvent::ConnectionLost(format!(
+                            "daemon start failed: {error}"
+                        ))));
+                    } else {
+                        self.dispatch(Action::Event(UiEvent::Error(format!(
+                            "daemon start failed: {error}"
+                        ))));
+                    }
+                }
+            },
             Effect::StopDaemon => match self.backend.execute(BackendCommand::StopDaemon).await {
                 Ok(BackendCommandResult::DaemonStopped { stopping }) => {
                     self.dispatch(Action::Event(UiEvent::DaemonStopped { stopping }));

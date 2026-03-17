@@ -17,6 +17,7 @@ pub enum BackendCommand {
     GetWorkUnit { work_unit_id: String },
     GetActiveTurns,
     LoadModels,
+    StartDaemon,
     StopDaemon,
     SubmitPrompt { thread_id: String, text: String },
 }
@@ -29,6 +30,7 @@ pub enum BackendCommandResult {
     WorkUnit(ipc::WorkunitGetResponse),
     ActiveTurns(Vec<ipc::TurnStateView>),
     Models(Vec<ipc::ModelSummary>),
+    DaemonStarted { connected: bool },
     DaemonStopped { stopping: bool },
     PromptStarted { thread_id: String, turn_id: String },
 }
@@ -165,6 +167,9 @@ impl OrcasDaemonBackend {
             BackendCommand::LoadModels => Ok(BackendCommandResult::Models(
                 client.models_list().await?.data,
             )),
+            BackendCommand::StartDaemon => Ok(BackendCommandResult::DaemonStarted {
+                connected: client.daemon_connect().await?.status.upstream.status == "connected",
+            }),
             BackendCommand::StopDaemon => Ok(BackendCommandResult::DaemonStopped {
                 stopping: client.daemon_stop().await?.stopping,
             }),
@@ -446,6 +451,9 @@ impl TuiBackend for FakeBackend {
                 guard.active_turns.clone(),
             )),
             BackendCommand::LoadModels => Ok(BackendCommandResult::Models(guard.models.clone())),
+            BackendCommand::StartDaemon => {
+                Ok(BackendCommandResult::DaemonStarted { connected: true })
+            }
             BackendCommand::StopDaemon => {
                 Ok(BackendCommandResult::DaemonStopped { stopping: true })
             }

@@ -111,14 +111,20 @@ fn render_models(state: &AppState) -> Paragraph<'static> {
 fn render_controls(state: &AppState) -> Paragraph<'static> {
     let mut lines = vec![Line::from("status: ready")];
     if let Some(daemon) = state.daemon.as_ref() {
-        let stop_hint = if daemon.upstream.status == "connected" {
+        let is_connected = daemon.upstream.status == "connected";
+        let start_hint = if is_connected {
+            "daemon already connected"
+        } else {
+            "s start daemon"
+        };
+        let stop_hint = if is_connected {
             "x stop daemon"
         } else {
             "daemon not connected"
         };
         lines.push(Line::from(format!(
-            "actions: {}  m refresh models",
-            stop_hint
+            "actions: {}  {}  m refresh models",
+            start_hint, stop_hint
         )));
         lines.push(Line::from(format!(
             "runtime: {} {} {}",
