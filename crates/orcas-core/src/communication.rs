@@ -121,6 +121,39 @@ impl AssignmentModeSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignmentCommunicationSeed {
+    #[serde(default)]
+    pub source_decision_id: Option<String>,
+    #[serde(default)]
+    pub source_report_id: Option<String>,
+    #[serde(default)]
+    pub source_proposal_id: Option<String>,
+    #[serde(default)]
+    pub predecessor_assignment_id: Option<String>,
+    pub objective: String,
+    #[serde(default)]
+    pub instructions: Vec<String>,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub stop_conditions: Vec<String>,
+    #[serde(default)]
+    pub required_context_refs: Vec<String>,
+    #[serde(default)]
+    pub expected_report_fields: Vec<String>,
+    #[serde(default)]
+    pub boundedness_note: Option<String>,
+    pub mode_spec: AssignmentModeSpec,
+}
+
+impl AssignmentCommunicationSeed {
+    #[must_use]
+    pub const fn task_mode(&self) -> AssignmentTaskMode {
+        self.mode_spec.task_mode()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerReportContract {
     pub schema_version: String,
     pub task_mode: AssignmentTaskMode,

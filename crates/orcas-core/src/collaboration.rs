@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::communication::AssignmentCommunicationRecord;
+use crate::communication::{AssignmentCommunicationRecord, AssignmentCommunicationSeed};
 use crate::supervisor::SupervisorProposalRecord;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -97,6 +97,8 @@ pub struct Assignment {
     pub worker_id: String,
     pub worker_session_id: String,
     pub instructions: String,
+    #[serde(default)]
+    pub communication_seed: Option<AssignmentCommunicationSeed>,
     #[serde(default)]
     pub status: AssignmentStatus,
     pub attempt_number: u32,

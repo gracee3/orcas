@@ -25,13 +25,15 @@ use orcas_core::jsonrpc::{
     JsonRpcResponse,
 };
 use orcas_core::{
-    AppConfig, AppPaths, Assignment, AssignmentStatus, CodexConnectionMode, CollaborationState,
-    ConnectionState, Decision, DecisionType, EventEnvelope, JsonSessionStore, OrcasError,
-    OrcasEvent, OrcasResult, OrcasSessionStore, Report, SupervisorContextPack, SupervisorProposal,
-    SupervisorProposalFailure, SupervisorProposalFailureStage, SupervisorProposalRecord,
-    SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorReasonerUsage,
-    ThreadMetadata, WorkUnit, WorkUnitStatus, Worker, WorkerSession, WorkerSessionAttachability,
-    WorkerSessionRuntimeStatus, WorkerStatus, Workstream, WorkstreamStatus,
+    AppConfig, AppPaths, Assignment, AssignmentCommunicationPacket, AssignmentCommunicationRecord,
+    AssignmentCommunicationSeed, AssignmentModeSpec, AssignmentStatus, CodexConnectionMode,
+    CollaborationState, ConnectionState, Decision, DecisionType, DraftAssignment, EventEnvelope,
+    ImplementModeSpec, JsonSessionStore, OrcasError, OrcasEvent, OrcasResult, OrcasSessionStore,
+    Report, SupervisorContextPack, SupervisorProposal, SupervisorProposalFailure,
+    SupervisorProposalFailureStage, SupervisorProposalRecord, SupervisorProposalStatus,
+    SupervisorProposalTriggerKind, SupervisorReasonerUsage, ThreadMetadata, WorkUnit,
+    WorkUnitStatus, Worker, WorkerSession, WorkerSessionAttachability, WorkerSessionRuntimeStatus,
+    WorkerStatus, Workstream, WorkstreamStatus,
 };
 
 use crate::assignment_comm::parse::parse_worker_report_for_turn;
@@ -2302,6 +2304,144 @@ impl OrcasDaemonService {
         Ok(ipc::ProposalListForWorkunitResponse { proposals })
     }
 
+    fn implement_mode_spec() -> AssignmentModeSpec {
+        AssignmentModeSpec::Implement(ImplementModeSpec {
+            expected_verification_commands: Vec::new(),
+        })
+    }
+
+    fn manual_implement_assignment_seed(
+        work_unit: &WorkUnit,
+        instructions: Option<&str>,
+        source_report_id: Option<String>,
+    ) -> AssignmentCommunicationSeed {
+        let objective = if !work_unit.task_statement.trim().is_empty() {
+            work_unit.task_statement.clone()
+        } else if let Some(instructions) = instructions.filter(|value| !value.trim().is_empty()) {
+            instructions.trim().to_string()
+        } else {
+            format!("Complete the bounded work for {}", work_unit.title)
+        };
+
+        AssignmentCommunicationSeed {
+            source_decision_id: None,
+            source_report_id,
+            source_proposal_id: None,
+            predecessor_assignment_id: None,
+            objective,
+            instructions: Self::manual_instruction_lines(work_unit, instructions),
+            acceptance_criteria: Vec::new(),
+            stop_conditions: Vec::new(),
+            required_context_refs: Vec::new(),
+            expected_report_fields: Vec::new(),
+            boundedness_note: None,
+            mode_spec: Self::implement_mode_spec(),
+        }
+    }
+
+    fn manual_instruction_lines(work_unit: &WorkUnit, instructions: Option<&str>) -> Vec<String> {
+        let Some(instructions) = instructions.map(str::trim) else {
+            return Vec::new();
+        };
+        if instructions.is_empty() || instructions == work_unit.task_statement {
+            return Vec::new();
+        }
+        vec![instructions.to_string()]
+    }
+
+    fn assignment_communication_seed_from_draft(
+        draft: &DraftAssignment,
+        source_report_id: &str,
+        source_proposal_id: &str,
+    ) -> AssignmentCommunicationSeed {
+        AssignmentCommunicationSeed {
+            source_decision_id: None,
+            source_report_id: Some(source_report_id.to_string()),
+            source_proposal_id: Some(source_proposal_id.to_string()),
+            predecessor_assignment_id: Some(draft.predecessor_assignment_id.clone()),
+            objective: draft.objective.clone(),
+            instructions: draft.instructions.clone(),
+            acceptance_criteria: draft.acceptance_criteria.clone(),
+            stop_conditions: draft.stop_conditions.clone(),
+            required_context_refs: draft.required_context_refs.clone(),
+            expected_report_fields: draft.expected_report_fields.clone(),
+            boundedness_note: (!draft.boundedness_note.trim().is_empty())
+                .then_some(draft.boundedness_note.clone()),
+            mode_spec: Self::implement_mode_spec(),
+        }
+    }
+
+    fn assignment_communication_seed_from_packet(
+        packet: &AssignmentCommunicationPacket,
+    ) -> AssignmentCommunicationSeed {
+        let required_context_refs = packet
+            .included_context
+            .iter()
+            .filter(|block| block.kind == "context_refs" || block.id == "required_context_refs")
+            .flat_map(|block| block.lines.iter().cloned())
+            .collect::<Vec<_>>();
+
+        AssignmentCommunicationSeed {
+            source_decision_id: packet.source_decision_id.clone(),
+            source_report_id: packet.source_report_id.clone(),
+            source_proposal_id: packet.source_proposal_id.clone(),
+            predecessor_assignment_id: packet.predecessor_assignment_id.clone(),
+            objective: packet.objective.clone(),
+            instructions: packet.instructions.clone(),
+            acceptance_criteria: packet
+                .acceptance_criteria
+                .iter()
+                .map(|item| item.text.clone())
+                .collect(),
+            stop_conditions: packet
+                .stop_conditions
+                .iter()
+                .map(|item| item.text.clone())
+                .collect(),
+            required_context_refs,
+            expected_report_fields: Vec::new(),
+            boundedness_note: packet.non_goals.first().cloned(),
+            mode_spec: packet.mode_spec.clone(),
+        }
+    }
+
+    fn next_assignment_communication_seed(
+        work_unit: &WorkUnit,
+        source_assignment: &Assignment,
+        source_record: Option<&AssignmentCommunicationRecord>,
+        report_id: Option<String>,
+        decision_id: &str,
+        override_instructions: Option<&str>,
+        explicit_seed: Option<AssignmentCommunicationSeed>,
+    ) -> AssignmentCommunicationSeed {
+        let has_explicit_seed = explicit_seed.is_some();
+        let mut seed = explicit_seed
+            .or_else(|| source_assignment.communication_seed.clone())
+            .or_else(|| {
+                source_record
+                    .map(|record| Self::assignment_communication_seed_from_packet(&record.packet))
+            })
+            .unwrap_or_else(|| {
+                Self::manual_implement_assignment_seed(
+                    work_unit,
+                    Some(source_assignment.instructions.as_str()),
+                    report_id.clone(),
+                )
+            });
+
+        if !has_explicit_seed && override_instructions.is_some() {
+            seed.instructions = Self::manual_instruction_lines(work_unit, override_instructions);
+        }
+
+        seed.source_decision_id = Some(decision_id.to_string());
+        seed.source_report_id = report_id;
+        seed.predecessor_assignment_id = Some(source_assignment.id.clone());
+        if !has_explicit_seed {
+            seed.source_proposal_id = None;
+        }
+        seed
+    }
+
     async fn proposal_approve(
         &self,
         params: ipc::ProposalApproveRequest,
@@ -2360,7 +2500,7 @@ impl OrcasDaemonService {
         let approved_proposal = apply_edits(original_proposal, &params.edits);
         validate_proposal(&approved_proposal, &proposal.context_pack, &collaboration)?;
 
-        let (instructions, worker_id, worker_kind) =
+        let (instructions, worker_id, worker_kind, communication_seed) =
             if approved_proposal.proposed_decision.requires_assignment {
                 let draft = approved_proposal
                     .draft_next_assignment
@@ -2378,21 +2518,29 @@ impl OrcasDaemonService {
                     )),
                     draft.preferred_worker_id.clone(),
                     draft.worker_kind.clone(),
+                    Some(Self::assignment_communication_seed_from_draft(
+                        draft,
+                        &proposal.source_report_id,
+                        &proposal.id,
+                    )),
                 )
             } else {
-                (None, None, None)
+                (None, None, None, None)
             };
 
         let decision_response = self
-            .decision_apply(ipc::DecisionApplyRequest {
-                work_unit_id: proposal.primary_work_unit_id.clone(),
-                report_id: Some(proposal.source_report_id.clone()),
-                decision_type: approved_proposal.proposed_decision.decision_type,
-                rationale: approved_proposal.proposed_decision.rationale.clone(),
-                instructions,
-                worker_id,
-                worker_kind,
-            })
+            .decision_apply_with_seed(
+                ipc::DecisionApplyRequest {
+                    work_unit_id: proposal.primary_work_unit_id.clone(),
+                    report_id: Some(proposal.source_report_id.clone()),
+                    decision_type: approved_proposal.proposed_decision.decision_type,
+                    rationale: approved_proposal.proposed_decision.rationale.clone(),
+                    instructions,
+                    worker_id,
+                    worker_kind,
+                },
+                communication_seed,
+            )
             .await?;
 
         let (updated_proposal, sibling_updates) = {
@@ -2516,6 +2664,14 @@ impl OrcasDaemonService {
         &self,
         params: ipc::DecisionApplyRequest,
     ) -> OrcasResult<ipc::DecisionApplyResponse> {
+        self.decision_apply_with_seed(params, None).await
+    }
+
+    async fn decision_apply_with_seed(
+        &self,
+        params: ipc::DecisionApplyRequest,
+        next_assignment_seed: Option<AssignmentCommunicationSeed>,
+    ) -> OrcasResult<ipc::DecisionApplyResponse> {
         let (response, closed_assignment, work_unit_event, workstream_event, stale_proposals) = {
             let now = Utc::now();
             let mut state = self.state.write().await;
@@ -2598,6 +2754,11 @@ impl OrcasDaemonService {
                                 "continue/redirect requires an existing assignment".to_string(),
                             )
                         })?;
+                    let source_record = state
+                        .collaboration
+                        .assignment_communications
+                        .get(&source_assignment.id)
+                        .cloned();
                     let worker_id = params
                         .worker_id
                         .clone()
@@ -2614,12 +2775,22 @@ impl OrcasDaemonService {
                         .instructions
                         .clone()
                         .unwrap_or_else(|| source_assignment.instructions.clone());
+                    let communication_seed = Self::next_assignment_communication_seed(
+                        &prior_work_unit,
+                        &source_assignment,
+                        source_record.as_ref(),
+                        decision.report_id.clone(),
+                        &decision.id,
+                        params.instructions.as_deref(),
+                        next_assignment_seed.clone(),
+                    );
                     let next_assignment = Assignment {
                         id: Self::new_object_id("assignment"),
                         work_unit_id: params.work_unit_id.clone(),
                         worker_id,
                         worker_session_id,
                         instructions,
+                        communication_seed: Some(communication_seed),
                         status: AssignmentStatus::Created,
                         attempt_number: source_assignment.attempt_number + 1,
                         created_at: now,
@@ -2868,7 +3039,13 @@ impl OrcasDaemonService {
                     worker_session_id: worker_session_id.clone(),
                     instructions: params
                         .instructions
+                        .clone()
                         .unwrap_or_else(|| work_unit.task_statement.clone()),
+                    communication_seed: Some(Self::manual_implement_assignment_seed(
+                        &work_unit,
+                        params.instructions.as_deref(),
+                        work_unit.latest_report_id.clone(),
+                    )),
                     status: AssignmentStatus::Created,
                     attempt_number,
                     created_at: now,
@@ -4900,13 +5077,14 @@ mod tests {
         protocol::jsonrpc as codex_jsonrpc, transport::TransportConnection, types,
     };
     use orcas_core::{
-        AppConfig, AppPaths, Assignment, AssignmentStatus, CollaborationState, DecisionType,
-        DraftAssignment, JsonSessionStore, OrcasError, OrcasResult, OrcasSessionStore,
-        ProposedDecision, Report, ReportConfidence, ReportDisposition, ReportParseResult,
-        SupervisorContextPack, SupervisorProposal, SupervisorProposalEdits,
-        SupervisorProposalFailureStage, SupervisorProposalStatus, SupervisorProposalTriggerKind,
-        SupervisorSummary, WorkUnit, WorkUnitStatus, WorkerSessionAttachability,
-        WorkerSessionRuntimeStatus, WorkerStatus, Workstream, WorkstreamStatus, ipc,
+        AppConfig, AppPaths, Assignment, AssignmentCommunicationSeed, AssignmentModeSpec,
+        AssignmentStatus, CollaborationState, DecisionType, DraftAssignment, ImplementModeSpec,
+        JsonSessionStore, OrcasError, OrcasResult, OrcasSessionStore, ProposedDecision, Report,
+        ReportConfidence, ReportDisposition, ReportParseResult, SupervisorContextPack,
+        SupervisorProposal, SupervisorProposalEdits, SupervisorProposalFailureStage,
+        SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorSummary, WorkUnit,
+        WorkUnitStatus, WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus,
+        Workstream, WorkstreamStatus, ipc,
     };
 
     #[derive(Debug)]
@@ -6125,6 +6303,36 @@ ORCAS_REPORT_END"#
             .replace("{{packet_id}}", packet_id)
     }
 
+    fn sample_structured_assignment_seed(
+        predecessor_assignment_id: &str,
+        source_report_id: &str,
+    ) -> AssignmentCommunicationSeed {
+        AssignmentCommunicationSeed {
+            source_decision_id: None,
+            source_report_id: Some(source_report_id.to_string()),
+            source_proposal_id: Some("proposal-structured".to_string()),
+            predecessor_assignment_id: Some(predecessor_assignment_id.to_string()),
+            objective: "Implement the structured recovery pass.".to_string(),
+            instructions: vec![
+                "Inspect only the structured recovery branch.".to_string(),
+                "Do not broaden beyond the current implement slice.".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "The structured recovery branch behavior is confirmed.".to_string(),
+            ],
+            stop_conditions: vec!["Stop if the recovery branch is not reproducible.".to_string()],
+            required_context_refs: vec!["ctx/recovery".to_string()],
+            expected_report_fields: vec![
+                "summary".to_string(),
+                "recommended_next_actions".to_string(),
+            ],
+            boundedness_note: Some("Keep the follow-up strictly bounded.".to_string()),
+            mode_spec: AssignmentModeSpec::Implement(ImplementModeSpec {
+                expected_verification_commands: Vec::new(),
+            }),
+        }
+    }
+
     fn wrap_report_envelope(json: &str) -> String {
         format!("ORCAS_REPORT_BEGIN\n{json}\nORCAS_REPORT_END")
     }
@@ -6159,6 +6367,11 @@ ORCAS_REPORT_END"#
             worker_id: "worker-parse".to_string(),
             worker_session_id: "session-parse".to_string(),
             instructions: "Implement the bounded task and report honestly.".to_string(),
+            communication_seed: Some(OrcasDaemonService::manual_implement_assignment_seed(
+                &work_unit,
+                Some("Implement the bounded task and report honestly."),
+                None,
+            )),
             status: AssignmentStatus::Created,
             attempt_number: 1,
             created_at: now,
@@ -6848,6 +7061,7 @@ ORCAS_REPORT_END"#
                 worker_id: assignment.worker_id.clone(),
                 worker_session_id: assignment.worker_session_id.clone(),
                 instructions: "manual replacement".to_string(),
+                communication_seed: None,
                 status: AssignmentStatus::Created,
                 attempt_number: assignment.attempt_number + 1,
                 created_at: now,
@@ -8588,6 +8802,107 @@ ORCAS_REPORT_END"#
     }
 
     #[test]
+    fn legacy_instruction_fallback_parses_existing_assignment_without_communication_seed() {
+        let now = Utc::now();
+        let workstream = Workstream {
+            id: "ws-legacy".to_string(),
+            title: "Legacy".to_string(),
+            objective: "Exercise the legacy back-compat path".to_string(),
+            status: WorkstreamStatus::Active,
+            priority: "normal".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let work_unit = WorkUnit {
+            id: "wu-legacy".to_string(),
+            workstream_id: workstream.id.clone(),
+            title: "Legacy work".to_string(),
+            task_statement: "Legacy work unit task statement.".to_string(),
+            status: WorkUnitStatus::Ready,
+            dependencies: Vec::new(),
+            latest_report_id: None,
+            current_assignment_id: Some("assignment-legacy".to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+        let assignment = Assignment {
+            id: "assignment-legacy".to_string(),
+            work_unit_id: work_unit.id.clone(),
+            worker_id: "worker-legacy".to_string(),
+            worker_session_id: "session-legacy".to_string(),
+            instructions: r#"Objective: Legacy objective
+Predecessor assignment: assignment-parent
+Source report: report-legacy
+Instructions:
+- Use the legacy instruction parser only for back-compat.
+Acceptance criteria:
+- Confirm the back-compat path still works.
+Stop conditions:
+- Stop if the legacy path is ambiguous.
+Required context refs: ctx/legacy
+Boundedness note: Stay within the legacy compatibility boundary."#
+                .to_string(),
+            communication_seed: None,
+            status: AssignmentStatus::Created,
+            attempt_number: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut collaboration = CollaborationState::default();
+        collaboration
+            .workstreams
+            .insert(workstream.id.clone(), workstream);
+        collaboration
+            .work_units
+            .insert(work_unit.id.clone(), work_unit);
+        collaboration
+            .assignments
+            .insert(assignment.id.clone(), assignment.clone());
+
+        let record = build_assignment_communication_record(
+            &collaboration,
+            &assignment,
+            None,
+            None,
+            None,
+            now,
+        )
+        .expect("legacy communication record");
+
+        assert_eq!(record.packet.objective, "Legacy objective");
+        assert_eq!(
+            record.packet.predecessor_assignment_id.as_deref(),
+            Some("assignment-parent")
+        );
+        assert_eq!(
+            record.packet.source_report_id.as_deref(),
+            Some("report-legacy")
+        );
+        assert_eq!(
+            record.packet.instructions,
+            vec!["Use the legacy instruction parser only for back-compat.".to_string()]
+        );
+        assert_eq!(
+            record
+                .packet
+                .acceptance_criteria
+                .iter()
+                .map(|item| item.text.clone())
+                .collect::<Vec<_>>(),
+            vec!["Confirm the back-compat path still works.".to_string()]
+        );
+        assert_eq!(
+            record
+                .packet
+                .stop_conditions
+                .iter()
+                .map(|item| item.text.clone())
+                .collect::<Vec<_>>(),
+            vec!["Stop if the legacy path is ambiguous.".to_string()]
+        );
+    }
+
+    #[test]
     fn parse_worker_report_accepts_clean_contract() {
         let (assignment, record) = sample_assignment_and_communication_record();
         let raw = sample_runtime_report_output_for(&assignment.id, &record.packet.packet_id);
@@ -9195,6 +9510,170 @@ ORCAS_REPORT_END"#
     }
 
     #[tokio::test]
+    async fn decision_apply_uses_structured_seed_for_packet_not_assignment_instructions() {
+        let service = test_service().await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "structured-seed").await;
+        let structured_seed = sample_structured_assignment_seed(&assignment.id, &report.id);
+
+        let response = service
+            .decision_apply_with_seed(
+                ipc::DecisionApplyRequest {
+                    work_unit_id: work_unit.id.clone(),
+                    report_id: Some(report.id.clone()),
+                    decision_type: DecisionType::Continue,
+                    rationale: "Use the structured seed for the successor assignment.".to_string(),
+                    instructions: Some("compatibility preview only".to_string()),
+                    worker_id: None,
+                    worker_kind: None,
+                },
+                Some(structured_seed.clone()),
+            )
+            .await
+            .expect("decision with structured seed");
+
+        let next_assignment = response.next_assignment.expect("next assignment");
+        assert_eq!(next_assignment.instructions, "compatibility preview only");
+
+        let state = service.state.read().await;
+        let record = state
+            .collaboration
+            .assignment_communications
+            .get(&next_assignment.id)
+            .expect("structured communication record");
+        assert_eq!(record.packet.objective, structured_seed.objective);
+        assert_eq!(record.packet.instructions, structured_seed.instructions);
+        assert_eq!(
+            record.packet.source_proposal_id,
+            structured_seed.source_proposal_id
+        );
+        assert_eq!(
+            record.packet.predecessor_assignment_id.as_deref(),
+            Some(assignment.id.as_str())
+        );
+        assert_eq!(
+            record.packet.source_report_id.as_deref(),
+            Some(report.id.as_str())
+        );
+        assert_eq!(
+            record.packet.source_decision_id.as_deref(),
+            Some(response.decision.id.as_str())
+        );
+        assert_eq!(
+            record
+                .packet
+                .acceptance_criteria
+                .iter()
+                .map(|item| item.text.clone())
+                .collect::<Vec<_>>(),
+            structured_seed.acceptance_criteria
+        );
+        assert_eq!(
+            record
+                .packet
+                .stop_conditions
+                .iter()
+                .map(|item| item.text.clone())
+                .collect::<Vec<_>>(),
+            structured_seed.stop_conditions
+        );
+    }
+
+    #[tokio::test]
+    async fn assignment_start_uses_persisted_packet_when_assignment_instructions_change() {
+        let reasoner = Arc::new(PackDrivenSupervisorReasoner::new(DecisionType::Continue));
+        let (service, fake_runtime_state) = test_service_with_fake_codex_runtime_capture(
+            auto_proposal_config(false),
+            reasoner,
+            sample_runtime_report_output_template(),
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Persisted packet".to_string(),
+                objective: "Verify prompt dispatch uses the persisted communication record."
+                    .to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: "Persisted packet work unit".to_string(),
+                task_statement: "Use the persisted packet for prompt dispatch.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-persisted".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Initial packet instructions".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("prepared assignment");
+        let original_prompt = service
+            .state
+            .read()
+            .await
+            .collaboration
+            .assignment_communications
+            .get(&prepared.assignment.id)
+            .expect("communication record")
+            .prompt_render
+            .prompt_text
+            .clone();
+
+        {
+            let mut state = service.state.write().await;
+            state
+                .collaboration
+                .assignments
+                .get_mut(&prepared.assignment.id)
+                .expect("assignment")
+                .instructions = "mutated after packet creation".to_string();
+        }
+
+        let response = service
+            .assignment_start(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-persisted".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("new start text should not rebuild the packet".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment start");
+
+        let sent_prompt = fake_runtime_state
+            .lock()
+            .await
+            .last_turn_start_text
+            .clone()
+            .expect("sent prompt");
+        assert_eq!(sent_prompt, original_prompt);
+        assert_eq!(response.report.parse_result, ReportParseResult::Parsed);
+
+        let state = service.state.read().await;
+        assert_eq!(state.collaboration.assignment_communications.len(), 1);
+        assert_eq!(
+            state.collaboration.assignment_communications[&prepared.assignment.id]
+                .prompt_render
+                .prompt_text,
+            original_prompt
+        );
+    }
+
+    #[tokio::test]
     async fn assignment_start_does_not_reopen_reported_assignment() {
         let service = test_service().await;
         let workstream = service
@@ -9302,6 +9781,7 @@ ORCAS_REPORT_END"#
                 worker_id: "worker-a".to_string(),
                 worker_session_id: first.assignment.worker_session_id.clone(),
                 instructions: "duplicate".to_string(),
+                communication_seed: None,
                 status: AssignmentStatus::Created,
                 attempt_number: first.assignment.attempt_number + 1,
                 created_at: Utc::now(),

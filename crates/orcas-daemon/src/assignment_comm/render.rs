@@ -4,12 +4,12 @@ use chrono::{DateTime, Utc};
 
 use orcas_core::{
     Assignment, AssignmentChangePolicy, AssignmentChecklistItem, AssignmentCommunicationPacket,
-    AssignmentCommunicationPolicy, AssignmentCommunicationRecord, AssignmentContextBlock,
-    AssignmentExecutionContext, AssignmentModeSpec, AssignmentScopeBoundary, AssignmentTaskMode,
-    CollaborationState, ImplementModePayload, ImplementModeSpec, OrcasError, OrcasResult,
-    PromptRenderArtifact, PromptRenderSpec, ReportConfidence, ReportDisposition, ReviewSignal,
-    ReviewSignalLevel, WorkUnit, WorkerReportContract, WorkerReportEnvelope,
-    WorkerReportModePayload, Workstream,
+    AssignmentCommunicationPolicy, AssignmentCommunicationRecord, AssignmentCommunicationSeed,
+    AssignmentContextBlock, AssignmentExecutionContext, AssignmentModeSpec,
+    AssignmentScopeBoundary, AssignmentTaskMode, CollaborationState, ImplementModePayload,
+    ImplementModeSpec, OrcasError, OrcasResult, PromptRenderArtifact, PromptRenderSpec,
+    ReportConfidence, ReportDisposition, ReviewSignal, ReviewSignalLevel, WorkUnit,
+    WorkerReportContract, WorkerReportEnvelope, WorkerReportModePayload, Workstream,
 };
 
 use crate::assignment_comm::{
@@ -71,7 +71,6 @@ pub fn build_assignment_communication_record(
             ))
         })?;
 
-    let legacy = parse_legacy_instruction_seed(&assignment.instructions);
     let execution_context = AssignmentExecutionContext {
         runtime_kind: "codex_app_server".to_string(),
         repo_root: requested_cwd
@@ -84,55 +83,29 @@ pub fn build_assignment_communication_record(
     };
 
     let response_contract = worker_report_contract();
-    let packet = AssignmentCommunicationPacket {
-        schema_version: ASSIGNMENT_COMMUNICATION_PACKET_SCHEMA_VERSION.to_string(),
-        packet_id: format!("packet-{}", assignment.id),
-        assignment_id: assignment.id.clone(),
-        workstream_id: workstream.id.clone(),
-        work_unit_id: work_unit.id.clone(),
-        worker_id: assignment.worker_id.clone(),
-        worker_session_id: assignment.worker_session_id.clone(),
-        created_at: now,
-        source_decision_id: None,
-        source_report_id: legacy
-            .source_report_id
-            .clone()
-            .or_else(|| work_unit.latest_report_id.clone()),
-        source_proposal_id: None,
-        predecessor_assignment_id: legacy.predecessor_assignment_id.clone(),
-        task_mode: AssignmentTaskMode::Implement,
-        mode_spec: AssignmentModeSpec::Implement(ImplementModeSpec {
-            expected_verification_commands: Vec::new(),
-        }),
-        execution_context,
-        objective: derive_objective(assignment, work_unit, &legacy),
-        instructions: derive_instructions(assignment, work_unit, &legacy),
-        acceptance_criteria: derive_acceptance_criteria(&legacy),
-        stop_conditions: derive_stop_conditions(&legacy),
-        allowed_scope: derive_allowed_scope(assignment, work_unit, &legacy, workstream),
-        disallowed_scope: vec![
-            "Do not create or execute follow-on work outside this assignment.".to_string(),
-            "Do not broaden scope beyond the bounded implement task.".to_string(),
-        ],
-        non_goals: legacy
-            .boundedness_note
-            .clone()
-            .into_iter()
-            .collect::<Vec<_>>(),
-        included_context: build_context_blocks(
+    let packet = if let Some(seed) = assignment.communication_seed.as_ref() {
+        build_packet_from_seed(
             collaboration,
             assignment,
             work_unit,
             workstream,
-            &legacy,
-        ),
-        response_contract,
-        policy: AssignmentCommunicationPolicy {
-            stop_at_boundary: true,
-            single_report_required: true,
-            recommendations_are_non_authoritative: true,
-            enforce_scope_boundary: true,
-        },
+            execution_context,
+            response_contract,
+            seed,
+            now,
+        )
+    } else {
+        // Legacy back-compat only: older assignments may still lack structured communication
+        // seed data and must recover packet semantics from the stored instruction preview.
+        build_packet_from_legacy_assignment_instructions(
+            collaboration,
+            assignment,
+            work_unit,
+            workstream,
+            execution_context,
+            response_contract,
+            now,
+        )
     };
 
     let packet_hash = json_fingerprint(&packet)?;
@@ -190,6 +163,113 @@ pub fn worker_report_contract() -> WorkerReportContract {
             ReportDisposition::Interrupted,
         ],
         strict_single_envelope: true,
+    }
+}
+
+fn build_packet_from_seed(
+    collaboration: &CollaborationState,
+    assignment: &Assignment,
+    work_unit: &WorkUnit,
+    workstream: &Workstream,
+    execution_context: AssignmentExecutionContext,
+    response_contract: WorkerReportContract,
+    seed: &AssignmentCommunicationSeed,
+    now: DateTime<Utc>,
+) -> AssignmentCommunicationPacket {
+    let task_mode = seed.task_mode();
+    AssignmentCommunicationPacket {
+        schema_version: ASSIGNMENT_COMMUNICATION_PACKET_SCHEMA_VERSION.to_string(),
+        packet_id: format!("packet-{}", assignment.id),
+        assignment_id: assignment.id.clone(),
+        workstream_id: workstream.id.clone(),
+        work_unit_id: work_unit.id.clone(),
+        worker_id: assignment.worker_id.clone(),
+        worker_session_id: assignment.worker_session_id.clone(),
+        created_at: now,
+        source_decision_id: seed.source_decision_id.clone(),
+        source_report_id: seed
+            .source_report_id
+            .clone()
+            .or_else(|| work_unit.latest_report_id.clone()),
+        source_proposal_id: seed.source_proposal_id.clone(),
+        predecessor_assignment_id: seed.predecessor_assignment_id.clone(),
+        task_mode,
+        mode_spec: seed.mode_spec.clone(),
+        execution_context: execution_context.clone(),
+        objective: derive_structured_objective(work_unit, seed),
+        instructions: derive_structured_instructions(seed),
+        acceptance_criteria: derive_structured_acceptance_criteria(seed),
+        stop_conditions: derive_structured_stop_conditions(seed),
+        allowed_scope: derive_structured_allowed_scope(&execution_context),
+        disallowed_scope: default_disallowed_scope(),
+        non_goals: seed
+            .boundedness_note
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        included_context: build_context_blocks_from_seed(
+            collaboration,
+            assignment,
+            work_unit,
+            workstream,
+            seed,
+        ),
+        response_contract,
+        policy: default_assignment_policy(),
+    }
+}
+
+fn build_packet_from_legacy_assignment_instructions(
+    collaboration: &CollaborationState,
+    assignment: &Assignment,
+    work_unit: &WorkUnit,
+    workstream: &Workstream,
+    execution_context: AssignmentExecutionContext,
+    response_contract: WorkerReportContract,
+    now: DateTime<Utc>,
+) -> AssignmentCommunicationPacket {
+    let legacy = parse_legacy_instruction_seed(&assignment.instructions);
+    AssignmentCommunicationPacket {
+        schema_version: ASSIGNMENT_COMMUNICATION_PACKET_SCHEMA_VERSION.to_string(),
+        packet_id: format!("packet-{}", assignment.id),
+        assignment_id: assignment.id.clone(),
+        workstream_id: workstream.id.clone(),
+        work_unit_id: work_unit.id.clone(),
+        worker_id: assignment.worker_id.clone(),
+        worker_session_id: assignment.worker_session_id.clone(),
+        created_at: now,
+        source_decision_id: None,
+        source_report_id: legacy
+            .source_report_id
+            .clone()
+            .or_else(|| work_unit.latest_report_id.clone()),
+        source_proposal_id: None,
+        predecessor_assignment_id: legacy.predecessor_assignment_id.clone(),
+        task_mode: AssignmentTaskMode::Implement,
+        mode_spec: AssignmentModeSpec::Implement(ImplementModeSpec {
+            expected_verification_commands: Vec::new(),
+        }),
+        execution_context: execution_context.clone(),
+        objective: derive_legacy_objective(assignment, work_unit, &legacy),
+        instructions: derive_legacy_instructions(assignment, work_unit, &legacy),
+        acceptance_criteria: derive_legacy_acceptance_criteria(&legacy),
+        stop_conditions: derive_legacy_stop_conditions(&legacy),
+        allowed_scope: derive_legacy_allowed_scope(assignment, &execution_context),
+        disallowed_scope: default_disallowed_scope(),
+        non_goals: legacy
+            .boundedness_note
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        included_context: build_context_blocks_from_legacy(
+            collaboration,
+            assignment,
+            work_unit,
+            workstream,
+            &legacy,
+        ),
+        response_contract,
+        policy: default_assignment_policy(),
     }
 }
 
@@ -314,7 +394,46 @@ pub fn render_prompt(
     })
 }
 
-fn derive_objective(
+fn derive_structured_objective(work_unit: &WorkUnit, seed: &AssignmentCommunicationSeed) -> String {
+    seed.objective
+        .trim()
+        .is_empty()
+        .then_some(())
+        .and_then(|_| {
+            (!work_unit.task_statement.trim().is_empty())
+                .then_some(work_unit.task_statement.clone())
+        })
+        .unwrap_or_else(|| seed.objective.clone())
+}
+
+fn derive_structured_instructions(seed: &AssignmentCommunicationSeed) -> Vec<String> {
+    if seed.instructions.is_empty() {
+        return default_instruction_lines();
+    }
+    seed.instructions.clone()
+}
+
+fn derive_structured_acceptance_criteria(
+    seed: &AssignmentCommunicationSeed,
+) -> Vec<AssignmentChecklistItem> {
+    checklist_items(
+        "acceptance",
+        seed.acceptance_criteria.clone(),
+        default_acceptance_lines(),
+    )
+}
+
+fn derive_structured_stop_conditions(
+    seed: &AssignmentCommunicationSeed,
+) -> Vec<AssignmentChecklistItem> {
+    checklist_items(
+        "stop",
+        seed.stop_conditions.clone(),
+        default_stop_condition_lines(),
+    )
+}
+
+fn derive_legacy_objective(
     assignment: &Assignment,
     work_unit: &WorkUnit,
     legacy: &LegacyInstructionSeed,
@@ -333,7 +452,7 @@ fn derive_objective(
         .unwrap_or_else(|| format!("Complete the bounded work for {}", work_unit.title))
 }
 
-fn derive_instructions(
+fn derive_legacy_instructions(
     assignment: &Assignment,
     work_unit: &WorkUnit,
     legacy: &LegacyInstructionSeed,
@@ -346,64 +465,36 @@ fn derive_instructions(
     {
         return vec![assignment.instructions.clone()];
     }
-    vec!["Implement the bounded task without broadening scope.".to_string()]
+    default_instruction_lines()
 }
 
-fn derive_acceptance_criteria(legacy: &LegacyInstructionSeed) -> Vec<AssignmentChecklistItem> {
-    let items = if legacy.acceptance_criteria.is_empty() {
-        vec![
-            "Complete the bounded implement task described in the objective and instructions."
-                .to_string(),
-            "Return a valid Orcas worker report envelope with honest implementation details."
-                .to_string(),
-        ]
-    } else {
-        legacy.acceptance_criteria.clone()
-    };
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(index, text)| AssignmentChecklistItem {
-            id: format!("acceptance_{}", index + 1),
-            text,
-        })
-        .collect()
+fn derive_legacy_acceptance_criteria(
+    legacy: &LegacyInstructionSeed,
+) -> Vec<AssignmentChecklistItem> {
+    checklist_items(
+        "acceptance",
+        legacy.acceptance_criteria.clone(),
+        default_acceptance_lines(),
+    )
 }
 
-fn derive_stop_conditions(legacy: &LegacyInstructionSeed) -> Vec<AssignmentChecklistItem> {
-    let items = if legacy.stop_conditions.is_empty() {
-        vec![
-            "Stop when the bounded implement task is complete.".to_string(),
-            "Stop when blocked or when supervisor or human input is required.".to_string(),
-            "Stop rather than broadening scope beyond the assignment boundary.".to_string(),
-        ]
-    } else {
-        legacy.stop_conditions.clone()
-    };
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(index, text)| AssignmentChecklistItem {
-            id: format!("stop_{}", index + 1),
-            text,
-        })
-        .collect()
+fn derive_legacy_stop_conditions(legacy: &LegacyInstructionSeed) -> Vec<AssignmentChecklistItem> {
+    checklist_items(
+        "stop",
+        legacy.stop_conditions.clone(),
+        default_stop_condition_lines(),
+    )
 }
 
-fn derive_allowed_scope(
-    assignment: &Assignment,
-    _work_unit: &WorkUnit,
-    _legacy: &LegacyInstructionSeed,
-    _workstream: &Workstream,
+fn derive_structured_allowed_scope(
+    execution_context: &AssignmentExecutionContext,
 ) -> AssignmentScopeBoundary {
-    let mut allowed_write_paths = Vec::new();
-    if let Some(path) = assignment
-        .instructions
-        .lines()
-        .find_map(|line| line.strip_prefix("Repo root: "))
-    {
-        allowed_write_paths.push(path.trim().to_string());
-    }
+    let allowed_write_paths = execution_context
+        .repo_root
+        .clone()
+        .or_else(|| execution_context.cwd.clone())
+        .into_iter()
+        .collect::<Vec<_>>();
     AssignmentScopeBoundary {
         change_policy: AssignmentChangePolicy::CodeAllowed,
         allowed_operations: vec![
@@ -417,14 +508,101 @@ fn derive_allowed_scope(
     }
 }
 
-fn build_context_blocks(
+fn derive_legacy_allowed_scope(
+    assignment: &Assignment,
+    execution_context: &AssignmentExecutionContext,
+) -> AssignmentScopeBoundary {
+    let mut scope = derive_structured_allowed_scope(execution_context);
+    if scope.allowed_write_paths.is_empty()
+        && let Some(path) = assignment
+            .instructions
+            .lines()
+            .find_map(|line| line.strip_prefix("Repo root: "))
+    {
+        scope.allowed_write_paths.push(path.trim().to_string());
+    }
+    scope
+}
+
+fn build_context_blocks_from_seed(
+    collaboration: &CollaborationState,
+    assignment: &Assignment,
+    work_unit: &WorkUnit,
+    workstream: &Workstream,
+    seed: &AssignmentCommunicationSeed,
+) -> Vec<AssignmentContextBlock> {
+    let mut blocks = default_context_blocks(work_unit, workstream);
+
+    if let Some(source_report_id) = seed
+        .source_report_id
+        .as_ref()
+        .or(work_unit.latest_report_id.as_ref())
+        && let Some(report) = collaboration.reports.get(source_report_id)
+    {
+        blocks.push(source_report_context_block(
+            report.id.clone(),
+            report.summary.clone(),
+            report.disposition,
+        ));
+    }
+
+    if !seed.required_context_refs.is_empty() {
+        blocks.push(AssignmentContextBlock {
+            id: "required_context_refs".to_string(),
+            kind: "context_refs".to_string(),
+            source_ref: assignment.id.clone(),
+            title: "Required context refs".to_string(),
+            lines: seed.required_context_refs.clone(),
+            required: false,
+            truncated: false,
+        });
+    }
+
+    blocks
+}
+
+fn build_context_blocks_from_legacy(
     collaboration: &CollaborationState,
     assignment: &Assignment,
     work_unit: &WorkUnit,
     workstream: &Workstream,
     legacy: &LegacyInstructionSeed,
 ) -> Vec<AssignmentContextBlock> {
-    let mut blocks = vec![
+    let mut blocks = default_context_blocks(work_unit, workstream);
+
+    if let Some(source_report_id) = legacy
+        .source_report_id
+        .as_ref()
+        .or(work_unit.latest_report_id.as_ref())
+        && let Some(report) = collaboration.reports.get(source_report_id)
+    {
+        blocks.push(source_report_context_block(
+            report.id.clone(),
+            report.summary.clone(),
+            report.disposition,
+        ));
+    }
+
+    if !legacy.required_context_refs.is_empty() {
+        blocks.push(AssignmentContextBlock {
+            id: "required_context_refs".to_string(),
+            kind: "context_refs".to_string(),
+            source_ref: assignment.id.clone(),
+            title: "Required context refs".to_string(),
+            lines: legacy.required_context_refs.clone(),
+            required: false,
+            truncated: false,
+        });
+    }
+
+    blocks
+}
+
+fn default_context_blocks(
+    work_unit: &WorkUnit,
+    workstream: &Workstream,
+) -> Vec<AssignmentContextBlock> {
+    vec![
         AssignmentContextBlock {
             id: "workstream".to_string(),
             kind: "workstream".to_string(),
@@ -443,41 +621,79 @@ fn build_context_blocks(
             required: true,
             truncated: false,
         },
-    ];
+    ]
+}
 
-    if let Some(source_report_id) = legacy
-        .source_report_id
-        .as_ref()
-        .or(work_unit.latest_report_id.as_ref())
-        && let Some(report) = collaboration.reports.get(source_report_id)
-    {
-        blocks.push(AssignmentContextBlock {
-            id: "source_report".to_string(),
-            kind: "report".to_string(),
-            source_ref: report.id.clone(),
-            title: "Source report".to_string(),
-            lines: vec![
-                format!("Disposition: {:?}", report.disposition),
-                format!("Summary: {}", report.summary),
-            ],
-            required: false,
-            truncated: false,
-        });
+fn source_report_context_block(
+    report_id: String,
+    summary: String,
+    disposition: ReportDisposition,
+) -> AssignmentContextBlock {
+    AssignmentContextBlock {
+        id: "source_report".to_string(),
+        kind: "report".to_string(),
+        source_ref: report_id,
+        title: "Source report".to_string(),
+        lines: vec![
+            format!("Disposition: {:?}", disposition),
+            format!("Summary: {}", summary),
+        ],
+        required: false,
+        truncated: false,
     }
+}
 
-    if !legacy.required_context_refs.is_empty() {
-        blocks.push(AssignmentContextBlock {
-            id: "required_context_refs".to_string(),
-            kind: "context_refs".to_string(),
-            source_ref: assignment.id.clone(),
-            title: "Required context refs".to_string(),
-            lines: legacy.required_context_refs.clone(),
-            required: false,
-            truncated: false,
-        });
+fn checklist_items(
+    prefix: &str,
+    items: Vec<String>,
+    defaults: Vec<String>,
+) -> Vec<AssignmentChecklistItem> {
+    let items = if items.is_empty() { defaults } else { items };
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| AssignmentChecklistItem {
+            id: format!("{prefix}_{}", index + 1),
+            text,
+        })
+        .collect()
+}
+
+fn default_instruction_lines() -> Vec<String> {
+    vec!["Implement the bounded task without broadening scope.".to_string()]
+}
+
+fn default_acceptance_lines() -> Vec<String> {
+    vec![
+        "Complete the bounded implement task described in the objective and instructions."
+            .to_string(),
+        "Return a valid Orcas worker report envelope with honest implementation details."
+            .to_string(),
+    ]
+}
+
+fn default_stop_condition_lines() -> Vec<String> {
+    vec![
+        "Stop when the bounded implement task is complete.".to_string(),
+        "Stop when blocked or when supervisor or human input is required.".to_string(),
+        "Stop rather than broadening scope beyond the assignment boundary.".to_string(),
+    ]
+}
+
+fn default_disallowed_scope() -> Vec<String> {
+    vec![
+        "Do not create or execute follow-on work outside this assignment.".to_string(),
+        "Do not broaden scope beyond the bounded implement task.".to_string(),
+    ]
+}
+
+fn default_assignment_policy() -> AssignmentCommunicationPolicy {
+    AssignmentCommunicationPolicy {
+        stop_at_boundary: true,
+        single_report_required: true,
+        recommendations_are_non_authoritative: true,
+        enforce_scope_boundary: true,
     }
-
-    blocks
 }
 
 fn parse_legacy_instruction_seed(input: &str) -> LegacyInstructionSeed {
