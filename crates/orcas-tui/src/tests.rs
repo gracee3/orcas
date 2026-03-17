@@ -4,9 +4,15 @@ use crate::app::{BannerLevel, DaemonConnectionPhase, NavigationFocus, UiEvent, U
 use crate::backend::BackendCommand;
 use crate::test_harness::AppHarness;
 use orcas_core::{
-    Assignment, AssignmentStatus, ConnectionState, Decision, DecisionType, Report,
-    ReportConfidence, ReportDisposition, ReportParseResult, WorkUnit, WorkUnitStatus,
-    WorkstreamStatus, ipc,
+    Assignment, AssignmentStatus, ConnectionState, Decision, DecisionPolicy, DecisionType,
+    DraftAssignment, ProposedDecision, RecentPrimaryHistory, Report, ReportConfidence,
+    ReportDisposition, ReportParseResult, SupervisorAssignmentContext, SupervisorContextPack,
+    SupervisorDependencyContext, SupervisorPackLimits, SupervisorPackTruncation,
+    SupervisorProposal, SupervisorProposalFailure, SupervisorProposalFailureStage,
+    SupervisorProposalRecord, SupervisorProposalStatus, SupervisorProposalTrigger,
+    SupervisorProposalTriggerKind, SupervisorSourceReportContext, SupervisorStateAnchor,
+    SupervisorSummary, SupervisorWorkUnitContext, SupervisorWorkerSessionContext,
+    SupervisorWorkstreamContext, WorkUnit, WorkUnitStatus, WorkstreamStatus, ipc,
 };
 
 fn sample_thread_summary(id: &str, preview: &str, updated_at: i64) -> ipc::ThreadSummary {
@@ -65,6 +71,247 @@ fn sample_turn_state(
     }
 }
 
+fn sample_proposal_summary(
+    latest_status: SupervisorProposalStatus,
+    latest_decision_type: Option<DecisionType>,
+) -> ipc::WorkUnitProposalSummary {
+    ipc::WorkUnitProposalSummary {
+        latest_proposal_id: "proposal-1".to_string(),
+        latest_status,
+        latest_proposed_decision_type: latest_decision_type,
+        latest_created_at: Utc::now(),
+        latest_reviewed_at: None,
+        latest_has_approval_edits: false,
+        latest_failure_stage: None,
+        has_open_proposal: latest_status == SupervisorProposalStatus::Open,
+        open_proposal_id: (latest_status == SupervisorProposalStatus::Open)
+            .then(|| "proposal-1".to_string()),
+        open_proposed_decision_type: (latest_status == SupervisorProposalStatus::Open)
+            .then_some(latest_decision_type)
+            .flatten(),
+        has_generation_failed: latest_status == SupervisorProposalStatus::GenerationFailed,
+        has_stale_or_superseded: matches!(
+            latest_status,
+            SupervisorProposalStatus::Stale | SupervisorProposalStatus::Superseded
+        ),
+    }
+}
+
+fn sample_proposal_record(
+    id: &str,
+    work_unit_id: &str,
+    report_id: &str,
+    assignment_id: &str,
+    decision_type: DecisionType,
+    status: SupervisorProposalStatus,
+) -> SupervisorProposalRecord {
+    let now = Utc::now();
+    let proposal = SupervisorProposal {
+        schema_version: "supervisor_proposal.v1".to_string(),
+        summary: SupervisorSummary {
+            headline: format!("Proposal {id}"),
+            situation: "The work unit reached a bounded decision point.".to_string(),
+            recommended_action: "Keep the next step reviewable.".to_string(),
+            key_evidence: vec!["The latest report is explicit.".to_string()],
+            risks: vec!["Avoid broadening scope.".to_string()],
+            review_focus: vec!["Check boundedness.".to_string()],
+        },
+        proposed_decision: ProposedDecision {
+            decision_type,
+            target_work_unit_id: work_unit_id.to_string(),
+            source_report_id: report_id.to_string(),
+            rationale: "Bounded follow-up remains appropriate.".to_string(),
+            expected_work_unit_status: match decision_type {
+                DecisionType::Accept => "accepted",
+                DecisionType::Continue | DecisionType::Redirect => "ready",
+                DecisionType::MarkComplete => "completed",
+                DecisionType::EscalateToHuman => "needs_human",
+            }
+            .to_string(),
+            requires_assignment: matches!(
+                decision_type,
+                DecisionType::Continue | DecisionType::Redirect
+            ),
+        },
+        draft_next_assignment: matches!(
+            decision_type,
+            DecisionType::Continue | DecisionType::Redirect
+        )
+        .then(|| DraftAssignment {
+            target_work_unit_id: work_unit_id.to_string(),
+            predecessor_assignment_id: assignment_id.to_string(),
+            derived_from_decision_type: decision_type,
+            preferred_worker_id: Some("worker-a".to_string()),
+            worker_kind: Some("codex".to_string()),
+            objective: "Resolve one bounded follow-up question.".to_string(),
+            instructions: vec![
+                "Inspect the remaining gap.".to_string(),
+                "Report the result without broadening scope.".to_string(),
+            ],
+            acceptance_criteria: vec!["The bounded question is resolved.".to_string()],
+            stop_conditions: vec!["Stop if human input is required.".to_string()],
+            required_context_refs: vec![report_id.to_string()],
+            expected_report_fields: vec!["summary".to_string(), "findings".to_string()],
+            boundedness_note: "Stay within one bounded follow-up.".to_string(),
+        }),
+        confidence: ReportConfidence::High,
+        warnings: Vec::new(),
+        open_questions: Vec::new(),
+    };
+
+    SupervisorProposalRecord {
+        id: id.to_string(),
+        workstream_id: "ws-1".to_string(),
+        primary_work_unit_id: work_unit_id.to_string(),
+        source_report_id: report_id.to_string(),
+        trigger: SupervisorProposalTrigger {
+            kind: SupervisorProposalTriggerKind::HumanRequested,
+            requested_at: now,
+            requested_by: "tester".to_string(),
+            source_report_id: report_id.to_string(),
+            note: Some("review the next bounded step".to_string()),
+        },
+        status,
+        created_at: now,
+        reasoner_backend: "test".to_string(),
+        reasoner_model: "test-supervisor".to_string(),
+        reasoner_response_id: Some("resp-1".to_string()),
+        reasoner_usage: None,
+        reasoner_output_text: Some("raw structured output".to_string()),
+        context_pack: SupervisorContextPack {
+            schema_version: "supervisor_context_pack.v1".to_string(),
+            generated_at: now,
+            trigger: SupervisorProposalTrigger {
+                kind: SupervisorProposalTriggerKind::HumanRequested,
+                requested_at: now,
+                requested_by: "tester".to_string(),
+                source_report_id: report_id.to_string(),
+                note: Some("review the next bounded step".to_string()),
+            },
+            pack_limits: SupervisorPackLimits {
+                max_related_work_units: 4,
+                max_prior_reports: 4,
+                max_prior_decisions: 4,
+                max_artifacts: 0,
+                max_raw_report_chars: 512,
+            },
+            truncation: SupervisorPackTruncation::default(),
+            state_anchor: SupervisorStateAnchor {
+                workstream_id: "ws-1".to_string(),
+                primary_work_unit_id: work_unit_id.to_string(),
+                source_report_id: report_id.to_string(),
+                source_report_created_at: now,
+                current_assignment_id: Some(assignment_id.to_string()),
+                primary_work_unit_updated_at: now,
+                latest_decision_id: None,
+                latest_decision_created_at: None,
+            },
+            decision_policy: DecisionPolicy {
+                supported_decisions: vec![
+                    DecisionType::Accept,
+                    DecisionType::Continue,
+                    DecisionType::Redirect,
+                    DecisionType::MarkComplete,
+                    DecisionType::EscalateToHuman,
+                ],
+                allowed_decisions: vec![
+                    DecisionType::Accept,
+                    DecisionType::Continue,
+                    DecisionType::Redirect,
+                    DecisionType::MarkComplete,
+                    DecisionType::EscalateToHuman,
+                ],
+                disallowed_decisions: Vec::new(),
+                disallowed_reasons_by_decision: std::collections::BTreeMap::new(),
+                assignment_required_for: vec![DecisionType::Continue, DecisionType::Redirect],
+                assignment_forbidden_for: vec![
+                    DecisionType::Accept,
+                    DecisionType::MarkComplete,
+                    DecisionType::EscalateToHuman,
+                ],
+                human_review_required: true,
+            },
+            workstream: SupervisorWorkstreamContext {
+                id: "ws-1".to_string(),
+                title: "Collaboration hardening".to_string(),
+                objective: "Harden collaboration snapshot semantics.".to_string(),
+                status: "active".to_string(),
+                priority: "high".to_string(),
+                success_criteria: Vec::new(),
+                constraints: Vec::new(),
+                summary: Some("Keep proposal visibility read-only.".to_string()),
+                open_work_unit_count: 2,
+                blocked_work_unit_count: 0,
+                completed_work_unit_count: 0,
+            },
+            primary_work_unit: SupervisorWorkUnitContext {
+                id: work_unit_id.to_string(),
+                title: "Snapshot wiring".to_string(),
+                task_statement: "Wire collaboration summaries into the snapshot.".to_string(),
+                status: "awaiting_decision".to_string(),
+                dependencies: Vec::new(),
+                current_assignment_id: Some(assignment_id.to_string()),
+                latest_report_id: Some(report_id.to_string()),
+                acceptance_criteria: Vec::new(),
+                stop_conditions: Vec::new(),
+                result_summary: None,
+            },
+            source_report: SupervisorSourceReportContext {
+                id: report_id.to_string(),
+                assignment_id: assignment_id.to_string(),
+                worker_id: "worker-a".to_string(),
+                worker_session_id: Some("session-1".to_string()),
+                submitted_at: now,
+                disposition: ReportDisposition::Partial,
+                summary: "Snapshot path is implemented, review is required.".to_string(),
+                findings: vec!["Event summaries need one more pass.".to_string()],
+                blockers: Vec::new(),
+                questions: vec!["Should summaries include objective?".to_string()],
+                recommended_next_actions: vec!["Supervisor decide continue.".to_string()],
+                confidence: ReportConfidence::Medium,
+                parse_result: ReportParseResult::Ambiguous,
+                needs_supervisor_review: true,
+                raw_output_excerpt: "noise + json".to_string(),
+            },
+            current_assignment: SupervisorAssignmentContext {
+                id: assignment_id.to_string(),
+                status: "awaiting_decision".to_string(),
+                attempt_number: 2,
+                worker_id: "worker-a".to_string(),
+                worker_session_id: "session-1".to_string(),
+                instructions: "Second bounded pass".to_string(),
+                created_at: now,
+                updated_at: now,
+            },
+            worker_session: SupervisorWorkerSessionContext {
+                id: "session-1".to_string(),
+                worker_id: "worker-a".to_string(),
+                backend_type: "codex".to_string(),
+                thread_id: Some("thread-1".to_string()),
+                active_turn_id: None,
+                runtime_status: "completed".to_string(),
+                attachability: "not_attachable".to_string(),
+                updated_at: now,
+            },
+            dependency_context: SupervisorDependencyContext::default(),
+            related_work_units: Vec::new(),
+            recent_primary_history: RecentPrimaryHistory::default(),
+            relevant_artifacts: Vec::new(),
+            operator_request: None,
+        },
+        proposal: Some(proposal),
+        approval_edits: None,
+        approved_proposal: None,
+        generation_failure: None,
+        validated_at: Some(now),
+        reviewed_at: None,
+        reviewed_by: None,
+        review_note: None,
+        approved_decision_id: None,
+        approved_assignment_id: None,
+    }
+}
+
 fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
     ipc::CollaborationSnapshot {
         workstreams: vec![
@@ -94,6 +341,14 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
                 dependency_count: 0,
                 current_assignment_id: Some("assignment-2".to_string()),
                 latest_report_id: Some("report-2".to_string()),
+                proposal: Some(ipc::WorkUnitProposalSummary {
+                    has_generation_failed: true,
+                    has_stale_or_superseded: false,
+                    ..sample_proposal_summary(
+                        SupervisorProposalStatus::Open,
+                        Some(DecisionType::Continue),
+                    )
+                }),
                 updated_at: Utc::now(),
             },
             ipc::WorkUnitSummary {
@@ -104,6 +359,10 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
                 dependency_count: 1,
                 current_assignment_id: Some("assignment-3".to_string()),
                 latest_report_id: Some("report-3".to_string()),
+                proposal: Some(ipc::WorkUnitProposalSummary {
+                    latest_failure_stage: Some(SupervisorProposalFailureStage::Backend),
+                    ..sample_proposal_summary(SupervisorProposalStatus::GenerationFailed, None)
+                }),
                 updated_at: Utc::now(),
             },
             ipc::WorkUnitSummary {
@@ -114,6 +373,7 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
                 dependency_count: 2,
                 current_assignment_id: None,
                 latest_report_id: None,
+                proposal: None,
                 updated_at: Utc::now(),
             },
         ],
@@ -222,88 +482,112 @@ fn sample_snapshot() -> ipc::StateSnapshot {
 fn sample_workunit_detail(work_unit_id: &str) -> ipc::WorkunitGetResponse {
     let now = Utc::now();
     match work_unit_id {
-        "wu-1" => ipc::WorkunitGetResponse {
-            work_unit: WorkUnit {
-                id: "wu-1".to_string(),
-                workstream_id: "ws-1".to_string(),
-                title: "Snapshot wiring".to_string(),
-                task_statement: "Wire collaboration summaries into the snapshot.".to_string(),
-                status: WorkUnitStatus::AwaitingDecision,
-                dependencies: Vec::new(),
-                latest_report_id: Some("report-2".to_string()),
-                current_assignment_id: Some("assignment-2".to_string()),
-                created_at: now,
-                updated_at: now,
-            },
-            assignments: vec![
-                Assignment {
-                    id: "assignment-1".to_string(),
-                    work_unit_id: "wu-1".to_string(),
-                    worker_id: "worker-a".to_string(),
-                    worker_session_id: "session-1".to_string(),
-                    instructions: "Initial snapshot pass".to_string(),
-                    status: AssignmentStatus::Closed,
-                    attempt_number: 1,
+        "wu-1" => {
+            let mut failed = sample_proposal_record(
+                "proposal-failed",
+                "wu-1",
+                "report-1",
+                "assignment-1",
+                DecisionType::Continue,
+                SupervisorProposalStatus::GenerationFailed,
+            );
+            failed.proposal = None;
+            failed.generation_failure = Some(SupervisorProposalFailure {
+                stage: SupervisorProposalFailureStage::Backend,
+                message: "request timed out".to_string(),
+            });
+            let open = sample_proposal_record(
+                "proposal-1",
+                "wu-1",
+                "report-2",
+                "assignment-2",
+                DecisionType::Continue,
+                SupervisorProposalStatus::Open,
+            );
+            ipc::WorkunitGetResponse {
+                work_unit: WorkUnit {
+                    id: "wu-1".to_string(),
+                    workstream_id: "ws-1".to_string(),
+                    title: "Snapshot wiring".to_string(),
+                    task_statement: "Wire collaboration summaries into the snapshot.".to_string(),
+                    status: WorkUnitStatus::AwaitingDecision,
+                    dependencies: Vec::new(),
+                    latest_report_id: Some("report-2".to_string()),
+                    current_assignment_id: Some("assignment-2".to_string()),
                     created_at: now,
                     updated_at: now,
                 },
-                Assignment {
-                    id: "assignment-2".to_string(),
+                assignments: vec![
+                    Assignment {
+                        id: "assignment-1".to_string(),
+                        work_unit_id: "wu-1".to_string(),
+                        worker_id: "worker-a".to_string(),
+                        worker_session_id: "session-1".to_string(),
+                        instructions: "Initial snapshot pass".to_string(),
+                        status: AssignmentStatus::Closed,
+                        attempt_number: 1,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                    Assignment {
+                        id: "assignment-2".to_string(),
+                        work_unit_id: "wu-1".to_string(),
+                        worker_id: "worker-a".to_string(),
+                        worker_session_id: "session-1".to_string(),
+                        instructions: "Second bounded pass".to_string(),
+                        status: AssignmentStatus::AwaitingDecision,
+                        attempt_number: 2,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                ],
+                reports: vec![
+                    Report {
+                        id: "report-1".to_string(),
+                        work_unit_id: "wu-1".to_string(),
+                        assignment_id: "assignment-1".to_string(),
+                        worker_id: "worker-a".to_string(),
+                        disposition: ReportDisposition::Completed,
+                        summary: "Initial snapshot path landed cleanly.".to_string(),
+                        findings: vec!["Snapshot summaries added.".to_string()],
+                        blockers: Vec::new(),
+                        questions: Vec::new(),
+                        recommended_next_actions: vec!["Review event model".to_string()],
+                        confidence: ReportConfidence::High,
+                        raw_output: "{}".to_string(),
+                        parse_result: ReportParseResult::Parsed,
+                        needs_supervisor_review: false,
+                        created_at: now,
+                    },
+                    Report {
+                        id: "report-2".to_string(),
+                        work_unit_id: "wu-1".to_string(),
+                        assignment_id: "assignment-2".to_string(),
+                        worker_id: "worker-a".to_string(),
+                        disposition: ReportDisposition::Partial,
+                        summary: "Snapshot path is implemented, review is required.".to_string(),
+                        findings: vec!["Event summaries need one more pass.".to_string()],
+                        blockers: Vec::new(),
+                        questions: vec!["Should summaries include objective?".to_string()],
+                        recommended_next_actions: vec!["Supervisor decide continue.".to_string()],
+                        confidence: ReportConfidence::Medium,
+                        raw_output: "noise + json".to_string(),
+                        parse_result: ReportParseResult::Ambiguous,
+                        needs_supervisor_review: true,
+                        created_at: now,
+                    },
+                ],
+                decisions: vec![Decision {
+                    id: "decision-1".to_string(),
                     work_unit_id: "wu-1".to_string(),
-                    worker_id: "worker-a".to_string(),
-                    worker_session_id: "session-1".to_string(),
-                    instructions: "Second bounded pass".to_string(),
-                    status: AssignmentStatus::AwaitingDecision,
-                    attempt_number: 2,
+                    report_id: Some("report-2".to_string()),
+                    decision_type: DecisionType::Continue,
+                    rationale: "Need one more bounded pass.".to_string(),
                     created_at: now,
-                    updated_at: now,
-                },
-            ],
-            reports: vec![
-                Report {
-                    id: "report-1".to_string(),
-                    work_unit_id: "wu-1".to_string(),
-                    assignment_id: "assignment-1".to_string(),
-                    worker_id: "worker-a".to_string(),
-                    disposition: ReportDisposition::Completed,
-                    summary: "Initial snapshot path landed cleanly.".to_string(),
-                    findings: vec!["Snapshot summaries added.".to_string()],
-                    blockers: Vec::new(),
-                    questions: Vec::new(),
-                    recommended_next_actions: vec!["Review event model".to_string()],
-                    confidence: ReportConfidence::High,
-                    raw_output: "{}".to_string(),
-                    parse_result: ReportParseResult::Parsed,
-                    needs_supervisor_review: false,
-                    created_at: now,
-                },
-                Report {
-                    id: "report-2".to_string(),
-                    work_unit_id: "wu-1".to_string(),
-                    assignment_id: "assignment-2".to_string(),
-                    worker_id: "worker-a".to_string(),
-                    disposition: ReportDisposition::Partial,
-                    summary: "Snapshot path is implemented, review is required.".to_string(),
-                    findings: vec!["Event summaries need one more pass.".to_string()],
-                    blockers: Vec::new(),
-                    questions: vec!["Should summaries include objective?".to_string()],
-                    recommended_next_actions: vec!["Supervisor decide continue.".to_string()],
-                    confidence: ReportConfidence::Medium,
-                    raw_output: "noise + json".to_string(),
-                    parse_result: ReportParseResult::Ambiguous,
-                    needs_supervisor_review: true,
-                    created_at: now,
-                },
-            ],
-            decisions: vec![Decision {
-                id: "decision-1".to_string(),
-                work_unit_id: "wu-1".to_string(),
-                report_id: Some("report-2".to_string()),
-                decision_type: DecisionType::Continue,
-                rationale: "Need one more bounded pass.".to_string(),
-                created_at: now,
-            }],
-        },
+                }],
+                proposals: vec![failed, open],
+            }
+        }
         "wu-2" => ipc::WorkunitGetResponse {
             work_unit: WorkUnit {
                 id: "wu-2".to_string(),
@@ -347,6 +631,7 @@ fn sample_workunit_detail(work_unit_id: &str) -> ipc::WorkunitGetResponse {
                 created_at: now,
             }],
             decisions: Vec::new(),
+            proposals: Vec::new(),
         },
         _ => panic!("unknown sample work unit"),
     }
@@ -577,6 +862,7 @@ async fn reconnect_recovers_with_snapshot_then_resubscribe() {
         dependency_count: 0,
         current_assignment_id: None,
         latest_report_id: None,
+        proposal: None,
         updated_at: Utc::now(),
     }];
     recovered.collaboration.assignments = Vec::new();
@@ -674,6 +960,135 @@ async fn collaboration_snapshot_drives_rendering() {
             .iter()
             .any(|line| line.contains("report-2 [partial ambiguous review=true]"))
     );
+    assert!(
+        history
+            .lines
+            .iter()
+            .any(|line| line.contains("proposal-1 [open] decision=continue"))
+    );
+}
+
+#[tokio::test]
+async fn proposal_state_renders_distinct_from_report_and_decision_state() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-1"))
+        .await;
+    harness.dispatch(UserAction::Refresh).await;
+
+    let work_units = harness.work_unit_list_vm();
+    let detail = harness.collaboration_detail_vm();
+    let history = harness.collaboration_history_vm();
+    let rendered = harness.render_text(160, 42);
+
+    assert!(work_units.rows.iter().any(|row| {
+        row.title == "Snapshot wiring"
+            && row.latest_report_parse_result == "ambiguous"
+            && row.proposal_status.contains("open/continue")
+            && row.latest_decision == "continue"
+    }));
+    assert!(work_units.rows.iter().any(|row| {
+        row.title == "Event wiring" && row.proposal_status.contains("generation_failed/backend")
+    }));
+    assert!(detail.lines.iter().any(|line| {
+        line.contains(
+            "proposal: proposal-1 status=open latest_decision=continue open=true stale_or_superseded=false failed=true edits=false",
+        )
+    }));
+    assert!(history.lines.iter().any(|line| line == "Proposals"));
+    assert!(
+        history
+            .lines
+            .iter()
+            .any(|line| line.contains("proposal-1 [open] decision=continue"))
+    );
+    assert!(
+        history
+            .lines
+            .iter()
+            .any(|line| line.contains("proposal-failed [generation_failed] decision=-"))
+    );
+    assert!(rendered.contains("proposal=open/continue"));
+    assert!(rendered.contains("proposal=generation_failed/backend"));
+}
+
+#[tokio::test]
+async fn proposal_lifecycle_event_refreshes_selected_work_unit_detail() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-1"))
+        .await;
+    harness.dispatch(UserAction::Refresh).await;
+
+    let mut updated_detail = sample_workunit_detail("wu-1");
+    let approved = updated_detail
+        .proposals
+        .iter_mut()
+        .find(|proposal| proposal.id == "proposal-1")
+        .expect("proposal");
+    approved.status = SupervisorProposalStatus::Approved;
+    approved.reviewed_at = Some(Utc::now());
+    approved.approved_proposal = approved.proposal.clone();
+
+    let mut updated_work_unit = sample_snapshot()
+        .collaboration
+        .work_units
+        .into_iter()
+        .find(|work_unit| work_unit.id == "wu-1")
+        .expect("work unit");
+    updated_work_unit.proposal = Some(ipc::WorkUnitProposalSummary {
+        latest_status: SupervisorProposalStatus::Approved,
+        latest_has_approval_edits: true,
+        latest_reviewed_at: Some(Utc::now()),
+        has_open_proposal: false,
+        open_proposal_id: None,
+        open_proposed_decision_type: None,
+        has_generation_failed: true,
+        has_stale_or_superseded: false,
+        ..sample_proposal_summary(
+            SupervisorProposalStatus::Approved,
+            Some(DecisionType::Continue),
+        )
+    });
+
+    harness.set_workunit_detail(updated_detail).await;
+    harness
+        .inject_event(ipc::DaemonEventEnvelope::new(
+            ipc::DaemonEvent::ProposalLifecycle {
+                action: ipc::ProposalLifecycleAction::Approved,
+                proposal: ipc::ProposalSummary {
+                    id: "proposal-1".to_string(),
+                    primary_work_unit_id: "wu-1".to_string(),
+                    source_report_id: "report-2".to_string(),
+                    status: SupervisorProposalStatus::Approved,
+                    proposed_decision_type: Some(DecisionType::Continue),
+                    created_at: Utc::now(),
+                    reviewed_at: Some(Utc::now()),
+                    has_approval_edits: true,
+                    generation_failure_stage: None,
+                    reasoner_model: "test-supervisor".to_string(),
+                },
+                work_unit: updated_work_unit,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let detail = harness.collaboration_detail_vm();
+    let history = harness.collaboration_history_vm();
+
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("status=approved latest_decision=continue open=false"))
+    );
+    assert!(
+        history
+            .lines
+            .iter()
+            .any(|line| line.contains("proposal-1 [approved] decision=continue edits=false"))
+    );
 }
 
 #[tokio::test]
@@ -707,6 +1122,7 @@ async fn collaboration_events_refresh_summaries_incrementally() {
                     dependency_count: 0,
                     current_assignment_id: Some("assignment-4".to_string()),
                     latest_report_id: Some("report-4".to_string()),
+                    proposal: None,
                     updated_at: Utc::now(),
                 },
             },
@@ -904,6 +1320,7 @@ async fn collaboration_history_shows_failed_interrupted_and_lost_states_explicit
         dependency_count: 0,
         current_assignment_id: Some("assignment-i".to_string()),
         latest_report_id: Some("report-i".to_string()),
+        proposal: None,
         updated_at: Utc::now(),
     }];
     snapshot.collaboration.assignments = vec![ipc::AssignmentSummary {
@@ -1000,6 +1417,7 @@ async fn collaboration_history_shows_failed_interrupted_and_lost_states_explicit
                 rationale: "Supervisor review is required.".to_string(),
                 created_at: Utc::now(),
             }],
+            proposals: Vec::new(),
         })
         .await;
     harness.dispatch(UserAction::Refresh).await;
@@ -1252,6 +1670,7 @@ async fn reconnect_refreshes_history_for_selected_work_unit() {
         dependency_count: 0,
         current_assignment_id: Some("assignment-9".to_string()),
         latest_report_id: Some("report-9".to_string()),
+        proposal: None,
         updated_at: Utc::now(),
     }];
     recovered.collaboration.assignments = vec![ipc::AssignmentSummary {
@@ -1334,6 +1753,7 @@ async fn reconnect_refreshes_history_for_selected_work_unit() {
                 rationale: "Recovered issue needs review.".to_string(),
                 created_at: Utc::now(),
             }],
+            proposals: Vec::new(),
         })
         .await;
 
@@ -1393,6 +1813,7 @@ async fn event_refresh_does_not_leave_invalid_parent_child_selection() {
                     dependency_count: 2,
                     current_assignment_id: None,
                     latest_report_id: None,
+                    proposal: None,
                     updated_at: Utc::now(),
                 },
             },
@@ -1434,6 +1855,10 @@ async fn reconnect_reconciles_collaboration_selection_to_authoritative_snapshot(
         dependency_count: 0,
         current_assignment_id: Some("assignment-r".to_string()),
         latest_report_id: Some("report-r".to_string()),
+        proposal: Some(ipc::WorkUnitProposalSummary {
+            latest_failure_stage: Some(SupervisorProposalFailureStage::Backend),
+            ..sample_proposal_summary(SupervisorProposalStatus::GenerationFailed, None)
+        }),
         updated_at: Utc::now(),
     }];
     recovered.collaboration.assignments = vec![ipc::AssignmentSummary {
@@ -1485,6 +1910,7 @@ async fn reconnect_reconciles_collaboration_selection_to_authoritative_snapshot(
     assert!(rendered.contains("Recovered [active]"));
     assert!(rendered.contains("Recovered unit"));
     assert!(rendered.contains("[awaiting_decision]"));
+    assert!(rendered.contains("proposal=generation_failed/backend"));
     assert!(!rendered.contains("Deferred work"));
     assert!(!rendered.contains("Out of scope"));
 }
@@ -1496,6 +1922,10 @@ async fn compact_layout_keeps_focus_selection_and_state_labels_visible_across_si
         .set_workunit_detail(sample_workunit_detail("wu-1"))
         .await;
     harness.dispatch(UserAction::Refresh).await;
+
+    let expanded = harness.render_text(160, 42);
+    assert!(expanded.contains("ambiguous"), "{expanded}");
+    assert!(expanded.contains("proposal="), "{expanded}");
 
     for (width, height) in [(120, 40), (100, 30), (80, 24)] {
         let rendered = harness.render_text(width, height);
@@ -1514,14 +1944,6 @@ async fn compact_layout_keeps_focus_selection_and_state_labels_visible_across_si
         assert!(
             rendered.contains("Snapshot wiring"),
             "missing selected work-unit title at {width}x{height}\n{rendered}"
-        );
-        assert!(
-            rendered.contains("ambiguous"),
-            "missing parse_result label at {width}x{height}\n{rendered}"
-        );
-        assert!(
-            rendered.contains("review"),
-            "missing review signal at {width}x{height}\n{rendered}"
         );
     }
 

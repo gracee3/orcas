@@ -1,6 +1,7 @@
 use crate::app::{AppState, BannerLevel, DaemonConnectionPhase, NavigationFocus};
 use orcas_core::{
     AssignmentStatus, DecisionType, ReportConfidence, ReportDisposition, ReportParseResult,
+    SupervisorProposalEdits, SupervisorProposalFailureStage, SupervisorProposalStatus,
     WorkUnitStatus, WorkstreamStatus, ipc,
 };
 
@@ -90,6 +91,7 @@ pub struct WorkUnitRowViewModel {
     pub current_assignment: String,
     pub latest_report_parse_result: String,
     pub needs_supervisor_review: bool,
+    pub proposal_status: String,
     pub latest_decision: String,
     pub selected: bool,
 }
@@ -390,6 +392,11 @@ pub fn work_unit_list(state: &AppState) -> WorkUnitListViewModel {
                         .unwrap_or_else(|| "-".to_string()),
                     needs_supervisor_review: latest_report
                         .is_some_and(|report| report.needs_supervisor_review),
+                    proposal_status: work_unit
+                        .proposal
+                        .as_ref()
+                        .map(proposal_summary_label)
+                        .unwrap_or_else(|| "-".to_string()),
                     latest_decision: latest_decision
                         .map(|decision| decision_type_label(decision.decision_type).to_string())
                         .unwrap_or_else(|| "-".to_string()),
@@ -467,6 +474,7 @@ pub fn collaboration_detail(state: &AppState) -> CollaborationDetailViewModel {
 
     let latest_report = latest_report_for_work_unit(state, work_unit_id);
     let latest_decision = latest_decision_for_work_unit(state, work_unit_id);
+    let latest_proposal = work_unit.proposal.as_ref();
     let assignment = work_unit
         .current_assignment_id
         .as_ref()
@@ -527,6 +535,49 @@ pub fn collaboration_detail(state: &AppState) -> CollaborationDetailViewModel {
         ));
     } else {
         lines.push("decision: -".to_string());
+    }
+
+    if let Some(proposal) = latest_proposal {
+        lines.push(format!(
+            "proposal: {} status={} latest_decision={} open={} stale_or_superseded={} failed={} edits={}",
+            short_id(&proposal.latest_proposal_id),
+            proposal_status_label(proposal.latest_status),
+            proposal
+                .latest_proposed_decision_type
+                .map(|decision| decision_type_label(decision).to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            proposal.has_open_proposal,
+            proposal.has_stale_or_superseded,
+            proposal.has_generation_failed,
+            proposal.latest_has_approval_edits
+        ));
+        if let Some(open_decision) = proposal.open_proposed_decision_type {
+            lines.push(format!(
+                "proposal_open: {} decision={}",
+                proposal
+                    .open_proposal_id
+                    .as_ref()
+                    .map(|id| short_id(id))
+                    .unwrap_or_else(|| "-".to_string()),
+                decision_type_label(open_decision)
+            ));
+        }
+        lines.push(format!(
+            "proposal_timing: created={} reviewed={}",
+            timestamp_label(proposal.latest_created_at),
+            proposal
+                .latest_reviewed_at
+                .map(timestamp_label)
+                .unwrap_or_else(|| "-".to_string())
+        ));
+        if let Some(stage) = proposal.latest_failure_stage {
+            lines.push(format!(
+                "proposal_failure: {}",
+                proposal_failure_stage_label(stage)
+            ));
+        }
+    } else {
+        lines.push("proposal: -".to_string());
     }
 
     CollaborationDetailViewModel {
@@ -618,6 +669,69 @@ pub fn collaboration_history(state: &AppState) -> CollaborationHistoryViewModel 
                 "    {}",
                 abbreviate(&compact_line(&decision.rationale), 88)
             ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Proposals".to_string());
+    if detail.proposals.is_empty() {
+        lines.push("  none".to_string());
+    } else {
+        for proposal in detail.proposals.iter().rev().take(6) {
+            lines.push(format!(
+                "  {} [{}] decision={} edits={} @ {}",
+                short_id(&proposal.id),
+                proposal_status_label(proposal.status),
+                proposal
+                    .approved_proposal
+                    .as_ref()
+                    .or(proposal.proposal.as_ref())
+                    .map(|proposal| decision_type_label(proposal.proposed_decision.decision_type))
+                    .unwrap_or("-"),
+                proposal
+                    .approval_edits
+                    .as_ref()
+                    .is_some_and(|edits| !edits.is_empty()),
+                timestamp_label(proposal.created_at)
+            ));
+            if let Some(summary) = proposal
+                .approved_proposal
+                .as_ref()
+                .map(|proposal| &proposal.summary)
+                .or_else(|| proposal.proposal.as_ref().map(|proposal| &proposal.summary))
+            {
+                lines.push(format!(
+                    "    {}",
+                    abbreviate(&compact_line(&summary.headline), 88)
+                ));
+            }
+            if let Some(failure) = proposal.generation_failure.as_ref() {
+                lines.push(format!(
+                    "    failure {}: {}",
+                    proposal_failure_stage_label(failure.stage),
+                    abbreviate(&compact_line(&failure.message), 88)
+                ));
+            }
+            if let Some(edits) = proposal
+                .approval_edits
+                .as_ref()
+                .filter(|edits| !edits.is_empty())
+            {
+                lines.push(format!("    edits {}", proposal_edits_label(edits)));
+            }
+            if let Some(approved) = proposal.approved_proposal.as_ref() {
+                lines.push(format!(
+                    "    approved {} next_assignment={}",
+                    decision_type_label(approved.proposed_decision.decision_type),
+                    proposal.approved_assignment_id.is_some()
+                ));
+            }
+            if let Some(note) = proposal.review_note.as_ref() {
+                lines.push(format!("    note {}", abbreviate(&compact_line(note), 88)));
+            }
+            if let Some(output) = proposal.reasoner_output_text.as_ref() {
+                lines.push(format!("    raw {}", abbreviate(&compact_line(output), 88)));
+            }
         }
     }
 
@@ -786,5 +900,77 @@ fn decision_type_label(decision_type: DecisionType) -> &'static str {
         DecisionType::Redirect => "redirect",
         DecisionType::MarkComplete => "mark_complete",
         DecisionType::EscalateToHuman => "escalate_to_human",
+    }
+}
+
+fn proposal_summary_label(summary: &ipc::WorkUnitProposalSummary) -> String {
+    let mut label = proposal_status_label(summary.latest_status).to_string();
+    if let Some(decision) = summary.latest_proposed_decision_type {
+        label.push('/');
+        label.push_str(decision_type_label(decision));
+    }
+    if summary.latest_has_approval_edits {
+        label.push_str(" edited");
+    }
+    if let Some(stage) = summary.latest_failure_stage {
+        label.push('/');
+        label.push_str(proposal_failure_stage_label(stage));
+    }
+    label
+}
+
+fn proposal_status_label(status: SupervisorProposalStatus) -> &'static str {
+    match status {
+        SupervisorProposalStatus::Open => "open",
+        SupervisorProposalStatus::Approved => "approved",
+        SupervisorProposalStatus::Rejected => "rejected",
+        SupervisorProposalStatus::Superseded => "superseded",
+        SupervisorProposalStatus::Stale => "stale",
+        SupervisorProposalStatus::GenerationFailed => "generation_failed",
+    }
+}
+
+fn proposal_failure_stage_label(stage: SupervisorProposalFailureStage) -> &'static str {
+    match stage {
+        SupervisorProposalFailureStage::Backend => "backend",
+        SupervisorProposalFailureStage::ResponseMalformed => "response_malformed",
+        SupervisorProposalFailureStage::ProposalMalformed => "proposal_malformed",
+        SupervisorProposalFailureStage::ProposalValidation => "proposal_validation",
+    }
+}
+
+fn proposal_edits_label(edits: &SupervisorProposalEdits) -> String {
+    let mut parts = Vec::new();
+    if let Some(decision_type) = edits.decision_type {
+        parts.push(format!("decision={}", decision_type_label(decision_type)));
+    }
+    if let Some(worker_id) = edits.preferred_worker_id.as_ref() {
+        parts.push(format!("worker={worker_id}"));
+    }
+    if let Some(worker_kind) = edits.worker_kind.as_ref() {
+        parts.push(format!("kind={worker_kind}"));
+    }
+    if let Some(objective) = edits.objective.as_ref() {
+        parts.push(format!(
+            "objective={}",
+            abbreviate(&compact_line(objective), 28)
+        ));
+    }
+    if !edits.instructions.is_empty() {
+        parts.push(format!("instructions={}", edits.instructions.len()));
+    }
+    if !edits.stop_conditions.is_empty() {
+        parts.push(format!("stop={}", edits.stop_conditions.len()));
+    }
+    if !edits.expected_report_fields.is_empty() {
+        parts.push(format!(
+            "report_fields={}",
+            edits.expected_report_fields.len()
+        ));
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" ")
     }
 }

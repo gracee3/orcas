@@ -8,7 +8,8 @@ use crate::collaboration::{
 };
 use crate::events::ConnectionState;
 use crate::supervisor::{
-    SupervisorProposalEdits, SupervisorProposalRecord, SupervisorProposalStatus,
+    SupervisorProposalEdits, SupervisorProposalFailureStage, SupervisorProposalRecord,
+    SupervisorProposalStatus,
 };
 
 pub mod methods {
@@ -237,6 +238,11 @@ pub enum DaemonEvent {
     DecisionApplied {
         decision: DecisionSummary,
     },
+    ProposalLifecycle {
+        action: ProposalLifecycleAction,
+        proposal: ProposalSummary,
+        work_unit: WorkUnitSummary,
+    },
     Warning {
         message: String,
     },
@@ -262,6 +268,17 @@ pub enum AssignmentLifecycleAction {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalLifecycleAction {
+    Created,
+    GenerationFailed,
+    Approved,
+    Rejected,
+    Superseded,
+    Stale,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkstreamSummary {
     pub id: String,
@@ -282,7 +299,25 @@ pub struct WorkUnitSummary {
     pub dependency_count: usize,
     pub current_assignment_id: Option<String>,
     pub latest_report_id: Option<String>,
+    #[serde(default)]
+    pub proposal: Option<WorkUnitProposalSummary>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkUnitProposalSummary {
+    pub latest_proposal_id: String,
+    pub latest_status: SupervisorProposalStatus,
+    pub latest_proposed_decision_type: Option<DecisionType>,
+    pub latest_created_at: DateTime<Utc>,
+    pub latest_reviewed_at: Option<DateTime<Utc>>,
+    pub latest_has_approval_edits: bool,
+    pub latest_failure_stage: Option<SupervisorProposalFailureStage>,
+    pub has_open_proposal: bool,
+    pub open_proposal_id: Option<String>,
+    pub open_proposed_decision_type: Option<DecisionType>,
+    pub has_generation_failed: bool,
+    pub has_stale_or_superseded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,6 +364,10 @@ pub struct ProposalSummary {
     pub status: SupervisorProposalStatus,
     pub proposed_decision_type: Option<DecisionType>,
     pub created_at: DateTime<Utc>,
+    pub reviewed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub has_approval_edits: bool,
+    pub generation_failure_stage: Option<SupervisorProposalFailureStage>,
     pub reasoner_model: String,
 }
 
@@ -402,6 +441,19 @@ mod tests {
         }))
         .expect("legacy decision summary should deserialize");
         assert!(decision.rationale.is_empty());
+
+        let work_unit = serde_json::from_value::<super::WorkUnitSummary>(json!({
+            "id": "wu-1",
+            "workstream_id": "ws-1",
+            "title": "Legacy work unit",
+            "status": "ready",
+            "dependency_count": 0,
+            "current_assignment_id": null,
+            "latest_report_id": null,
+            "updated_at": Utc::now()
+        }))
+        .expect("legacy work unit summary should deserialize");
+        assert!(work_unit.proposal.is_none());
     }
 }
 
@@ -668,6 +720,8 @@ pub struct WorkunitGetResponse {
     pub assignments: Vec<Assignment>,
     pub reports: Vec<Report>,
     pub decisions: Vec<Decision>,
+    #[serde(default)]
+    pub proposals: Vec<SupervisorProposalRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -544,6 +544,7 @@ fn workunit_details_from_snapshot(
                 assignments,
                 reports,
                 decisions,
+                proposals: Vec::new(),
             },
         );
     }

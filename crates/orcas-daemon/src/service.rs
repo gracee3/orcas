@@ -1036,6 +1036,21 @@ impl OrcasDaemonService {
         &self,
         params: ipc::WorkunitGetRequest,
     ) -> OrcasResult<ipc::WorkunitGetResponse> {
+        let stale_proposals = {
+            let mut state = self.state.write().await;
+            Self::refresh_stale_proposals_for_work_unit(
+                &mut state.collaboration,
+                &params.work_unit_id,
+            )
+        };
+        if !stale_proposals.is_empty() {
+            self.persist_collaboration_state().await?;
+            for proposal in &stale_proposals {
+                self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                    .await;
+            }
+        }
+
         let state = self.state.read().await;
         let work_unit = state
             .collaboration
@@ -1081,11 +1096,24 @@ impl OrcasDaemonService {
                 .cmp(&right.created_at)
                 .then_with(|| left.id.cmp(&right.id))
         });
+        let mut proposals = state
+            .collaboration
+            .supervisor_proposals
+            .values()
+            .filter(|proposal| proposal.primary_work_unit_id == params.work_unit_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        proposals.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         Ok(ipc::WorkunitGetResponse {
             work_unit,
             assignments,
             reports,
             decisions,
+            proposals,
         })
     }
 
@@ -1233,7 +1261,7 @@ impl OrcasDaemonService {
             .raw_output_for_turn(&thread_id, &turn.turn_id)
             .await
             .unwrap_or_default();
-        let (report, assignment_after_report, work_unit_after_report) = self
+        let (report, assignment_after_report, work_unit_after_report, stale_proposals) = self
             .record_assignment_turn_outcome(
                 &assignment_id,
                 &worker_id,
@@ -1259,6 +1287,10 @@ impl OrcasDaemonService {
             &work_unit_after_report,
         )
         .await;
+        for proposal in &stale_proposals {
+            self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                .await;
+        }
 
         let (assignment, worker, worker_session) = {
             let state = self.state.read().await;
@@ -1453,7 +1485,7 @@ impl OrcasDaemonService {
         worker_session_id: &str,
         turn_state: ipc::TurnStateView,
         raw_output: String,
-    ) -> OrcasResult<(Report, Assignment, WorkUnit)> {
+    ) -> OrcasResult<(Report, Assignment, WorkUnit, Vec<SupervisorProposalRecord>)> {
         let parsed_report = Self::parse_worker_report_for_turn(&raw_output, turn_state.lifecycle);
         let now = Utc::now();
         let mut state = self.state.write().await;
@@ -1523,6 +1555,8 @@ impl OrcasDaemonService {
             };
             session.updated_at = now;
         }
+        let stale_proposals =
+            Self::refresh_stale_proposals_for_work_unit(&mut state.collaboration, &work_unit_id);
         Self::refresh_workstream_statuses(&mut state.collaboration);
         let assignment_after_report = state
             .collaboration
@@ -1536,7 +1570,12 @@ impl OrcasDaemonService {
             .get(&work_unit_id)
             .cloned()
             .ok_or_else(|| OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`")))?;
-        Ok((report, assignment_after_report, work_unit_after_report))
+        Ok((
+            report,
+            assignment_after_report,
+            work_unit_after_report,
+            stale_proposals,
+        ))
     }
 
     async fn assignment_get(
@@ -1633,12 +1672,23 @@ impl OrcasDaemonService {
             .requested_by
             .clone()
             .unwrap_or_else(|| "supervisor_cli".to_string());
-        let (source_report_id, supersede_candidate_ids, refresh_changed) = {
+        let stale_proposals = {
             let mut state = self.state.write().await;
-            let stale_changed = Self::refresh_stale_proposals_for_work_unit(
+            Self::refresh_stale_proposals_for_work_unit(
                 &mut state.collaboration,
                 &params.work_unit_id,
-            );
+            )
+        };
+        if !stale_proposals.is_empty() {
+            self.persist_collaboration_state().await?;
+            for proposal in &stale_proposals {
+                self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                    .await;
+            }
+        }
+
+        let (source_report_id, supersede_candidate_ids) = {
+            let state = self.state.read().await;
             let work_unit = state
                 .collaboration
                 .work_units
@@ -1692,11 +1742,8 @@ impl OrcasDaemonService {
                     work_unit.id, source_report_id
                 )));
             }
-            (source_report_id, open_same_source, stale_changed)
+            (source_report_id, open_same_source)
         };
-        if refresh_changed {
-            self.persist_collaboration_state().await?;
-        }
 
         let collaboration = self.state.read().await.collaboration.clone();
         let context_pack = build_context_pack(
@@ -1727,6 +1774,11 @@ impl OrcasDaemonService {
                         },
                     )
                     .await?;
+                self.emit_proposal_lifecycle(
+                    ipc::ProposalLifecycleAction::GenerationFailed,
+                    &record,
+                )
+                .await;
                 return Err(Self::proposal_generation_failure_error(&record));
             }
         };
@@ -1747,6 +1799,8 @@ impl OrcasDaemonService {
                     },
                 )
                 .await?;
+            self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::GenerationFailed, &record)
+                .await;
             return Err(Self::proposal_generation_failure_error(&record));
         }
 
@@ -1776,6 +1830,7 @@ impl OrcasDaemonService {
             approved_assignment_id: None,
         };
 
+        let mut superseded_proposals = Vec::new();
         {
             let mut state = self.state.write().await;
             if let Some(reason) = state_anchor_freshness_error(
@@ -1804,6 +1859,7 @@ impl OrcasDaemonService {
                                     .to_string(),
                             );
                         }
+                        superseded_proposals.push(other.clone());
                     }
                 }
             }
@@ -1813,6 +1869,21 @@ impl OrcasDaemonService {
                 .insert(proposal.id.clone(), proposal.clone());
         }
         self.persist_collaboration_state().await?;
+        for superseded in &superseded_proposals {
+            self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Superseded, superseded)
+                .await;
+        }
+        self.emit_proposal_lifecycle(
+            match proposal.status {
+                SupervisorProposalStatus::GenerationFailed => {
+                    ipc::ProposalLifecycleAction::GenerationFailed
+                }
+                SupervisorProposalStatus::Stale => ipc::ProposalLifecycleAction::Stale,
+                _ => ipc::ProposalLifecycleAction::Created,
+            },
+            &proposal,
+        )
+        .await;
 
         Ok(ipc::ProposalCreateResponse { proposal })
     }
@@ -1821,7 +1892,7 @@ impl OrcasDaemonService {
         &self,
         params: ipc::ProposalGetRequest,
     ) -> OrcasResult<ipc::ProposalGetResponse> {
-        let (proposal, changed) = {
+        let (proposal, stale_proposals) = {
             let mut state = self.state.write().await;
             let work_unit_id = state
                 .collaboration
@@ -1831,7 +1902,7 @@ impl OrcasDaemonService {
                 .ok_or_else(|| {
                     OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
                 })?;
-            let changed = Self::refresh_stale_proposals_for_work_unit(
+            let stale_proposals = Self::refresh_stale_proposals_for_work_unit(
                 &mut state.collaboration,
                 &work_unit_id,
             );
@@ -1843,10 +1914,14 @@ impl OrcasDaemonService {
                 .ok_or_else(|| {
                     OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
                 })?;
-            (proposal, changed)
+            (proposal, stale_proposals)
         };
-        if changed {
+        if !stale_proposals.is_empty() {
             self.persist_collaboration_state().await?;
+            for proposal in &stale_proposals {
+                self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                    .await;
+            }
         }
         Ok(ipc::ProposalGetResponse { proposal })
     }
@@ -1855,9 +1930,9 @@ impl OrcasDaemonService {
         &self,
         params: ipc::ProposalListForWorkunitRequest,
     ) -> OrcasResult<ipc::ProposalListForWorkunitResponse> {
-        let (proposals, changed) = {
+        let (proposals, stale_proposals) = {
             let mut state = self.state.write().await;
-            let changed = Self::refresh_stale_proposals_for_work_unit(
+            let stale_proposals = Self::refresh_stale_proposals_for_work_unit(
                 &mut state.collaboration,
                 &params.work_unit_id,
             );
@@ -1874,10 +1949,14 @@ impl OrcasDaemonService {
                     .cmp(&left.created_at)
                     .then_with(|| left.id.cmp(&right.id))
             });
-            (proposals, changed)
+            (proposals, stale_proposals)
         };
-        if changed {
+        if !stale_proposals.is_empty() {
             self.persist_collaboration_state().await?;
+            for proposal in &stale_proposals {
+                self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                    .await;
+            }
         }
         Ok(ipc::ProposalListForWorkunitResponse { proposals })
     }
@@ -1891,7 +1970,7 @@ impl OrcasDaemonService {
             .clone()
             .unwrap_or_else(|| "supervisor_cli".to_string());
 
-        let (proposal, collaboration, changed) = {
+        let (proposal, collaboration, stale_proposals) = {
             let mut state = self.state.write().await;
             let work_unit_id = state
                 .collaboration
@@ -1901,7 +1980,7 @@ impl OrcasDaemonService {
                 .ok_or_else(|| {
                     OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
                 })?;
-            let changed = Self::refresh_stale_proposals_for_work_unit(
+            let stale_proposals = Self::refresh_stale_proposals_for_work_unit(
                 &mut state.collaboration,
                 &work_unit_id,
             );
@@ -1914,10 +1993,14 @@ impl OrcasDaemonService {
                     OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
                 })?;
             let collaboration = state.collaboration.clone();
-            (proposal, collaboration, changed)
+            (proposal, collaboration, stale_proposals)
         };
-        if changed {
+        if !stale_proposals.is_empty() {
             self.persist_collaboration_state().await?;
+            for proposal in &stale_proposals {
+                self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                    .await;
+            }
         }
 
         if proposal.status != SupervisorProposalStatus::Open {
@@ -1971,8 +2054,9 @@ impl OrcasDaemonService {
             })
             .await?;
 
-        let updated_proposal = {
+        let (updated_proposal, sibling_updates) = {
             let mut state = self.state.write().await;
+            let mut sibling_updates = Vec::new();
             for other in state.collaboration.supervisor_proposals.values_mut() {
                 if other.primary_work_unit_id != proposal.primary_work_unit_id
                     || other.id == proposal.id
@@ -1991,6 +2075,7 @@ impl OrcasDaemonService {
                         proposal.id
                     ));
                 }
+                sibling_updates.push(other.clone());
             }
 
             let proposal_record = state
@@ -2011,9 +2096,19 @@ impl OrcasDaemonService {
                 .next_assignment
                 .as_ref()
                 .map(|assignment| assignment.id.clone());
-            proposal_record.clone()
+            (proposal_record.clone(), sibling_updates)
         };
         self.persist_collaboration_state().await?;
+        for sibling in &sibling_updates {
+            let action = match sibling.status {
+                SupervisorProposalStatus::Superseded => ipc::ProposalLifecycleAction::Superseded,
+                SupervisorProposalStatus::Stale => ipc::ProposalLifecycleAction::Stale,
+                _ => continue,
+            };
+            self.emit_proposal_lifecycle(action, sibling).await;
+        }
+        self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Approved, &updated_proposal)
+            .await;
 
         Ok(ipc::ProposalApproveResponse {
             proposal: updated_proposal,
@@ -2030,7 +2125,7 @@ impl OrcasDaemonService {
             .reviewed_by
             .clone()
             .unwrap_or_else(|| "supervisor_cli".to_string());
-        let (proposal, _changed) = {
+        let stale_proposals = {
             let mut state = self.state.write().await;
             let work_unit_id = state
                 .collaboration
@@ -2040,10 +2135,17 @@ impl OrcasDaemonService {
                 .ok_or_else(|| {
                     OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
                 })?;
-            let changed = Self::refresh_stale_proposals_for_work_unit(
-                &mut state.collaboration,
-                &work_unit_id,
-            );
+            Self::refresh_stale_proposals_for_work_unit(&mut state.collaboration, &work_unit_id)
+        };
+        if !stale_proposals.is_empty() {
+            self.persist_collaboration_state().await?;
+            for proposal in &stale_proposals {
+                self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                    .await;
+            }
+        }
+        let proposal = {
+            let mut state = self.state.write().await;
             let proposal_record = state
                 .collaboration
                 .supervisor_proposals
@@ -2061,9 +2163,11 @@ impl OrcasDaemonService {
             proposal_record.reviewed_at = Some(Utc::now());
             proposal_record.reviewed_by = Some(reviewed_by);
             proposal_record.review_note = params.review_note.clone();
-            (proposal_record.clone(), changed)
+            proposal_record.clone()
         };
         self.persist_collaboration_state().await?;
+        self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Rejected, &proposal)
+            .await;
         Ok(ipc::ProposalRejectResponse { proposal })
     }
 
@@ -2071,7 +2175,7 @@ impl OrcasDaemonService {
         &self,
         params: ipc::DecisionApplyRequest,
     ) -> OrcasResult<ipc::DecisionApplyResponse> {
-        let (response, closed_assignment, work_unit_event, workstream_event) = {
+        let (response, closed_assignment, work_unit_event, workstream_event, stale_proposals) = {
             let now = Utc::now();
             let mut state = self.state.write().await;
             let prior_work_unit = state
@@ -2196,6 +2300,10 @@ impl OrcasDaemonService {
             };
 
             Self::refresh_blocked_work_units(&mut state.collaboration);
+            let stale_proposals = Self::refresh_stale_proposals_for_work_unit(
+                &mut state.collaboration,
+                &params.work_unit_id,
+            );
             Self::refresh_workstream_statuses(&mut state.collaboration);
             let work_unit = state
                 .collaboration
@@ -2239,6 +2347,7 @@ impl OrcasDaemonService {
                 closed_assignment,
                 (work_unit_action, work_unit),
                 (workstream_action, workstream),
+                stale_proposals,
             )
         };
         self.persist_collaboration_state().await?;
@@ -2257,6 +2366,10 @@ impl OrcasDaemonService {
                 next_assignment,
             )
             .await;
+        }
+        for proposal in &stale_proposals {
+            self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                .await;
         }
         Ok(response)
     }
@@ -2561,11 +2674,21 @@ impl OrcasDaemonService {
         action: ipc::CollaborationLifecycleAction,
         work_unit: &WorkUnit,
     ) {
-        self.emit(ipc::DaemonEvent::WorkUnitLifecycle {
-            action,
-            work_unit: Self::work_unit_summary(work_unit),
-        })
-        .await;
+        let work_unit = {
+            let state = self.state.read().await;
+            state
+                .collaboration
+                .work_units
+                .get(&work_unit.id)
+                .map(|work_unit| {
+                    Self::work_unit_summary_for_collaboration(work_unit, &state.collaboration)
+                })
+                .unwrap_or_else(|| {
+                    Self::work_unit_summary_for_collaboration(work_unit, &state.collaboration)
+                })
+        };
+        self.emit(ipc::DaemonEvent::WorkUnitLifecycle { action, work_unit })
+            .await;
     }
 
     async fn emit_assignment_lifecycle(
@@ -2590,6 +2713,42 @@ impl OrcasDaemonService {
     async fn emit_decision_applied(&self, decision: &Decision) {
         self.emit(ipc::DaemonEvent::DecisionApplied {
             decision: Self::decision_summary(decision),
+        })
+        .await;
+    }
+
+    async fn emit_proposal_lifecycle(
+        &self,
+        action: ipc::ProposalLifecycleAction,
+        proposal: &SupervisorProposalRecord,
+    ) {
+        let work_unit = {
+            let state = self.state.read().await;
+            state
+                .collaboration
+                .work_units
+                .get(&proposal.primary_work_unit_id)
+                .map(|work_unit| {
+                    Self::work_unit_summary_for_collaboration(work_unit, &state.collaboration)
+                })
+                .unwrap_or_else(|| ipc::WorkUnitSummary {
+                    id: proposal.primary_work_unit_id.clone(),
+                    workstream_id: proposal.workstream_id.clone(),
+                    title: proposal.context_pack.primary_work_unit.title.clone(),
+                    status: WorkUnitStatus::AwaitingDecision,
+                    dependency_count: proposal.context_pack.primary_work_unit.dependencies.len(),
+                    current_assignment_id: Some(
+                        proposal.context_pack.current_assignment.id.clone(),
+                    ),
+                    latest_report_id: Some(proposal.source_report_id.clone()),
+                    proposal: None,
+                    updated_at: proposal.created_at,
+                })
+        };
+        self.emit(ipc::DaemonEvent::ProposalLifecycle {
+            action,
+            proposal: Self::proposal_summary(proposal),
+            work_unit,
         })
         .await;
     }
@@ -2633,7 +2792,7 @@ impl OrcasDaemonService {
         let mut work_units = collaboration
             .work_units
             .values()
-            .map(Self::work_unit_summary)
+            .map(|work_unit| Self::work_unit_summary_for_collaboration(work_unit, collaboration))
             .collect::<Vec<_>>();
         work_units.sort_by(|left, right| {
             right
@@ -2699,7 +2858,10 @@ impl OrcasDaemonService {
         }
     }
 
-    fn work_unit_summary(work_unit: &WorkUnit) -> ipc::WorkUnitSummary {
+    fn work_unit_summary_for_collaboration(
+        work_unit: &WorkUnit,
+        collaboration: &CollaborationState,
+    ) -> ipc::WorkUnitSummary {
         ipc::WorkUnitSummary {
             id: work_unit.id.clone(),
             workstream_id: work_unit.workstream_id.clone(),
@@ -2708,6 +2870,7 @@ impl OrcasDaemonService {
             dependency_count: work_unit.dependencies.len(),
             current_assignment_id: work_unit.current_assignment_id.clone(),
             latest_report_id: work_unit.latest_report_id.clone(),
+            proposal: Self::work_unit_proposal_summary(collaboration, &work_unit.id),
             updated_at: work_unit.updated_at,
         }
     }
@@ -2756,13 +2919,83 @@ impl OrcasDaemonService {
             primary_work_unit_id: proposal.primary_work_unit_id.clone(),
             source_report_id: proposal.source_report_id.clone(),
             status: proposal.status,
-            proposed_decision_type: proposal
-                .proposal
-                .as_ref()
-                .map(|proposal| proposal.proposed_decision.decision_type),
+            proposed_decision_type: Self::proposal_decision_type(proposal),
             created_at: proposal.created_at,
+            reviewed_at: proposal.reviewed_at,
+            has_approval_edits: proposal
+                .approval_edits
+                .as_ref()
+                .is_some_and(|edits| !edits.is_empty()),
+            generation_failure_stage: proposal.generation_failure.as_ref().map(|f| f.stage),
             reasoner_model: proposal.reasoner_model.clone(),
         }
+    }
+
+    fn proposal_decision_type(proposal: &SupervisorProposalRecord) -> Option<DecisionType> {
+        proposal
+            .approved_proposal
+            .as_ref()
+            .or(proposal.proposal.as_ref())
+            .map(|proposal| proposal.proposed_decision.decision_type)
+    }
+
+    fn work_unit_proposal_summary(
+        collaboration: &CollaborationState,
+        work_unit_id: &str,
+    ) -> Option<ipc::WorkUnitProposalSummary> {
+        let proposals = collaboration
+            .supervisor_proposals
+            .values()
+            .filter(|proposal| proposal.primary_work_unit_id == work_unit_id)
+            .collect::<Vec<_>>();
+        let latest = proposals.into_iter().max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        })?;
+
+        let open = collaboration
+            .supervisor_proposals
+            .values()
+            .filter(|proposal| {
+                proposal.primary_work_unit_id == work_unit_id
+                    && proposal.status == SupervisorProposalStatus::Open
+            })
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+
+        Some(ipc::WorkUnitProposalSummary {
+            latest_proposal_id: latest.id.clone(),
+            latest_status: latest.status,
+            latest_proposed_decision_type: Self::proposal_decision_type(latest),
+            latest_created_at: latest.created_at,
+            latest_reviewed_at: latest.reviewed_at,
+            latest_has_approval_edits: latest
+                .approval_edits
+                .as_ref()
+                .is_some_and(|edits| !edits.is_empty()),
+            latest_failure_stage: latest
+                .generation_failure
+                .as_ref()
+                .map(|failure| failure.stage),
+            has_open_proposal: open.is_some(),
+            open_proposal_id: open.map(|proposal| proposal.id.clone()),
+            open_proposed_decision_type: open.and_then(Self::proposal_decision_type),
+            has_generation_failed: collaboration.supervisor_proposals.values().any(|proposal| {
+                proposal.primary_work_unit_id == work_unit_id
+                    && proposal.status == SupervisorProposalStatus::GenerationFailed
+            }),
+            has_stale_or_superseded: collaboration.supervisor_proposals.values().any(|proposal| {
+                proposal.primary_work_unit_id == work_unit_id
+                    && matches!(
+                        proposal.status,
+                        SupervisorProposalStatus::Stale | SupervisorProposalStatus::Superseded
+                    )
+            }),
+        })
     }
 
     async fn persist_failed_proposal_record(
@@ -2841,8 +3074,8 @@ impl OrcasDaemonService {
     fn refresh_stale_proposals_for_work_unit(
         collaboration: &mut CollaborationState,
         work_unit_id: &str,
-    ) -> bool {
-        let mut changed = false;
+    ) -> Vec<SupervisorProposalRecord> {
+        let mut changed = Vec::new();
         let candidate_ids = collaboration
             .supervisor_proposals
             .values()
@@ -2863,7 +3096,7 @@ impl OrcasDaemonService {
                     if proposal.review_note.is_none() {
                         proposal.review_note = Some(format!("Proposal became stale: {reason}"));
                     }
-                    changed = true;
+                    changed.push(proposal.clone());
                 }
             }
         }
@@ -3814,6 +4047,14 @@ Assignment instructions:\n\
             ipc::DaemonEvent::DecisionApplied { decision } => (
                 "decision",
                 format!("decision {} {:?}", decision.id, decision.decision_type),
+                None,
+                None,
+            ),
+            ipc::DaemonEvent::ProposalLifecycle {
+                action, proposal, ..
+            } => (
+                "proposal",
+                format!("proposal {} {:?}", proposal.id, action),
                 None,
                 None,
             ),
@@ -4820,6 +5061,30 @@ mod tests {
             .expect("latest proposal")
     }
 
+    async fn wait_for_proposal_action(
+        events: &mut broadcast::Receiver<ipc::DaemonEventEnvelope>,
+        expected: ipc::ProposalLifecycleAction,
+    ) -> ipc::ProposalSummary {
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event");
+            if let ipc::DaemonEvent::ProposalLifecycle {
+                action,
+                work_unit,
+                proposal,
+            } = event.event
+            {
+                assert_eq!(proposal.primary_work_unit_id, work_unit.id);
+                assert!(work_unit.proposal.is_some());
+                if action == expected {
+                    return proposal;
+                }
+            }
+        }
+    }
+
     async fn assert_terminal_approval_path(
         decision_type: DecisionType,
         expected_work_unit_status: WorkUnitStatus,
@@ -5726,6 +5991,373 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn snapshot_includes_bounded_proposal_summary_after_creation() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "snapshot-proposal").await;
+        let proposal =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
+
+        let snapshot = service.snapshot().await.expect("snapshot");
+        let summary = snapshot
+            .collaboration
+            .work_units
+            .iter()
+            .find(|work_unit| work_unit.id == proposal.primary_work_unit_id)
+            .and_then(|work_unit| work_unit.proposal.as_ref())
+            .expect("proposal summary");
+        assert_eq!(summary.latest_proposal_id, proposal.id);
+        assert_eq!(summary.latest_status, SupervisorProposalStatus::Open);
+        assert_eq!(
+            summary.latest_proposed_decision_type,
+            Some(DecisionType::Continue)
+        );
+        assert!(summary.has_open_proposal);
+        assert_eq!(
+            summary.open_proposal_id.as_deref(),
+            Some(proposal.id.as_str())
+        );
+
+        let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot json");
+        assert!(!snapshot_json.contains("reasoner_output_text"));
+        assert!(!snapshot_json.contains("Objective:"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_reflects_generation_failed_approved_rejected_stale_and_superseded_proposals()
+    {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+
+        let (_ws_approved, wu_approved, assignment_approved, report_approved) =
+            seed_awaiting_decision_fixture(&service, "approved-summary").await;
+        let approved = create_proposal_for_decision(
+            &service,
+            &reasoner,
+            &wu_approved,
+            &assignment_approved,
+            &report_approved,
+            DecisionType::Accept,
+        )
+        .await
+        .proposal;
+        let _ = approve_proposal(&service, &approved.id, SupervisorProposalEdits::default()).await;
+
+        let (_ws_rejected, wu_rejected, assignment_rejected, report_rejected) =
+            seed_awaiting_decision_fixture(&service, "rejected-summary").await;
+        let rejected = create_default_proposal(
+            &service,
+            &reasoner,
+            &wu_rejected,
+            &assignment_rejected,
+            &report_rejected,
+        )
+        .await
+        .proposal;
+        let _ = service
+            .proposal_reject(ipc::ProposalRejectRequest {
+                proposal_id: rejected.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("reject".to_string()),
+            })
+            .await
+            .expect("reject");
+
+        let (_ws_stale, wu_stale, assignment_stale, report_stale) =
+            seed_awaiting_decision_fixture(&service, "stale-summary").await;
+        let _stale = create_default_proposal(
+            &service,
+            &reasoner,
+            &wu_stale,
+            &assignment_stale,
+            &report_stale,
+        )
+        .await
+        .proposal;
+        let _ = service
+            .decision_apply(ipc::DecisionApplyRequest {
+                work_unit_id: wu_stale.id.clone(),
+                report_id: Some(report_stale.id.clone()),
+                decision_type: DecisionType::EscalateToHuman,
+                rationale: "force stale".to_string(),
+                instructions: None,
+                worker_id: None,
+                worker_kind: None,
+            })
+            .await
+            .expect("decision");
+
+        let (_ws_superseded, wu_superseded, assignment_superseded, report_superseded) =
+            seed_awaiting_decision_fixture(&service, "superseded-summary").await;
+        let first = create_default_proposal(
+            &service,
+            &reasoner,
+            &wu_superseded,
+            &assignment_superseded,
+            &report_superseded,
+        )
+        .await
+        .proposal;
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Redirect,
+                &wu_superseded.id,
+                &report_superseded.id,
+                &assignment_superseded.id,
+                &assignment_superseded.worker_id,
+            ))
+            .await;
+        let _second = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: wu_superseded.id.clone(),
+                source_report_id: Some(report_superseded.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: Some("resynthesize".to_string()),
+                supersede_open: true,
+            })
+            .await
+            .expect("supersede create")
+            .proposal;
+        let first_record = service
+            .proposal_get(ipc::ProposalGetRequest {
+                proposal_id: first.id.clone(),
+            })
+            .await
+            .expect("first proposal");
+        assert_eq!(
+            first_record.proposal.status,
+            SupervisorProposalStatus::Superseded
+        );
+
+        let (_ws_failed, wu_failed, _assignment_failed, report_failed) =
+            seed_awaiting_decision_fixture(&service, "failed-summary").await;
+        reasoner
+            .set_failure(
+                SupervisorProposalFailureStage::Backend,
+                "timeout contacting provider",
+                Some("provider timeout".to_string()),
+            )
+            .await;
+        let _ = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: wu_failed.id.clone(),
+                source_report_id: Some(report_failed.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect_err("generation failure");
+
+        let snapshot = service.snapshot().await.expect("snapshot");
+        let summary_for = |work_unit_id: &str| {
+            snapshot
+                .collaboration
+                .work_units
+                .iter()
+                .find(|work_unit| work_unit.id == work_unit_id)
+                .and_then(|work_unit| work_unit.proposal.as_ref())
+                .cloned()
+                .expect("proposal summary for work unit")
+        };
+
+        let approved_summary = summary_for(&wu_approved.id);
+        assert_eq!(
+            approved_summary.latest_status,
+            SupervisorProposalStatus::Approved
+        );
+        assert!(!approved_summary.has_open_proposal);
+
+        let rejected_summary = summary_for(&wu_rejected.id);
+        assert_eq!(
+            rejected_summary.latest_status,
+            SupervisorProposalStatus::Rejected
+        );
+        assert!(!rejected_summary.has_open_proposal);
+
+        let stale_summary = summary_for(&wu_stale.id);
+        assert_eq!(stale_summary.latest_status, SupervisorProposalStatus::Stale);
+        assert!(stale_summary.has_stale_or_superseded);
+
+        let superseded_summary = summary_for(&wu_superseded.id);
+        assert_eq!(
+            superseded_summary.latest_status,
+            SupervisorProposalStatus::Open
+        );
+        assert_eq!(
+            superseded_summary.latest_proposed_decision_type,
+            Some(DecisionType::Redirect)
+        );
+        assert!(superseded_summary.has_stale_or_superseded);
+
+        let failed_summary = summary_for(&wu_failed.id);
+        assert_eq!(
+            failed_summary.latest_status,
+            SupervisorProposalStatus::GenerationFailed
+        );
+        assert_eq!(
+            failed_summary.latest_failure_stage,
+            Some(SupervisorProposalFailureStage::Backend)
+        );
+        assert!(failed_summary.has_generation_failed);
+        assert!(!failed_summary.has_open_proposal);
+    }
+
+    #[tokio::test]
+    async fn daemon_emits_proposal_lifecycle_events_for_main_transitions() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let mut events = service.event_tx.subscribe();
+
+        let (_ws_created, wu_created, assignment_created, report_created) =
+            seed_awaiting_decision_fixture(&service, "events-created").await;
+        let _ = create_default_proposal(
+            &service,
+            &reasoner,
+            &wu_created,
+            &assignment_created,
+            &report_created,
+        )
+        .await
+        .proposal;
+        let created_event =
+            wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::Created).await;
+        assert_eq!(created_event.primary_work_unit_id, wu_created.id);
+
+        let (_ws_rejected, wu_rejected, assignment_rejected, report_rejected) =
+            seed_awaiting_decision_fixture(&service, "events-rejected").await;
+        let rejected = create_default_proposal(
+            &service,
+            &reasoner,
+            &wu_rejected,
+            &assignment_rejected,
+            &report_rejected,
+        )
+        .await
+        .proposal;
+        let _ = wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::Created).await;
+        let _ = service
+            .proposal_reject(ipc::ProposalRejectRequest {
+                proposal_id: rejected.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("reject".to_string()),
+            })
+            .await
+            .expect("reject");
+        let rejected_event =
+            wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::Rejected).await;
+        assert_eq!(rejected_event.primary_work_unit_id, wu_rejected.id);
+
+        let (_ws_approved, wu_approved, assignment_approved, report_approved) =
+            seed_awaiting_decision_fixture(&service, "events-approved").await;
+        let approved = create_proposal_for_decision(
+            &service,
+            &reasoner,
+            &wu_approved,
+            &assignment_approved,
+            &report_approved,
+            DecisionType::Accept,
+        )
+        .await
+        .proposal;
+        let _ = wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::Created).await;
+        let _ = approve_proposal(&service, &approved.id, SupervisorProposalEdits::default()).await;
+        let approved_event =
+            wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::Approved).await;
+        assert_eq!(approved_event.primary_work_unit_id, wu_approved.id);
+
+        let (_ws_stale, wu_stale, assignment_stale, report_stale) =
+            seed_awaiting_decision_fixture(&service, "events-stale").await;
+        let _stale = create_default_proposal(
+            &service,
+            &reasoner,
+            &wu_stale,
+            &assignment_stale,
+            &report_stale,
+        )
+        .await
+        .proposal;
+        let _ = wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::Created).await;
+        let _ = service
+            .decision_apply(ipc::DecisionApplyRequest {
+                work_unit_id: wu_stale.id.clone(),
+                report_id: Some(report_stale.id.clone()),
+                decision_type: DecisionType::EscalateToHuman,
+                rationale: "stale event".to_string(),
+                instructions: None,
+                worker_id: None,
+                worker_kind: None,
+            })
+            .await
+            .expect("decision");
+        let stale_event =
+            wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::Stale).await;
+        assert_eq!(stale_event.primary_work_unit_id, wu_stale.id);
+
+        let (_ws_superseded, wu_superseded, assignment_superseded, report_superseded) =
+            seed_awaiting_decision_fixture(&service, "events-superseded").await;
+        let _first = create_default_proposal(
+            &service,
+            &reasoner,
+            &wu_superseded,
+            &assignment_superseded,
+            &report_superseded,
+        )
+        .await
+        .proposal;
+        let _ = wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::Created).await;
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Redirect,
+                &wu_superseded.id,
+                &report_superseded.id,
+                &assignment_superseded.id,
+                &assignment_superseded.worker_id,
+            ))
+            .await;
+        let _ = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: wu_superseded.id.clone(),
+                source_report_id: Some(report_superseded.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: Some("supersede".to_string()),
+                supersede_open: true,
+            })
+            .await
+            .expect("supersede");
+        let superseded_event =
+            wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::Superseded).await;
+        assert_eq!(superseded_event.primary_work_unit_id, wu_superseded.id);
+
+        let (_ws_failed, wu_failed, _assignment_failed, report_failed) =
+            seed_awaiting_decision_fixture(&service, "events-failed").await;
+        reasoner
+            .set_failure(
+                SupervisorProposalFailureStage::Backend,
+                "timeout contacting provider",
+                Some("provider timeout".to_string()),
+            )
+            .await;
+        let _ = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: wu_failed.id.clone(),
+                source_report_id: Some(report_failed.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect_err("generation failure");
+        let failed_event =
+            wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::GenerationFailed)
+                .await;
+        assert_eq!(failed_event.primary_work_unit_id, wu_failed.id);
+    }
+
     #[test]
     fn scoped_thread_summaries_prefer_orcas_relevant_threads() {
         let mut threads = HashMap::new();
@@ -6232,7 +6864,7 @@ ORCAS_REPORT_END"#;
             updated_at: Utc::now(),
             error_message: Some("interrupted".to_string()),
         };
-        let (report, assignment, updated_work_unit) = service
+        let (report, assignment, updated_work_unit, _stale_proposals) = service
             .record_assignment_turn_outcome(
                 &prepared.assignment.id,
                 &prepared.assignment.worker_id,

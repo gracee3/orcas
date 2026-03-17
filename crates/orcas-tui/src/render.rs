@@ -284,26 +284,28 @@ fn render_work_units(state: &AppState) -> Paragraph<'static> {
     let lines = if rows.is_empty() {
         vec![Line::from("No work units loaded.")]
     } else {
-        rows.into_iter()
-            .take(8)
-            .map(|row| {
-                let prefix = if row.selected { ">" } else { " " };
-                let review = if row.needs_supervisor_review {
-                    " review=true"
-                } else {
-                    " review=false"
-                };
-                Line::from(format!(
-                    "{prefix} {} parse={}{} [{}] a={} decision={}",
-                    row.title,
-                    row.latest_report_parse_result,
-                    review,
-                    row.status,
-                    row.current_assignment,
-                    row.latest_decision
-                ))
-            })
-            .collect()
+        let mut lines = Vec::new();
+        for row in rows.into_iter().take(4) {
+            let prefix = if row.selected { ">" } else { " " };
+            let review = if row.needs_supervisor_review {
+                " review"
+            } else {
+                ""
+            };
+            lines.push(Line::from(format!(
+                "{prefix} {} [{}]",
+                row.title, row.status
+            )));
+            lines.push(Line::from(format!(
+                "  proposal={} parse={}{} decision={} a={}",
+                row.proposal_status,
+                row.latest_report_parse_result,
+                review,
+                row.latest_decision,
+                row.current_assignment,
+            )));
+        }
+        lines
     };
     Paragraph::new(Text::from(lines))
         .block(

@@ -112,6 +112,11 @@ pub enum UiEvent {
     },
     ReportRecorded(ipc::ReportSummary),
     DecisionApplied(ipc::DecisionSummary),
+    ProposalLifecycle {
+        action: ipc::ProposalLifecycleAction,
+        proposal: ipc::ProposalSummary,
+        work_unit: ipc::WorkUnitSummary,
+    },
     WorkUnitDetailLoaded(ipc::WorkunitGetResponse),
     TurnUpdated {
         thread_id: String,
@@ -150,6 +155,15 @@ impl UiEvent {
             }
             ipc::DaemonEvent::ReportRecorded { report } => Self::ReportRecorded(report),
             ipc::DaemonEvent::DecisionApplied { decision } => Self::DecisionApplied(decision),
+            ipc::DaemonEvent::ProposalLifecycle {
+                action,
+                proposal,
+                work_unit,
+            } => Self::ProposalLifecycle {
+                action,
+                proposal,
+                work_unit,
+            },
             ipc::DaemonEvent::TurnUpdated { thread_id, turn } => {
                 Self::TurnUpdated { thread_id, turn }
             }
@@ -454,6 +468,21 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             upsert_decision_summary(&mut state.collaboration.decisions, decision);
             if selected {
                 effects.extend(load_selected_work_unit_detail(state));
+            }
+        }
+        UiEvent::ProposalLifecycle {
+            proposal,
+            work_unit,
+            ..
+        } => {
+            let selected = state.selected_work_unit_id.as_deref() == Some(work_unit.id.as_str());
+            upsert_work_unit_summary(&mut state.collaboration.work_units, work_unit);
+            if selected {
+                effects.extend(load_selected_work_unit_detail(state));
+            } else {
+                state
+                    .work_unit_details
+                    .remove(&proposal.primary_work_unit_id);
             }
         }
         UiEvent::WorkUnitDetailLoaded(detail) => {
@@ -1032,6 +1061,21 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
             None,
             None,
         ),
+        UiEvent::ProposalLifecycle {
+            action,
+            proposal,
+            work_unit,
+        } => (
+            "proposal",
+            format!(
+                "proposal {} {} for {}",
+                proposal.id,
+                proposal_action_label(*action),
+                work_unit.id
+            ),
+            None,
+            None,
+        ),
         UiEvent::TurnUpdated { thread_id, turn } => (
             "turn",
             format!("turn {} {}", turn.id, turn.status),
@@ -1082,5 +1126,16 @@ fn assignment_action_label(action: ipc::AssignmentLifecycleAction) -> &'static s
         ipc::AssignmentLifecycleAction::Closed => "closed",
         ipc::AssignmentLifecycleAction::Interrupted => "interrupted",
         ipc::AssignmentLifecycleAction::Failed => "failed",
+    }
+}
+
+fn proposal_action_label(action: ipc::ProposalLifecycleAction) -> &'static str {
+    match action {
+        ipc::ProposalLifecycleAction::Created => "created",
+        ipc::ProposalLifecycleAction::GenerationFailed => "generation_failed",
+        ipc::ProposalLifecycleAction::Approved => "approved",
+        ipc::ProposalLifecycleAction::Rejected => "rejected",
+        ipc::ProposalLifecycleAction::Superseded => "superseded",
+        ipc::ProposalLifecycleAction::Stale => "stale",
     }
 }
