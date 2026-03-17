@@ -13,6 +13,7 @@ use orcas_daemon::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendCommand {
     GetThread { thread_id: String },
+    AttachThread { thread_id: String },
     GetTurn { thread_id: String, turn_id: String },
     GetWorkUnit { work_unit_id: String },
     GetActiveTurns,
@@ -26,6 +27,7 @@ pub enum BackendCommand {
 pub enum BackendCommandResult {
     Snapshot(ipc::StateSnapshot),
     Thread(ipc::ThreadView),
+    ThreadAttached(ipc::ThreadAttachResponse),
     Turn(ipc::TurnAttachResponse),
     WorkUnit(ipc::WorkunitGetResponse),
     ActiveTurns(Vec<ipc::TurnStateView>),
@@ -151,9 +153,18 @@ impl OrcasDaemonBackend {
         match command {
             BackendCommand::GetThread { thread_id } => Ok(BackendCommandResult::Thread(
                 client
-                    .thread_get(&ipc::ThreadGetRequest { thread_id })
+                    .thread_read_history(&ipc::ThreadReadHistoryRequest { thread_id })
                     .await?
                     .thread,
+            )),
+            BackendCommand::AttachThread { thread_id } => Ok(BackendCommandResult::ThreadAttached(
+                client
+                    .thread_attach(&ipc::ThreadAttachRequest {
+                        thread_id,
+                        cwd: None,
+                        model: None,
+                    })
+                    .await?,
             )),
             BackendCommand::GetTurn { thread_id, turn_id } => Ok(BackendCommandResult::Turn(
                 client
@@ -432,6 +443,20 @@ impl TuiBackend for FakeBackend {
                 .cloned()
                 .map(BackendCommandResult::Thread)
                 .ok_or_else(|| anyhow!("unknown thread `{thread_id}`")),
+            BackendCommand::AttachThread { thread_id } => {
+                let thread = guard
+                    .threads
+                    .get_mut(&thread_id)
+                    .ok_or_else(|| anyhow!("unknown thread `{thread_id}`"))?;
+                thread.summary.monitor_state = ipc::ThreadMonitorState::Attached;
+                Ok(BackendCommandResult::ThreadAttached(
+                    ipc::ThreadAttachResponse {
+                        thread: Some(thread.clone()),
+                        attached: true,
+                        reason: None,
+                    },
+                ))
+            }
             BackendCommand::GetTurn { thread_id, turn_id } => Ok(BackendCommandResult::Turn(
                 guard
                     .turns

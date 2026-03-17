@@ -371,6 +371,38 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                 )
                 .await
             }
+            Effect::AttachThread { thread_id } => {
+                let effect = Effect::AttachThread {
+                    thread_id: thread_id.clone(),
+                };
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::AttachThread {
+                        thread_id: thread_id.clone(),
+                    },
+                    |response| match response {
+                        BackendCommandResult::ThreadAttached(response) => {
+                            vec![Action::Event(UiEvent::ThreadAttached(response))]
+                        }
+                        other => {
+                            vec![Action::Event(UiEvent::Error(format!(
+                                "unexpected thread-attach response: {other:?}"
+                            )))]
+                        }
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "thread attach failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!("thread attach failed: {error}")))
+                        }
+                    },
+                )
+                .await
+            }
             Effect::LoadTurnState { thread_id, turn_id } => {
                 let effect = Effect::LoadTurnState {
                     thread_id: thread_id.clone(),

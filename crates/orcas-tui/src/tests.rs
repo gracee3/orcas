@@ -29,26 +29,71 @@ fn sample_thread_summary(id: &str, preview: &str, updated_at: i64) -> ipc::Threa
         created_at: updated_at - 10,
         updated_at,
         scope: "orcas_managed".to_string(),
+        archived: false,
+        loaded_status: ipc::ThreadLoadedStatus::Idle,
+        active_flags: Vec::new(),
+        active_turn_id: None,
+        last_seen_turn_id: Some("turn-1".to_string()),
         recent_output: Some(preview.to_string()),
         recent_event: Some("thread idle".to_string()),
         turn_in_flight: false,
+        monitor_state: ipc::ThreadMonitorState::Detached,
+        last_sync_at: Utc::now(),
+        source_kind: None,
+        raw_summary: None,
     }
 }
 
 fn sample_thread_view(id: &str, preview: &str, output: &str) -> ipc::ThreadView {
     ipc::ThreadView {
         summary: sample_thread_summary(id, preview, 200),
+        history_loaded: true,
         turns: vec![ipc::TurnView {
             id: "turn-1".to_string(),
             status: "completed".to_string(),
             error_message: None,
+            error_summary: None,
+            started_at: None,
+            completed_at: None,
+            latest_diff: None,
+            latest_plan_snapshot: None,
+            token_usage_snapshot: None,
             items: vec![ipc::ItemView {
                 id: "item-1".to_string(),
                 item_type: "agent_message".to_string(),
                 status: Some("completed".to_string()),
                 text: Some(output.to_string()),
+                summary: Some(output.to_string()),
+                payload: None,
             }],
         }],
+    }
+}
+
+fn sample_codex_assignment_summary(
+    thread_id: &str,
+    status: orcas_core::CodexThreadAssignmentStatus,
+) -> ipc::CodexThreadAssignmentSummary {
+    ipc::CodexThreadAssignmentSummary {
+        assignment_id: "cta-1".to_string(),
+        codex_thread_id: thread_id.to_string(),
+        workstream_id: "ws-1".to_string(),
+        work_unit_id: "wu-1".to_string(),
+        supervisor_id: "supervisor-a".to_string(),
+        assigned_by: "operator".to_string(),
+        assigned_at: Utc::now(),
+        updated_at: Utc::now(),
+        status,
+        send_policy: orcas_core::CodexThreadSendPolicy::HumanApprovalRequired,
+        bootstrap_state: orcas_core::CodexThreadBootstrapState::Pending,
+        latest_basis_turn_id: Some("turn-1".to_string()),
+        latest_decision_id: None,
+        notes: Some("watch this thread".to_string()),
+        active: matches!(
+            status,
+            orcas_core::CodexThreadAssignmentStatus::Proposed
+                | orcas_core::CodexThreadAssignmentStatus::Active
+        ),
     }
 }
 
@@ -400,6 +445,7 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
                 updated_at: Utc::now(),
             },
         ],
+        codex_thread_assignments: Vec::new(),
         reports: vec![
             ipc::ReportSummary {
                 id: "report-2".to_string(),
@@ -772,6 +818,43 @@ async fn thread_selection_loads_detail() {
 }
 
 #[tokio::test]
+async fn thread_list_and_detail_show_codex_assignment_state() {
+    let mut snapshot = sample_snapshot();
+    snapshot
+        .collaboration
+        .codex_thread_assignments
+        .push(sample_codex_assignment_summary(
+            "thread-1",
+            orcas_core::CodexThreadAssignmentStatus::Paused,
+        ));
+
+    let harness = AppHarness::new(snapshot).await.unwrap();
+    let list = harness.thread_list_vm();
+    assert_eq!(list.rows[0].assignment_badge.as_deref(), Some("paused"));
+
+    let summary = harness.thread_summary_vm();
+    assert!(
+        summary
+            .lines
+            .iter()
+            .any(|line| line.contains("assignment: cta-1 [paused]"))
+    );
+
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("assignment cta-1 [paused]"))
+    );
+    assert!(
+        detail.lines.iter().any(|line| {
+            line.contains("workstream=ws-1  work_unit=wu-1  supervisor=supervisor-a")
+        })
+    );
+}
+
+#[tokio::test]
 async fn streamed_deltas_accumulate_in_selected_thread() {
     let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
     harness
@@ -782,6 +865,12 @@ async fn streamed_deltas_accumulate_in_selected_thread() {
                     id: "turn-2".to_string(),
                     status: "in_progress".to_string(),
                     error_message: None,
+                    error_summary: None,
+                    started_at: None,
+                    completed_at: None,
+                    latest_diff: None,
+                    latest_plan_snapshot: None,
+                    token_usage_snapshot: None,
                     items: Vec::new(),
                 },
             },
@@ -838,6 +927,12 @@ async fn completed_turn_clears_in_progress_marker() {
                     id: "turn-1".to_string(),
                     status: "completed".to_string(),
                     error_message: None,
+                    error_summary: None,
+                    started_at: None,
+                    completed_at: None,
+                    latest_diff: None,
+                    latest_plan_snapshot: None,
+                    token_usage_snapshot: None,
                     items: Vec::new(),
                 },
             },

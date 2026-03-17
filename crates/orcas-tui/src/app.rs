@@ -147,6 +147,7 @@ pub enum UiEvent {
     },
     ConnectionLost(String),
     ThreadLoaded(ipc::ThreadView),
+    ThreadAttached(ipc::ThreadAttachResponse),
     ActiveTurnsLoaded(Vec<ipc::TurnStateView>),
     TurnStateLoaded(ipc::TurnAttachResponse),
     ModelsLoaded(Vec<ipc::ModelSummary>),
@@ -176,6 +177,10 @@ pub enum UiEvent {
     AssignmentLifecycle {
         action: ipc::AssignmentLifecycleAction,
         assignment: ipc::AssignmentSummary,
+    },
+    CodexAssignmentLifecycle {
+        action: ipc::CodexAssignmentLifecycleAction,
+        assignment: ipc::CodexThreadAssignmentSummary,
     },
     ReportRecorded(ipc::ReportSummary),
     DecisionApplied(ipc::DecisionSummary),
@@ -219,6 +224,9 @@ impl UiEvent {
             }
             ipc::DaemonEvent::AssignmentLifecycle { action, assignment } => {
                 Self::AssignmentLifecycle { action, assignment }
+            }
+            ipc::DaemonEvent::CodexAssignmentLifecycle { action, assignment } => {
+                Self::CodexAssignmentLifecycle { action, assignment }
             }
             ipc::DaemonEvent::ReportRecorded { report } => Self::ReportRecorded(report),
             ipc::DaemonEvent::DecisionApplied { decision } => Self::DecisionApplied(decision),
@@ -266,6 +274,7 @@ pub enum Effect {
     ScheduleReconnect,
     LoadActiveTurns,
     LoadThread { thread_id: String },
+    AttachThread { thread_id: String },
     LoadTurnState { thread_id: String, turn_id: String },
     LoadWorkUnitDetail { work_unit_id: String },
     SubmitPrompt { thread_id: String, text: String },
@@ -456,6 +465,12 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             {
                 effects.push(Effect::LoadThread { thread_id });
             }
+            if let Some(thread_id) = state.selected_thread_id.clone()
+                && let Some(thread) = state.thread_details.get(&thread_id)
+                && thread.summary.monitor_state != ipc::ThreadMonitorState::Attached
+            {
+                effects.push(Effect::AttachThread { thread_id });
+            }
             reconcile_collaboration_selection(state);
             effects.extend(load_selected_work_unit_detail_if_needed(state));
             effects.push(Effect::LoadActiveTurns);
@@ -503,7 +518,27 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
                 thread_id: thread_id.clone(),
                 turn_id,
             }));
+            if state.thread_details.get(&thread_id).is_some_and(|thread| {
+                thread.summary.monitor_state != ipc::ThreadMonitorState::Attached
+            }) {
+                effects.push(Effect::AttachThread { thread_id });
+            }
             state.banner = None;
+        }
+        UiEvent::ThreadAttached(response) => {
+            if let Some(thread) = response.thread {
+                let thread_id = thread.summary.id.clone();
+                upsert_thread_summary(&mut state.threads, thread.summary.clone());
+                state.thread_details.insert(thread_id, thread);
+            }
+            if !response.attached
+                && let Some(reason) = response.reason
+            {
+                state.banner = Some(StatusBanner {
+                    level: BannerLevel::Warning,
+                    message: format!("Live attach unavailable: {reason}"),
+                });
+            }
         }
         UiEvent::ActiveTurnsLoaded(turns) => {
             state.turn_states.retain(|_, turn| !turn.attachable);
@@ -623,6 +658,8 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
                 }
                 if !state.thread_details.contains_key(&thread_id) {
                     effects.push(Effect::LoadThread { thread_id });
+                } else {
+                    effects.push(Effect::AttachThread { thread_id });
                 }
             }
         }
@@ -663,6 +700,12 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             if selected {
                 effects.extend(load_selected_work_unit_detail(state));
             }
+        }
+        UiEvent::CodexAssignmentLifecycle { assignment, .. } => {
+            upsert_codex_assignment_summary(
+                &mut state.collaboration.codex_thread_assignments,
+                assignment,
+            );
         }
         UiEvent::ReportRecorded(report) => {
             let selected =
@@ -785,8 +828,12 @@ fn select_relative_thread(state: &mut AppState, delta: isize) -> Vec<Effect> {
 
 fn select_thread(state: &mut AppState, thread_id: String) -> Vec<Effect> {
     state.selected_thread_id = Some(thread_id.clone());
-    if state.thread_details.contains_key(&thread_id) {
-        Vec::new()
+    if let Some(thread) = state.thread_details.get(&thread_id) {
+        if thread.summary.monitor_state != ipc::ThreadMonitorState::Attached {
+            vec![Effect::AttachThread { thread_id }]
+        } else {
+            Vec::new()
+        }
     } else {
         vec![Effect::LoadThread { thread_id }]
     }
@@ -985,14 +1032,24 @@ fn ensure_thread_detail(state: &mut AppState, thread_id: &str) {
             created_at: 0,
             updated_at: 0,
             scope: "live_observed".to_string(),
+            archived: false,
+            loaded_status: ipc::ThreadLoadedStatus::Unknown,
+            active_flags: Vec::new(),
+            active_turn_id: None,
+            last_seen_turn_id: None,
             recent_output: None,
             recent_event: None,
             turn_in_flight: false,
+            monitor_state: ipc::ThreadMonitorState::Detached,
+            last_sync_at: chrono::Utc::now(),
+            source_kind: None,
+            raw_summary: None,
         });
     state.thread_details.insert(
         thread_id.to_string(),
         ipc::ThreadView {
             summary,
+            history_loaded: false,
             turns: Vec::new(),
         },
     );
@@ -1052,6 +1109,12 @@ fn ensure_turn<'a>(thread: &'a mut ipc::ThreadView, turn_id: &str) -> &'a mut ip
         id: turn_id.to_string(),
         status: "in_progress".to_string(),
         error_message: None,
+        error_summary: None,
+        started_at: None,
+        completed_at: None,
+        latest_diff: None,
+        latest_plan_snapshot: None,
+        token_usage_snapshot: None,
         items: Vec::new(),
     });
     let index = thread.turns.len() - 1;
@@ -1067,6 +1130,8 @@ fn ensure_item<'a>(turn: &'a mut ipc::TurnView, item_id: &str) -> &'a mut ipc::I
         item_type: "agent_message".to_string(),
         status: None,
         text: None,
+        summary: None,
+        payload: None,
     });
     let index = turn.items.len() - 1;
     &mut turn.items[index]
@@ -1080,6 +1145,24 @@ fn upsert_turn(thread: &mut ipc::ThreadView, turn: ipc::TurnView) {
     {
         existing.status = turn.status;
         existing.error_message = turn.error_message;
+        if turn.error_summary.is_some() {
+            existing.error_summary = turn.error_summary;
+        }
+        if turn.started_at.is_some() {
+            existing.started_at = turn.started_at;
+        }
+        if turn.completed_at.is_some() {
+            existing.completed_at = turn.completed_at;
+        }
+        if turn.latest_diff.is_some() {
+            existing.latest_diff = turn.latest_diff;
+        }
+        if turn.latest_plan_snapshot.is_some() {
+            existing.latest_plan_snapshot = turn.latest_plan_snapshot;
+        }
+        if turn.token_usage_snapshot.is_some() {
+            existing.token_usage_snapshot = turn.token_usage_snapshot;
+        }
         for item in turn.items {
             upsert_item(existing, item);
         }
@@ -1100,6 +1183,12 @@ fn upsert_item(turn: &mut ipc::TurnView, item: ipc::ItemView) {
         }
         if item.text.is_some() {
             existing.text = item.text;
+        }
+        if item.summary.is_some() {
+            existing.summary = item.summary;
+        }
+        if item.payload.is_some() {
+            existing.payload = item.payload;
         }
         return;
     }
@@ -1180,6 +1269,26 @@ fn upsert_assignment_summary(
     });
 }
 
+fn upsert_codex_assignment_summary(
+    assignments: &mut Vec<ipc::CodexThreadAssignmentSummary>,
+    summary: ipc::CodexThreadAssignmentSummary,
+) {
+    if let Some(existing) = assignments
+        .iter_mut()
+        .find(|assignment| assignment.assignment_id == summary.assignment_id)
+    {
+        *existing = summary;
+    } else {
+        assignments.push(summary);
+    }
+    assignments.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.assignment_id.cmp(&right.assignment_id))
+    });
+}
+
 fn upsert_report_summary(reports: &mut Vec<ipc::ReportSummary>, summary: ipc::ReportSummary) {
     if let Some(existing) = reports.iter_mut().find(|report| report.id == summary.id) {
         *existing = summary;
@@ -1238,6 +1347,22 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
             "thread",
             format!("loaded thread {}", thread.summary.id),
             Some(thread.summary.id.clone()),
+            None,
+        ),
+        UiEvent::ThreadAttached(response) => (
+            "thread_attach",
+            if response.attached {
+                "thread live attach confirmed".to_string()
+            } else {
+                response
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "thread live attach unavailable".to_string())
+            },
+            response
+                .thread
+                .as_ref()
+                .map(|thread| thread.summary.id.clone()),
             None,
         ),
         UiEvent::ActiveTurnsLoaded(turns) => (
@@ -1322,6 +1447,16 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
             None,
             None,
         ),
+        UiEvent::CodexAssignmentLifecycle { action, assignment } => (
+            "codex_assignment",
+            format!(
+                "assignment {} {}",
+                assignment.assignment_id,
+                codex_assignment_action_label(*action)
+            ),
+            Some(assignment.codex_thread_id.clone()),
+            assignment.latest_basis_turn_id.clone(),
+        ),
         UiEvent::ReportRecorded(report) => (
             "report",
             format!("report {} {:?}", report.id, report.parse_result),
@@ -1399,6 +1534,16 @@ fn assignment_action_label(action: ipc::AssignmentLifecycleAction) -> &'static s
         ipc::AssignmentLifecycleAction::Closed => "closed",
         ipc::AssignmentLifecycleAction::Interrupted => "interrupted",
         ipc::AssignmentLifecycleAction::Failed => "failed",
+    }
+}
+
+fn codex_assignment_action_label(action: ipc::CodexAssignmentLifecycleAction) -> &'static str {
+    match action {
+        ipc::CodexAssignmentLifecycleAction::Created => "created",
+        ipc::CodexAssignmentLifecycleAction::Paused => "paused",
+        ipc::CodexAssignmentLifecycleAction::Resumed => "resumed",
+        ipc::CodexAssignmentLifecycleAction::Released => "released",
+        ipc::CodexAssignmentLifecycleAction::Updated => "updated",
     }
 }
 

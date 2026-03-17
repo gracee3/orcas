@@ -27,6 +27,7 @@ use orcas_core::jsonrpc::{
 use orcas_core::{
     AppConfig, AppPaths, Assignment, AssignmentCommunicationPacket, AssignmentCommunicationRecord,
     AssignmentCommunicationSeed, AssignmentModeSpec, AssignmentStatus, CodexConnectionMode,
+    CodexThreadAssignment, CodexThreadAssignmentStatus, CodexThreadBootstrapState,
     CollaborationState, ConnectionState, Decision, DecisionType, DraftAssignment, EventEnvelope,
     ImplementModeSpec, JsonSessionStore, OrcasError, OrcasEvent, OrcasResult, OrcasSessionStore,
     Report, SupervisorContextPack, SupervisorProposal, SupervisorProposalFailure,
@@ -282,14 +283,23 @@ impl OrcasDaemonService {
             status: "disconnected".to_string(),
             detail: None,
         };
-        state.threads = stored
-            .registry
-            .threads
-            .values()
-            .map(|metadata| {
-                let view = Self::thread_view_from_metadata(metadata);
-                (view.summary.id.clone(), view)
-            })
+        state.threads = if stored.thread_views.is_empty() {
+            stored
+                .registry
+                .threads
+                .values()
+                .map(|metadata| {
+                    let view = Self::thread_view_from_metadata(metadata);
+                    (view.summary.id.clone(), view)
+                })
+                .collect()
+        } else {
+            stored.thread_views.into_iter().collect()
+        };
+        state.turns = stored
+            .turn_states
+            .into_values()
+            .map(|turn| (TurnKey::new(&turn.thread_id, &turn.turn_id), turn))
             .collect();
         state.recent_thread_id = state
             .threads
@@ -449,6 +459,10 @@ impl OrcasDaemonService {
                 let _: ipc::ThreadsListScopedRequest = Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.threads_list_scoped().await?)?
             }
+            ipc::methods::THREADS_LIST_LOADED => {
+                let _: ipc::ThreadsListLoadedRequest = Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.threads_list_loaded().await?)?
+            }
             ipc::methods::THREAD_START => {
                 let params: ipc::ThreadStartRequest = Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.thread_start(params).await?)?
@@ -457,9 +471,22 @@ impl OrcasDaemonService {
                 let params: ipc::ThreadReadRequest = Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.thread_read(params).await?)?
             }
+            ipc::methods::THREAD_READ_HISTORY => {
+                let params: ipc::ThreadReadHistoryRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.thread_read_history(params).await?)?
+            }
             ipc::methods::THREAD_GET => {
                 let params: ipc::ThreadGetRequest = Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.thread_get(params).await?)?
+            }
+            ipc::methods::THREAD_ATTACH => {
+                let params: ipc::ThreadAttachRequest = Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.thread_attach(params).await?)?
+            }
+            ipc::methods::THREAD_DETACH => {
+                let params: ipc::ThreadDetachRequest = Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.thread_detach(params).await?)?
             }
             ipc::methods::THREAD_RESUME => {
                 let params: ipc::ThreadResumeRequest = Self::decode_params(request.params.clone())?;
@@ -527,6 +554,36 @@ impl OrcasDaemonService {
                 let params: ipc::AssignmentGetRequest =
                     Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.assignment_get(params).await?)?
+            }
+            ipc::methods::CODEX_ASSIGNMENT_CREATE => {
+                let params: ipc::CodexAssignmentCreateRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.codex_assignment_create(params).await?)?
+            }
+            ipc::methods::CODEX_ASSIGNMENT_GET => {
+                let params: ipc::CodexAssignmentGetRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.codex_assignment_get(params).await?)?
+            }
+            ipc::methods::CODEX_ASSIGNMENT_LIST => {
+                let params: ipc::CodexAssignmentListRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.codex_assignment_list(params).await?)?
+            }
+            ipc::methods::CODEX_ASSIGNMENT_PAUSE => {
+                let params: ipc::CodexAssignmentPauseRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.codex_assignment_pause(params).await?)?
+            }
+            ipc::methods::CODEX_ASSIGNMENT_RESUME => {
+                let params: ipc::CodexAssignmentResumeRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.codex_assignment_resume(params).await?)?
+            }
+            ipc::methods::CODEX_ASSIGNMENT_RELEASE => {
+                let params: ipc::CodexAssignmentReleaseRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.codex_assignment_release(params).await?)?
             }
             ipc::methods::ASSIGNMENT_COMMUNICATION_GET => {
                 let params: ipc::AssignmentCommunicationGetRequest =
@@ -677,6 +734,22 @@ impl OrcasDaemonService {
         })
     }
 
+    async fn threads_list_loaded(&self) -> OrcasResult<ipc::ThreadsListResponse> {
+        let mut data = self
+            .known_thread_summaries()
+            .await
+            .into_iter()
+            .filter(|thread| thread.loaded_status != ipc::ThreadLoadedStatus::NotLoaded)
+            .collect::<Vec<_>>();
+        data.sort_by(|left, right| {
+            right
+                .last_sync_at
+                .cmp(&left.last_sync_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(ipc::ThreadsListResponse { data })
+    }
+
     async fn thread_start(
         &self,
         params: ipc::ThreadStartRequest,
@@ -705,6 +778,8 @@ impl OrcasDaemonService {
                 Some("orcas_managed"),
             )
             .await?;
+        self.set_thread_monitor_state(&view.summary.id, ipc::ThreadMonitorState::Attached)
+            .await?;
         self.set_active_thread(&view.summary.id).await;
         Ok(ipc::ThreadStartResponse {
             thread: view.summary,
@@ -727,6 +802,21 @@ impl OrcasDaemonService {
             .sync_thread(&response.thread, None, Some("live_observed"))
             .await?;
         Ok(ipc::ThreadReadResponse { thread: view })
+    }
+
+    async fn thread_read_history(
+        &self,
+        params: ipc::ThreadReadHistoryRequest,
+    ) -> OrcasResult<ipc::ThreadReadHistoryResponse> {
+        let response = self
+            .thread_read(ipc::ThreadReadRequest {
+                thread_id: params.thread_id,
+                include_turns: true,
+            })
+            .await?;
+        Ok(ipc::ThreadReadHistoryResponse {
+            thread: response.thread,
+        })
     }
 
     async fn thread_get(
@@ -786,9 +876,101 @@ impl OrcasDaemonService {
                 Some("orcas_managed"),
             )
             .await?;
+        self.set_thread_monitor_state(&view.summary.id, ipc::ThreadMonitorState::Attached)
+            .await?;
         self.set_active_thread(&view.summary.id).await;
         Ok(ipc::ThreadResumeResponse {
             thread: view.summary,
+        })
+    }
+
+    async fn thread_attach(
+        &self,
+        params: ipc::ThreadAttachRequest,
+    ) -> OrcasResult<ipc::ThreadAttachResponse> {
+        if let Some(thread) = self.thread_from_state(&params.thread_id).await
+            && thread.summary.monitor_state == ipc::ThreadMonitorState::Attached
+        {
+            return Ok(ipc::ThreadAttachResponse {
+                thread: Some(thread),
+                attached: true,
+                reason: None,
+            });
+        }
+
+        self.set_thread_monitor_state(&params.thread_id, ipc::ThreadMonitorState::Attaching)
+            .await?;
+        self.connect_upstream().await?;
+
+        let response = self
+            .codex_client
+            .thread_resume(types::ThreadResumeParams {
+                thread_id: params.thread_id.clone(),
+                cwd: params.cwd.or_else(|| {
+                    self.config
+                        .defaults
+                        .cwd
+                        .clone()
+                        .map(|path| path.display().to_string())
+                }),
+                model: params.model.or_else(|| self.config.defaults.model.clone()),
+                approval_policy: Some(types::AskForApproval::default()),
+                approvals_reviewer: None,
+                sandbox: None,
+                config: None,
+                base_instructions: None,
+                developer_instructions: None,
+                persist_extended_history: true,
+            })
+            .await;
+
+        match response {
+            Ok(response) => {
+                let view = self
+                    .sync_thread(
+                        &response.thread,
+                        Some(response.model),
+                        Some("live_observed"),
+                    )
+                    .await?;
+                self.set_thread_monitor_state(&view.summary.id, ipc::ThreadMonitorState::Attached)
+                    .await?;
+                Ok(ipc::ThreadAttachResponse {
+                    thread: self.thread_from_state(&view.summary.id).await,
+                    attached: true,
+                    reason: None,
+                })
+            }
+            Err(error) => {
+                self.set_thread_monitor_state(&params.thread_id, ipc::ThreadMonitorState::Errored)
+                    .await?;
+                Ok(ipc::ThreadAttachResponse {
+                    thread: self.thread_from_state(&params.thread_id).await,
+                    attached: false,
+                    reason: Some(error.to_string()),
+                })
+            }
+        }
+    }
+
+    async fn thread_detach(
+        &self,
+        params: ipc::ThreadDetachRequest,
+    ) -> OrcasResult<ipc::ThreadDetachResponse> {
+        let Some(thread) = self.thread_from_state(&params.thread_id).await else {
+            return Ok(ipc::ThreadDetachResponse {
+                thread: None,
+                detached: false,
+                reason: Some("thread was not found in the Orcas mirror".to_string()),
+            });
+        };
+
+        self.set_thread_monitor_state(&params.thread_id, ipc::ThreadMonitorState::Detached)
+            .await?;
+        Ok(ipc::ThreadDetachResponse {
+            thread: self.thread_from_state(&thread.summary.id).await,
+            detached: true,
+            reason: None,
         })
     }
 
@@ -1757,6 +1939,297 @@ impl OrcasDaemonService {
             worker_session,
             report,
         })
+    }
+
+    async fn codex_assignment_create(
+        &self,
+        params: ipc::CodexAssignmentCreateRequest,
+    ) -> OrcasResult<ipc::CodexAssignmentCreateResponse> {
+        if params.codex_thread_id.trim().is_empty()
+            || params.workstream_id.trim().is_empty()
+            || params.work_unit_id.trim().is_empty()
+            || params.supervisor_id.trim().is_empty()
+            || params.assigned_by.trim().is_empty()
+        {
+            return Err(OrcasError::Protocol(
+                "codex assignment create requires non-empty thread, workstream, work unit, supervisor, and assigned_by fields".to_string(),
+            ));
+        }
+
+        let thread = self
+            .thread_from_state(&params.codex_thread_id)
+            .await
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!(
+                    "unknown Codex thread `{}`; discover or load the thread before assigning it",
+                    params.codex_thread_id
+                ))
+            })?;
+
+        let assignment = {
+            let now = Utc::now();
+            let mut state = self.state.write().await;
+            let workstream = state
+                .collaboration
+                .workstreams
+                .get(&params.workstream_id)
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown workstream `{}`", params.workstream_id))
+                })?;
+            let work_unit = state
+                .collaboration
+                .work_units
+                .get(&params.work_unit_id)
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown work unit `{}`", params.work_unit_id))
+                })?;
+            if work_unit.workstream_id != workstream.id {
+                return Err(OrcasError::Protocol(format!(
+                    "work unit `{}` does not belong to workstream `{}`",
+                    params.work_unit_id, params.workstream_id
+                )));
+            }
+            if let Some(conflict) =
+                state
+                    .collaboration
+                    .codex_thread_assignments
+                    .values()
+                    .find(|assignment| {
+                        assignment.codex_thread_id == params.codex_thread_id
+                            && Self::codex_assignment_status_is_active(assignment.status)
+                    })
+            {
+                return Err(OrcasError::Protocol(format!(
+                    "Codex thread `{}` already has active assignment `{}`",
+                    params.codex_thread_id, conflict.assignment_id
+                )));
+            }
+
+            let assignment = CodexThreadAssignment {
+                assignment_id: Self::new_object_id("cta"),
+                codex_thread_id: params.codex_thread_id,
+                workstream_id: params.workstream_id,
+                work_unit_id: params.work_unit_id,
+                supervisor_id: params.supervisor_id,
+                assigned_by: params.assigned_by,
+                assigned_at: now,
+                updated_at: now,
+                status: CodexThreadAssignmentStatus::Active,
+                send_policy: params.send_policy.unwrap_or_default(),
+                bootstrap_state: Self::codex_assignment_bootstrap_state_for_thread(&thread),
+                latest_basis_turn_id: thread.summary.last_seen_turn_id.clone(),
+                latest_decision_id: None,
+                notes: params.notes,
+            };
+            state
+                .collaboration
+                .codex_thread_assignments
+                .insert(assignment.assignment_id.clone(), assignment.clone());
+            assignment
+        };
+        self.persist_collaboration_state().await?;
+        self.emit_codex_assignment_lifecycle(
+            ipc::CodexAssignmentLifecycleAction::Created,
+            &assignment,
+        )
+        .await;
+        Ok(ipc::CodexAssignmentCreateResponse { assignment })
+    }
+
+    async fn codex_assignment_get(
+        &self,
+        params: ipc::CodexAssignmentGetRequest,
+    ) -> OrcasResult<ipc::CodexAssignmentGetResponse> {
+        let assignment = self
+            .state
+            .read()
+            .await
+            .collaboration
+            .codex_thread_assignments
+            .get(&params.assignment_id)
+            .cloned()
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!(
+                    "unknown Codex thread assignment `{}`",
+                    params.assignment_id
+                ))
+            })?;
+        Ok(ipc::CodexAssignmentGetResponse { assignment })
+    }
+
+    async fn codex_assignment_list(
+        &self,
+        params: ipc::CodexAssignmentListRequest,
+    ) -> OrcasResult<ipc::CodexAssignmentListResponse> {
+        let state = self.state.read().await;
+        let mut assignments = state
+            .collaboration
+            .codex_thread_assignments
+            .values()
+            .filter(|assignment| {
+                params
+                    .codex_thread_id
+                    .as_ref()
+                    .map(|thread_id| &assignment.codex_thread_id == thread_id)
+                    .unwrap_or(true)
+                    && params
+                        .workstream_id
+                        .as_ref()
+                        .map(|workstream_id| &assignment.workstream_id == workstream_id)
+                        .unwrap_or(true)
+                    && params
+                        .work_unit_id
+                        .as_ref()
+                        .map(|work_unit_id| &assignment.work_unit_id == work_unit_id)
+                        .unwrap_or(true)
+                    && (params.include_inactive
+                        || Self::codex_assignment_status_is_active(assignment.status))
+            })
+            .map(Self::codex_assignment_summary)
+            .collect::<Vec<_>>();
+        assignments.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.assignment_id.cmp(&right.assignment_id))
+        });
+        Ok(ipc::CodexAssignmentListResponse { assignments })
+    }
+
+    async fn codex_assignment_pause(
+        &self,
+        params: ipc::CodexAssignmentPauseRequest,
+    ) -> OrcasResult<ipc::CodexAssignmentPauseResponse> {
+        let assignment = {
+            let now = Utc::now();
+            let mut state = self.state.write().await;
+            let assignment = state
+                .collaboration
+                .codex_thread_assignments
+                .get_mut(&params.assignment_id)
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "unknown Codex thread assignment `{}`",
+                        params.assignment_id
+                    ))
+                })?;
+            if !matches!(
+                assignment.status,
+                CodexThreadAssignmentStatus::Active | CodexThreadAssignmentStatus::Proposed
+            ) {
+                return Err(OrcasError::Protocol(format!(
+                    "Codex thread assignment `{}` can only be paused from active/proposed state",
+                    params.assignment_id
+                )));
+            }
+            assignment.status = CodexThreadAssignmentStatus::Paused;
+            assignment.updated_at = now;
+            Self::merge_assignment_notes(&mut assignment.notes, params.notes);
+            assignment.clone()
+        };
+        self.persist_collaboration_state().await?;
+        self.emit_codex_assignment_lifecycle(
+            ipc::CodexAssignmentLifecycleAction::Paused,
+            &assignment,
+        )
+        .await;
+        Ok(ipc::CodexAssignmentPauseResponse { assignment })
+    }
+
+    async fn codex_assignment_resume(
+        &self,
+        params: ipc::CodexAssignmentResumeRequest,
+    ) -> OrcasResult<ipc::CodexAssignmentResumeResponse> {
+        let assignment = {
+            let now = Utc::now();
+            let mut state = self.state.write().await;
+            let existing = state
+                .collaboration
+                .codex_thread_assignments
+                .get(&params.assignment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "unknown Codex thread assignment `{}`",
+                        params.assignment_id
+                    ))
+                })?;
+            if existing.status != CodexThreadAssignmentStatus::Paused {
+                return Err(OrcasError::Protocol(format!(
+                    "Codex thread assignment `{}` can only be resumed from paused state",
+                    params.assignment_id
+                )));
+            }
+            if let Some(conflict) =
+                state
+                    .collaboration
+                    .codex_thread_assignments
+                    .values()
+                    .find(|assignment| {
+                        assignment.assignment_id != params.assignment_id
+                            && assignment.codex_thread_id == existing.codex_thread_id
+                            && Self::codex_assignment_status_is_active(assignment.status)
+                    })
+            {
+                return Err(OrcasError::Protocol(format!(
+                    "Codex thread `{}` already has active assignment `{}`",
+                    existing.codex_thread_id, conflict.assignment_id
+                )));
+            }
+            let assignment = state
+                .collaboration
+                .codex_thread_assignments
+                .get_mut(&params.assignment_id)
+                .expect("assignment exists");
+            assignment.status = CodexThreadAssignmentStatus::Active;
+            assignment.updated_at = now;
+            Self::merge_assignment_notes(&mut assignment.notes, params.notes);
+            assignment.clone()
+        };
+        self.persist_collaboration_state().await?;
+        self.emit_codex_assignment_lifecycle(
+            ipc::CodexAssignmentLifecycleAction::Resumed,
+            &assignment,
+        )
+        .await;
+        Ok(ipc::CodexAssignmentResumeResponse { assignment })
+    }
+
+    async fn codex_assignment_release(
+        &self,
+        params: ipc::CodexAssignmentReleaseRequest,
+    ) -> OrcasResult<ipc::CodexAssignmentReleaseResponse> {
+        let assignment = {
+            let now = Utc::now();
+            let mut state = self.state.write().await;
+            let assignment = state
+                .collaboration
+                .codex_thread_assignments
+                .get_mut(&params.assignment_id)
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "unknown Codex thread assignment `{}`",
+                        params.assignment_id
+                    ))
+                })?;
+            if assignment.status == CodexThreadAssignmentStatus::Released {
+                return Err(OrcasError::Protocol(format!(
+                    "Codex thread assignment `{}` is already released",
+                    params.assignment_id
+                )));
+            }
+            assignment.status = CodexThreadAssignmentStatus::Released;
+            assignment.updated_at = now;
+            Self::merge_assignment_notes(&mut assignment.notes, params.notes);
+            assignment.clone()
+        };
+        self.persist_collaboration_state().await?;
+        self.emit_codex_assignment_lifecycle(
+            ipc::CodexAssignmentLifecycleAction::Released,
+            &assignment,
+        )
+        .await;
+        Ok(ipc::CodexAssignmentReleaseResponse { assignment })
     }
 
     async fn assignment_communication_get(
@@ -3365,6 +3838,18 @@ impl OrcasDaemonService {
         .await;
     }
 
+    async fn emit_codex_assignment_lifecycle(
+        &self,
+        action: ipc::CodexAssignmentLifecycleAction,
+        assignment: &CodexThreadAssignment,
+    ) {
+        self.emit(ipc::DaemonEvent::CodexAssignmentLifecycle {
+            action,
+            assignment: Self::codex_assignment_summary(assignment),
+        })
+        .await;
+    }
+
     async fn emit_report_recorded(&self, report: &Report) {
         self.emit(ipc::DaemonEvent::ReportRecorded {
             report: Self::report_summary(report),
@@ -3476,6 +3961,18 @@ impl OrcasDaemonService {
                 .then_with(|| left.id.cmp(&right.id))
         });
 
+        let mut codex_thread_assignments = collaboration
+            .codex_thread_assignments
+            .values()
+            .map(Self::codex_assignment_summary)
+            .collect::<Vec<_>>();
+        codex_thread_assignments.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.assignment_id.cmp(&right.assignment_id))
+        });
+
         let mut reports = collaboration
             .reports
             .values()
@@ -3504,6 +4001,7 @@ impl OrcasDaemonService {
             workstreams,
             work_units,
             assignments,
+            codex_thread_assignments,
             reports,
             decisions,
         }
@@ -3546,6 +4044,61 @@ impl OrcasDaemonService {
             status: assignment.status,
             attempt_number: assignment.attempt_number,
             updated_at: assignment.updated_at,
+        }
+    }
+
+    fn codex_assignment_status_is_active(status: CodexThreadAssignmentStatus) -> bool {
+        matches!(
+            status,
+            CodexThreadAssignmentStatus::Proposed | CodexThreadAssignmentStatus::Active
+        )
+    }
+
+    fn codex_assignment_bootstrap_state_for_thread(
+        thread: &ipc::ThreadView,
+    ) -> CodexThreadBootstrapState {
+        if thread.summary.last_seen_turn_id.is_some() || thread.summary.active_turn_id.is_some() {
+            CodexThreadBootstrapState::Pending
+        } else {
+            CodexThreadBootstrapState::Pending
+        }
+    }
+
+    fn merge_assignment_notes(notes: &mut Option<String>, update: Option<String>) {
+        let Some(update) = update.map(|note| note.trim().to_string()) else {
+            return;
+        };
+        if update.is_empty() {
+            return;
+        }
+        match notes {
+            Some(existing) if !existing.trim().is_empty() => {
+                existing.push('\n');
+                existing.push_str(&update);
+            }
+            _ => *notes = Some(update),
+        }
+    }
+
+    fn codex_assignment_summary(
+        assignment: &CodexThreadAssignment,
+    ) -> ipc::CodexThreadAssignmentSummary {
+        ipc::CodexThreadAssignmentSummary {
+            assignment_id: assignment.assignment_id.clone(),
+            codex_thread_id: assignment.codex_thread_id.clone(),
+            workstream_id: assignment.workstream_id.clone(),
+            work_unit_id: assignment.work_unit_id.clone(),
+            supervisor_id: assignment.supervisor_id.clone(),
+            assigned_by: assignment.assigned_by.clone(),
+            assigned_at: assignment.assigned_at,
+            updated_at: assignment.updated_at,
+            status: assignment.status,
+            send_policy: assignment.send_policy,
+            bootstrap_state: assignment.bootstrap_state,
+            latest_basis_turn_id: assignment.latest_basis_turn_id.clone(),
+            latest_decision_id: assignment.latest_decision_id.clone(),
+            notes: assignment.notes.clone(),
+            active: Self::codex_assignment_status_is_active(assignment.status),
         }
     }
 
@@ -4046,11 +4599,45 @@ impl OrcasDaemonService {
                 updated_at,
                 status: thread.summary.status.clone(),
                 scope: thread.summary.scope.clone(),
+                archived: thread.summary.archived,
+                loaded_status: thread.summary.loaded_status,
+                active_flags: thread.summary.active_flags.clone(),
+                active_turn_id: thread.summary.active_turn_id.clone(),
+                last_seen_turn_id: thread.summary.last_seen_turn_id.clone(),
                 recent_output: thread.summary.recent_output.clone(),
                 recent_event: thread.summary.recent_event.clone(),
                 turn_in_flight: thread.summary.turn_in_flight,
+                monitor_state: thread.summary.monitor_state,
+                last_sync_at: thread.summary.last_sync_at,
+                source_kind: thread.summary.source_kind.clone(),
+                raw_summary: thread.summary.raw_summary.clone(),
             })
-            .await
+            .await?;
+        self.store.upsert_thread_view(thread.clone()).await
+    }
+
+    async fn persist_turn_state_view(&self, turn: &ipc::TurnStateView) -> OrcasResult<()> {
+        self.store.upsert_turn_state(turn.clone()).await
+    }
+
+    async fn set_thread_monitor_state(
+        &self,
+        thread_id: &str,
+        monitor_state: ipc::ThreadMonitorState,
+    ) -> OrcasResult<()> {
+        let maybe_thread = {
+            let mut state = self.state.write().await;
+            let Some(thread) = state.threads.get_mut(thread_id) else {
+                return Ok(());
+            };
+            thread.summary.monitor_state = monitor_state;
+            thread.summary.last_sync_at = Utc::now();
+            Some(thread.clone())
+        };
+        if let Some(thread) = maybe_thread.as_ref() {
+            self.persist_thread_view(thread, None).await?;
+        }
+        Ok(())
     }
 
     async fn thread_from_state(&self, thread_id: &str) -> Option<ipc::ThreadView> {
@@ -4118,7 +4705,7 @@ impl OrcasDaemonService {
     }
 
     async fn record_turn_started(&self, thread_id: &str, turn_id: &str, status: &str) {
-        let (session, turn, thread) = {
+        let (session, turn, thread, turn_state) = {
             let mut state = self.state.write().await;
             let (turn, thread_summary, turn_state) = {
                 let thread = Self::ensure_thread_entry(&mut state, thread_id);
@@ -4131,6 +4718,12 @@ impl OrcasDaemonService {
                         id: turn_id.to_string(),
                         status: status.to_string(),
                         error_message: None,
+                        error_summary: None,
+                        started_at: Some(Utc::now()),
+                        completed_at: None,
+                        latest_diff: None,
+                        latest_plan_snapshot: None,
+                        token_usage_snapshot: None,
                         items: Vec::new(),
                     },
                 );
@@ -4156,15 +4749,16 @@ impl OrcasDaemonService {
                     },
                 )
             };
-            Self::upsert_turn_state(&mut state, turn_state);
+            Self::upsert_turn_state(&mut state, turn_state.clone());
             Self::refresh_session_from_turns(&mut state);
             state.session.active_thread_id = Some(thread_id.to_string());
             state.recent_thread_id = Some(thread_id.to_string());
-            (state.session.clone(), turn, thread_summary)
+            (state.session.clone(), turn, thread_summary, turn_state)
         };
         if let Some(thread_view) = self.thread_from_state(thread_id).await.as_ref() {
             let _ = self.persist_thread_view(thread_view, None).await;
         }
+        let _ = self.persist_turn_state_view(&turn_state).await;
         self.emit(ipc::DaemonEvent::ThreadUpdated { thread }).await;
         self.emit(ipc::DaemonEvent::SessionChanged { session })
             .await;
@@ -4178,15 +4772,27 @@ impl OrcasDaemonService {
     async fn apply_codex_event(&self, envelope: EventEnvelope) {
         match envelope.event {
             OrcasEvent::ConnectionStateChanged(upstream) => {
-                let maybe_session = {
+                let (maybe_session, threads_to_persist, turns_to_persist) = {
                     let mut state = self.state.write().await;
                     state.upstream = upstream.clone();
                     if upstream.status != "connected" {
                         Self::mark_turns_lost(&mut state);
                     }
                     Self::refresh_session_from_turns(&mut state);
-                    state.session.clone()
+                    (
+                        state.session.clone(),
+                        state.threads.values().cloned().collect::<Vec<_>>(),
+                        state.turns.values().cloned().collect::<Vec<_>>(),
+                    )
                 };
+                if upstream.status != "connected" {
+                    for thread in &threads_to_persist {
+                        let _ = self.persist_thread_view(thread, None).await;
+                    }
+                    for turn in &turns_to_persist {
+                        let _ = self.persist_turn_state_view(turn).await;
+                    }
+                }
                 self.emit(ipc::DaemonEvent::UpstreamStatusChanged { upstream })
                     .await;
                 self.emit(ipc::DaemonEvent::SessionChanged {
@@ -4236,6 +4842,8 @@ impl OrcasDaemonService {
                     let summary = {
                         let thread = Self::ensure_thread_entry(&mut state, &thread_id);
                         thread.summary.status = status;
+                        thread.summary.loaded_status =
+                            Self::thread_loaded_status_from_label(&thread.summary.status);
                         thread.summary.recent_event =
                             Some(format!("thread {}", thread.summary.status));
                         Self::touch_thread(thread);
@@ -4260,7 +4868,7 @@ impl OrcasDaemonService {
                 turn_id,
                 status,
             } => {
-                let (session, turn, thread) = {
+                let (session, turn, thread, turn_state) = {
                     let mut state = self.state.write().await;
                     let (turn, thread_summary, turn_state) = {
                         let thread = Self::ensure_thread_entry(&mut state, &thread_id);
@@ -4272,6 +4880,12 @@ impl OrcasDaemonService {
                                 id: turn_id.clone(),
                                 status: status.clone(),
                                 error_message: None,
+                                error_summary: None,
+                                started_at: None,
+                                completed_at: Some(Utc::now()),
+                                latest_diff: None,
+                                latest_plan_snapshot: None,
+                                token_usage_snapshot: None,
                                 items: Vec::new(),
                             },
                         );
@@ -4297,17 +4911,18 @@ impl OrcasDaemonService {
                             },
                         )
                     };
-                    Self::upsert_turn_state(&mut state, turn_state);
+                    Self::upsert_turn_state(&mut state, turn_state.clone());
                     Self::refresh_session_from_turns(&mut state);
                     if state.session.active_turns.is_empty() {
                         state.session.active_thread_id = Some(thread_id.clone());
                     }
                     state.recent_thread_id = Some(thread_id.clone());
-                    (state.session.clone(), turn, thread_summary)
+                    (state.session.clone(), turn, thread_summary, turn_state)
                 };
                 if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
                     let _ = self.persist_thread_view(thread_view, None).await;
                 }
+                let _ = self.persist_turn_state_view(&turn_state).await;
                 self.emit(ipc::DaemonEvent::ThreadUpdated { thread }).await;
                 self.emit(ipc::DaemonEvent::SessionChanged { session })
                     .await;
@@ -4426,6 +5041,7 @@ impl OrcasDaemonService {
                 item.text
                     .get_or_insert_with(String::new)
                     .push_str(&text_delta);
+                item.summary = item.text.as_ref().map(|text| Self::truncate_snippet(text));
             }
             item.clone()
         };
@@ -4450,23 +5066,23 @@ impl OrcasDaemonService {
         let lifecycle = Self::turn_lifecycle_from_status(&turn_status);
         let attachable = !Self::is_final_turn_lifecycle(lifecycle);
         let live_stream = saw_delta || status.is_some();
-        Self::upsert_turn_state(
-            &mut state,
-            ipc::TurnStateView {
-                thread_id: thread_id.to_string(),
-                turn_id: turn_id.to_string(),
-                lifecycle,
-                status: turn_status.clone(),
-                attachable,
-                live_stream,
-                terminal: Self::is_terminal_status(&turn_status),
-                recent_output: live_output,
-                recent_event,
-                updated_at: Utc::now(),
-                error_message,
-            },
-        );
+        let turn_state = ipc::TurnStateView {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            lifecycle,
+            status: turn_status.clone(),
+            attachable,
+            live_stream,
+            terminal: Self::is_terminal_status(&turn_status),
+            recent_output: live_output,
+            recent_event,
+            updated_at: Utc::now(),
+            error_message,
+        };
+        Self::upsert_turn_state(&mut state, turn_state.clone());
         Self::refresh_session_from_turns(&mut state);
+        drop(state);
+        let _ = self.persist_turn_state_view(&turn_state).await;
         item
     }
 
@@ -4550,6 +5166,12 @@ impl OrcasDaemonService {
                 format!("assignment {} {:?}", assignment.id, action),
                 None,
                 None,
+            ),
+            ipc::DaemonEvent::CodexAssignmentLifecycle { action, assignment } => (
+                "codex_assignment",
+                format!("codex assignment {} {:?}", assignment.assignment_id, action),
+                Some(assignment.codex_thread_id.clone()),
+                assignment.latest_basis_turn_id.clone(),
             ),
             ipc::DaemonEvent::ReportRecorded { report } => (
                 "report",
@@ -4651,10 +5273,20 @@ impl OrcasDaemonService {
                 created_at: now,
                 updated_at: now,
                 scope: "live_observed".to_string(),
+                archived: false,
+                loaded_status: ipc::ThreadLoadedStatus::Unknown,
+                active_flags: Vec::new(),
+                active_turn_id: None,
+                last_seen_turn_id: None,
                 recent_output: None,
                 recent_event: None,
                 turn_in_flight: false,
+                monitor_state: ipc::ThreadMonitorState::Detached,
+                last_sync_at: Utc::now(),
+                source_kind: None,
+                raw_summary: None,
             },
+            history_loaded: false,
             turns: Vec::new(),
         }
     }
@@ -4679,10 +5311,20 @@ impl OrcasDaemonService {
                 } else {
                     metadata.scope.clone()
                 },
+                archived: metadata.archived,
+                loaded_status: metadata.loaded_status,
+                active_flags: metadata.active_flags.clone(),
+                active_turn_id: metadata.active_turn_id.clone(),
+                last_seen_turn_id: metadata.last_seen_turn_id.clone(),
                 recent_output: metadata.recent_output.clone(),
                 recent_event: metadata.recent_event.clone(),
                 turn_in_flight: metadata.turn_in_flight,
+                monitor_state: metadata.monitor_state,
+                last_sync_at: metadata.last_sync_at,
+                source_kind: metadata.source_kind.clone(),
+                raw_summary: metadata.raw_summary.clone(),
             },
+            history_loaded: false,
             turns: Vec::new(),
         }
     }
@@ -4692,6 +5334,10 @@ impl OrcasDaemonService {
         existing: Option<&ipc::ThreadView>,
         scope: Option<&str>,
     ) -> ipc::ThreadView {
+        let loaded_status = Self::thread_loaded_status_from_codex(&thread.status);
+        let active_flags = Self::thread_active_flags(&thread.status);
+        let source_kind = Self::thread_source_kind(thread.source.as_ref());
+        let raw_summary = serde_json::to_value(&thread).ok();
         let mut view = ipc::ThreadView {
             summary: ipc::ThreadSummary {
                 id: thread.id,
@@ -4707,12 +5353,35 @@ impl OrcasDaemonService {
                     .or_else(|| existing.map(|thread| thread.summary.scope.clone()))
                     .filter(|scope| !scope.is_empty())
                     .unwrap_or_else(|| "upstream_discovered".to_string()),
+                archived: thread
+                    .extra
+                    .get("archived")
+                    .and_then(Value::as_bool)
+                    .or_else(|| existing.map(|thread| thread.summary.archived))
+                    .unwrap_or(false),
+                loaded_status,
+                active_flags,
+                active_turn_id: existing.and_then(|thread| thread.summary.active_turn_id.clone()),
+                last_seen_turn_id: existing
+                    .and_then(|thread| thread.summary.last_seen_turn_id.clone()),
                 recent_output: existing.and_then(|thread| thread.summary.recent_output.clone()),
                 recent_event: existing.and_then(|thread| thread.summary.recent_event.clone()),
                 turn_in_flight: existing
                     .map(|thread| thread.summary.turn_in_flight)
                     .unwrap_or(false),
+                monitor_state: existing
+                    .map(|thread| thread.summary.monitor_state)
+                    .unwrap_or(ipc::ThreadMonitorState::Detached),
+                last_sync_at: Utc::now(),
+                source_kind: source_kind
+                    .or_else(|| existing.and_then(|thread| thread.summary.source_kind.clone())),
+                raw_summary: raw_summary
+                    .or_else(|| existing.and_then(|thread| thread.summary.raw_summary.clone())),
             },
+            history_loaded: !thread.turns.is_empty()
+                || existing
+                    .map(|thread| thread.history_loaded)
+                    .unwrap_or(false),
             turns: if thread.turns.is_empty() {
                 existing
                     .map(|thread| thread.turns.clone())
@@ -4730,42 +5399,84 @@ impl OrcasDaemonService {
     }
 
     fn turn_view_from_codex(turn: types::Turn) -> ipc::TurnView {
+        let error_summary = turn.error.as_ref().map(|error| {
+            error
+                .additional_details
+                .as_ref()
+                .map(|details| format!("{} ({details})", error.message))
+                .unwrap_or_else(|| error.message.clone())
+        });
+        let items = turn
+            .items
+            .into_iter()
+            .map(Self::item_view_from_codex)
+            .collect::<Vec<_>>();
         ipc::TurnView {
             id: turn.id,
             status: turn.status.label().to_string(),
             error_message: turn.error.map(|error| error.message),
-            items: turn
-                .items
-                .into_iter()
-                .map(|item| {
-                    let text = item.text().map(ToOwned::to_owned);
-                    ipc::ItemView {
-                        id: item.id,
-                        item_type: item.item_type,
-                        status: None,
-                        text,
-                    }
-                })
-                .collect(),
+            error_summary,
+            started_at: None,
+            completed_at: None,
+            latest_diff: Self::latest_diff_from_items(&items),
+            latest_plan_snapshot: Self::latest_plan_snapshot_from_items(&items),
+            token_usage_snapshot: Self::token_usage_snapshot_from_items(&items),
+            items,
+        }
+    }
+
+    fn item_view_from_codex(item: types::ThreadItem) -> ipc::ItemView {
+        let text = item.text().map(ToOwned::to_owned);
+        let payload = (!item.extra.is_empty()).then_some(Value::Object(item.extra));
+        let summary = text
+            .as_ref()
+            .map(|text| Self::truncate_snippet(text))
+            .or_else(|| payload.as_ref().map(Self::payload_summary));
+        ipc::ItemView {
+            id: item.id,
+            item_type: item.item_type,
+            status: None,
+            text,
+            summary,
+            payload,
         }
     }
 
     fn touch_thread(thread: &mut ipc::ThreadView) {
         thread.summary.updated_at = Utc::now().timestamp();
+        thread.summary.last_sync_at = Utc::now();
     }
 
     fn refresh_thread_summary(thread: &mut ipc::ThreadView) {
-        thread.summary.turn_in_flight = thread
+        thread.summary.last_seen_turn_id = thread.turns.last().map(|turn| turn.id.clone());
+        thread.summary.active_turn_id = thread
             .turns
             .iter()
-            .any(|turn| !Self::is_terminal_status(&turn.status));
+            .rev()
+            .find(|turn| !Self::is_terminal_status(&turn.status))
+            .map(|turn| turn.id.clone());
+        thread.summary.turn_in_flight = thread.summary.active_turn_id.is_some();
+        if thread.summary.turn_in_flight {
+            thread.summary.loaded_status = ipc::ThreadLoadedStatus::Active;
+        } else if thread.summary.loaded_status == ipc::ThreadLoadedStatus::Unknown {
+            thread.summary.loaded_status =
+                Self::thread_loaded_status_from_label(&thread.summary.status);
+        }
+        if let Some(turn) = thread
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| !Self::is_terminal_status(&turn.status))
+        {
+            thread.summary.active_flags = vec![format!("turn:{}", turn.id)];
+        }
         if let Some(output) = thread
             .turns
             .iter()
             .rev()
             .flat_map(|turn| turn.items.iter().rev())
-            .filter_map(|item| item.text.as_deref())
-            .find(|text| !text.trim().is_empty())
+            .find_map(|item| item.text.as_deref().or(item.summary.as_deref()))
+            .filter(|text| !text.trim().is_empty())
         {
             thread.summary.recent_output = Some(Self::truncate_snippet(output));
         }
@@ -4782,9 +5493,47 @@ impl OrcasDaemonService {
         let text = turn
             .items
             .iter()
-            .filter_map(|item| item.text.as_deref())
+            .filter_map(|item| item.text.as_deref().or(item.summary.as_deref()))
             .collect::<String>();
         (!text.is_empty()).then_some(Self::truncate_snippet(&text))
+    }
+
+    fn payload_summary(payload: &Value) -> String {
+        match payload {
+            Value::Object(map) if map.is_empty() => "empty payload".to_string(),
+            Value::Object(map) => {
+                let keys = map.keys().take(4).cloned().collect::<Vec<_>>().join(", ");
+                format!("payload keys: {keys}")
+            }
+            Value::Array(values) => format!("payload array ({} items)", values.len()),
+            other => Self::truncate_snippet(&other.to_string()),
+        }
+    }
+
+    fn latest_diff_from_items(items: &[ipc::ItemView]) -> Option<String> {
+        items.iter().rev().find_map(|item| {
+            (item.item_type.contains("diff") || item.item_type.contains("patch"))
+                .then(|| item.text.clone().or(item.summary.clone()))
+                .flatten()
+        })
+    }
+
+    fn latest_plan_snapshot_from_items(items: &[ipc::ItemView]) -> Option<Value> {
+        items.iter().rev().find_map(|item| {
+            item.item_type
+                .contains("plan")
+                .then(|| item.payload.clone())
+                .flatten()
+        })
+    }
+
+    fn token_usage_snapshot_from_items(items: &[ipc::ItemView]) -> Option<Value> {
+        items.iter().rev().find_map(|item| {
+            item.payload
+                .as_ref()
+                .and_then(|payload| payload.get("usage"))
+                .cloned()
+        })
     }
 
     fn truncate_snippet(text: &str) -> String {
@@ -4802,6 +5551,42 @@ impl OrcasDaemonService {
         } else {
             current.to_string()
         }
+    }
+
+    fn thread_loaded_status_from_codex(status: &types::ThreadStatus) -> ipc::ThreadLoadedStatus {
+        match status {
+            types::ThreadStatus::NotLoaded => ipc::ThreadLoadedStatus::NotLoaded,
+            types::ThreadStatus::Idle => ipc::ThreadLoadedStatus::Idle,
+            types::ThreadStatus::SystemError => ipc::ThreadLoadedStatus::SystemError,
+            types::ThreadStatus::Active { .. } => ipc::ThreadLoadedStatus::Active,
+        }
+    }
+
+    fn thread_loaded_status_from_label(label: &str) -> ipc::ThreadLoadedStatus {
+        match label {
+            "notLoaded" | "not_loaded" => ipc::ThreadLoadedStatus::NotLoaded,
+            "idle" => ipc::ThreadLoadedStatus::Idle,
+            "systemError" | "system_error" => ipc::ThreadLoadedStatus::SystemError,
+            "active" => ipc::ThreadLoadedStatus::Active,
+            _ => ipc::ThreadLoadedStatus::Unknown,
+        }
+    }
+
+    fn thread_active_flags(status: &types::ThreadStatus) -> Vec<String> {
+        match status {
+            types::ThreadStatus::Active { active_flags } => active_flags.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn thread_source_kind(source: Option<&Value>) -> Option<String> {
+        source.and_then(|value| {
+            value
+                .get("kind")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("type").and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+        })
     }
 
     fn turn_lifecycle_from_status(status: &str) -> ipc::TurnLifecycleState {
@@ -4838,6 +5623,24 @@ impl OrcasDaemonService {
             if turn.error_message.is_some() {
                 existing.error_message = turn.error_message;
             }
+            if turn.error_summary.is_some() {
+                existing.error_summary = turn.error_summary;
+            }
+            if turn.started_at.is_some() {
+                existing.started_at = turn.started_at;
+            }
+            if turn.completed_at.is_some() {
+                existing.completed_at = turn.completed_at;
+            }
+            if turn.latest_diff.is_some() {
+                existing.latest_diff = turn.latest_diff;
+            }
+            if turn.latest_plan_snapshot.is_some() {
+                existing.latest_plan_snapshot = turn.latest_plan_snapshot;
+            }
+            if turn.token_usage_snapshot.is_some() {
+                existing.token_usage_snapshot = turn.token_usage_snapshot;
+            }
             for item in turn.items {
                 let _ = Self::upsert_item(existing, item);
             }
@@ -4859,6 +5662,12 @@ impl OrcasDaemonService {
             if let Some(text) = item.text {
                 existing.text = Some(text);
             }
+            if let Some(summary) = item.summary {
+                existing.summary = Some(summary);
+            }
+            if let Some(payload) = item.payload {
+                existing.payload = Some(payload);
+            }
             if !item.item_type.is_empty() {
                 existing.item_type = item.item_type;
             }
@@ -4879,6 +5688,12 @@ impl OrcasDaemonService {
             id: turn_id.to_string(),
             status: "in_progress".to_string(),
             error_message: None,
+            error_summary: None,
+            started_at: None,
+            completed_at: None,
+            latest_diff: None,
+            latest_plan_snapshot: None,
+            token_usage_snapshot: None,
             items: Vec::new(),
         });
         let index = thread.turns.len() - 1;
@@ -4898,6 +5713,8 @@ impl OrcasDaemonService {
             item_type: item_type.to_string(),
             status: None,
             text: None,
+            summary: None,
+            payload: None,
         });
         let index = turn.items.len() - 1;
         &mut turn.items[index]
@@ -5151,13 +5968,14 @@ mod tests {
     };
     use orcas_core::{
         AppConfig, AppPaths, Assignment, AssignmentCommunicationSeed, AssignmentModeSpec,
-        AssignmentStatus, CollaborationState, DecisionType, DraftAssignment, ImplementModeSpec,
-        JsonSessionStore, OrcasError, OrcasResult, OrcasSessionStore, ProposedDecision, Report,
-        ReportConfidence, ReportDisposition, ReportParseResult, SupervisorContextPack,
-        SupervisorProposal, SupervisorProposalEdits, SupervisorProposalFailureStage,
-        SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorSummary, WorkUnit,
-        WorkUnitStatus, WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus,
-        Workstream, WorkstreamStatus, ipc,
+        AssignmentStatus, CodexThreadAssignmentStatus, CollaborationState, DecisionType,
+        DraftAssignment, EventEnvelope, ImplementModeSpec, JsonSessionStore, OrcasError,
+        OrcasEvent, OrcasResult, OrcasSessionStore, ProposedDecision, Report, ReportConfidence,
+        ReportDisposition, ReportParseResult, SupervisorContextPack, SupervisorProposal,
+        SupervisorProposalEdits, SupervisorProposalFailureStage, SupervisorProposalStatus,
+        SupervisorProposalTriggerKind, SupervisorSummary, WorkUnit, WorkUnitStatus,
+        WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, Workstream,
+        WorkstreamStatus, ipc,
     };
 
     #[derive(Debug)]
@@ -5326,6 +6144,35 @@ mod tests {
                         &inbound_tx,
                         request.id,
                         &types::ThreadReadResponse { thread },
+                    )
+                    .await?;
+                }
+                methods::THREAD_RESUME => {
+                    let params: types::ThreadResumeParams =
+                        serde_json::from_value(request.params.unwrap_or(Value::Null))?;
+                    let (thread, cwd) = {
+                        let mut state = state.lock().await;
+                        let thread = state.threads.get_mut(&params.thread_id).ok_or_else(|| {
+                            OrcasError::Protocol(format!(
+                                "fake codex runtime missing thread `{}`",
+                                params.thread_id
+                            ))
+                        })?;
+                        if let Some(cwd) = params.cwd.clone() {
+                            thread.cwd = cwd;
+                        }
+                        thread.updated_at = Utc::now().timestamp();
+                        (thread.clone(), thread.cwd.clone())
+                    };
+                    Self::send_response(
+                        &inbound_tx,
+                        request.id,
+                        &types::ThreadResumeResponse {
+                            thread,
+                            model: params.model.unwrap_or_else(|| "gpt-5.4".to_string()),
+                            model_provider: "openai".to_string(),
+                            cwd,
+                        },
                     )
                     .await?;
                 }
@@ -5822,12 +6669,54 @@ mod tests {
                 created_at: updated_at - 10,
                 updated_at,
                 scope: scope.to_string(),
+                archived: false,
+                loaded_status: ipc::ThreadLoadedStatus::Idle,
+                active_flags: Vec::new(),
+                active_turn_id: None,
+                last_seen_turn_id: None,
                 recent_output: None,
                 recent_event: None,
                 turn_in_flight: false,
+                monitor_state: ipc::ThreadMonitorState::Detached,
+                last_sync_at: Utc::now(),
+                source_kind: None,
+                raw_summary: None,
             },
+            history_loaded: false,
             turns: Vec::new(),
         }
+    }
+
+    async fn seed_codex_thread_assignment_fixture(
+        service: &Arc<OrcasDaemonService>,
+        thread: ipc::ThreadView,
+    ) -> (Workstream, WorkUnit) {
+        {
+            let mut state = service.state.write().await;
+            state
+                .threads
+                .insert(thread.summary.id.clone(), thread.clone());
+        }
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Codex assignment stream".to_string(),
+                objective: "Track one Codex thread assignment".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: "Codex assignment unit".to_string(),
+                task_statement: "Bind an external Codex thread.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        (workstream, work_unit)
     }
 
     fn extract_prompt_line_value(prompt: &str, prefix: &str) -> Option<String> {
@@ -8722,11 +9611,19 @@ ORCAS_REPORT_END"#
             id: "turn-1".to_string(),
             status: "in_progress".to_string(),
             error_message: None,
+            error_summary: None,
+            started_at: None,
+            completed_at: None,
+            latest_diff: None,
+            latest_plan_snapshot: None,
+            token_usage_snapshot: None,
             items: vec![ipc::ItemView {
                 id: "item-1".to_string(),
                 item_type: "agent_message".to_string(),
                 status: Some("streaming".to_string()),
                 text: Some("hello world".to_string()),
+                summary: Some("hello world".to_string()),
+                payload: None,
             }],
         });
 
@@ -8749,11 +9646,19 @@ ORCAS_REPORT_END"#
             id: "turn-1".to_string(),
             status: "in_progress".to_string(),
             error_message: None,
+            error_summary: None,
+            started_at: None,
+            completed_at: None,
+            latest_diff: None,
+            latest_plan_snapshot: None,
+            token_usage_snapshot: None,
             items: vec![ipc::ItemView {
                 id: "item-1".to_string(),
                 item_type: "agent_message".to_string(),
                 status: Some("streaming".to_string()),
                 text: Some("partial output".to_string()),
+                summary: Some("partial output".to_string()),
+                payload: None,
             }],
         });
         state.threads.insert("thread-1".to_string(), thread);
@@ -8798,11 +9703,19 @@ ORCAS_REPORT_END"#
             id: "turn-1".to_string(),
             status: "completed".to_string(),
             error_message: None,
+            error_summary: None,
+            started_at: None,
+            completed_at: None,
+            latest_diff: None,
+            latest_plan_snapshot: None,
+            token_usage_snapshot: None,
             items: vec![ipc::ItemView {
                 id: "item-1".to_string(),
                 item_type: "agent_message".to_string(),
                 status: Some("completed".to_string()),
                 text: Some("hello world".to_string()),
+                summary: Some("hello world".to_string()),
+                payload: None,
             }],
         });
 
@@ -8823,6 +9736,12 @@ ORCAS_REPORT_END"#
             id: "turn-2".to_string(),
             status: "in_progress".to_string(),
             error_message: None,
+            error_summary: None,
+            started_at: None,
+            completed_at: None,
+            latest_diff: None,
+            latest_plan_snapshot: None,
+            token_usage_snapshot: None,
             items: Vec::new(),
         });
 
@@ -8831,6 +9750,672 @@ ORCAS_REPORT_END"#
         assert_eq!(unknown_state.lifecycle, ipc::TurnLifecycleState::Unknown);
         assert!(!unknown_state.attachable);
         assert!(!unknown_state.live_stream);
+    }
+
+    #[tokio::test]
+    async fn read_history_discovers_and_persists_headless_external_thread() {
+        let (service, runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        runtime.lock().await.threads.insert(
+            "thread-headless".to_string(),
+            types::Thread {
+                id: "thread-headless".to_string(),
+                preview: "headless preview".to_string(),
+                ephemeral: false,
+                model_provider: "openai".to_string(),
+                created_at: 10,
+                updated_at: 20,
+                status: types::ThreadStatus::Idle,
+                path: None,
+                cwd: "/tmp/headless".to_string(),
+                cli_version: "test".to_string(),
+                source: Some(serde_json::json!({ "kind": "headless" })),
+                name: Some("Headless".to_string()),
+                turns: vec![types::Turn {
+                    id: "turn-headless-1".to_string(),
+                    items: vec![types::ThreadItem {
+                        id: "item-headless-1".to_string(),
+                        item_type: "agent_message".to_string(),
+                        extra: Map::from_iter([(
+                            "text".to_string(),
+                            Value::String("persisted history".to_string()),
+                        )]),
+                    }],
+                    status: types::TurnStatus::Completed,
+                    error: None,
+                }],
+                extra: Map::new(),
+            },
+        );
+
+        let listed = service.threads_list().await.expect("list threads");
+        assert!(
+            listed
+                .data
+                .iter()
+                .any(|thread| thread.id == "thread-headless")
+        );
+
+        let response = service
+            .thread_read_history(ipc::ThreadReadHistoryRequest {
+                thread_id: "thread-headless".to_string(),
+            })
+            .await
+            .expect("read history");
+        assert!(response.thread.history_loaded);
+        assert_eq!(response.thread.turns.len(), 1);
+        assert_eq!(
+            response.thread.turns[0].items[0].text.as_deref(),
+            Some("persisted history")
+        );
+        assert_eq!(
+            response.thread.summary.source_kind.as_deref(),
+            Some("headless")
+        );
+
+        let stored = service.store.load().await.expect("stored thread mirror");
+        let persisted = stored
+            .thread_views
+            .get("thread-headless")
+            .expect("persisted headless thread");
+        assert!(persisted.history_loaded);
+        assert_eq!(persisted.turns.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn attach_and_detach_update_monitor_state_without_dropping_thread_history() {
+        let (service, runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        runtime.lock().await.threads.insert(
+            "thread-headless".to_string(),
+            types::Thread {
+                id: "thread-headless".to_string(),
+                preview: "headless preview".to_string(),
+                ephemeral: false,
+                model_provider: "openai".to_string(),
+                created_at: 10,
+                updated_at: 20,
+                status: types::ThreadStatus::Idle,
+                path: None,
+                cwd: "/tmp/headless".to_string(),
+                cli_version: "test".to_string(),
+                source: Some(serde_json::json!({ "kind": "headless" })),
+                name: Some("Headless".to_string()),
+                turns: Vec::new(),
+                extra: Map::new(),
+            },
+        );
+
+        service.threads_list().await.expect("discover thread");
+        let attached = service
+            .thread_attach(ipc::ThreadAttachRequest {
+                thread_id: "thread-headless".to_string(),
+                cwd: None,
+                model: None,
+            })
+            .await
+            .expect("attach");
+        assert!(attached.attached);
+        assert_eq!(
+            attached
+                .thread
+                .as_ref()
+                .expect("attached thread")
+                .summary
+                .monitor_state,
+            ipc::ThreadMonitorState::Attached
+        );
+
+        let detached = service
+            .thread_detach(ipc::ThreadDetachRequest {
+                thread_id: "thread-headless".to_string(),
+            })
+            .await
+            .expect("detach");
+        assert!(detached.detached);
+        assert_eq!(
+            detached
+                .thread
+                .as_ref()
+                .expect("detached thread")
+                .summary
+                .monitor_state,
+            ipc::ThreadMonitorState::Detached
+        );
+
+        let persisted = service
+            .thread_get(ipc::ThreadGetRequest {
+                thread_id: "thread-headless".to_string(),
+            })
+            .await
+            .expect("thread still queryable")
+            .thread;
+        assert_eq!(persisted.summary.id, "thread-headless");
+    }
+
+    #[tokio::test]
+    async fn attached_headless_thread_ingests_future_events() {
+        let (service, runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        runtime.lock().await.threads.insert(
+            "thread-headless".to_string(),
+            types::Thread {
+                id: "thread-headless".to_string(),
+                preview: "headless preview".to_string(),
+                ephemeral: false,
+                model_provider: "openai".to_string(),
+                created_at: 10,
+                updated_at: 20,
+                status: types::ThreadStatus::Idle,
+                path: None,
+                cwd: "/tmp/headless".to_string(),
+                cli_version: "test".to_string(),
+                source: Some(serde_json::json!({ "kind": "headless" })),
+                name: Some("Headless".to_string()),
+                turns: Vec::new(),
+                extra: Map::new(),
+            },
+        );
+
+        service.threads_list().await.expect("discover thread");
+        service
+            .thread_attach(ipc::ThreadAttachRequest {
+                thread_id: "thread-headless".to_string(),
+                cwd: None,
+                model: None,
+            })
+            .await
+            .expect("attach");
+
+        service
+            .apply_codex_event(EventEnvelope::new(
+                "test",
+                OrcasEvent::TurnStarted {
+                    thread_id: "thread-headless".to_string(),
+                    turn_id: "turn-live-1".to_string(),
+                },
+            ))
+            .await;
+        service
+            .apply_codex_event(EventEnvelope::new(
+                "test",
+                OrcasEvent::ItemStarted {
+                    thread_id: "thread-headless".to_string(),
+                    turn_id: "turn-live-1".to_string(),
+                    item_id: "item-live-1".to_string(),
+                    item_type: "agent_message".to_string(),
+                },
+            ))
+            .await;
+        service
+            .apply_codex_event(EventEnvelope::new(
+                "test",
+                OrcasEvent::AgentMessageDelta {
+                    thread_id: "thread-headless".to_string(),
+                    turn_id: "turn-live-1".to_string(),
+                    item_id: "item-live-1".to_string(),
+                    delta: "live text".to_string(),
+                },
+            ))
+            .await;
+        service
+            .apply_codex_event(EventEnvelope::new(
+                "test",
+                OrcasEvent::ItemCompleted {
+                    thread_id: "thread-headless".to_string(),
+                    turn_id: "turn-live-1".to_string(),
+                    item_id: "item-live-1".to_string(),
+                    item_type: "agent_message".to_string(),
+                },
+            ))
+            .await;
+        service
+            .apply_codex_event(EventEnvelope::new(
+                "test",
+                OrcasEvent::TurnCompleted {
+                    thread_id: "thread-headless".to_string(),
+                    turn_id: "turn-live-1".to_string(),
+                    status: "completed".to_string(),
+                },
+            ))
+            .await;
+
+        let thread = service
+            .thread_get(ipc::ThreadGetRequest {
+                thread_id: "thread-headless".to_string(),
+            })
+            .await
+            .expect("query thread")
+            .thread;
+        assert_eq!(thread.turns.len(), 1);
+        assert_eq!(thread.turns[0].items[0].text.as_deref(), Some("live text"));
+        let turn_state = service
+            .turn_get(ipc::TurnGetRequest {
+                thread_id: "thread-headless".to_string(),
+                turn_id: "turn-live-1".to_string(),
+            })
+            .await
+            .expect("turn state")
+            .turn
+            .expect("turn exists");
+        assert_eq!(turn_state.lifecycle, ipc::TurnLifecycleState::Completed);
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_persisted_headless_thread_history() {
+        let (service, runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        runtime.lock().await.threads.insert(
+            "thread-headless".to_string(),
+            types::Thread {
+                id: "thread-headless".to_string(),
+                preview: "headless preview".to_string(),
+                ephemeral: false,
+                model_provider: "openai".to_string(),
+                created_at: 10,
+                updated_at: 20,
+                status: types::ThreadStatus::Idle,
+                path: None,
+                cwd: "/tmp/headless".to_string(),
+                cli_version: "test".to_string(),
+                source: Some(serde_json::json!({ "kind": "headless" })),
+                name: Some("Headless".to_string()),
+                turns: vec![types::Turn {
+                    id: "turn-headless-1".to_string(),
+                    items: vec![types::ThreadItem {
+                        id: "item-headless-1".to_string(),
+                        item_type: "agent_message".to_string(),
+                        extra: Map::from_iter([(
+                            "text".to_string(),
+                            Value::String("persisted history".to_string()),
+                        )]),
+                    }],
+                    status: types::TurnStatus::Completed,
+                    error: None,
+                }],
+                extra: Map::new(),
+            },
+        );
+
+        service
+            .thread_read_history(ipc::ThreadReadHistoryRequest {
+                thread_id: "thread-headless".to_string(),
+            })
+            .await
+            .expect("read history");
+
+        let restarted = test_service_at_with_components(
+            service.paths.clone(),
+            service.config.clone(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            Arc::new(FakeCodexDaemonManager {
+                endpoint: service.config.codex.listen_url.clone(),
+            }),
+            CodexClient::new(
+                Arc::new(FakeCodexTransport::new(
+                    service.config.codex.listen_url.clone(),
+                    "unused",
+                    FakeCodexTerminalOutcome::Completed,
+                )),
+                service.config.codex.reconnect.clone(),
+                Arc::new(RejectingApprovalRouter),
+            ),
+            false,
+        )
+        .await;
+
+        let thread = restarted
+            .thread_get(ipc::ThreadGetRequest {
+                thread_id: "thread-headless".to_string(),
+            })
+            .await
+            .expect("reloaded thread")
+            .thread;
+        assert!(thread.history_loaded);
+        assert_eq!(thread.turns.len(), 1);
+        assert_eq!(
+            thread.turns[0].items[0].text.as_deref(),
+            Some("persisted history")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_codex_assignment_for_unassigned_thread() {
+        let service = test_service().await;
+        let thread = sample_thread("thread-assigned", "live_observed", 200);
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+
+        let response = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id.clone(),
+                work_unit_id: work_unit.id.clone(),
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: Some("monitor this thread".to_string()),
+            })
+            .await
+            .expect("create codex assignment");
+
+        assert_eq!(response.assignment.codex_thread_id, thread.summary.id);
+        assert_eq!(
+            response.assignment.status,
+            CodexThreadAssignmentStatus::Active
+        );
+        assert_eq!(
+            response.assignment.send_policy,
+            orcas_core::CodexThreadSendPolicy::HumanApprovalRequired
+        );
+        let listed = service
+            .codex_assignment_list(ipc::CodexAssignmentListRequest {
+                codex_thread_id: Some("thread-assigned".to_string()),
+                workstream_id: None,
+                work_unit_id: None,
+                include_inactive: true,
+            })
+            .await
+            .expect("list assignments");
+        assert_eq!(listed.assignments.len(), 1);
+        assert!(listed.assignments[0].active);
+    }
+
+    #[tokio::test]
+    async fn reject_second_active_codex_assignment_for_same_thread() {
+        let service = test_service().await;
+        let thread = sample_thread("thread-assigned", "live_observed", 200);
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let work_unit_two = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: "Second unit".to_string(),
+                task_statement: "Attempt conflicting assignment.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("second workunit")
+            .work_unit;
+
+        service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id.clone(),
+                work_unit_id: work_unit.id.clone(),
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("first assignment");
+
+        let error = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit_two.id,
+                supervisor_id: "supervisor-b".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect_err("conflicting active assignment must fail");
+        assert!(error.to_string().contains("already has active assignment"));
+    }
+
+    #[tokio::test]
+    async fn create_codex_assignment_for_active_thread_does_not_send_turn() {
+        let (service, runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let mut thread = sample_thread("thread-active", "live_observed", 200);
+        thread.summary.status = "active".to_string();
+        thread.summary.loaded_status = ipc::ThreadLoadedStatus::Active;
+        thread.summary.active_turn_id = Some("turn-live".to_string());
+        thread.summary.last_seen_turn_id = Some("turn-live".to_string());
+        thread.summary.turn_in_flight = true;
+        thread.turns.push(ipc::TurnView {
+            id: "turn-live".to_string(),
+            status: "in_progress".to_string(),
+            error_message: None,
+            error_summary: None,
+            started_at: Some(Utc::now()),
+            completed_at: None,
+            latest_diff: None,
+            latest_plan_snapshot: None,
+            token_usage_snapshot: None,
+            items: Vec::new(),
+        });
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+
+        let response = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create");
+
+        assert_eq!(
+            response.assignment.latest_basis_turn_id.as_deref(),
+            Some("turn-live")
+        );
+        assert_eq!(runtime.lock().await.last_turn_start_text, None);
+        let thread_after = service
+            .thread_get(ipc::ThreadGetRequest {
+                thread_id: "thread-active".to_string(),
+            })
+            .await
+            .expect("thread get")
+            .thread;
+        assert_eq!(thread_after.turns.len(), 1);
+        assert_eq!(thread_after.turns[0].id, "turn-live");
+    }
+
+    #[tokio::test]
+    async fn pause_resume_and_release_codex_assignment() {
+        let service = test_service().await;
+        let thread = sample_thread("thread-assigned", "live_observed", 200);
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let created = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id,
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("create")
+            .assignment;
+
+        let paused = service
+            .codex_assignment_pause(ipc::CodexAssignmentPauseRequest {
+                assignment_id: created.assignment_id.clone(),
+                notes: Some("paused for operator review".to_string()),
+            })
+            .await
+            .expect("pause")
+            .assignment;
+        assert_eq!(paused.status, CodexThreadAssignmentStatus::Paused);
+
+        let resumed = service
+            .codex_assignment_resume(ipc::CodexAssignmentResumeRequest {
+                assignment_id: created.assignment_id.clone(),
+                notes: Some("resume after review".to_string()),
+            })
+            .await
+            .expect("resume")
+            .assignment;
+        assert_eq!(resumed.status, CodexThreadAssignmentStatus::Active);
+
+        let released = service
+            .codex_assignment_release(ipc::CodexAssignmentReleaseRequest {
+                assignment_id: created.assignment_id.clone(),
+                notes: Some("released from Orcas management".to_string()),
+            })
+            .await
+            .expect("release")
+            .assignment;
+        assert_eq!(released.status, CodexThreadAssignmentStatus::Released);
+        assert!(
+            released
+                .notes
+                .as_deref()
+                .unwrap_or_default()
+                .contains("released from Orcas management")
+        );
+
+        let listed = service
+            .codex_assignment_list(ipc::CodexAssignmentListRequest {
+                codex_thread_id: Some("thread-assigned".to_string()),
+                workstream_id: None,
+                work_unit_id: None,
+                include_inactive: true,
+            })
+            .await
+            .expect("list");
+        assert_eq!(listed.assignments.len(), 1);
+        assert!(!listed.assignments[0].active);
+    }
+
+    #[tokio::test]
+    async fn codex_assignment_persists_across_restart() {
+        let base = std::env::temp_dir().join(format!("orcas-codex-assignment-{}", Uuid::new_v4()));
+        let service = test_service_at(base.clone()).await;
+        let thread = sample_thread("thread-assigned", "live_observed", 200);
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let created = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id,
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: Some("persist me".to_string()),
+            })
+            .await
+            .expect("create")
+            .assignment;
+
+        let restarted = test_service_at(base).await;
+        let assignment = restarted
+            .codex_assignment_get(ipc::CodexAssignmentGetRequest {
+                assignment_id: created.assignment_id,
+            })
+            .await
+            .expect("get after restart")
+            .assignment;
+        assert_eq!(assignment.status, CodexThreadAssignmentStatus::Active);
+        assert_eq!(assignment.notes.as_deref(), Some("persist me"));
+    }
+
+    #[tokio::test]
+    async fn codex_assignment_does_not_mutate_thread_history_or_mirror() {
+        let service = test_service().await;
+        let mut thread = sample_thread("thread-assigned", "live_observed", 200);
+        thread.history_loaded = true;
+        thread.turns.push(ipc::TurnView {
+            id: "turn-1".to_string(),
+            status: "completed".to_string(),
+            error_message: None,
+            error_summary: None,
+            started_at: None,
+            completed_at: None,
+            latest_diff: None,
+            latest_plan_snapshot: None,
+            token_usage_snapshot: None,
+            items: vec![ipc::ItemView {
+                id: "item-1".to_string(),
+                item_type: "agent_message".to_string(),
+                status: Some("completed".to_string()),
+                text: Some("history".to_string()),
+                summary: Some("history".to_string()),
+                payload: None,
+            }],
+        });
+        let original_thread = thread.clone();
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+
+        service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: "thread-assigned".to_string(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("create assignment");
+
+        let thread_after = service
+            .thread_get(ipc::ThreadGetRequest {
+                thread_id: "thread-assigned".to_string(),
+            })
+            .await
+            .expect("thread get")
+            .thread;
+        assert_eq!(thread_after.summary.id, original_thread.summary.id);
+        assert_eq!(
+            thread_after.summary.preview,
+            original_thread.summary.preview
+        );
+        assert_eq!(
+            thread_after.summary.last_seen_turn_id,
+            original_thread.summary.last_seen_turn_id
+        );
+        assert_eq!(thread_after.turns.len(), original_thread.turns.len());
+        assert_eq!(thread_after.turns[0].id, original_thread.turns[0].id);
+        assert_eq!(
+            thread_after.turns[0].status,
+            original_thread.turns[0].status
+        );
+        assert_eq!(
+            thread_after.turns[0].items[0].text,
+            original_thread.turns[0].items[0].text
+        );
+        assert_eq!(thread_after.history_loaded, original_thread.history_loaded);
     }
 
     #[test]

@@ -26,6 +26,61 @@ pub struct CollaborationState {
     pub assignment_communications: BTreeMap<String, AssignmentCommunicationRecord>,
     #[serde(default)]
     pub supervisor_proposals: BTreeMap<String, SupervisorProposalRecord>,
+    #[serde(default)]
+    pub codex_thread_assignments: BTreeMap<String, CodexThreadAssignment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexThreadAssignmentStatus {
+    Proposed,
+    #[default]
+    Active,
+    Paused,
+    Completed,
+    Released,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexThreadSendPolicy {
+    #[default]
+    HumanApprovalRequired,
+    SupervisorMaySend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexThreadBootstrapState {
+    NotNeeded,
+    #[default]
+    Pending,
+    Proposed,
+    Sent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexThreadAssignment {
+    pub assignment_id: String,
+    pub codex_thread_id: String,
+    pub workstream_id: String,
+    pub work_unit_id: String,
+    pub supervisor_id: String,
+    pub assigned_by: String,
+    pub assigned_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub status: CodexThreadAssignmentStatus,
+    #[serde(default)]
+    pub send_policy: CodexThreadSendPolicy,
+    #[serde(default)]
+    pub bootstrap_state: CodexThreadBootstrapState,
+    #[serde(default)]
+    pub latest_basis_turn_id: Option<String>,
+    #[serde(default)]
+    pub latest_decision_id: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -3,6 +3,9 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::ipc::{ThreadLoadedStatus, ThreadMonitorState};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ThreadRegistry {
@@ -31,11 +34,29 @@ pub struct ThreadMetadata {
     #[serde(default)]
     pub scope: String,
     #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub loaded_status: ThreadLoadedStatus,
+    #[serde(default)]
+    pub active_flags: Vec<String>,
+    #[serde(default)]
+    pub active_turn_id: Option<String>,
+    #[serde(default)]
+    pub last_seen_turn_id: Option<String>,
+    #[serde(default)]
     pub recent_output: Option<String>,
     #[serde(default)]
     pub recent_event: Option<String>,
     #[serde(default)]
     pub turn_in_flight: bool,
+    #[serde(default)]
+    pub monitor_state: ThreadMonitorState,
+    #[serde(default = "Utc::now")]
+    pub last_sync_at: DateTime<Utc>,
+    #[serde(default)]
+    pub source_kind: Option<String>,
+    #[serde(default)]
+    pub raw_summary: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

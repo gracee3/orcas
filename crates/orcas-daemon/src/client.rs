@@ -101,6 +101,14 @@ impl OrcasIpcClient {
         .await
     }
 
+    pub async fn threads_list_loaded(&self) -> OrcasResult<ipc::ThreadsListResponse> {
+        self.request(
+            ipc::methods::THREADS_LIST_LOADED,
+            &ipc::ThreadsListLoadedRequest::default(),
+        )
+        .await
+    }
+
     pub async fn thread_start(
         &self,
         params: &ipc::ThreadStartRequest,
@@ -115,11 +123,33 @@ impl OrcasIpcClient {
         self.request(ipc::methods::THREAD_READ, params).await
     }
 
+    pub async fn thread_read_history(
+        &self,
+        params: &ipc::ThreadReadHistoryRequest,
+    ) -> OrcasResult<ipc::ThreadReadHistoryResponse> {
+        self.request(ipc::methods::THREAD_READ_HISTORY, params)
+            .await
+    }
+
     pub async fn thread_get(
         &self,
         params: &ipc::ThreadGetRequest,
     ) -> OrcasResult<ipc::ThreadGetResponse> {
         self.request(ipc::methods::THREAD_GET, params).await
+    }
+
+    pub async fn thread_attach(
+        &self,
+        params: &ipc::ThreadAttachRequest,
+    ) -> OrcasResult<ipc::ThreadAttachResponse> {
+        self.request(ipc::methods::THREAD_ATTACH, params).await
+    }
+
+    pub async fn thread_detach(
+        &self,
+        params: &ipc::ThreadDetachRequest,
+    ) -> OrcasResult<ipc::ThreadDetachResponse> {
+        self.request(ipc::methods::THREAD_DETACH, params).await
     }
 
     pub async fn thread_resume(
@@ -225,6 +255,54 @@ impl OrcasIpcClient {
         params: &ipc::AssignmentGetRequest,
     ) -> OrcasResult<ipc::AssignmentGetResponse> {
         self.request(ipc::methods::ASSIGNMENT_GET, params).await
+    }
+
+    pub async fn codex_assignment_create(
+        &self,
+        params: &ipc::CodexAssignmentCreateRequest,
+    ) -> OrcasResult<ipc::CodexAssignmentCreateResponse> {
+        self.request(ipc::methods::CODEX_ASSIGNMENT_CREATE, params)
+            .await
+    }
+
+    pub async fn codex_assignment_get(
+        &self,
+        params: &ipc::CodexAssignmentGetRequest,
+    ) -> OrcasResult<ipc::CodexAssignmentGetResponse> {
+        self.request(ipc::methods::CODEX_ASSIGNMENT_GET, params)
+            .await
+    }
+
+    pub async fn codex_assignment_list(
+        &self,
+        params: &ipc::CodexAssignmentListRequest,
+    ) -> OrcasResult<ipc::CodexAssignmentListResponse> {
+        self.request(ipc::methods::CODEX_ASSIGNMENT_LIST, params)
+            .await
+    }
+
+    pub async fn codex_assignment_pause(
+        &self,
+        params: &ipc::CodexAssignmentPauseRequest,
+    ) -> OrcasResult<ipc::CodexAssignmentPauseResponse> {
+        self.request(ipc::methods::CODEX_ASSIGNMENT_PAUSE, params)
+            .await
+    }
+
+    pub async fn codex_assignment_resume(
+        &self,
+        params: &ipc::CodexAssignmentResumeRequest,
+    ) -> OrcasResult<ipc::CodexAssignmentResumeResponse> {
+        self.request(ipc::methods::CODEX_ASSIGNMENT_RESUME, params)
+            .await
+    }
+
+    pub async fn codex_assignment_release(
+        &self,
+        params: &ipc::CodexAssignmentReleaseRequest,
+    ) -> OrcasResult<ipc::CodexAssignmentReleaseResponse> {
+        self.request(ipc::methods::CODEX_ASSIGNMENT_RELEASE, params)
+            .await
     }
 
     pub async fn assignment_communication_get(

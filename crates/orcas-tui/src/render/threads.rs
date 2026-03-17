@@ -74,6 +74,11 @@ fn render_thread_list(
                     .as_ref()
                     .map(|badge| format!(" turn={badge}"))
                     .unwrap_or_default();
+                let assignment = row
+                    .assignment_badge
+                    .as_ref()
+                    .map(|badge| format!(" assign={badge}"))
+                    .unwrap_or_default();
                 let mut line = vec![
                     Span::styled(
                         format!("{marker}"),
@@ -90,8 +95,12 @@ fn render_thread_list(
                     if !badge.is_empty() {
                         line.push(Span::styled(format!("{badge}"), metadata_style()));
                     }
+                    if !assignment.is_empty() {
+                        line.push(Span::styled(format!("{assignment}"), metadata_style()));
+                    }
                 } else {
                     line.push(Span::styled(format!(" {badge}"), metadata_style()));
+                    line.push(Span::styled(format!(" {assignment}"), metadata_style()));
                     line.push(Span::styled(format!(" {}", row.preview), metadata_style()));
                 }
 

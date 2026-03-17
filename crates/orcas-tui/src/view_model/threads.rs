@@ -1,13 +1,16 @@
 use crate::app::AppState;
-use orcas_core::ipc;
+use orcas_core::{
+    CodexThreadAssignmentStatus, CodexThreadBootstrapState, CodexThreadSendPolicy, ipc,
+};
 
-use super::shared::{PanelViewModel, abbreviate, compact_line, lifecycle_label};
+use super::shared::{PanelViewModel, abbreviate, compact_line, lifecycle_label, timestamp_label};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadRowViewModel {
     pub id: String,
     pub status: String,
     pub turn_badge: Option<String>,
+    pub assignment_badge: Option<String>,
     pub preview: String,
     pub selected: bool,
 }
@@ -39,6 +42,7 @@ pub fn thread_list(state: &AppState) -> ThreadListViewModel {
                 id: thread.id.clone(),
                 status: thread_status_label(state, thread),
                 turn_badge: thread_turn_badge(state, &thread.id),
+                assignment_badge: thread_assignment_badge(state, &thread.id),
                 preview: abbreviate(&thread.preview.replace('\n', " "), 40),
                 selected: state.selected_thread_id.as_deref() == Some(thread.id.as_str()),
             })
@@ -63,10 +67,40 @@ pub fn thread_summary(state: &AppState) -> PanelViewModel {
 
     let mut lines = vec![
         format!("status: {}", thread_status_label(state, summary)),
+        format!("loaded: {}", loaded_status_label(summary.loaded_status)),
+        format!("monitor: {}", monitor_state_label(summary.monitor_state)),
         format!("cwd: {}", summary.cwd),
         format!("provider: {}", summary.model_provider),
         format!("scope: {}", summary.scope),
     ];
+
+    if let Some(source_kind) = summary.source_kind.as_ref() {
+        lines.push(format!("source: {source_kind}"));
+    }
+    if let Some(turn_id) = summary.active_turn_id.as_ref() {
+        lines.push(format!("active turn: {turn_id}"));
+    }
+    if let Some(turn_id) = summary.last_seen_turn_id.as_ref() {
+        lines.push(format!("last seen turn: {turn_id}"));
+    }
+    if let Some(assignment) = thread_assignment_for_display(state, thread_id) {
+        lines.push(format!(
+            "assignment: {} [{}]",
+            assignment.assignment_id,
+            codex_assignment_status_label(assignment.status)
+        ));
+        lines.push(format!(
+            "binding: stream={} unit={} supervisor={}",
+            assignment.workstream_id, assignment.work_unit_id, assignment.supervisor_id
+        ));
+        lines.push(format!(
+            "policy: {}  bootstrap: {}",
+            codex_send_policy_label(assignment.send_policy),
+            codex_bootstrap_state_label(assignment.bootstrap_state)
+        ));
+    } else {
+        lines.push("assignment: unassigned".to_string());
+    }
 
     if let Some(turn_state) = latest_turn_state_for_thread(state, thread_id) {
         lines.push(format!(
@@ -104,7 +138,14 @@ pub fn thread_summary(state: &AppState) -> PanelViewModel {
         state
             .thread_details
             .get(thread_id)
-            .map(|thread| format!("{} turns cached", thread.turns.len()))
+            .map(|thread| {
+                let history = if thread.history_loaded {
+                    "history loaded"
+                } else {
+                    "summary only"
+                };
+                format!("{} turns cached, {history}", thread.turns.len())
+            })
             .unwrap_or_else(|| "loading on demand".to_string())
     ));
 
@@ -130,11 +171,46 @@ pub fn thread_detail(state: &AppState) -> ThreadDetailViewModel {
     };
 
     let mut lines = Vec::new();
+    if let Some(assignment) = thread_assignment_for_display(state, thread_id) {
+        lines.push(format!(
+            "assignment {} [{}]",
+            assignment.assignment_id,
+            codex_assignment_status_label(assignment.status)
+        ));
+        lines.push(format!(
+            "  workstream={}  work_unit={}  supervisor={}",
+            assignment.workstream_id, assignment.work_unit_id, assignment.supervisor_id
+        ));
+        lines.push(format!(
+            "  policy={}  bootstrap={}",
+            codex_send_policy_label(assignment.send_policy),
+            codex_bootstrap_state_label(assignment.bootstrap_state)
+        ));
+        lines.push(format!(
+            "  assigned by {} at {}",
+            assignment.assigned_by,
+            timestamp_label(assignment.assigned_at)
+        ));
+        if let Some(turn_id) = assignment.latest_basis_turn_id.as_ref() {
+            lines.push(format!("  latest basis turn {turn_id}"));
+        }
+        if let Some(notes) = assignment.notes.as_ref() {
+            lines.push(format!("  notes {}", abbreviate(&compact_line(notes), 84)));
+        }
+        lines.push(String::new());
+    } else {
+        lines.push("Assignment: unassigned".to_string());
+        lines.push(String::new());
+    }
+
     if thread.turns.is_empty() {
         lines.push("No turns loaded.".to_string());
     } else {
         for turn in thread.turns.iter().rev().take(4) {
             lines.push(format!("turn {} [{}]", turn.id, turn.status));
+            if let Some(diff) = turn.latest_diff.as_ref() {
+                lines.push(format!("  diff {}", abbreviate(&compact_line(diff), 84)));
+            }
             if let Some(turn_state) = turn_state_for_turn(state, thread_id, &turn.id) {
                 lines.push(format!(
                     "  lifecycle={} attachable={} live_stream={} terminal={}",
@@ -164,6 +240,7 @@ pub fn thread_detail(state: &AppState) -> ThreadDetailViewModel {
                 let text = item
                     .text
                     .as_ref()
+                    .or(item.summary.as_ref())
                     .map(|text| abbreviate(&compact_line(text), 84))
                     .unwrap_or_else(|| "-".to_string());
                 lines.push(format!("  {} [{}] {}", item.item_type, status, text));
@@ -199,6 +276,95 @@ fn thread_turn_badge(state: &AppState, thread_id: &str) -> Option<String> {
             lifecycle_label(&turn.lifecycle).to_string()
         }
     })
+}
+
+fn thread_assignment_badge(state: &AppState, thread_id: &str) -> Option<String> {
+    let assignment = current_thread_assignment(state, thread_id)?;
+    Some(codex_assignment_status_label(assignment.status).to_string())
+}
+
+fn loaded_status_label(status: ipc::ThreadLoadedStatus) -> &'static str {
+    match status {
+        ipc::ThreadLoadedStatus::NotLoaded => "not loaded",
+        ipc::ThreadLoadedStatus::Idle => "idle",
+        ipc::ThreadLoadedStatus::Active => "active",
+        ipc::ThreadLoadedStatus::SystemError => "system error",
+        ipc::ThreadLoadedStatus::Unknown => "unknown",
+    }
+}
+
+fn monitor_state_label(state: ipc::ThreadMonitorState) -> &'static str {
+    match state {
+        ipc::ThreadMonitorState::Detached => "history only",
+        ipc::ThreadMonitorState::Attaching => "attaching",
+        ipc::ThreadMonitorState::Attached => "live attached",
+        ipc::ThreadMonitorState::Errored => "attach errored",
+    }
+}
+
+fn codex_assignment_status_label(status: CodexThreadAssignmentStatus) -> &'static str {
+    match status {
+        CodexThreadAssignmentStatus::Proposed => "proposed",
+        CodexThreadAssignmentStatus::Active => "assigned",
+        CodexThreadAssignmentStatus::Paused => "paused",
+        CodexThreadAssignmentStatus::Completed => "completed",
+        CodexThreadAssignmentStatus::Released => "released",
+    }
+}
+
+fn codex_send_policy_label(policy: CodexThreadSendPolicy) -> &'static str {
+    match policy {
+        CodexThreadSendPolicy::HumanApprovalRequired => "human approval required",
+        CodexThreadSendPolicy::SupervisorMaySend => "supervisor may send",
+    }
+}
+
+fn codex_bootstrap_state_label(state: CodexThreadBootstrapState) -> &'static str {
+    match state {
+        CodexThreadBootstrapState::NotNeeded => "not needed",
+        CodexThreadBootstrapState::Pending => "pending",
+        CodexThreadBootstrapState::Proposed => "proposed",
+        CodexThreadBootstrapState::Sent => "sent",
+    }
+}
+
+fn current_thread_assignment<'a>(
+    state: &'a AppState,
+    thread_id: &str,
+) -> Option<&'a ipc::CodexThreadAssignmentSummary> {
+    state
+        .collaboration
+        .codex_thread_assignments
+        .iter()
+        .find(|assignment| {
+            assignment.codex_thread_id == thread_id
+                && matches!(
+                    assignment.status,
+                    CodexThreadAssignmentStatus::Proposed
+                        | CodexThreadAssignmentStatus::Active
+                        | CodexThreadAssignmentStatus::Paused
+                )
+        })
+}
+
+fn latest_thread_assignment<'a>(
+    state: &'a AppState,
+    thread_id: &str,
+) -> Option<&'a ipc::CodexThreadAssignmentSummary> {
+    state
+        .collaboration
+        .codex_thread_assignments
+        .iter()
+        .filter(|assignment| assignment.codex_thread_id == thread_id)
+        .max_by(|left, right| left.updated_at.cmp(&right.updated_at))
+}
+
+fn thread_assignment_for_display<'a>(
+    state: &'a AppState,
+    thread_id: &str,
+) -> Option<&'a ipc::CodexThreadAssignmentSummary> {
+    current_thread_assignment(state, thread_id)
+        .or_else(|| latest_thread_assignment(state, thread_id))
 }
 
 fn latest_turn_state_for_thread<'a>(

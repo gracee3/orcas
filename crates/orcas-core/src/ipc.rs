@@ -1,10 +1,12 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::collaboration::{
-    Assignment, AssignmentStatus, Decision, DecisionType, Report, ReportConfidence,
-    ReportDisposition, ReportParseResult, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
-    Workstream, WorkstreamStatus,
+    Assignment, AssignmentStatus, CodexThreadAssignment, CodexThreadAssignmentStatus,
+    CodexThreadBootstrapState, CodexThreadSendPolicy, Decision, DecisionType, Report,
+    ReportConfidence, ReportDisposition, ReportParseResult, WorkUnit, WorkUnitStatus, Worker,
+    WorkerSession, Workstream, WorkstreamStatus,
 };
 use crate::communication::AssignmentCommunicationRecord;
 use crate::events::ConnectionState;
@@ -23,9 +25,13 @@ pub mod methods {
     pub const MODELS_LIST: &str = "models/list";
     pub const THREADS_LIST: &str = "threads/list";
     pub const THREADS_LIST_SCOPED: &str = "threads/list_scoped";
+    pub const THREADS_LIST_LOADED: &str = "threads/list_loaded";
     pub const THREAD_START: &str = "thread/start";
     pub const THREAD_READ: &str = "thread/read";
+    pub const THREAD_READ_HISTORY: &str = "thread/read_history";
     pub const THREAD_GET: &str = "thread/get";
+    pub const THREAD_ATTACH: &str = "thread/attach";
+    pub const THREAD_DETACH: &str = "thread/detach";
     pub const THREAD_RESUME: &str = "thread/resume";
     pub const TURNS_LIST_ACTIVE: &str = "turns/list_active";
     pub const TURNS_RECENT: &str = "turns/recent";
@@ -42,6 +48,12 @@ pub mod methods {
     pub const ASSIGNMENT_START: &str = "assignment/start";
     pub const ASSIGNMENT_GET: &str = "assignment/get";
     pub const ASSIGNMENT_COMMUNICATION_GET: &str = "assignment_communication/get";
+    pub const CODEX_ASSIGNMENT_CREATE: &str = "codex_assignment/create";
+    pub const CODEX_ASSIGNMENT_GET: &str = "codex_assignment/get";
+    pub const CODEX_ASSIGNMENT_LIST: &str = "codex_assignment/list";
+    pub const CODEX_ASSIGNMENT_PAUSE: &str = "codex_assignment/pause";
+    pub const CODEX_ASSIGNMENT_RESUME: &str = "codex_assignment/resume";
+    pub const CODEX_ASSIGNMENT_RELEASE: &str = "codex_assignment/release";
     pub const REPORT_GET: &str = "report/get";
     pub const REPORT_LIST_FOR_WORKUNIT: &str = "report/list_for_workunit";
     pub const DECISION_APPLY: &str = "decision/apply";
@@ -153,6 +165,8 @@ pub struct CollaborationSnapshot {
     pub workstreams: Vec<WorkstreamSummary>,
     pub work_units: Vec<WorkUnitSummary>,
     pub assignments: Vec<AssignmentSummary>,
+    #[serde(default)]
+    pub codex_thread_assignments: Vec<CodexThreadAssignmentSummary>,
     pub reports: Vec<ReportSummary>,
     pub decisions: Vec<DecisionSummary>,
 }
@@ -234,6 +248,10 @@ pub enum DaemonEvent {
         action: AssignmentLifecycleAction,
         assignment: AssignmentSummary,
     },
+    CodexAssignmentLifecycle {
+        action: CodexAssignmentLifecycleAction,
+        assignment: CodexThreadAssignmentSummary,
+    },
     ReportRecorded {
         report: ReportSummary,
     },
@@ -268,6 +286,16 @@ pub enum AssignmentLifecycleAction {
     Closed,
     Interrupted,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAssignmentLifecycleAction {
+    Created,
+    Paused,
+    Resumed,
+    Released,
+    Updated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +359,25 @@ pub struct AssignmentSummary {
     pub status: AssignmentStatus,
     pub attempt_number: u32,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexThreadAssignmentSummary {
+    pub assignment_id: String,
+    pub codex_thread_id: String,
+    pub workstream_id: String,
+    pub work_unit_id: String,
+    pub supervisor_id: String,
+    pub assigned_by: String,
+    pub assigned_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub status: CodexThreadAssignmentStatus,
+    pub send_policy: CodexThreadSendPolicy,
+    pub bootstrap_state: CodexThreadBootstrapState,
+    pub latest_basis_turn_id: Option<String>,
+    pub latest_decision_id: Option<String>,
+    pub notes: Option<String>,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,6 +511,10 @@ pub struct ModelsListResponse {
     pub data: Vec<ModelSummary>,
 }
 
+fn default_sync_timestamp() -> DateTime<Utc> {
+    Utc::now()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSummary {
     pub id: String,
@@ -472,11 +523,35 @@ pub struct ModelSummary {
     pub is_default: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadLoadedStatus {
+    NotLoaded,
+    Idle,
+    Active,
+    SystemError,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadMonitorState {
+    #[default]
+    Detached,
+    Attaching,
+    Attached,
+    Errored,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThreadsListRequest {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThreadsListScopedRequest {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ThreadsListLoadedRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadsListResponse {
@@ -494,14 +569,34 @@ pub struct ThreadSummary {
     pub created_at: i64,
     pub updated_at: i64,
     pub scope: String,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub loaded_status: ThreadLoadedStatus,
+    #[serde(default)]
+    pub active_flags: Vec<String>,
+    #[serde(default)]
+    pub active_turn_id: Option<String>,
+    #[serde(default)]
+    pub last_seen_turn_id: Option<String>,
     pub recent_output: Option<String>,
     pub recent_event: Option<String>,
     pub turn_in_flight: bool,
+    #[serde(default)]
+    pub monitor_state: ThreadMonitorState,
+    #[serde(default = "default_sync_timestamp")]
+    pub last_sync_at: DateTime<Utc>,
+    #[serde(default)]
+    pub source_kind: Option<String>,
+    #[serde(default)]
+    pub raw_summary: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadView {
     pub summary: ThreadSummary,
+    #[serde(default)]
+    pub history_loaded: bool,
     pub turns: Vec<TurnView>,
 }
 
@@ -510,6 +605,18 @@ pub struct TurnView {
     pub id: String,
     pub status: String,
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub error_summary: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub latest_diff: Option<String>,
+    #[serde(default)]
+    pub latest_plan_snapshot: Option<Value>,
+    #[serde(default)]
+    pub token_usage_snapshot: Option<Value>,
     pub items: Vec<ItemView>,
 }
 
@@ -553,6 +660,10 @@ pub struct ItemView {
     pub item_type: String,
     pub status: Option<String>,
     pub text: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub payload: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -591,6 +702,16 @@ pub struct ThreadReadResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadReadHistoryRequest {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadReadHistoryResponse {
+    pub thread: ThreadView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadGetRequest {
     pub thread_id: String,
 }
@@ -598,6 +719,32 @@ pub struct ThreadGetRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadGetResponse {
     pub thread: ThreadView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadAttachRequest {
+    pub thread_id: String,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadAttachResponse {
+    pub thread: Option<ThreadView>,
+    pub attached: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadDetachRequest {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadDetachResponse {
+    pub thread: Option<ThreadView>,
+    pub detached: bool,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -755,6 +902,87 @@ pub struct AssignmentGetResponse {
     pub worker: Worker,
     pub worker_session: WorkerSession,
     pub report: Option<Report>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAssignmentCreateRequest {
+    pub codex_thread_id: String,
+    pub workstream_id: String,
+    pub work_unit_id: String,
+    pub supervisor_id: String,
+    pub assigned_by: String,
+    #[serde(default)]
+    pub send_policy: Option<CodexThreadSendPolicy>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAssignmentCreateResponse {
+    pub assignment: CodexThreadAssignment,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAssignmentGetRequest {
+    pub assignment_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAssignmentGetResponse {
+    pub assignment: CodexThreadAssignment,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CodexAssignmentListRequest {
+    #[serde(default)]
+    pub codex_thread_id: Option<String>,
+    #[serde(default)]
+    pub workstream_id: Option<String>,
+    #[serde(default)]
+    pub work_unit_id: Option<String>,
+    #[serde(default)]
+    pub include_inactive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAssignmentListResponse {
+    pub assignments: Vec<CodexThreadAssignmentSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAssignmentPauseRequest {
+    pub assignment_id: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAssignmentPauseResponse {
+    pub assignment: CodexThreadAssignment,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAssignmentResumeRequest {
+    pub assignment_id: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAssignmentResumeResponse {
+    pub assignment: CodexThreadAssignment,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAssignmentReleaseRequest {
+    pub assignment_id: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAssignmentReleaseResponse {
+    pub assignment: CodexThreadAssignment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

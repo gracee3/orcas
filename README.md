@@ -10,6 +10,7 @@ Orcas is a local Rust supervisor layer built around Codex `app-server`.
 `orcasd` owns the upstream Codex connection, Orcas-owned persistent workflow state, local IPC, live snapshots, and event streams. The CLI (`orcas`) and TUI (`orcas-tui`) are clients of that daemon rather than direct Codex clients.
 
 Orcas state is authoritative. Codex remains the worker execution substrate. Supervisor proposals are review artifacts, not workflow truth, and human approval is required before Orcas records an authoritative `Decision` or creates a successor `Assignment`.
+Codex-thread assignment metadata is also Orcas-native and is kept separate from Codex thread runtime/history.
 
 ## App Summary
 
@@ -26,6 +27,10 @@ Orcas state is authoritative. Codex remains the worker execution substrate. Supe
 - `crates/orcas-daemon`: `orcasd`, UDS server, event fanout, shared IPC client/process manager
 - `crates/orcas-supervisor`: `orcas` CLI that talks to `orcasd`
 - `crates/orcas-tui`: TUI app core, runtime, render layer, and tests
+
+## Docs
+
+- [Codex Thread Supervision v1](docs/codex-thread-supervision-v1.md)
 
 ## Build
 
