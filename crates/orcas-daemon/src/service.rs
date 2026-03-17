@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{TimeZone, Utc};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -28,14 +27,17 @@ use orcas_core::jsonrpc::{
 use orcas_core::{
     AppConfig, AppPaths, Assignment, AssignmentStatus, CodexConnectionMode, CollaborationState,
     ConnectionState, Decision, DecisionType, EventEnvelope, JsonSessionStore, OrcasError,
-    OrcasEvent, OrcasResult, OrcasSessionStore, Report, ReportConfidence, ReportDisposition,
-    ReportParseResult, SupervisorContextPack, SupervisorProposal, SupervisorProposalFailure,
-    SupervisorProposalFailureStage, SupervisorProposalRecord, SupervisorProposalStatus,
-    SupervisorProposalTriggerKind, SupervisorReasonerUsage, ThreadMetadata, WorkUnit,
-    WorkUnitStatus, Worker, WorkerSession, WorkerSessionAttachability, WorkerSessionRuntimeStatus,
-    WorkerStatus, Workstream, WorkstreamStatus,
+    OrcasEvent, OrcasResult, OrcasSessionStore, Report, SupervisorContextPack, SupervisorProposal,
+    SupervisorProposalFailure, SupervisorProposalFailureStage, SupervisorProposalRecord,
+    SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorReasonerUsage,
+    ThreadMetadata, WorkUnit, WorkUnitStatus, Worker, WorkerSession, WorkerSessionAttachability,
+    WorkerSessionRuntimeStatus, WorkerStatus, Workstream, WorkstreamStatus,
 };
 
+use crate::assignment_comm::parse::parse_worker_report_for_turn;
+use crate::assignment_comm::policy::validate_assignment_packet;
+use crate::assignment_comm::render::build_assignment_communication_record;
+use crate::assignment_comm::stable_fingerprint;
 use crate::process::{
     ENV_CODEX_BIN, ENV_CODEX_LISTEN_URL, ENV_CONNECTION_MODE, ENV_DEFAULT_CWD, ENV_DEFAULT_MODEL,
     OrcasDaemonProcessManager, OrcasRuntimeOverrides, apply_runtime_overrides,
@@ -74,30 +76,6 @@ impl Default for DaemonState {
             collaboration: CollaborationState::default(),
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkerReportPayload {
-    disposition: String,
-    summary: String,
-    findings: Vec<String>,
-    blockers: Vec<String>,
-    questions: Vec<String>,
-    recommended_next_actions: Vec<String>,
-    confidence: String,
-}
-
-#[derive(Debug)]
-struct ParsedWorkerReport {
-    disposition: ReportDisposition,
-    summary: String,
-    findings: Vec<String>,
-    blockers: Vec<String>,
-    questions: Vec<String>,
-    recommended_next_actions: Vec<String>,
-    confidence: ReportConfidence,
-    parse_result: ReportParseResult,
-    needs_supervisor_review: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1159,6 +1137,16 @@ impl OrcasDaemonService {
     ) -> OrcasResult<ipc::AssignmentStartResponse> {
         let session_model = params.model.clone();
         let session_cwd = params.cwd.clone();
+        let communication_model = session_model
+            .clone()
+            .or_else(|| self.config.defaults.model.clone());
+        let communication_cwd = session_cwd.clone().or_else(|| {
+            self.config
+                .defaults
+                .cwd
+                .as_ref()
+                .map(|path| path.display().to_string())
+        });
         let prepared = self.prepare_assignment(params).await?;
         let assignment_id = prepared.assignment.id.clone();
         let worker_id = prepared.assignment.worker_id.clone();
@@ -1190,19 +1178,26 @@ impl OrcasDaemonService {
             return Err(error);
         };
 
-        let instructions = {
-            let state = self.state.read().await;
-            let assignment = state
-                .collaboration
-                .assignments
-                .get(&assignment_id)
-                .ok_or_else(|| {
-                    OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
-                })?;
-            assignment.instructions.clone()
-        };
+        self.ensure_assignment_communication_record(
+            &assignment_id,
+            communication_model,
+            communication_cwd,
+        )
+        .await?;
 
-        let prompt = Self::build_worker_prompt(&instructions);
+        let prompt = {
+            let state = self.state.read().await;
+            state
+                .collaboration
+                .assignment_communications
+                .get(&assignment_id)
+                .map(|record| record.prompt_render.prompt_text.clone())
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "missing assignment communication record for `{assignment_id}`"
+                    ))
+                })?
+        };
         let turn = match self
             .turn_start(ipc::TurnStartRequest {
                 thread_id: thread_id.clone(),
@@ -1501,7 +1496,37 @@ impl OrcasDaemonService {
         turn_state: ipc::TurnStateView,
         raw_output: String,
     ) -> OrcasResult<(Report, Assignment, WorkUnit, Vec<SupervisorProposalRecord>)> {
-        let parsed_report = Self::parse_worker_report_for_turn(&raw_output, turn_state.lifecycle);
+        self.ensure_assignment_communication_record(assignment_id, None, None)
+            .await?;
+        let (assignment_for_parse, communication_record) = {
+            let state = self.state.read().await;
+            let assignment = state
+                .collaboration
+                .assignments
+                .get(assignment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
+                })?;
+            let record = state
+                .collaboration
+                .assignment_communications
+                .get(assignment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "missing assignment communication record for `{assignment_id}`"
+                    ))
+                })?;
+            (assignment, record)
+        };
+        let parsed_report = parse_worker_report_for_turn(
+            &raw_output,
+            turn_state.lifecycle,
+            &assignment_for_parse,
+            &communication_record,
+        );
+        let raw_output_hash = stable_fingerprint(&raw_output);
         let now = Utc::now();
         let mut state = self.state.write().await;
         let assignment = state
@@ -1532,14 +1557,23 @@ impl OrcasDaemonService {
             recommended_next_actions: parsed_report.recommended_next_actions,
             confidence: parsed_report.confidence,
             raw_output,
-            parse_result: parsed_report.parse_result,
-            needs_supervisor_review: parsed_report.needs_supervisor_review,
+            parse_result: parsed_report.validation.parse_result,
+            needs_supervisor_review: parsed_report.validation.needs_supervisor_review,
             created_at: now,
         };
         state
             .collaboration
             .reports
             .insert(report.id.clone(), report.clone());
+        if let Some(record) = state
+            .collaboration
+            .assignment_communications
+            .get_mut(assignment_id)
+        {
+            record.response_envelope = parsed_report.envelope.clone();
+            record.validation = Some(parsed_report.validation.clone());
+            record.raw_output_hash = Some(raw_output_hash);
+        }
         if let Some(work_unit) = state.collaboration.work_units.get_mut(&work_unit_id) {
             work_unit.status = WorkUnitStatus::AwaitingDecision;
             work_unit.latest_report_id = Some(report.id.clone());
@@ -2657,6 +2691,10 @@ impl OrcasDaemonService {
                 stale_proposals,
             )
         };
+        if let Some(next_assignment) = response.next_assignment.as_ref() {
+            self.ensure_assignment_communication_record(&next_assignment.id, None, None)
+                .await?;
+        }
         self.persist_collaboration_state().await?;
         if let Some(assignment) = closed_assignment.as_ref() {
             self.emit_assignment_lifecycle(ipc::AssignmentLifecycleAction::Closed, assignment)
@@ -2733,6 +2771,11 @@ impl OrcasDaemonService {
         &self,
         params: ipc::AssignmentStartRequest,
     ) -> OrcasResult<PreparedAssignment> {
+        let requested_model = params
+            .model
+            .clone()
+            .or_else(|| self.config.defaults.model.clone());
+        let requested_cwd = params.cwd.clone();
         let outcome = {
             let now = Utc::now();
             let mut state = self.state.write().await;
@@ -2790,63 +2833,130 @@ impl OrcasDaemonService {
                     == Some(pending_assignment.id.as_str())
                     && latest_assignment_id.as_deref() == Some(pending_assignment.id.as_str())
                 {
-                    return Ok(PreparedAssignment {
+                    PreparedAssignment {
                         assignment: pending_assignment.clone(),
                         created_new: false,
-                    });
+                    }
+                } else {
+                    return Err(OrcasError::Protocol(format!(
+                        "work unit `{}` has an unexecuted pending assignment that is not the current latest successor",
+                        params.work_unit_id
+                    )));
                 }
-                return Err(OrcasError::Protocol(format!(
-                    "work unit `{}` has an unexecuted pending assignment that is not the current latest successor",
-                    params.work_unit_id
-                )));
-            }
-
-            // Reusing a worker session is allowed, but the assignment remains the execution-bearing
-            // protocol object. A new execution segment always gets its own explicit assignment id.
-            let worker_session_id = Self::select_worker_session_for_assignment(
-                &mut state.collaboration,
-                &params.worker_id,
-                params
-                    .worker_kind
-                    .clone()
-                    .unwrap_or_else(|| "codex".to_string()),
-            );
-            let attempt_number = state
-                .collaboration
-                .assignments
-                .values()
-                .filter(|assignment| assignment.work_unit_id == params.work_unit_id)
-                .count() as u32
-                + 1;
-            let assignment = Assignment {
-                id: Self::new_object_id("assignment"),
-                work_unit_id: params.work_unit_id.clone(),
-                worker_id: params.worker_id.clone(),
-                worker_session_id: worker_session_id.clone(),
-                instructions: params
-                    .instructions
-                    .unwrap_or_else(|| work_unit.task_statement.clone()),
-                status: AssignmentStatus::Created,
-                attempt_number,
-                created_at: now,
-                updated_at: now,
-            };
-            state
-                .collaboration
-                .assignments
-                .insert(assignment.id.clone(), assignment.clone());
-            if let Some(work_unit) = state.collaboration.work_units.get_mut(&params.work_unit_id) {
-                work_unit.current_assignment_id = Some(assignment.id.clone());
-                work_unit.status = WorkUnitStatus::Ready;
-                work_unit.updated_at = now;
-            }
-            PreparedAssignment {
-                assignment,
-                created_new: true,
+            } else {
+                // Reusing a worker session is allowed, but the assignment remains the execution-bearing
+                // protocol object. A new execution segment always gets its own explicit assignment id.
+                let worker_session_id = Self::select_worker_session_for_assignment(
+                    &mut state.collaboration,
+                    &params.worker_id,
+                    params
+                        .worker_kind
+                        .clone()
+                        .unwrap_or_else(|| "codex".to_string()),
+                );
+                let attempt_number = state
+                    .collaboration
+                    .assignments
+                    .values()
+                    .filter(|assignment| assignment.work_unit_id == params.work_unit_id)
+                    .count() as u32
+                    + 1;
+                let assignment = Assignment {
+                    id: Self::new_object_id("assignment"),
+                    work_unit_id: params.work_unit_id.clone(),
+                    worker_id: params.worker_id.clone(),
+                    worker_session_id: worker_session_id.clone(),
+                    instructions: params
+                        .instructions
+                        .unwrap_or_else(|| work_unit.task_statement.clone()),
+                    status: AssignmentStatus::Created,
+                    attempt_number,
+                    created_at: now,
+                    updated_at: now,
+                };
+                state
+                    .collaboration
+                    .assignments
+                    .insert(assignment.id.clone(), assignment.clone());
+                if let Some(work_unit) =
+                    state.collaboration.work_units.get_mut(&params.work_unit_id)
+                {
+                    work_unit.current_assignment_id = Some(assignment.id.clone());
+                    work_unit.status = WorkUnitStatus::Ready;
+                    work_unit.updated_at = now;
+                }
+                PreparedAssignment {
+                    assignment,
+                    created_new: true,
+                }
             }
         };
+        let _ = self
+            .ensure_assignment_communication_record(
+                &outcome.assignment.id,
+                requested_model,
+                requested_cwd,
+            )
+            .await?;
         self.persist_collaboration_state().await?;
         Ok(outcome)
+    }
+
+    async fn ensure_assignment_communication_record(
+        &self,
+        assignment_id: &str,
+        requested_model: Option<String>,
+        requested_cwd: Option<String>,
+    ) -> OrcasResult<()> {
+        if self
+            .state
+            .read()
+            .await
+            .collaboration
+            .assignment_communications
+            .contains_key(assignment_id)
+        {
+            return Ok(());
+        }
+
+        let record = {
+            let now = Utc::now();
+            let mut state = self.state.write().await;
+            if state
+                .collaboration
+                .assignment_communications
+                .contains_key(assignment_id)
+            {
+                return Ok(());
+            }
+            let assignment = state
+                .collaboration
+                .assignments
+                .get(assignment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "unknown assignment `{assignment_id}` for communication record"
+                    ))
+                })?;
+            let record = build_assignment_communication_record(
+                &state.collaboration,
+                &assignment,
+                requested_model,
+                requested_cwd,
+                self.config.defaults.cwd.as_ref(),
+                now,
+            )?;
+            validate_assignment_packet(&record.packet)?;
+            state
+                .collaboration
+                .assignment_communications
+                .insert(assignment_id.to_string(), record.clone());
+            record
+        };
+        let _ = record;
+        self.persist_collaboration_state().await?;
+        Ok(())
     }
 
     async fn ensure_worker_session_thread(
@@ -3506,160 +3616,6 @@ impl OrcasDaemonService {
             .thread_get(ipc::ThreadGetRequest { thread_id })
             .await
             .is_err())
-    }
-
-    fn build_worker_prompt(instructions: &str) -> String {
-        format!(
-            "You are an Orcas worker executing one bounded assignment.\n\
-Stop when the assignment is complete, blocked, failed, or uncertain enough to require supervisor review.\n\
-At the end, emit exactly one report block in this format and do not wrap it in markdown fences:\n\
-ORCAS_REPORT_BEGIN\n\
-{{\n\
-  \"disposition\": \"completed|partial|blocked|failed|interrupted\",\n\
-  \"summary\": \"one short summary\",\n\
-  \"findings\": [\"...\"],\n\
-  \"blockers\": [\"...\"],\n\
-  \"questions\": [\"...\"],\n\
-  \"recommended_next_actions\": [\"...\"],\n\
-  \"confidence\": \"low|medium|high\"\n\
-}}\n\
-ORCAS_REPORT_END\n\
-\n\
-Assignment instructions:\n\
-{instructions}"
-        )
-    }
-
-    fn parse_worker_report(raw_output: &str) -> ParsedWorkerReport {
-        let fallback = || {
-            ParsedWorkerReport {
-                disposition: ReportDisposition::Unknown,
-                summary: "Worker output retained for supervisor review because the structured report was invalid or incomplete.".to_string(),
-                findings: Vec::new(),
-                blockers: Vec::new(),
-                questions: Vec::new(),
-                recommended_next_actions: Vec::new(),
-                confidence: ReportConfidence::Unknown,
-                parse_result: ReportParseResult::Invalid,
-                needs_supervisor_review: true,
-            }
-        };
-
-        let Some((prefix, after_begin)) = raw_output.split_once("ORCAS_REPORT_BEGIN") else {
-            return fallback();
-        };
-        let Some((json_payload, suffix)) = after_begin.split_once("ORCAS_REPORT_END") else {
-            return fallback();
-        };
-        if after_begin.contains("ORCAS_REPORT_BEGIN") || suffix.contains("ORCAS_REPORT_END") {
-            return fallback();
-        }
-
-        let Ok(payload) = serde_json::from_str::<WorkerReportPayload>(json_payload.trim()) else {
-            return fallback();
-        };
-
-        let disposition = Self::parse_report_disposition(&payload.disposition);
-        let confidence = Self::parse_report_confidence(&payload.confidence);
-        let has_review_noise = !prefix.trim().is_empty() || !suffix.trim().is_empty();
-        let parse_result = if payload.summary.trim().is_empty()
-            || disposition == ReportDisposition::Unknown
-            || confidence == ReportConfidence::Unknown
-        {
-            ReportParseResult::Invalid
-        } else if has_review_noise {
-            ReportParseResult::Ambiguous
-        } else {
-            ReportParseResult::Parsed
-        };
-
-        ParsedWorkerReport {
-            disposition,
-            summary: if payload.summary.trim().is_empty() {
-                "Worker output retained for supervisor review because the structured report summary was empty.".to_string()
-            } else {
-                payload.summary
-            },
-            findings: payload.findings,
-            blockers: payload.blockers,
-            questions: payload.questions,
-            recommended_next_actions: payload.recommended_next_actions,
-            confidence,
-            needs_supervisor_review: parse_result != ReportParseResult::Parsed,
-            parse_result,
-        }
-    }
-
-    fn parse_worker_report_for_turn(
-        raw_output: &str,
-        lifecycle: ipc::TurnLifecycleState,
-    ) -> ParsedWorkerReport {
-        let mut parsed = Self::parse_worker_report(raw_output);
-        match lifecycle {
-            ipc::TurnLifecycleState::Interrupted => {
-                parsed.disposition = ReportDisposition::Interrupted;
-                parsed.summary = if raw_output.trim().is_empty() {
-                    "Execution was interrupted before a valid Orcas report was produced."
-                        .to_string()
-                } else {
-                    "Execution was interrupted. Raw output was retained for supervisor review."
-                        .to_string()
-                };
-                parsed.findings.clear();
-                parsed.blockers.clear();
-                parsed.questions.clear();
-                parsed.recommended_next_actions.clear();
-                parsed.confidence = ReportConfidence::Unknown;
-                parsed.parse_result = match parsed.parse_result {
-                    ReportParseResult::Invalid => ReportParseResult::Invalid,
-                    _ => ReportParseResult::Ambiguous,
-                };
-                parsed.needs_supervisor_review = true;
-                parsed
-            }
-            ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
-                parsed.disposition = ReportDisposition::Failed;
-                parsed.summary = if raw_output.trim().is_empty() {
-                    "Execution lost runtime continuity before a valid Orcas report was produced."
-                        .to_string()
-                } else {
-                    "Execution lost runtime continuity. Raw output was retained for supervisor review."
-                        .to_string()
-                };
-                parsed.findings.clear();
-                parsed.blockers.clear();
-                parsed.questions.clear();
-                parsed.recommended_next_actions.clear();
-                parsed.confidence = ReportConfidence::Unknown;
-                parsed.parse_result = match parsed.parse_result {
-                    ReportParseResult::Invalid => ReportParseResult::Invalid,
-                    _ => ReportParseResult::Ambiguous,
-                };
-                parsed.needs_supervisor_review = true;
-                parsed
-            }
-            _ => parsed,
-        }
-    }
-
-    fn parse_report_disposition(value: &str) -> ReportDisposition {
-        match value {
-            "completed" => ReportDisposition::Completed,
-            "partial" => ReportDisposition::Partial,
-            "blocked" => ReportDisposition::Blocked,
-            "failed" => ReportDisposition::Failed,
-            "interrupted" => ReportDisposition::Interrupted,
-            _ => ReportDisposition::Unknown,
-        }
-    }
-
-    fn parse_report_confidence(value: &str) -> ReportConfidence {
-        match value {
-            "low" => ReportConfidence::Low,
-            "medium" => ReportConfidence::Medium,
-            "high" => ReportConfidence::High,
-            _ => ReportConfidence::Unknown,
-        }
     }
 
     fn full_turn_output_from_view(thread: &ipc::ThreadView, turn_id: &str) -> Option<String> {
@@ -4933,6 +4889,8 @@ mod tests {
 
     use super::OrcasDaemonService;
     use super::{DaemonState, TurnKey};
+    use crate::assignment_comm::parse::{parse_worker_report, parse_worker_report_for_turn};
+    use crate::assignment_comm::render::{build_assignment_communication_record, render_prompt};
     use crate::supervisor::{
         SupervisorReasoner, SupervisorReasonerFailure, SupervisorReasonerResult,
     };
@@ -4942,13 +4900,13 @@ mod tests {
         protocol::jsonrpc as codex_jsonrpc, transport::TransportConnection, types,
     };
     use orcas_core::{
-        AppConfig, AppPaths, Assignment, AssignmentStatus, DecisionType, DraftAssignment,
-        JsonSessionStore, OrcasError, OrcasResult, OrcasSessionStore, ProposedDecision, Report,
-        ReportConfidence, ReportDisposition, ReportParseResult, SupervisorContextPack,
-        SupervisorProposal, SupervisorProposalEdits, SupervisorProposalFailureStage,
-        SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorSummary, WorkUnit,
-        WorkUnitStatus, WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus,
-        Workstream, WorkstreamStatus, ipc,
+        AppConfig, AppPaths, Assignment, AssignmentStatus, CollaborationState, DecisionType,
+        DraftAssignment, JsonSessionStore, OrcasError, OrcasResult, OrcasSessionStore,
+        ProposedDecision, Report, ReportConfidence, ReportDisposition, ReportParseResult,
+        SupervisorContextPack, SupervisorProposal, SupervisorProposalEdits,
+        SupervisorProposalFailureStage, SupervisorProposalStatus, SupervisorProposalTriggerKind,
+        SupervisorSummary, WorkUnit, WorkUnitStatus, WorkerSessionAttachability,
+        WorkerSessionRuntimeStatus, WorkerStatus, Workstream, WorkstreamStatus, ipc,
     };
 
     #[derive(Debug)]
@@ -4981,6 +4939,7 @@ mod tests {
         next_thread_id: usize,
         next_turn_id: usize,
         threads: HashMap<String, types::Thread>,
+        last_turn_start_text: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -5122,9 +5081,13 @@ mod tests {
                 methods::TURN_START => {
                     let params: types::TurnStartParams =
                         serde_json::from_value(request.params.unwrap_or(Value::Null))?;
+                    let turn_prompt = Self::turn_start_text(&params);
+                    let rendered_output =
+                        Self::substitute_prompt_placeholders(&turn_output, turn_prompt.as_deref());
                     let turn = {
                         let mut state = state.lock().await;
                         state.next_turn_id += 1;
+                        state.last_turn_start_text = turn_prompt.clone();
                         let turn = types::Turn {
                             id: format!("turn-fake-{}", state.next_turn_id),
                             items: Vec::new(),
@@ -5185,7 +5148,7 @@ mod tests {
                                 thread_id: params.thread_id.clone(),
                                 turn_id: turn.id.clone(),
                                 item_id: item_id.clone(),
-                                delta: turn_output.clone(),
+                                delta: rendered_output.clone(),
                             },
                         )
                         .await;
@@ -5212,8 +5175,10 @@ mod tests {
                             };
                             let completed_item = {
                                 let mut extra = Map::new();
-                                extra
-                                    .insert("text".to_string(), Value::String(turn_output.clone()));
+                                extra.insert(
+                                    "text".to_string(),
+                                    Value::String(rendered_output.clone()),
+                                );
                                 types::ThreadItem {
                                     id: item_id,
                                     item_type: "agent_message".to_string(),
@@ -5306,6 +5271,28 @@ mod tests {
                     "failed to send fake codex notification to client: {error}"
                 ))
             })
+        }
+
+        fn turn_start_text(params: &types::TurnStartParams) -> Option<String> {
+            params.input.iter().find_map(|input| match input {
+                types::UserInput::Text { text, .. } => Some(text.clone()),
+            })
+        }
+
+        fn substitute_prompt_placeholders(template: &str, prompt_text: Option<&str>) -> String {
+            let Some(prompt_text) = prompt_text else {
+                return template.to_string();
+            };
+            let assignment_id = extract_prompt_line_value(prompt_text, "Assignment id:");
+            let packet_id = extract_prompt_line_value(prompt_text, "Packet id:");
+            let output = template.replace(
+                "{{assignment_id}}",
+                assignment_id.as_deref().unwrap_or("assignment-missing"),
+            );
+            output.replace(
+                "{{packet_id}}",
+                packet_id.as_deref().unwrap_or("packet-missing"),
+            )
         }
     }
 
@@ -5592,6 +5579,15 @@ mod tests {
         }
     }
 
+    fn extract_prompt_line_value(prompt: &str, prefix: &str) -> Option<String> {
+        prompt
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(prefix))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
     async fn test_service() -> Arc<OrcasDaemonService> {
         let base = std::env::temp_dir().join(format!("orcas-collab-test-{}", Uuid::new_v4()));
         test_service_at(base).await
@@ -5708,6 +5704,22 @@ mod tests {
         turn_output: &str,
         terminal_outcome: FakeCodexTerminalOutcome,
     ) -> Arc<OrcasDaemonService> {
+        test_service_with_fake_codex_runtime_capture(
+            config,
+            supervisor_reasoner,
+            turn_output,
+            terminal_outcome,
+        )
+        .await
+        .0
+    }
+
+    async fn test_service_with_fake_codex_runtime_capture(
+        config: AppConfig,
+        supervisor_reasoner: Arc<dyn SupervisorReasoner>,
+        turn_output: &str,
+        terminal_outcome: FakeCodexTerminalOutcome,
+    ) -> (Arc<OrcasDaemonService>, Arc<Mutex<FakeCodexRuntimeState>>) {
         let base = std::env::temp_dir().join(format!("orcas-collab-test-{}", Uuid::new_v4()));
         let paths = AppPaths {
             config_dir: base.join("config"),
@@ -5724,16 +5736,18 @@ mod tests {
         let codex_daemon: Arc<dyn CodexDaemonManager> = Arc::new(FakeCodexDaemonManager {
             endpoint: config.codex.listen_url.clone(),
         });
+        let fake_transport = Arc::new(FakeCodexTransport::new(
+            config.codex.listen_url.clone(),
+            turn_output.to_string(),
+            terminal_outcome,
+        ));
+        let fake_runtime_state = Arc::clone(&fake_transport.state);
         let codex_client = CodexClient::new(
-            Arc::new(FakeCodexTransport::new(
-                config.codex.listen_url.clone(),
-                turn_output.to_string(),
-                terminal_outcome,
-            )),
+            fake_transport,
             config.codex.reconnect.clone(),
             Arc::new(RejectingApprovalRouter),
         );
-        test_service_at_with_components(
+        let service = test_service_at_with_components(
             paths,
             config,
             supervisor_reasoner,
@@ -5741,7 +5755,8 @@ mod tests {
             codex_client,
             true,
         )
-        .await
+        .await;
+        (service, fake_runtime_state)
     }
 
     async fn seed_awaiting_decision_fixture(
@@ -5934,18 +5949,18 @@ mod tests {
             updated_at: Utc::now(),
             error_message: None,
         };
-        let raw_output = r#"ORCAS_REPORT_BEGIN
-{
-  "disposition": "completed",
-  "summary": "finished the bounded task",
-  "findings": ["root cause isolated"],
-  "blockers": [],
-  "questions": [],
-  "recommended_next_actions": ["apply supervisor decision"],
-  "confidence": "high"
-}
-ORCAS_REPORT_END"#
-            .to_string();
+        let packet_id = service
+            .state
+            .read()
+            .await
+            .collaboration
+            .assignment_communications
+            .get(&assignment.id)
+            .expect("communication record")
+            .packet
+            .packet_id
+            .clone();
+        let raw_output = sample_runtime_report_output_for(&assignment.id, &packet_id);
 
         (workstream, work_unit, assignment, turn_state, raw_output)
     }
@@ -6070,18 +6085,105 @@ ORCAS_REPORT_END"#
         }
     }
 
-    fn sample_runtime_report_output() -> &'static str {
+    fn sample_runtime_report_output_template() -> &'static str {
         r#"ORCAS_REPORT_BEGIN
 {
+  "schema_version": "worker_report_envelope.v1",
+  "assignment_id": "{{assignment_id}}",
+  "packet_id": "{{packet_id}}",
+  "task_mode": "implement",
   "disposition": "completed",
   "summary": "finished the bounded task",
-  "findings": ["root cause isolated"],
+  "confidence": "high",
+  "acceptance_results": [],
+  "triggered_stop_condition_ids": [],
+  "touched_files": [],
+  "commands_run": [],
+  "artifacts": [],
   "blockers": [],
   "questions": [],
   "recommended_next_actions": ["apply supervisor decision"],
-  "confidence": "high"
+  "uncertainties": [],
+  "review_signal": {
+    "level": "normal",
+    "reasons": [],
+    "focus": []
+  },
+  "mode_payload": {
+    "kind": "implement",
+    "semantic_changes": ["root cause isolated"],
+    "tests_run": ["cargo test -p orcas-daemon"],
+    "rough_edges": []
+  }
 }
 ORCAS_REPORT_END"#
+    }
+
+    fn sample_runtime_report_output_for(assignment_id: &str, packet_id: &str) -> String {
+        sample_runtime_report_output_template()
+            .replace("{{assignment_id}}", assignment_id)
+            .replace("{{packet_id}}", packet_id)
+    }
+
+    fn wrap_report_envelope(json: &str) -> String {
+        format!("ORCAS_REPORT_BEGIN\n{json}\nORCAS_REPORT_END")
+    }
+
+    fn sample_assignment_and_communication_record()
+    -> (Assignment, orcas_core::AssignmentCommunicationRecord) {
+        let now = Utc::now();
+        let workstream = Workstream {
+            id: "ws-parse".to_string(),
+            title: "Parse".to_string(),
+            objective: "Exercise worker report parsing".to_string(),
+            status: WorkstreamStatus::Active,
+            priority: "normal".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let work_unit = WorkUnit {
+            id: "wu-parse".to_string(),
+            workstream_id: workstream.id.clone(),
+            title: "Implement".to_string(),
+            task_statement: "Implement one bounded step.".to_string(),
+            status: WorkUnitStatus::Ready,
+            dependencies: Vec::new(),
+            latest_report_id: None,
+            current_assignment_id: Some("assignment-parse".to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+        let assignment = Assignment {
+            id: "assignment-parse".to_string(),
+            work_unit_id: work_unit.id.clone(),
+            worker_id: "worker-parse".to_string(),
+            worker_session_id: "session-parse".to_string(),
+            instructions: "Implement the bounded task and report honestly.".to_string(),
+            status: AssignmentStatus::Created,
+            attempt_number: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut collaboration = CollaborationState::default();
+        collaboration
+            .workstreams
+            .insert(workstream.id.clone(), workstream);
+        collaboration
+            .work_units
+            .insert(work_unit.id.clone(), work_unit);
+        collaboration
+            .assignments
+            .insert(assignment.id.clone(), assignment.clone());
+        let record = build_assignment_communication_record(
+            &collaboration,
+            &assignment,
+            None,
+            None,
+            None,
+            now,
+        )
+        .expect("communication record");
+        (assignment, record)
     }
 
     async fn assert_terminal_approval_path(
@@ -6993,10 +7095,10 @@ ORCAS_REPORT_END"#
     #[tokio::test]
     async fn full_assignment_runtime_path_creates_auto_proposal_with_fake_codex_runtime() {
         let reasoner = Arc::new(PackDrivenSupervisorReasoner::new(DecisionType::Continue));
-        let service = test_service_with_fake_codex_runtime(
+        let (service, fake_runtime_state) = test_service_with_fake_codex_runtime_capture(
             auto_proposal_config(true),
             reasoner.clone(),
-            sample_runtime_report_output(),
+            sample_runtime_report_output_template(),
             FakeCodexTerminalOutcome::Completed,
         )
         .await;
@@ -7063,6 +7165,10 @@ ORCAS_REPORT_END"#
         assert_eq!(response.report.assignment_id, response.assignment.id);
         assert_eq!(response.report.work_unit_id, work_unit.id);
         assert_eq!(response.report.parse_result, ReportParseResult::Parsed);
+        assert_eq!(
+            response.report.findings,
+            vec!["root cause isolated".to_string()]
+        );
         assert_eq!(recorded_report.id, response.report.id);
         assert_eq!(reasoner.propose_call_count(), 1);
         assert_eq!(proposal_event.source_report_id, response.report.id);
@@ -7100,6 +7206,36 @@ ORCAS_REPORT_END"#
         let state = service.state.read().await;
         assert!(state.collaboration.decisions.is_empty());
         assert_eq!(state.collaboration.assignments.len(), 1);
+        let communication = state
+            .collaboration
+            .assignment_communications
+            .get(&response.assignment.id)
+            .expect("assignment communication");
+        assert_eq!(communication.assignment_id, response.assignment.id);
+        assert_eq!(
+            communication.packet.task_mode,
+            orcas_core::AssignmentTaskMode::Implement
+        );
+        assert_eq!(
+            communication.prompt_render.render_spec.template_version,
+            "assignment_prompt.v1"
+        );
+        assert_eq!(
+            communication
+                .validation
+                .as_ref()
+                .expect("validation")
+                .parse_result,
+            ReportParseResult::Parsed
+        );
+        assert_eq!(
+            communication
+                .response_envelope
+                .as_ref()
+                .expect("response envelope")
+                .assignment_id,
+            response.assignment.id
+        );
         assert_eq!(
             state.collaboration.work_units[&work_unit.id].status,
             WorkUnitStatus::AwaitingDecision
@@ -7112,6 +7248,26 @@ ORCAS_REPORT_END"#
             state.collaboration.work_units[&work_unit.id].latest_report_id,
             Some(response.report.id.clone())
         );
+        drop(state);
+
+        let sent_prompt = fake_runtime_state
+            .lock()
+            .await
+            .last_turn_start_text
+            .clone()
+            .expect("sent prompt");
+        let stored_prompt = service
+            .state
+            .read()
+            .await
+            .collaboration
+            .assignment_communications
+            .get(&response.assignment.id)
+            .expect("communication record")
+            .prompt_render
+            .prompt_text
+            .clone();
+        assert_eq!(sent_prompt, stored_prompt);
     }
 
     #[tokio::test]
@@ -7120,7 +7276,7 @@ ORCAS_REPORT_END"#
         let service = test_service_with_fake_codex_runtime(
             auto_proposal_config(false),
             reasoner.clone(),
-            sample_runtime_report_output(),
+            sample_runtime_report_output_template(),
             FakeCodexTerminalOutcome::Completed,
         )
         .await;
@@ -8391,89 +8547,258 @@ ORCAS_REPORT_END"#
     }
 
     #[test]
-    fn parse_worker_report_accepts_clean_contract() {
-        let raw = r#"ORCAS_REPORT_BEGIN
-{
-  "disposition": "completed",
-  "summary": "finished the bounded task",
-  "findings": ["root cause isolated"],
-  "blockers": [],
-  "questions": [],
-  "recommended_next_actions": ["apply supervisor decision"],
-  "confidence": "high"
-}
-ORCAS_REPORT_END"#;
+    fn assignment_prompt_render_is_deterministic_for_same_packet() {
+        let (_assignment, record) = sample_assignment_and_communication_record();
+        let rerendered = render_prompt(&record.packet, &record.packet_hash, record.created_at)
+            .expect("re-render prompt");
 
-        let parsed = OrcasDaemonService::parse_worker_report(raw);
+        assert_eq!(
+            record.prompt_render.render_spec.template_version,
+            "assignment_prompt.v1"
+        );
+        assert_eq!(record.prompt_render.prompt_text, rerendered.prompt_text);
+        assert_eq!(record.prompt_render.prompt_hash, rerendered.prompt_hash);
+        assert_eq!(
+            record.prompt_render.render_spec.section_order,
+            rerendered.render_spec.section_order
+        );
+        assert!(
+            record
+                .prompt_render
+                .prompt_text
+                .contains("Response Contract:\n- Emit exactly one JSON envelope")
+        );
+        let objective_index = record
+            .prompt_render
+            .prompt_text
+            .find("Objective:\n")
+            .expect("objective section");
+        let instructions_index = record
+            .prompt_render
+            .prompt_text
+            .find("Instructions:\n")
+            .expect("instructions section");
+        let response_index = record
+            .prompt_render
+            .prompt_text
+            .find("Response Contract:\n")
+            .expect("response contract section");
+        assert!(objective_index < instructions_index);
+        assert!(instructions_index < response_index);
+    }
+
+    #[test]
+    fn parse_worker_report_accepts_clean_contract() {
+        let (assignment, record) = sample_assignment_and_communication_record();
+        let raw = sample_runtime_report_output_for(&assignment.id, &record.packet.packet_id);
+
+        let parsed = parse_worker_report(&raw, &assignment, &record);
         assert_eq!(parsed.disposition, ReportDisposition::Completed);
         assert_eq!(parsed.confidence, ReportConfidence::High);
-        assert_eq!(parsed.parse_result, ReportParseResult::Parsed);
-        assert!(!parsed.needs_supervisor_review);
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Parsed);
+        assert!(!parsed.validation.needs_supervisor_review);
         assert_eq!(parsed.findings, vec!["root cause isolated".to_string()]);
+        let envelope = parsed.envelope.expect("parsed envelope");
+        assert!(envelope.touched_files.is_empty());
+        assert!(envelope.commands_run.is_empty());
+        assert!(envelope.acceptance_results.is_empty());
+        assert!(envelope.artifacts.is_empty());
     }
 
     #[test]
     fn parse_worker_report_flags_ambiguous_output_for_review() {
-        let raw = r#"here is the report
-ORCAS_REPORT_BEGIN
-{
+        let (assignment, record) = sample_assignment_and_communication_record();
+        let raw = format!(
+            "here is the report\n{}",
+            sample_runtime_report_output_for(&assignment.id, &record.packet.packet_id)
+        );
+
+        let parsed = parse_worker_report(&raw, &assignment, &record);
+        assert_eq!(parsed.disposition, ReportDisposition::Completed);
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Ambiguous);
+        assert!(parsed.validation.needs_supervisor_review);
+    }
+
+    #[test]
+    fn parse_worker_report_rejects_malformed_json() {
+        let (assignment, record) = sample_assignment_and_communication_record();
+
+        let parsed = parse_worker_report(
+            &wrap_report_envelope("{ not valid json }"),
+            &assignment,
+            &record,
+        );
+
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Invalid);
+        assert!(parsed.validation.needs_supervisor_review);
+        assert!(parsed.envelope.is_none());
+    }
+
+    #[test]
+    fn parse_worker_report_rejects_assignment_id_mismatch() {
+        let (assignment, record) = sample_assignment_and_communication_record();
+        let raw = wrap_report_envelope(&format!(
+            r#"{{
+  "schema_version": "worker_report_envelope.v1",
+  "assignment_id": "assignment-other",
+  "packet_id": "{}",
+  "task_mode": "implement",
   "disposition": "completed",
   "summary": "finished the bounded task",
-  "findings": [],
+  "confidence": "high",
+  "acceptance_results": [],
+  "triggered_stop_condition_ids": [],
+  "touched_files": [],
+  "commands_run": [],
+  "artifacts": [],
   "blockers": [],
   "questions": [],
   "recommended_next_actions": [],
-  "confidence": "high"
-}
-ORCAS_REPORT_END"#;
+  "uncertainties": [],
+  "review_signal": {{
+    "level": "normal",
+    "reasons": [],
+    "focus": []
+  }},
+  "mode_payload": {{
+    "kind": "implement",
+    "semantic_changes": [],
+    "tests_run": [],
+    "rough_edges": []
+  }}
+}}"#,
+            record.packet.packet_id
+        ));
 
-        let parsed = OrcasDaemonService::parse_worker_report(raw);
-        assert_eq!(parsed.disposition, ReportDisposition::Completed);
-        assert_eq!(parsed.parse_result, ReportParseResult::Ambiguous);
-        assert!(parsed.needs_supervisor_review);
+        let parsed = parse_worker_report(&raw, &assignment, &record);
+
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Invalid);
+        assert!(parsed.validation.needs_supervisor_review);
+    }
+
+    #[test]
+    fn parse_worker_report_rejects_packet_id_mismatch() {
+        let (assignment, record) = sample_assignment_and_communication_record();
+        let raw = wrap_report_envelope(&format!(
+            r#"{{
+  "schema_version": "worker_report_envelope.v1",
+  "assignment_id": "{}",
+  "packet_id": "packet-other",
+  "task_mode": "implement",
+  "disposition": "completed",
+  "summary": "finished the bounded task",
+  "confidence": "high",
+  "acceptance_results": [],
+  "triggered_stop_condition_ids": [],
+  "touched_files": [],
+  "commands_run": [],
+  "artifacts": [],
+  "blockers": [],
+  "questions": [],
+  "recommended_next_actions": [],
+  "uncertainties": [],
+  "review_signal": {{
+    "level": "normal",
+    "reasons": [],
+    "focus": []
+  }},
+  "mode_payload": {{
+    "kind": "implement",
+    "semantic_changes": [],
+    "tests_run": [],
+    "rough_edges": []
+  }}
+}}"#,
+            assignment.id
+        ));
+
+        let parsed = parse_worker_report(&raw, &assignment, &record);
+
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Invalid);
+        assert!(parsed.validation.needs_supervisor_review);
+    }
+
+    #[test]
+    fn parse_worker_report_requires_common_fields_to_exist() {
+        let (assignment, record) = sample_assignment_and_communication_record();
+        let raw = wrap_report_envelope(&format!(
+            r#"{{
+  "schema_version": "worker_report_envelope.v1",
+  "assignment_id": "{}",
+  "packet_id": "{}",
+  "task_mode": "implement",
+  "disposition": "completed",
+  "summary": "finished the bounded task",
+  "confidence": "high",
+  "acceptance_results": [],
+  "triggered_stop_condition_ids": [],
+  "touched_files": [],
+  "commands_run": [],
+  "artifacts": [],
+  "blockers": [],
+  "recommended_next_actions": [],
+  "uncertainties": [],
+  "review_signal": {{
+    "level": "normal",
+    "reasons": [],
+    "focus": []
+  }},
+  "mode_payload": {{
+    "kind": "implement",
+    "semantic_changes": [],
+    "tests_run": [],
+    "rough_edges": []
+  }}
+}}"#,
+            assignment.id, record.packet.packet_id
+        ));
+
+        let parsed = parse_worker_report(&raw, &assignment, &record);
+
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Invalid);
+        assert!(parsed.validation.needs_supervisor_review);
     }
 
     #[test]
     fn parse_worker_report_invalid_output_requires_review_and_preserves_invalid_result() {
-        let parsed = OrcasDaemonService::parse_worker_report("no structured report here");
-        assert_eq!(parsed.parse_result, ReportParseResult::Invalid);
-        assert!(parsed.needs_supervisor_review);
+        let (assignment, record) = sample_assignment_and_communication_record();
+
+        let parsed = parse_worker_report("no structured report here", &assignment, &record);
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Invalid);
+        assert!(parsed.validation.needs_supervisor_review);
     }
 
     #[test]
     fn interrupted_turn_report_is_downgraded_for_supervisor_review() {
-        let raw = r#"ORCAS_REPORT_BEGIN
-{
-  "disposition": "completed",
-  "summary": "finished the bounded task",
-  "findings": ["root cause isolated"],
-  "blockers": [],
-  "questions": [],
-  "recommended_next_actions": ["apply supervisor decision"],
-  "confidence": "high"
-}
-ORCAS_REPORT_END"#;
+        let (assignment, record) = sample_assignment_and_communication_record();
+        let raw = sample_runtime_report_output_for(&assignment.id, &record.packet.packet_id);
 
-        let parsed = OrcasDaemonService::parse_worker_report_for_turn(
-            raw,
+        let parsed = parse_worker_report_for_turn(
+            &raw,
             ipc::TurnLifecycleState::Interrupted,
+            &assignment,
+            &record,
         );
         assert_eq!(parsed.disposition, ReportDisposition::Interrupted);
         assert_eq!(parsed.confidence, ReportConfidence::Unknown);
-        assert_eq!(parsed.parse_result, ReportParseResult::Ambiguous);
-        assert!(parsed.needs_supervisor_review);
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Ambiguous);
+        assert!(parsed.validation.needs_supervisor_review);
         assert!(parsed.findings.is_empty());
     }
 
     #[test]
     fn lost_turn_report_stays_invalid_when_no_contract_exists() {
-        let parsed = OrcasDaemonService::parse_worker_report_for_turn(
+        let (assignment, record) = sample_assignment_and_communication_record();
+
+        let parsed = parse_worker_report_for_turn(
             "partial raw output",
             ipc::TurnLifecycleState::Lost,
+            &assignment,
+            &record,
         );
         assert_eq!(parsed.disposition, ReportDisposition::Failed);
-        assert_eq!(parsed.parse_result, ReportParseResult::Invalid);
-        assert!(parsed.needs_supervisor_review);
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Invalid);
+        assert!(parsed.validation.needs_supervisor_review);
         assert!(parsed.recommended_next_actions.is_empty());
     }
 
@@ -8583,6 +8908,29 @@ ORCAS_REPORT_END"#;
         assert_eq!(assignment.worker_session_id, worker_session_id);
         assert_eq!(assignment.status, AssignmentStatus::Created);
         assert!(prepared.created_new);
+        let communication = state
+            .collaboration
+            .assignment_communications
+            .get(&assignment_id)
+            .expect("assignment communication");
+        assert_eq!(state.collaboration.assignment_communications.len(), 1);
+        assert_eq!(communication.assignment_id, assignment_id);
+        assert_eq!(communication.packet.assignment_id, assignment_id);
+        assert_eq!(
+            communication.prompt_render.render_spec.template_version,
+            "assignment_prompt.v1"
+        );
+        assert_eq!(
+            communication.packet_hash,
+            communication.prompt_render.packet_hash
+        );
+        assert_eq!(
+            communication.prompt_hash,
+            communication.prompt_render.prompt_hash
+        );
+        assert!(!communication.packet.instructions.is_empty());
+        assert!(!communication.packet.acceptance_criteria.is_empty());
+        assert!(!communication.packet.stop_conditions.is_empty());
         assert_eq!(
             state.collaboration.workers[&worker_id].status,
             WorkerStatus::Idle
@@ -8836,6 +9184,14 @@ ORCAS_REPORT_END"#;
 
         assert_eq!(first.assignment.id, second.assignment.id);
         assert!(!second.created_new);
+        let state = service.state.read().await;
+        assert_eq!(state.collaboration.assignment_communications.len(), 1);
+        assert!(
+            state
+                .collaboration
+                .assignment_communications
+                .contains_key(&first.assignment.id)
+        );
     }
 
     #[tokio::test]
