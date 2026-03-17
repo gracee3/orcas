@@ -1,10 +1,7 @@
 use chrono::Utc;
-use ratatui::Terminal;
-use ratatui::backend::TestBackend;
 
-use crate::app::{BannerLevel, DaemonConnectionPhase, NavigationFocus, UserAction};
+use crate::app::{BannerLevel, DaemonConnectionPhase, NavigationFocus, UiEvent, UserAction};
 use crate::backend::BackendCommand;
-use crate::render;
 use crate::test_harness::AppHarness;
 use orcas_core::{
     Assignment, AssignmentStatus, ConnectionState, Decision, DecisionType, Report,
@@ -657,7 +654,7 @@ async fn collaboration_snapshot_drives_rendering() {
         detail
             .lines
             .iter()
-            .any(|line| line.contains("parse_result: ambiguous"))
+            .any(|line| line.contains("report: report-2 parse=ambiguous review=true"))
     );
     assert!(
         detail
@@ -842,13 +839,13 @@ async fn parse_result_and_supervisor_review_display_are_distinct() {
         detail
             .lines
             .iter()
-            .any(|line| line.contains("parse_result: ambiguous"))
+            .any(|line| line.contains("report: report-2 parse=ambiguous review=true"))
     );
     assert!(
         detail
             .lines
             .iter()
-            .any(|line| line.contains("needs_supervisor_review: true"))
+            .any(|line| line.contains("report: report-2 parse=ambiguous review=true"))
     );
     assert!(
         history
@@ -1017,13 +1014,13 @@ async fn collaboration_history_shows_failed_interrupted_and_lost_states_explicit
         detail
             .lines
             .iter()
-            .any(|line| line.contains("parse_result: invalid"))
+            .any(|line| line.contains("report: report-i parse=invalid review=true"))
     );
     assert!(
         detail
             .lines
             .iter()
-            .any(|line| { line.contains("needs_supervisor_review: true") })
+            .any(|line| line.contains("report: report-i parse=invalid review=true"))
     );
     assert!(history.lines.iter().any(|line| {
         line.contains("assignment-f [failed] attempt=1 worker=worker-a session=session-1")
@@ -1047,6 +1044,151 @@ async fn focus_switches_collaboration_navigation_without_overwriting_thread_stat
     assert_eq!(status.focus, NavigationFocus::WorkUnits);
     assert!(detail.title.contains("Deferred work"));
     assert!(threads.rows[0].selected);
+}
+
+#[tokio::test]
+async fn focus_cycle_order_is_threads_then_workstreams_then_work_units_then_threads() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+
+    assert_eq!(harness.focus(), NavigationFocus::Threads);
+    harness.dispatch(UserAction::CycleFocus).await;
+    assert_eq!(harness.focus(), NavigationFocus::Workstreams);
+    harness.dispatch(UserAction::CycleFocus).await;
+    assert_eq!(harness.focus(), NavigationFocus::WorkUnits);
+    harness.dispatch(UserAction::CycleFocus).await;
+    assert_eq!(harness.focus(), NavigationFocus::Threads);
+}
+
+#[tokio::test]
+async fn j_and_k_only_move_the_focused_list_selection() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+
+    let initial_thread = harness.selected_thread_id().map(str::to_string);
+    let initial_workstream = harness.selected_workstream_id().map(str::to_string);
+    let initial_work_unit = harness.selected_work_unit_id().map(str::to_string);
+
+    harness.dispatch(UserAction::CycleFocus).await;
+    harness.dispatch(UserAction::SelectNextInFocus).await;
+
+    assert_eq!(harness.focus(), NavigationFocus::Workstreams);
+    assert_eq!(harness.selected_thread_id(), initial_thread.as_deref());
+    assert_ne!(
+        harness.selected_workstream_id(),
+        initial_workstream.as_deref()
+    );
+    assert_ne!(
+        harness.selected_work_unit_id(),
+        initial_work_unit.as_deref()
+    );
+
+    let workstream_after_move = harness.selected_workstream_id().map(str::to_string);
+    let thread_after_workstream_move = harness.selected_thread_id().map(str::to_string);
+    harness.dispatch(UserAction::CycleFocus).await;
+    harness.dispatch(UserAction::SelectPreviousInFocus).await;
+
+    assert_eq!(harness.focus(), NavigationFocus::WorkUnits);
+    assert_eq!(
+        harness.selected_thread_id(),
+        thread_after_workstream_move.as_deref()
+    );
+    assert_eq!(
+        harness.selected_workstream_id(),
+        workstream_after_move.as_deref()
+    );
+    assert_eq!(harness.selected_work_unit_id(), Some("wu-3"));
+}
+
+#[tokio::test]
+async fn workstream_navigation_updates_selected_work_unit_and_rendered_context() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness.dispatch(UserAction::CycleFocus).await;
+    harness.dispatch(UserAction::SelectNextInFocus).await;
+
+    let status = harness.collaboration_status_vm();
+    let workstreams = harness.workstream_list_vm();
+    let work_units = harness.work_unit_list_vm();
+    let history = harness.collaboration_history_vm();
+    let rendered = harness.render_text(160, 42);
+
+    assert_eq!(status.focus, NavigationFocus::Workstreams);
+    assert!(
+        workstreams
+            .rows
+            .iter()
+            .any(|row| row.title == "Deferred work" && row.selected)
+    );
+    assert_eq!(work_units.rows.len(), 1);
+    assert_eq!(work_units.rows[0].title, "Out of scope");
+    assert!(work_units.rows[0].selected);
+    assert!(history.title.contains("Out of scope"));
+    assert!(rendered.contains("focus=workstreams"));
+    assert!(rendered.contains("Workstreams <focus>"));
+    assert!(rendered.contains("> Deferred work [blocked]"));
+    assert!(rendered.contains("> Out of scope"));
+    assert!(rendered.contains("[blocked]"));
+    assert!(rendered.contains("nav: tab focus=workstreams"));
+}
+
+#[tokio::test]
+async fn work_unit_navigation_refreshes_detail_history_and_fetch_command() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness.dispatch(UserAction::CycleFocus).await;
+    harness.dispatch(UserAction::CycleFocus).await;
+    harness.dispatch(UserAction::SelectNextInFocus).await;
+
+    let status = harness.collaboration_status_vm();
+    let work_units = harness.work_unit_list_vm();
+    let detail = harness.collaboration_detail_vm();
+    let history = harness.collaboration_history_vm();
+    let commands = harness.recorded_commands().await;
+    let rendered = harness.render_text(160, 42);
+
+    assert_eq!(status.focus, NavigationFocus::WorkUnits);
+    assert!(
+        work_units
+            .rows
+            .iter()
+            .any(|row| row.title == "Event wiring" && row.selected)
+    );
+    assert!(detail.title.contains("Work Unit wu-2"));
+    assert!(history.title.contains("Event wiring"));
+    assert!(commands.contains(&BackendCommand::GetWorkUnit {
+        work_unit_id: "wu-2".to_string(),
+    }));
+    assert!(rendered.contains("focus=work_units"));
+    assert!(rendered.contains("Work Units <focus>"));
+    assert!(rendered.contains("> Event wiring"));
+    assert!(rendered.contains("[ready]"));
+    assert!(rendered.contains("assignment-3"));
+    assert!(rendered.contains("[created]"));
+}
+
+#[tokio::test]
+async fn late_detail_for_non_selected_work_unit_does_not_overwrite_visible_history() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness.dispatch(UserAction::CycleFocus).await;
+    harness.dispatch(UserAction::CycleFocus).await;
+    harness.dispatch(UserAction::SelectNextInFocus).await;
+    assert_eq!(harness.selected_work_unit_id(), Some("wu-2"));
+    harness.dispatch(UserAction::SelectPreviousInFocus).await;
+    assert_eq!(harness.selected_work_unit_id(), Some("wu-1"));
+
+    harness
+        .inject_ui_event(UiEvent::WorkUnitDetailLoaded(sample_workunit_detail(
+            "wu-2",
+        )))
+        .await;
+
+    let detail = harness.collaboration_detail_vm();
+    let history = harness.collaboration_history_vm();
+    assert!(detail.title.contains("Work Unit wu-1"));
+    assert!(history.title.contains("Snapshot wiring"));
+    assert!(
+        !history
+            .lines
+            .iter()
+            .any(|line| line.contains("assignment-3 [created]"))
+    );
 }
 
 #[tokio::test]
@@ -1232,6 +1374,165 @@ async fn reconnect_refreshes_history_for_selected_work_unit() {
 }
 
 #[tokio::test]
+async fn event_refresh_does_not_leave_invalid_parent_child_selection() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness.dispatch(UserAction::CycleFocus).await;
+    harness.dispatch(UserAction::SelectNextInFocus).await;
+    assert_eq!(harness.selected_workstream_id(), Some("ws-2"));
+    assert_eq!(harness.selected_work_unit_id(), Some("wu-3"));
+
+    harness
+        .inject_event(ipc::DaemonEventEnvelope::new(
+            ipc::DaemonEvent::WorkUnitLifecycle {
+                action: ipc::CollaborationLifecycleAction::Updated,
+                work_unit: ipc::WorkUnitSummary {
+                    id: "wu-3".to_string(),
+                    workstream_id: "ws-1".to_string(),
+                    title: "Out of scope".to_string(),
+                    status: WorkUnitStatus::Blocked,
+                    dependency_count: 2,
+                    current_assignment_id: None,
+                    latest_report_id: None,
+                    updated_at: Utc::now(),
+                },
+            },
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.selected_workstream_id(), Some("ws-2"));
+    assert_eq!(harness.selected_work_unit_id(), None);
+    assert!(
+        harness
+            .workstream_detail_vm()
+            .lines
+            .iter()
+            .any(|line| line.contains("units: total=0"))
+    );
+}
+
+#[tokio::test]
+async fn reconnect_reconciles_collaboration_selection_to_authoritative_snapshot() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness.dispatch(UserAction::CycleFocus).await;
+    harness.dispatch(UserAction::SelectNextInFocus).await;
+
+    let mut recovered = sample_snapshot();
+    recovered.collaboration.workstreams = vec![ipc::WorkstreamSummary {
+        id: "ws-r".to_string(),
+        title: "Recovered".to_string(),
+        objective: "Replace stale selection.".to_string(),
+        status: WorkstreamStatus::Active,
+        priority: "high".to_string(),
+        updated_at: Utc::now(),
+    }];
+    recovered.collaboration.work_units = vec![ipc::WorkUnitSummary {
+        id: "wu-r".to_string(),
+        workstream_id: "ws-r".to_string(),
+        title: "Recovered unit".to_string(),
+        status: WorkUnitStatus::AwaitingDecision,
+        dependency_count: 0,
+        current_assignment_id: Some("assignment-r".to_string()),
+        latest_report_id: Some("report-r".to_string()),
+        updated_at: Utc::now(),
+    }];
+    recovered.collaboration.assignments = vec![ipc::AssignmentSummary {
+        id: "assignment-r".to_string(),
+        work_unit_id: "wu-r".to_string(),
+        worker_id: "worker-r".to_string(),
+        worker_session_id: "session-r".to_string(),
+        status: AssignmentStatus::Failed,
+        attempt_number: 1,
+        updated_at: Utc::now(),
+    }];
+    recovered.collaboration.reports = vec![ipc::ReportSummary {
+        id: "report-r".to_string(),
+        work_unit_id: "wu-r".to_string(),
+        assignment_id: "assignment-r".to_string(),
+        worker_id: "worker-r".to_string(),
+        disposition: ReportDisposition::Failed,
+        summary: "Recovered failure state.".to_string(),
+        confidence: ReportConfidence::Unknown,
+        parse_result: ReportParseResult::Invalid,
+        needs_supervisor_review: true,
+        created_at: Utc::now(),
+    }];
+    recovered.collaboration.decisions = vec![ipc::DecisionSummary {
+        id: "decision-r".to_string(),
+        work_unit_id: "wu-r".to_string(),
+        report_id: Some("report-r".to_string()),
+        decision_type: DecisionType::EscalateToHuman,
+        rationale: "Recovered review required.".to_string(),
+        created_at: Utc::now(),
+    }];
+    harness.replace_snapshot(recovered).await;
+
+    harness.disconnect_events().await;
+    harness.process().await;
+    harness.force_reconnect_now();
+    harness.process().await;
+
+    assert_eq!(
+        harness.state().selected_workstream_id.as_deref(),
+        Some("ws-r")
+    );
+    assert_eq!(
+        harness.state().selected_work_unit_id.as_deref(),
+        Some("wu-r")
+    );
+
+    let rendered = harness.render_text(160, 42);
+    assert!(rendered.contains("Recovered [active]"));
+    assert!(rendered.contains("Recovered unit"));
+    assert!(rendered.contains("[awaiting_decision]"));
+    assert!(!rendered.contains("Deferred work"));
+    assert!(!rendered.contains("Out of scope"));
+}
+
+#[tokio::test]
+async fn compact_layout_keeps_focus_selection_and_state_labels_visible_across_sizes() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-1"))
+        .await;
+    harness.dispatch(UserAction::Refresh).await;
+
+    for (width, height) in [(120, 40), (100, 30), (80, 24)] {
+        let rendered = harness.render_text(width, height);
+        assert!(
+            rendered.contains("Threads <focus>"),
+            "missing thread focus marker at {width}x{height}\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Workstreams"),
+            "missing workstreams title at {width}x{height}\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Work Units"),
+            "missing work units title at {width}x{height}\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Snapshot wiring"),
+            "missing selected work-unit title at {width}x{height}\n{rendered}"
+        );
+        assert!(
+            rendered.contains("ambiguous"),
+            "missing parse_result label at {width}x{height}\n{rendered}"
+        );
+        assert!(
+            rendered.contains("review"),
+            "missing review signal at {width}x{height}\n{rendered}"
+        );
+    }
+
+    let boundary = harness.render_text(72, 22);
+    assert!(boundary.contains("Threads <focus>"), "{boundary}");
+    assert!(boundary.contains("Workstreams"), "{boundary}");
+    assert!(boundary.contains("Work Units"), "{boundary}");
+    assert!(boundary.contains("Snapshot wiring"), "{boundary}");
+}
+
+#[tokio::test]
 async fn small_terminal_render_keeps_collaboration_surface_stable() {
     let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
     harness
@@ -1239,17 +1540,7 @@ async fn small_terminal_render_keeps_collaboration_surface_stable() {
         .await;
     harness.dispatch(UserAction::Refresh).await;
 
-    let backend = TestBackend::new(110, 34);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render::render(frame, harness.state()))
-        .unwrap();
-    let buffer = terminal.backend().buffer().clone();
-    let rendered = buffer
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
+    let rendered = harness.render_text(110, 34);
 
     assert!(rendered.contains("Workstreams"));
     assert!(rendered.contains("History"));

@@ -483,6 +483,26 @@ pub fn collaboration_detail(state: &AppState) -> CollaborationDetailViewModel {
         format!("status: {}", work_unit_status_label(work_unit.status)),
     ];
 
+    if let Some(report) = latest_report {
+        lines.push(format!(
+            "report: {} parse={} review={}",
+            report.id,
+            report_parse_result_label(report.parse_result),
+            report.needs_supervisor_review
+        ));
+        lines.push(format!(
+            "disposition: {} confidence: {}",
+            report_disposition_label(report.disposition),
+            report_confidence_label(report.confidence)
+        ));
+        lines.push(format!(
+            "report_summary: {}",
+            abbreviate(&compact_line(&report.summary), 84)
+        ));
+    } else {
+        lines.push("report: -".to_string());
+    }
+
     if let Some(assignment) = assignment {
         lines.push(format!(
             "assignment: {} [{}] worker={} session={}",
@@ -493,29 +513,6 @@ pub fn collaboration_detail(state: &AppState) -> CollaborationDetailViewModel {
         ));
     } else {
         lines.push("assignment: -".to_string());
-    }
-
-    if let Some(report) = latest_report {
-        lines.push(format!("report: {}", report.id));
-        lines.push(format!(
-            "report_summary: {}",
-            abbreviate(&compact_line(&report.summary), 84)
-        ));
-        lines.push(format!(
-            "parse_result: {}",
-            report_parse_result_label(report.parse_result)
-        ));
-        lines.push(format!(
-            "needs_supervisor_review: {}",
-            report.needs_supervisor_review
-        ));
-        lines.push(format!(
-            "disposition: {}  confidence: {}",
-            report_disposition_label(report.disposition),
-            report_confidence_label(report.confidence)
-        ));
-    } else {
-        lines.push("report: -".to_string());
     }
 
     if let Some(decision) = latest_decision {

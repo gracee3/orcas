@@ -9,12 +9,27 @@ use crate::view_model;
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let compact = frame.area().width < 150 || frame.area().height < 40;
+    let very_compact = frame.area().width <= 100 || frame.area().height <= 30;
+    let status_height = if frame.area().height < 28 {
+        4
+    } else if compact {
+        5
+    } else {
+        6
+    };
+    let event_height = if frame.area().height < 28 {
+        4
+    } else if compact {
+        6
+    } else {
+        8
+    };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
-            Constraint::Min(20),
-            Constraint::Length(8),
+            Constraint::Length(status_height),
+            Constraint::Min(if very_compact { 11 } else { 20 }),
+            Constraint::Length(event_height),
             Constraint::Length(3),
         ])
         .split(frame.area());
@@ -33,19 +48,35 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(if compact { 8 } else { 7 }),
-            Constraint::Length(if compact { 10 } else { 9 }),
-            Constraint::Min(8),
+            Constraint::Length(if very_compact {
+                3
+            } else if compact {
+                8
+            } else {
+                7
+            }),
+            Constraint::Length(if very_compact {
+                4
+            } else if compact {
+                10
+            } else {
+                9
+            }),
+            Constraint::Min(if very_compact { 3 } else { 8 }),
         ])
         .split(main[1]);
 
     let collaboration_top = Layout::default()
-        .direction(if compact {
+        .direction(if very_compact {
+            Direction::Horizontal
+        } else if compact {
             Direction::Vertical
         } else {
             Direction::Horizontal
         })
-        .constraints(if compact {
+        .constraints(if very_compact {
+            vec![Constraint::Percentage(42), Constraint::Percentage(58)]
+        } else if compact {
             vec![Constraint::Length(4), Constraint::Min(4)]
         } else {
             vec![Constraint::Length(34), Constraint::Min(30)]
@@ -53,12 +84,16 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         .split(collaboration[1]);
 
     let collaboration_middle = Layout::default()
-        .direction(if compact {
+        .direction(if very_compact {
+            Direction::Horizontal
+        } else if compact {
             Direction::Vertical
         } else {
             Direction::Horizontal
         })
-        .constraints(if compact {
+        .constraints(if very_compact {
+            vec![Constraint::Percentage(58), Constraint::Percentage(42)]
+        } else if compact {
             vec![Constraint::Length(5), Constraint::Min(4)]
         } else {
             vec![Constraint::Percentage(60), Constraint::Percentage(40)]
@@ -66,12 +101,16 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         .split(collaboration[2]);
 
     let collaboration_bottom = Layout::default()
-        .direction(if compact {
+        .direction(if very_compact {
+            Direction::Horizontal
+        } else if compact {
             Direction::Vertical
         } else {
             Direction::Horizontal
         })
-        .constraints(if compact {
+        .constraints(if very_compact {
+            vec![Constraint::Percentage(50), Constraint::Percentage(50)]
+        } else if compact {
             vec![Constraint::Length(8), Constraint::Min(8)]
         } else {
             vec![Constraint::Percentage(44), Constraint::Percentage(56)]
@@ -123,13 +162,16 @@ fn render_status(state: &AppState) -> Paragraph<'static> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
     } else if state.show_help {
-        lines.push(Line::from(
-            "keys: q quit, r refresh, tab cycles panels, j/k move selected panel, i prompt",
-        ));
+        lines.push(Line::from(format!(
+            "keys: q quit, r refresh, tab focus, j/k move {} selection, i prompt",
+            navigation_target_label(state.navigation_focus)
+        )));
     } else {
-        lines.push(Line::from(
-            "keys: q quit, r refresh, tab cycles panels, j/k move selected panel, ? help",
-        ));
+        lines.push(Line::from(format!(
+            "nav: tab focus={}  j/k={}  i prompt  ? help",
+            navigation_focus_label(state.navigation_focus),
+            navigation_target_label(state.navigation_focus)
+        )));
     }
 
     Paragraph::new(Text::from(lines)).block(Block::default().title("Daemon").borders(Borders::ALL))
@@ -157,7 +199,14 @@ fn render_threads(state: &AppState) -> Paragraph<'static> {
             .collect()
     };
     Paragraph::new(Text::from(lines))
-        .block(Block::default().title("Threads").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(focus_title(
+                    "Threads",
+                    state.navigation_focus == NavigationFocus::Threads,
+                ))
+                .borders(Borders::ALL),
+        )
         .wrap(Wrap { trim: true })
 }
 
@@ -210,7 +259,14 @@ fn render_workstreams(state: &AppState) -> Paragraph<'static> {
             .collect()
     };
     Paragraph::new(Text::from(lines))
-        .block(Block::default().title("Workstreams").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(focus_title(
+                    "Workstreams",
+                    state.navigation_focus == NavigationFocus::Workstreams,
+                ))
+                .borders(Borders::ALL),
+        )
         .wrap(Wrap { trim: true })
 }
 
@@ -233,24 +289,31 @@ fn render_work_units(state: &AppState) -> Paragraph<'static> {
             .map(|row| {
                 let prefix = if row.selected { ">" } else { " " };
                 let review = if row.needs_supervisor_review {
-                    " review"
+                    " review=true"
                 } else {
-                    ""
+                    " review=false"
                 };
                 Line::from(format!(
-                    "{prefix} {} [{}] a={} parse={}{} decision={}",
+                    "{prefix} {} parse={}{} [{}] a={} decision={}",
                     row.title,
-                    row.status,
-                    row.current_assignment,
                     row.latest_report_parse_result,
                     review,
+                    row.status,
+                    row.current_assignment,
                     row.latest_decision
                 ))
             })
             .collect()
     };
     Paragraph::new(Text::from(lines))
-        .block(Block::default().title("Work Units").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(focus_title(
+                    "Work Units",
+                    state.navigation_focus == NavigationFocus::WorkUnits,
+                ))
+                .borders(Borders::ALL),
+        )
         .wrap(Wrap { trim: true })
 }
 
@@ -325,4 +388,28 @@ fn render_prompt(state: &AppState) -> Paragraph<'static> {
         prompt.text
     ))]))
     .block(Block::default().title("Prompt").borders(Borders::ALL))
+}
+
+fn focus_title(base: &str, focused: bool) -> String {
+    if focused {
+        format!("{base} <focus>")
+    } else {
+        base.to_string()
+    }
+}
+
+fn navigation_focus_label(focus: NavigationFocus) -> &'static str {
+    match focus {
+        NavigationFocus::Threads => "threads",
+        NavigationFocus::Workstreams => "workstreams",
+        NavigationFocus::WorkUnits => "work_units",
+    }
+}
+
+fn navigation_target_label(focus: NavigationFocus) -> &'static str {
+    match focus {
+        NavigationFocus::Threads => "threads",
+        NavigationFocus::Workstreams => "workstreams/work-units",
+        NavigationFocus::WorkUnits => "work-units",
+    }
 }

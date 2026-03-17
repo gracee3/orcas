@@ -131,7 +131,9 @@ pub struct StateSnapshot {
     pub session: SessionState,
     pub threads: Vec<ThreadSummary>,
     pub active_thread: Option<ThreadView>,
+    #[serde(default)]
     pub collaboration: CollaborationSnapshot,
+    #[serde(default)]
     pub recent_events: Vec<EventSummary>,
 }
 
@@ -256,6 +258,7 @@ pub enum AssignmentLifecycleAction {
 pub struct WorkstreamSummary {
     pub id: String,
     pub title: String,
+    #[serde(default)]
     pub objective: String,
     pub status: WorkstreamStatus,
     pub priority: String,
@@ -305,8 +308,82 @@ pub struct DecisionSummary {
     pub work_unit_id: String,
     pub report_id: Option<String>,
     pub decision_type: DecisionType,
+    #[serde(default)]
     pub rationale: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use serde_json::json;
+
+    use super::{DecisionSummary, StateSnapshot};
+    use crate::{DecisionType, WorkstreamStatus};
+
+    #[test]
+    fn state_snapshot_deserializes_when_collaboration_is_missing() {
+        let snapshot = serde_json::from_value::<StateSnapshot>(json!({
+            "daemon": {
+                "socket_path": "/tmp/orcasd.sock",
+                "metadata_path": "/tmp/orcasd.json",
+                "codex_endpoint": "ws://127.0.0.1:4500",
+                "codex_binary_path": "/tmp/codex",
+                "upstream": {
+                    "endpoint": "ws://127.0.0.1:4500",
+                    "status": "connected",
+                    "detail": null
+                },
+                "client_count": 1,
+                "known_threads": 0,
+                "runtime": {
+                    "pid": 4242,
+                    "started_at": Utc::now(),
+                    "version": "0.1.0",
+                    "build_fingerprint": "abc123",
+                    "binary_path": "/tmp/orcasd",
+                    "socket_path": "/tmp/orcasd.sock",
+                    "metadata_path": "/tmp/orcasd.json",
+                    "git_commit": null
+                }
+            },
+            "session": {
+                "active_thread_id": null,
+                "active_turns": []
+            },
+            "threads": [],
+            "active_thread": null,
+            "recent_events": []
+        }))
+        .expect("legacy snapshot should deserialize");
+
+        assert!(snapshot.collaboration.workstreams.is_empty());
+        assert!(snapshot.collaboration.work_units.is_empty());
+        assert!(snapshot.collaboration.assignments.is_empty());
+    }
+
+    #[test]
+    fn summary_defaults_cover_missing_additive_fields() {
+        let workstream = serde_json::from_value::<super::WorkstreamSummary>(json!({
+            "id": "ws-1",
+            "title": "Legacy",
+            "status": WorkstreamStatus::Active,
+            "priority": "high",
+            "updated_at": Utc::now()
+        }))
+        .expect("legacy workstream summary should deserialize");
+        assert!(workstream.objective.is_empty());
+
+        let decision = serde_json::from_value::<DecisionSummary>(json!({
+            "id": "decision-1",
+            "work_unit_id": "wu-1",
+            "report_id": null,
+            "decision_type": DecisionType::Continue,
+            "created_at": Utc::now()
+        }))
+        .expect("legacy decision summary should deserialize");
+        assert!(decision.rationale.is_empty());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

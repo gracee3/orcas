@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
-use crate::app::{Action, AppState, UserAction};
+use crate::app::{Action, AppState, NavigationFocus, UiEvent, UserAction};
 use crate::backend::{BackendCommand, FakeBackend};
+use crate::render;
 use crate::runtime::AppRuntime;
 use crate::view_model;
 use orcas_core::ipc;
@@ -27,6 +30,11 @@ impl AppHarness {
 
     pub async fn dispatch(&mut self, action: UserAction) {
         self.runtime.dispatch(Action::User(action));
+        self.runtime.process_all().await;
+    }
+
+    pub async fn inject_ui_event(&mut self, event: UiEvent) {
+        self.runtime.dispatch(Action::Event(event));
         self.runtime.process_all().await;
     }
 
@@ -108,6 +116,22 @@ impl AppHarness {
         view_model::connection_status(self.runtime.state())
     }
 
+    pub fn focus(&self) -> NavigationFocus {
+        self.runtime.state().navigation_focus
+    }
+
+    pub fn selected_thread_id(&self) -> Option<&str> {
+        self.runtime.state().selected_thread_id.as_deref()
+    }
+
+    pub fn selected_workstream_id(&self) -> Option<&str> {
+        self.runtime.state().selected_workstream_id.as_deref()
+    }
+
+    pub fn selected_work_unit_id(&self) -> Option<&str> {
+        self.runtime.state().selected_work_unit_id.as_deref()
+    }
+
     pub fn thread_detail_vm(&self) -> view_model::ThreadDetailViewModel {
         view_model::thread_detail(self.runtime.state())
     }
@@ -138,5 +162,27 @@ impl AppHarness {
 
     pub fn collaboration_history_vm(&self) -> view_model::CollaborationHistoryViewModel {
         view_model::collaboration_history(self.runtime.state())
+    }
+
+    pub fn render_text(&self, width: u16, height: u16) -> String {
+        self.render_lines(width, height).join("\n")
+    }
+
+    pub fn render_lines(&self, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render::render(frame, self.runtime.state()))
+            .expect("render");
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|row| {
+                let mut line = String::new();
+                for col in 0..width {
+                    line.push_str(buffer[(col, row)].symbol());
+                }
+                line.trim_end().to_string()
+            })
+            .collect()
     }
 }
