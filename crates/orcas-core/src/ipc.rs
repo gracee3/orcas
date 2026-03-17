@@ -327,7 +327,7 @@ pub struct ProposalSummary {
     pub primary_work_unit_id: String,
     pub source_report_id: String,
     pub status: SupervisorProposalStatus,
-    pub proposed_decision_type: DecisionType,
+    pub proposed_decision_type: Option<DecisionType>,
     pub created_at: DateTime<Utc>,
     pub reasoner_model: String,
 }

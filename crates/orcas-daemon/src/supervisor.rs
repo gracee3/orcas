@@ -12,8 +12,9 @@ use orcas_core::supervisor::{
     SupervisorAssignmentContext, SupervisorContextPack, SupervisorDependencyContext,
     SupervisorDependencyContextItem, SupervisorOperatorRequest, SupervisorPackLimits,
     SupervisorPackTruncation, SupervisorProposal, SupervisorProposalEdits,
-    SupervisorProposalRecord, SupervisorSourceReportContext, SupervisorStateAnchor,
-    SupervisorWorkUnitContext, SupervisorWorkerSessionContext, SupervisorWorkstreamContext,
+    SupervisorProposalFailureStage, SupervisorProposalRecord, SupervisorSourceReportContext,
+    SupervisorStateAnchor, SupervisorWorkUnitContext, SupervisorWorkerSessionContext,
+    SupervisorWorkstreamContext,
 };
 use orcas_core::{
     AppConfig, Assignment, CollaborationState, Decision, DecisionType, OrcasError, OrcasResult,
@@ -40,11 +41,25 @@ pub struct SupervisorReasonerResult {
     pub model: String,
     pub response_id: Option<String>,
     pub usage: Option<SupervisorReasonerUsage>,
+    pub output_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SupervisorReasonerFailure {
+    pub stage: SupervisorProposalFailureStage,
+    pub message: String,
+    pub backend_kind: String,
+    pub model: String,
+    pub response_id: Option<String>,
+    pub output_text: Option<String>,
 }
 
 #[async_trait]
 pub trait SupervisorReasoner: Send + Sync {
-    async fn propose(&self, pack: SupervisorContextPack) -> OrcasResult<SupervisorReasonerResult>;
+    async fn propose(
+        &self,
+        pack: SupervisorContextPack,
+    ) -> Result<SupervisorReasonerResult, SupervisorReasonerFailure>;
 }
 
 #[derive(Debug)]
@@ -106,13 +121,47 @@ impl ResponsesApiReasoner {
             }
         }))
     }
+
+    fn failure(
+        &self,
+        stage: SupervisorProposalFailureStage,
+        message: impl Into<String>,
+        response_id: Option<String>,
+        output_text: Option<String>,
+    ) -> SupervisorReasonerFailure {
+        SupervisorReasonerFailure {
+            stage,
+            message: message.into(),
+            backend_kind: "responses_api".to_string(),
+            model: self.config.supervisor.model.clone(),
+            response_id,
+            output_text,
+        }
+    }
 }
 
 #[async_trait]
 impl SupervisorReasoner for ResponsesApiReasoner {
-    async fn propose(&self, pack: SupervisorContextPack) -> OrcasResult<SupervisorReasonerResult> {
-        let api_key = self.api_key()?;
-        let body = self.request_body(&pack)?;
+    async fn propose(
+        &self,
+        pack: SupervisorContextPack,
+    ) -> Result<SupervisorReasonerResult, SupervisorReasonerFailure> {
+        let api_key = self.api_key().map_err(|error| {
+            self.failure(
+                SupervisorProposalFailureStage::Backend,
+                error.to_string(),
+                None,
+                None,
+            )
+        })?;
+        let body = self.request_body(&pack).map_err(|error| {
+            self.failure(
+                SupervisorProposalFailureStage::Backend,
+                error.to_string(),
+                None,
+                None,
+            )
+        })?;
         let response = self
             .client
             .post(self.endpoint())
@@ -121,39 +170,80 @@ impl SupervisorReasoner for ResponsesApiReasoner {
             .send()
             .await
             .map_err(|error| {
-                OrcasError::Transport(format!("supervisor Responses API request failed: {error}"))
+                self.failure(
+                    SupervisorProposalFailureStage::Backend,
+                    format!("supervisor Responses API request failed: {error}"),
+                    None,
+                    None,
+                )
             })?;
 
         let status = response.status();
         let raw = response.text().await.map_err(|error| {
-            OrcasError::Transport(format!(
-                "failed to read supervisor Responses API response body: {error}"
-            ))
+            self.failure(
+                SupervisorProposalFailureStage::Backend,
+                format!("failed to read supervisor Responses API response body: {error}"),
+                None,
+                None,
+            )
         })?;
 
         if !status.is_success() {
-            return Err(OrcasError::Transport(format!(
-                "supervisor Responses API request failed with status {}: {}",
-                status, raw
-            )));
+            return Err(self.failure(
+                SupervisorProposalFailureStage::Backend,
+                format!(
+                    "supervisor Responses API request failed with status {}: {}",
+                    status, raw
+                ),
+                None,
+                Some(raw),
+            ));
         }
 
-        let value: Value = serde_json::from_str(&raw)?;
+        let value: Value = serde_json::from_str(&raw).map_err(|error| {
+            self.failure(
+                SupervisorProposalFailureStage::ResponseMalformed,
+                format!("failed to decode supervisor Responses API response JSON: {error}"),
+                None,
+                Some(raw.clone()),
+            )
+        })?;
         if let Some(error) = value.get("error") {
             if !error.is_null() {
-                return Err(OrcasError::Transport(format!(
-                    "supervisor Responses API returned an error payload: {error}"
-                )));
+                return Err(self.failure(
+                    SupervisorProposalFailureStage::Backend,
+                    format!("supervisor Responses API returned an error payload: {error}"),
+                    value
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    Some(raw.clone()),
+                ));
             }
         }
 
         let Some(output_text) = extract_output_text(&value) else {
-            return Err(OrcasError::Transport(
-                "supervisor Responses API response did not contain assistant output_text"
-                    .to_string(),
+            return Err(self.failure(
+                SupervisorProposalFailureStage::ResponseMalformed,
+                "supervisor Responses API response did not contain assistant output_text",
+                value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                Some(raw),
             ));
         };
-        let proposal: SupervisorProposal = serde_json::from_str(&output_text)?;
+        let proposal: SupervisorProposal = serde_json::from_str(&output_text).map_err(|error| {
+            self.failure(
+                SupervisorProposalFailureStage::ProposalMalformed,
+                format!("failed to decode supervisor proposal JSON: {error}"),
+                value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                Some(output_text.clone()),
+            )
+        })?;
         let usage = value.get("usage").map(extract_usage);
 
         Ok(SupervisorReasonerResult {
@@ -169,6 +259,7 @@ impl SupervisorReasoner for ResponsesApiReasoner {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
             usage,
+            output_text: Some(output_text),
         })
     }
 }
@@ -1242,55 +1333,4 @@ fn proposal_json_schema() -> Value {
             }
         }
     })
-}
-
-#[cfg(test)]
-pub(crate) fn sample_continue_proposal(
-    work_unit_id: &str,
-    report_id: &str,
-    assignment_id: &str,
-    worker_id: &str,
-) -> SupervisorProposal {
-    SupervisorProposal {
-        schema_version: PROPOSAL_SCHEMA_VERSION.to_string(),
-        summary: orcas_core::SupervisorSummary {
-            headline: "One more bounded pass is required.".to_string(),
-            situation: "The report is useful but leaves one open question.".to_string(),
-            recommended_action: "Continue with a narrower follow-up assignment.".to_string(),
-            key_evidence: vec!["The report asked one unresolved question.".to_string()],
-            risks: vec!["Completion would be premature.".to_string()],
-            review_focus: vec!["Confirm the follow-up scope is narrow.".to_string()],
-        },
-        proposed_decision: orcas_core::ProposedDecision {
-            decision_type: DecisionType::Continue,
-            target_work_unit_id: work_unit_id.to_string(),
-            source_report_id: report_id.to_string(),
-            rationale: "One more bounded pass is needed.".to_string(),
-            expected_work_unit_status: "ready".to_string(),
-            requires_assignment: true,
-        },
-        draft_next_assignment: Some(DraftAssignment {
-            target_work_unit_id: work_unit_id.to_string(),
-            predecessor_assignment_id: assignment_id.to_string(),
-            derived_from_decision_type: DecisionType::Continue,
-            preferred_worker_id: Some(worker_id.to_string()),
-            worker_kind: Some("codex".to_string()),
-            objective: "Resolve the remaining open question.".to_string(),
-            instructions: vec![
-                "Inspect the exact branch handling reconnect recovery.".to_string(),
-                "Confirm whether interrupted semantics are surfaced honestly.".to_string(),
-            ],
-            acceptance_criteria: vec!["The reconnect branch behavior is confirmed.".to_string()],
-            stop_conditions: vec!["Stop if product input is required.".to_string()],
-            required_context_refs: vec![report_id.to_string()],
-            expected_report_fields: EXPECTED_REPORT_FIELDS
-                .iter()
-                .map(|field| (*field).to_string())
-                .collect(),
-            boundedness_note: "This follow-up only answers one remaining question.".to_string(),
-        }),
-        confidence: orcas_core::ReportConfidence::High,
-        warnings: Vec::new(),
-        open_questions: Vec::new(),
-    }
 }

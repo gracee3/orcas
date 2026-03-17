@@ -310,6 +310,22 @@ pub enum SupervisorProposalStatus {
     Rejected,
     Superseded,
     Stale,
+    GenerationFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorProposalFailureStage {
+    Backend,
+    ResponseMalformed,
+    ProposalMalformed,
+    ProposalValidation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorProposalFailure {
+    pub stage: SupervisorProposalFailureStage,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,10 +342,17 @@ pub struct SupervisorProposalRecord {
     pub reasoner_model: String,
     pub reasoner_response_id: Option<String>,
     pub reasoner_usage: Option<SupervisorReasonerUsage>,
+    #[serde(default)]
+    pub reasoner_output_text: Option<String>,
     pub context_pack: SupervisorContextPack,
-    pub proposal: SupervisorProposal,
+    #[serde(default)]
+    pub proposal: Option<SupervisorProposal>,
+    #[serde(default)]
+    pub approval_edits: Option<SupervisorProposalEdits>,
     pub approved_proposal: Option<SupervisorProposal>,
-    pub validated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub generation_failure: Option<SupervisorProposalFailure>,
+    pub validated_at: Option<DateTime<Utc>>,
     pub reviewed_at: Option<DateTime<Utc>>,
     pub reviewed_by: Option<String>,
     pub review_note: Option<String>,
@@ -337,7 +360,7 @@ pub struct SupervisorProposalRecord {
     pub approved_assignment_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SupervisorProposalEdits {
     pub decision_type: Option<DecisionType>,
     pub decision_rationale: Option<String>,
@@ -352,4 +375,18 @@ pub struct SupervisorProposalEdits {
     pub stop_conditions: Vec<String>,
     #[serde(default)]
     pub expected_report_fields: Vec<String>,
+}
+
+impl SupervisorProposalEdits {
+    pub fn is_empty(&self) -> bool {
+        self.decision_type.is_none()
+            && self.decision_rationale.is_none()
+            && self.preferred_worker_id.is_none()
+            && self.worker_kind.is_none()
+            && self.objective.is_none()
+            && self.instructions.is_empty()
+            && self.acceptance_criteria.is_empty()
+            && self.stop_conditions.is_empty()
+            && self.expected_report_fields.is_empty()
+    }
 }

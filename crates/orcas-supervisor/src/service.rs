@@ -603,10 +603,13 @@ impl SupervisorService {
 
         for proposal in response.proposals {
             println!(
-                "{}\t{:?}\t{:?}\t{}\t{}\t{}",
+                "{}\t{:?}\t{}\t{}\t{}\t{}",
                 proposal.id,
                 proposal.status,
-                proposal.proposed_decision_type,
+                proposal
+                    .proposed_decision_type
+                    .map(|decision| format!("{decision:?}"))
+                    .unwrap_or_else(|| "-".to_string()),
                 proposal.created_at,
                 proposal.reasoner_model,
                 proposal.source_report_id
@@ -900,62 +903,138 @@ impl SupervisorService {
         if let Some(response_id) = proposal.reasoner_response_id.as_ref() {
             println!("reasoner_response_id: {response_id}");
         }
-        println!(
-            "proposal_schema_version: {}",
-            proposal.proposal.schema_version
-        );
-        println!("summary_headline: {}", proposal.proposal.summary.headline);
-        println!("summary_situation: {}", proposal.proposal.summary.situation);
-        println!(
-            "summary_recommended_action: {}",
-            proposal.proposal.summary.recommended_action
-        );
-        println!(
-            "proposed_decision_type: {:?}",
-            proposal.proposal.proposed_decision.decision_type
-        );
-        println!(
-            "proposed_decision_rationale: {}",
-            proposal.proposal.proposed_decision.rationale
-        );
-        println!(
-            "expected_work_unit_status: {}",
-            proposal
-                .proposal
-                .proposed_decision
-                .expected_work_unit_status
-        );
-        println!(
-            "requires_assignment: {}",
-            proposal.proposal.proposed_decision.requires_assignment
-        );
-        println!("confidence: {:?}", proposal.proposal.confidence);
-        if !proposal.proposal.summary.key_evidence.is_empty() {
+        if let Some(validated_at) = proposal.validated_at.as_ref() {
+            println!("validated_at: {validated_at}");
+        }
+        if let Some(output_text) = proposal.reasoner_output_text.as_ref() {
+            println!("reasoner_output_text: {output_text}");
+        }
+        if let Some(model_proposal) = proposal.proposal.as_ref() {
             println!(
-                "key_evidence: {}",
-                proposal.proposal.summary.key_evidence.join(" | ")
+                "model_proposal_schema_version: {}",
+                model_proposal.schema_version
             );
-        }
-        if !proposal.proposal.summary.risks.is_empty() {
-            println!("risks: {}", proposal.proposal.summary.risks.join(" | "));
-        }
-        if !proposal.proposal.summary.review_focus.is_empty() {
             println!(
-                "review_focus: {}",
-                proposal.proposal.summary.review_focus.join(" | ")
+                "model_summary_headline: {}",
+                model_proposal.summary.headline
             );
-        }
-        if !proposal.proposal.warnings.is_empty() {
-            println!("warnings: {}", proposal.proposal.warnings.join(" | "));
-        }
-        if !proposal.proposal.open_questions.is_empty() {
             println!(
-                "open_questions: {}",
-                proposal.proposal.open_questions.join(" | ")
+                "model_summary_situation: {}",
+                model_proposal.summary.situation
             );
+            println!(
+                "model_summary_recommended_action: {}",
+                model_proposal.summary.recommended_action
+            );
+            println!(
+                "model_proposed_decision_type: {:?}",
+                model_proposal.proposed_decision.decision_type
+            );
+            println!(
+                "model_proposed_decision_rationale: {}",
+                model_proposal.proposed_decision.rationale
+            );
+            println!(
+                "model_expected_work_unit_status: {}",
+                model_proposal.proposed_decision.expected_work_unit_status
+            );
+            println!(
+                "model_requires_assignment: {}",
+                model_proposal.proposed_decision.requires_assignment
+            );
+            println!("model_confidence: {:?}", model_proposal.confidence);
+            if !model_proposal.summary.key_evidence.is_empty() {
+                println!(
+                    "model_key_evidence: {}",
+                    model_proposal.summary.key_evidence.join(" | ")
+                );
+            }
+            if !model_proposal.summary.risks.is_empty() {
+                println!("model_risks: {}", model_proposal.summary.risks.join(" | "));
+            }
+            if !model_proposal.summary.review_focus.is_empty() {
+                println!(
+                    "model_review_focus: {}",
+                    model_proposal.summary.review_focus.join(" | ")
+                );
+            }
+            if !model_proposal.warnings.is_empty() {
+                println!("model_warnings: {}", model_proposal.warnings.join(" | "));
+            }
+            if !model_proposal.open_questions.is_empty() {
+                println!(
+                    "model_open_questions: {}",
+                    model_proposal.open_questions.join(" | ")
+                );
+            }
+            if let Some(draft) = model_proposal.draft_next_assignment.as_ref() {
+                Self::print_draft_assignment("model", draft);
+            }
+        } else {
+            println!("model_proposal: none");
         }
-        if let Some(draft) = proposal.proposal.draft_next_assignment.as_ref() {
-            Self::print_draft_assignment(draft);
+        if let Some(failure) = proposal.generation_failure.as_ref() {
+            println!("generation_failure_stage: {:?}", failure.stage);
+            println!("generation_failure_message: {}", failure.message);
+        }
+        if let Some(edits) = proposal.approval_edits.as_ref() {
+            println!("approval_edits_present: true");
+            if edits.is_empty() {
+                println!("approval_edits: none");
+            } else {
+                if let Some(decision_type) = edits.decision_type {
+                    println!("approval_edit_decision_type: {:?}", decision_type);
+                }
+                if let Some(rationale) = edits.decision_rationale.as_ref() {
+                    println!("approval_edit_decision_rationale: {rationale}");
+                }
+                if let Some(worker_id) = edits.preferred_worker_id.as_ref() {
+                    println!("approval_edit_preferred_worker_id: {worker_id}");
+                }
+                if let Some(worker_kind) = edits.worker_kind.as_ref() {
+                    println!("approval_edit_worker_kind: {worker_kind}");
+                }
+                if let Some(objective) = edits.objective.as_ref() {
+                    println!("approval_edit_objective: {objective}");
+                }
+                if !edits.instructions.is_empty() {
+                    println!(
+                        "approval_edit_instructions: {}",
+                        edits.instructions.join(" | ")
+                    );
+                }
+                if !edits.acceptance_criteria.is_empty() {
+                    println!(
+                        "approval_edit_acceptance_criteria: {}",
+                        edits.acceptance_criteria.join(" | ")
+                    );
+                }
+                if !edits.stop_conditions.is_empty() {
+                    println!(
+                        "approval_edit_stop_conditions: {}",
+                        edits.stop_conditions.join(" | ")
+                    );
+                }
+                if !edits.expected_report_fields.is_empty() {
+                    println!(
+                        "approval_edit_expected_report_fields: {}",
+                        edits.expected_report_fields.join(",")
+                    );
+                }
+            }
+        }
+        if let Some(approved_proposal) = proposal.approved_proposal.as_ref() {
+            println!(
+                "approved_proposed_decision_type: {:?}",
+                approved_proposal.proposed_decision.decision_type
+            );
+            println!(
+                "approved_proposed_decision_rationale: {}",
+                approved_proposal.proposed_decision.rationale
+            );
+            if let Some(draft) = approved_proposal.draft_next_assignment.as_ref() {
+                Self::print_draft_assignment("approved", draft);
+            }
         }
         if let Some(reviewed_at) = proposal.reviewed_at.as_ref() {
             println!("reviewed_at: {reviewed_at}");
@@ -974,58 +1053,58 @@ impl SupervisorService {
         }
     }
 
-    fn print_draft_assignment(draft: &orcas_core::DraftAssignment) {
+    fn print_draft_assignment(prefix: &str, draft: &orcas_core::DraftAssignment) {
         println!(
-            "draft_assignment_target_work_unit_id: {}",
+            "{prefix}_draft_assignment_target_work_unit_id: {}",
             draft.target_work_unit_id
         );
         println!(
-            "draft_assignment_predecessor_assignment_id: {}",
+            "{prefix}_draft_assignment_predecessor_assignment_id: {}",
             draft.predecessor_assignment_id
         );
         println!(
-            "draft_assignment_derived_from_decision_type: {:?}",
+            "{prefix}_draft_assignment_derived_from_decision_type: {:?}",
             draft.derived_from_decision_type
         );
         if let Some(worker_id) = draft.preferred_worker_id.as_ref() {
-            println!("draft_assignment_preferred_worker_id: {worker_id}");
+            println!("{prefix}_draft_assignment_preferred_worker_id: {worker_id}");
         }
         if let Some(worker_kind) = draft.worker_kind.as_ref() {
-            println!("draft_assignment_worker_kind: {worker_kind}");
+            println!("{prefix}_draft_assignment_worker_kind: {worker_kind}");
         }
-        println!("draft_assignment_objective: {}", draft.objective);
+        println!("{prefix}_draft_assignment_objective: {}", draft.objective);
         if !draft.instructions.is_empty() {
             println!(
-                "draft_assignment_instructions: {}",
+                "{prefix}_draft_assignment_instructions: {}",
                 draft.instructions.join(" | ")
             );
         }
         if !draft.acceptance_criteria.is_empty() {
             println!(
-                "draft_assignment_acceptance_criteria: {}",
+                "{prefix}_draft_assignment_acceptance_criteria: {}",
                 draft.acceptance_criteria.join(" | ")
             );
         }
         if !draft.stop_conditions.is_empty() {
             println!(
-                "draft_assignment_stop_conditions: {}",
+                "{prefix}_draft_assignment_stop_conditions: {}",
                 draft.stop_conditions.join(" | ")
             );
         }
         if !draft.required_context_refs.is_empty() {
             println!(
-                "draft_assignment_required_context_refs: {}",
+                "{prefix}_draft_assignment_required_context_refs: {}",
                 draft.required_context_refs.join(",")
             );
         }
         if !draft.expected_report_fields.is_empty() {
             println!(
-                "draft_assignment_expected_report_fields: {}",
+                "{prefix}_draft_assignment_expected_report_fields: {}",
                 draft.expected_report_fields.join(",")
             );
         }
         println!(
-            "draft_assignment_boundedness_note: {}",
+            "{prefix}_draft_assignment_boundedness_note: {}",
             draft.boundedness_note
         );
     }

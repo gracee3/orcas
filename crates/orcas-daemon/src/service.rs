@@ -29,9 +29,11 @@ use orcas_core::{
     AppConfig, AppPaths, Assignment, AssignmentStatus, CodexConnectionMode, CollaborationState,
     ConnectionState, Decision, DecisionType, EventEnvelope, JsonSessionStore, OrcasError,
     OrcasEvent, OrcasResult, OrcasSessionStore, Report, ReportConfidence, ReportDisposition,
-    ReportParseResult, SupervisorProposalRecord, SupervisorProposalStatus, ThreadMetadata,
-    WorkUnit, WorkUnitStatus, Worker, WorkerSession, WorkerSessionAttachability,
-    WorkerSessionRuntimeStatus, WorkerStatus, Workstream, WorkstreamStatus,
+    ReportParseResult, SupervisorContextPack, SupervisorProposal, SupervisorProposalFailure,
+    SupervisorProposalFailureStage, SupervisorProposalRecord, SupervisorProposalStatus,
+    SupervisorReasonerUsage, ThreadMetadata, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
+    WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, Workstream,
+    WorkstreamStatus,
 };
 
 use crate::process::{
@@ -1631,7 +1633,7 @@ impl OrcasDaemonService {
             .requested_by
             .clone()
             .unwrap_or_else(|| "supervisor_cli".to_string());
-        let (source_report_id, mutated_existing) = {
+        let (source_report_id, supersede_candidate_ids, refresh_changed) = {
             let mut state = self.state.write().await;
             let stale_changed = Self::refresh_stale_proposals_for_work_unit(
                 &mut state.collaboration,
@@ -1673,15 +1675,16 @@ impl OrcasDaemonService {
                 ));
             }
 
-            let mut open_same_source = state
+            let open_same_source = state
                 .collaboration
                 .supervisor_proposals
-                .values_mut()
+                .values()
                 .filter(|proposal| {
                     proposal.primary_work_unit_id == work_unit.id
                         && proposal.source_report_id == source_report_id
                         && proposal.status == SupervisorProposalStatus::Open
                 })
+                .map(|proposal| proposal.id.clone())
                 .collect::<Vec<_>>();
             if !open_same_source.is_empty() && !params.supersede_open {
                 return Err(OrcasError::Protocol(format!(
@@ -1689,20 +1692,9 @@ impl OrcasDaemonService {
                     work_unit.id, source_report_id
                 )));
             }
-            if params.supersede_open {
-                for proposal in &mut open_same_source {
-                    proposal.status = SupervisorProposalStatus::Superseded;
-                    if proposal.review_note.is_none() {
-                        proposal.review_note = Some(
-                            "Superseded by an operator-requested re-synthesis for the same report."
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-            (source_report_id, stale_changed || params.supersede_open)
+            (source_report_id, open_same_source, stale_changed)
         };
-        if mutated_existing {
+        if refresh_changed {
             self.persist_collaboration_state().await?;
         }
 
@@ -1715,14 +1707,51 @@ impl OrcasDaemonService {
             params.note.clone(),
             orcas_core::SupervisorProposalTriggerKind::HumanRequested,
         )?;
-        let result = self
-            .supervisor_reasoner
-            .propose(context_pack.clone())
-            .await?;
-        validate_proposal(&result.proposal, &context_pack, &collaboration)?;
+        let proposal_id = Self::new_object_id("proposal");
+        let result = match self.supervisor_reasoner.propose(context_pack.clone()).await {
+            Ok(result) => result,
+            Err(failure) => {
+                let record = self
+                    .persist_failed_proposal_record(
+                        proposal_id.clone(),
+                        context_pack.clone(),
+                        failure.backend_kind.clone(),
+                        failure.model.clone(),
+                        failure.response_id.clone(),
+                        None,
+                        failure.output_text.clone(),
+                        None,
+                        SupervisorProposalFailure {
+                            stage: failure.stage,
+                            message: failure.message.clone(),
+                        },
+                    )
+                    .await?;
+                return Err(Self::proposal_generation_failure_error(&record));
+            }
+        };
+        if let Err(error) = validate_proposal(&result.proposal, &context_pack, &collaboration) {
+            let record = self
+                .persist_failed_proposal_record(
+                    proposal_id.clone(),
+                    context_pack.clone(),
+                    result.backend_kind.clone(),
+                    result.model.clone(),
+                    result.response_id.clone(),
+                    result.usage.clone(),
+                    result.output_text.clone(),
+                    Some(result.proposal.clone()),
+                    SupervisorProposalFailure {
+                        stage: SupervisorProposalFailureStage::ProposalValidation,
+                        message: error.to_string(),
+                    },
+                )
+                .await?;
+            return Err(Self::proposal_generation_failure_error(&record));
+        }
 
         let mut proposal = SupervisorProposalRecord {
-            id: Self::new_object_id("proposal"),
+            id: proposal_id,
             workstream_id: context_pack.workstream.id.clone(),
             primary_work_unit_id: context_pack.primary_work_unit.id.clone(),
             source_report_id: context_pack.source_report.id.clone(),
@@ -1733,10 +1762,13 @@ impl OrcasDaemonService {
             reasoner_model: result.model,
             reasoner_response_id: result.response_id,
             reasoner_usage: result.usage,
+            reasoner_output_text: result.output_text,
             context_pack,
-            proposal: result.proposal,
+            proposal: Some(result.proposal),
+            approval_edits: None,
             approved_proposal: None,
-            validated_at: Utc::now(),
+            generation_failure: None,
+            validated_at: Some(Utc::now()),
             reviewed_at: None,
             reviewed_by: None,
             review_note: None,
@@ -1754,6 +1786,26 @@ impl OrcasDaemonService {
                 proposal.review_note = Some(format!(
                     "Proposal became stale before persistence: {reason}"
                 ));
+            }
+            if proposal.status == SupervisorProposalStatus::Open {
+                for proposal_id in &supersede_candidate_ids {
+                    if let Some(other) = state
+                        .collaboration
+                        .supervisor_proposals
+                        .get_mut(proposal_id)
+                        && other.status == SupervisorProposalStatus::Open
+                        && other.primary_work_unit_id == proposal.primary_work_unit_id
+                        && other.source_report_id == proposal.source_report_id
+                    {
+                        other.status = SupervisorProposalStatus::Superseded;
+                        if other.review_note.is_none() {
+                            other.review_note = Some(
+                                "Superseded by an operator-requested re-synthesis for the same report."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
             }
             state
                 .collaboration
@@ -1875,7 +1927,13 @@ impl OrcasDaemonService {
             )));
         }
 
-        let approved_proposal = apply_edits(&proposal.proposal, &params.edits);
+        let original_proposal = proposal.proposal.as_ref().ok_or_else(|| {
+            OrcasError::Protocol(format!(
+                "proposal `{}` does not contain a model-generated proposal payload",
+                proposal.id
+            ))
+        })?;
+        let approved_proposal = apply_edits(original_proposal, &params.edits);
         validate_proposal(&approved_proposal, &proposal.context_pack, &collaboration)?;
 
         let (instructions, worker_id, worker_kind) =
@@ -1943,6 +2001,7 @@ impl OrcasDaemonService {
                     OrcasError::Protocol(format!("unknown proposal `{}`", proposal.id))
                 })?;
             proposal_record.status = SupervisorProposalStatus::Approved;
+            proposal_record.approval_edits = Some(params.edits.clone());
             proposal_record.approved_proposal = Some(approved_proposal);
             proposal_record.reviewed_at = Some(Utc::now());
             proposal_record.reviewed_by = Some(reviewed_by);
@@ -2697,9 +2756,85 @@ impl OrcasDaemonService {
             primary_work_unit_id: proposal.primary_work_unit_id.clone(),
             source_report_id: proposal.source_report_id.clone(),
             status: proposal.status,
-            proposed_decision_type: proposal.proposal.proposed_decision.decision_type,
+            proposed_decision_type: proposal
+                .proposal
+                .as_ref()
+                .map(|proposal| proposal.proposed_decision.decision_type),
             created_at: proposal.created_at,
             reasoner_model: proposal.reasoner_model.clone(),
+        }
+    }
+
+    async fn persist_failed_proposal_record(
+        &self,
+        proposal_id: String,
+        context_pack: SupervisorContextPack,
+        reasoner_backend: String,
+        reasoner_model: String,
+        reasoner_response_id: Option<String>,
+        reasoner_usage: Option<SupervisorReasonerUsage>,
+        reasoner_output_text: Option<String>,
+        proposal: Option<SupervisorProposal>,
+        failure: SupervisorProposalFailure,
+    ) -> OrcasResult<SupervisorProposalRecord> {
+        let record = SupervisorProposalRecord {
+            id: proposal_id,
+            workstream_id: context_pack.workstream.id.clone(),
+            primary_work_unit_id: context_pack.primary_work_unit.id.clone(),
+            source_report_id: context_pack.source_report.id.clone(),
+            trigger: context_pack.trigger.clone(),
+            status: SupervisorProposalStatus::GenerationFailed,
+            created_at: Utc::now(),
+            reasoner_backend,
+            reasoner_model,
+            reasoner_response_id,
+            reasoner_usage,
+            reasoner_output_text,
+            context_pack,
+            proposal,
+            approval_edits: None,
+            approved_proposal: None,
+            generation_failure: Some(failure),
+            validated_at: None,
+            reviewed_at: None,
+            reviewed_by: None,
+            review_note: None,
+            approved_decision_id: None,
+            approved_assignment_id: None,
+        };
+
+        {
+            let mut state = self.state.write().await;
+            state
+                .collaboration
+                .supervisor_proposals
+                .insert(record.id.clone(), record.clone());
+        }
+        self.persist_collaboration_state().await?;
+        Ok(record)
+    }
+
+    fn proposal_generation_failure_error(record: &SupervisorProposalRecord) -> OrcasError {
+        let detail = record
+            .generation_failure
+            .as_ref()
+            .map(|failure| failure.message.clone())
+            .unwrap_or_else(|| "unknown supervisor proposal generation failure".to_string());
+        let message = format!(
+            "supervisor proposal generation failed; inspect proposal `{}` for details: {}",
+            record.id, detail
+        );
+
+        match record
+            .generation_failure
+            .as_ref()
+            .map(|failure| failure.stage)
+            .unwrap_or(SupervisorProposalFailureStage::Backend)
+        {
+            SupervisorProposalFailureStage::Backend => OrcasError::Transport(message),
+            SupervisorProposalFailureStage::ResponseMalformed
+            | SupervisorProposalFailureStage::ProposalMalformed
+            | SupervisorProposalFailureStage::ProposalValidation => OrcasError::Protocol(message),
         }
     }
 
@@ -4249,28 +4384,64 @@ mod tests {
     use super::OrcasDaemonService;
     use super::{DaemonState, TurnKey};
     use crate::supervisor::{
-        SupervisorReasoner, SupervisorReasonerResult, sample_continue_proposal,
+        SupervisorReasoner, SupervisorReasonerFailure, SupervisorReasonerResult,
     };
     use orcas_codex::{
         CodexClient, LocalCodexDaemonManager, RejectingApprovalRouter, WebSocketTransport,
     };
     use orcas_core::{
-        AppConfig, AppPaths, Assignment, AssignmentStatus, DecisionType, JsonSessionStore,
-        OrcasError, OrcasResult, OrcasSessionStore, Report, ReportConfidence, ReportDisposition,
-        ReportParseResult, SupervisorContextPack, SupervisorProposal, SupervisorProposalStatus,
-        SupervisorProposalTriggerKind, WorkUnit, WorkUnitStatus, WorkerSessionRuntimeStatus,
-        WorkerStatus, Workstream, WorkstreamStatus, ipc,
+        AppConfig, AppPaths, Assignment, AssignmentStatus, DecisionType, DraftAssignment,
+        JsonSessionStore, OrcasSessionStore, ProposedDecision, Report, ReportConfidence,
+        ReportDisposition, ReportParseResult, SupervisorContextPack, SupervisorProposal,
+        SupervisorProposalEdits, SupervisorProposalFailureStage, SupervisorProposalStatus,
+        SupervisorProposalTriggerKind, SupervisorSummary, WorkUnit, WorkUnitStatus,
+        WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, Workstream,
+        WorkstreamStatus, ipc,
     };
+
+    #[derive(Clone)]
+    enum StaticSupervisorReasonerOutcome {
+        Success(SupervisorReasonerResult),
+        Failure(SupervisorReasonerFailure),
+    }
 
     #[derive(Default)]
     struct StaticSupervisorReasoner {
-        proposal: Mutex<Option<SupervisorProposal>>,
+        outcome: Mutex<Option<StaticSupervisorReasonerOutcome>>,
         last_pack: Mutex<Option<SupervisorContextPack>>,
     }
 
     impl StaticSupervisorReasoner {
         async fn set_proposal(&self, proposal: SupervisorProposal) {
-            *self.proposal.lock().await = Some(proposal);
+            let output_text = serde_json::to_string(&proposal).expect("serialize proposal");
+            *self.outcome.lock().await = Some(StaticSupervisorReasonerOutcome::Success(
+                SupervisorReasonerResult {
+                    proposal,
+                    backend_kind: "test".to_string(),
+                    model: "test-supervisor".to_string(),
+                    response_id: Some("resp-test".to_string()),
+                    usage: None,
+                    output_text: Some(output_text),
+                },
+            ));
+        }
+
+        async fn set_failure(
+            &self,
+            stage: SupervisorProposalFailureStage,
+            message: impl Into<String>,
+            output_text: Option<String>,
+        ) {
+            *self.outcome.lock().await = Some(StaticSupervisorReasonerOutcome::Failure(
+                SupervisorReasonerFailure {
+                    stage,
+                    message: message.into(),
+                    backend_kind: "test".to_string(),
+                    model: "test-supervisor".to_string(),
+                    response_id: Some("resp-test".to_string()),
+                    output_text,
+                },
+            ));
         }
 
         async fn last_pack(&self) -> Option<SupervisorContextPack> {
@@ -4283,18 +4454,95 @@ mod tests {
         async fn propose(
             &self,
             pack: SupervisorContextPack,
-        ) -> OrcasResult<SupervisorReasonerResult> {
+        ) -> Result<SupervisorReasonerResult, SupervisorReasonerFailure> {
             *self.last_pack.lock().await = Some(pack);
-            let proposal = self.proposal.lock().await.clone().ok_or_else(|| {
-                OrcasError::Protocol("missing test supervisor proposal".to_string())
-            })?;
-            Ok(SupervisorReasonerResult {
-                proposal,
-                backend_kind: "test".to_string(),
-                model: "test-supervisor".to_string(),
-                response_id: Some("resp-test".to_string()),
-                usage: None,
-            })
+            match self.outcome.lock().await.clone() {
+                Some(StaticSupervisorReasonerOutcome::Success(result)) => Ok(result),
+                Some(StaticSupervisorReasonerOutcome::Failure(failure)) => Err(failure),
+                None => Err(SupervisorReasonerFailure {
+                    stage: SupervisorProposalFailureStage::Backend,
+                    message: "missing test supervisor reasoner outcome".to_string(),
+                    backend_kind: "test".to_string(),
+                    model: "test-supervisor".to_string(),
+                    response_id: Some("resp-test".to_string()),
+                    output_text: None,
+                }),
+            }
+        }
+    }
+
+    fn sample_proposal_for_decision(
+        decision_type: DecisionType,
+        work_unit_id: &str,
+        report_id: &str,
+        assignment_id: &str,
+        worker_id: &str,
+    ) -> SupervisorProposal {
+        let requires_assignment = matches!(
+            decision_type,
+            DecisionType::Continue | DecisionType::Redirect
+        );
+        let recommended_action = match decision_type {
+            DecisionType::Accept => "Accept the work as a valid intermediate result.",
+            DecisionType::Continue => "Continue with one more bounded assignment.",
+            DecisionType::Redirect => "Redirect the next bounded assignment.",
+            DecisionType::MarkComplete => "Mark the work unit complete.",
+            DecisionType::EscalateToHuman => "Escalate this decision point to a human.",
+        };
+        SupervisorProposal {
+            schema_version: "supervisor_proposal.v1".to_string(),
+            summary: SupervisorSummary {
+                headline: format!("Decision proposal: {:?}", decision_type),
+                situation: "The latest report reached a bounded decision point.".to_string(),
+                recommended_action: recommended_action.to_string(),
+                key_evidence: vec!["The source report is explicit and reviewable.".to_string()],
+                risks: Vec::new(),
+                review_focus: vec!["Verify the decision remains bounded.".to_string()],
+            },
+            proposed_decision: ProposedDecision {
+                decision_type,
+                target_work_unit_id: work_unit_id.to_string(),
+                source_report_id: report_id.to_string(),
+                rationale: format!("Apply {:?} for this decision point.", decision_type),
+                expected_work_unit_status: match decision_type {
+                    DecisionType::Accept => "accepted",
+                    DecisionType::Continue | DecisionType::Redirect => "ready",
+                    DecisionType::MarkComplete => "completed",
+                    DecisionType::EscalateToHuman => "needs_human",
+                }
+                .to_string(),
+                requires_assignment,
+            },
+            draft_next_assignment: requires_assignment.then(|| DraftAssignment {
+                target_work_unit_id: work_unit_id.to_string(),
+                predecessor_assignment_id: assignment_id.to_string(),
+                derived_from_decision_type: decision_type,
+                preferred_worker_id: Some(worker_id.to_string()),
+                worker_kind: Some("codex".to_string()),
+                objective: match decision_type {
+                    DecisionType::Redirect => {
+                        "Re-run the bounded follow-up with the redirected focus.".to_string()
+                    }
+                    _ => "Resolve the remaining bounded follow-up.".to_string(),
+                },
+                instructions: vec![
+                    "Inspect the remaining bounded gap.".to_string(),
+                    "Record the exact result without broadening scope.".to_string(),
+                ],
+                acceptance_criteria: vec!["The bounded question is resolved.".to_string()],
+                stop_conditions: vec!["Stop if human input is required.".to_string()],
+                required_context_refs: vec![report_id.to_string()],
+                expected_report_fields: vec![
+                    "summary".to_string(),
+                    "findings".to_string(),
+                    "questions".to_string(),
+                ],
+                boundedness_note: "This assignment stays within one bounded follow-up question."
+                    .to_string(),
+            }),
+            confidence: ReportConfidence::High,
+            warnings: Vec::new(),
+            open_questions: Vec::new(),
         }
     }
 
@@ -4433,6 +4681,14 @@ mod tests {
                 .get_mut(&assignment.id)
                 .expect("assignment")
                 .status = AssignmentStatus::AwaitingDecision;
+            let worker_session = state
+                .collaboration
+                .worker_sessions
+                .get_mut(&assignment.worker_session_id)
+                .expect("worker session");
+            worker_session.runtime_status = WorkerSessionRuntimeStatus::Completed;
+            worker_session.attachability = WorkerSessionAttachability::NotAttachable;
+            worker_session.updated_at = now;
             let work_unit_entry = state
                 .collaboration
                 .work_units
@@ -4482,22 +4738,24 @@ mod tests {
         (workstream, work_unit, assignment, report)
     }
 
-    #[tokio::test]
-    async fn proposal_create_persists_open_record_with_context_pack() {
-        let reasoner = Arc::new(StaticSupervisorReasoner::default());
-        let service = test_service_with_reasoner(reasoner.clone()).await;
-        let (_workstream, work_unit, assignment, report) =
-            seed_awaiting_decision_fixture(&service, "create").await;
+    async fn create_proposal_for_decision(
+        service: &Arc<OrcasDaemonService>,
+        reasoner: &Arc<StaticSupervisorReasoner>,
+        work_unit: &WorkUnit,
+        assignment: &Assignment,
+        report: &Report,
+        decision_type: DecisionType,
+    ) -> ipc::ProposalCreateResponse {
         reasoner
-            .set_proposal(sample_continue_proposal(
+            .set_proposal(sample_proposal_for_decision(
+                decision_type,
                 &work_unit.id,
                 &report.id,
                 &assignment.id,
                 &assignment.worker_id,
             ))
             .await;
-
-        let response = service
+        service
             .proposal_create(ipc::ProposalCreateRequest {
                 work_unit_id: work_unit.id.clone(),
                 source_report_id: Some(report.id.clone()),
@@ -4506,12 +4764,171 @@ mod tests {
                 supersede_open: false,
             })
             .await
-            .expect("proposal create");
+            .expect("proposal create")
+    }
+
+    async fn create_default_proposal(
+        service: &Arc<OrcasDaemonService>,
+        reasoner: &Arc<StaticSupervisorReasoner>,
+        work_unit: &WorkUnit,
+        assignment: &Assignment,
+        report: &Report,
+    ) -> ipc::ProposalCreateResponse {
+        create_proposal_for_decision(
+            service,
+            reasoner,
+            work_unit,
+            assignment,
+            report,
+            DecisionType::Continue,
+        )
+        .await
+    }
+
+    async fn approve_proposal(
+        service: &Arc<OrcasDaemonService>,
+        proposal_id: &str,
+        edits: SupervisorProposalEdits,
+    ) -> ipc::ProposalApproveResponse {
+        service
+            .proposal_approve(ipc::ProposalApproveRequest {
+                proposal_id: proposal_id.to_string(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("approved".to_string()),
+                edits,
+            })
+            .await
+            .expect("proposal approve")
+    }
+
+    async fn latest_proposal_record_for_workunit(
+        service: &Arc<OrcasDaemonService>,
+        work_unit_id: &str,
+    ) -> orcas_core::SupervisorProposalRecord {
+        let state = service.state.read().await;
+        state
+            .collaboration
+            .supervisor_proposals
+            .values()
+            .filter(|proposal| proposal.primary_work_unit_id == work_unit_id)
+            .cloned()
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+            .expect("latest proposal")
+    }
+
+    async fn assert_terminal_approval_path(
+        decision_type: DecisionType,
+        expected_work_unit_status: WorkUnitStatus,
+        expected_workstream_status: WorkstreamStatus,
+    ) {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, &format!("{decision_type:?}")).await;
+        let proposal = create_proposal_for_decision(
+            &service,
+            &reasoner,
+            &work_unit,
+            &assignment,
+            &report,
+            decision_type,
+        )
+        .await
+        .proposal;
+
+        let response =
+            approve_proposal(&service, &proposal.id, SupervisorProposalEdits::default()).await;
+
+        assert_eq!(response.decision.decision_type, decision_type);
+        assert!(response.next_assignment.is_none());
+        assert_eq!(response.proposal.status, SupervisorProposalStatus::Approved);
+        let state = service.state.read().await;
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].status,
+            expected_work_unit_status
+        );
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id]
+                .current_assignment_id
+                .as_deref(),
+            None
+        );
+        assert_eq!(
+            state.collaboration.assignments[&assignment.id].status,
+            AssignmentStatus::Closed
+        );
+        assert_eq!(
+            state.collaboration.workstreams[&workstream.id].status,
+            expected_workstream_status
+        );
+    }
+
+    async fn assert_assignment_approval_path(decision_type: DecisionType) {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, &format!("{decision_type:?}")).await;
+        let proposal = create_proposal_for_decision(
+            &service,
+            &reasoner,
+            &work_unit,
+            &assignment,
+            &report,
+            decision_type,
+        )
+        .await
+        .proposal;
+
+        let response =
+            approve_proposal(&service, &proposal.id, SupervisorProposalEdits::default()).await;
+        let next_assignment = response.next_assignment.expect("next assignment");
+        assert_eq!(response.decision.decision_type, decision_type);
+        assert_eq!(response.proposal.status, SupervisorProposalStatus::Approved);
+        assert_eq!(next_assignment.status, AssignmentStatus::Created);
+        assert_eq!(
+            next_assignment.attempt_number,
+            assignment.attempt_number + 1
+        );
+        let state = service.state.read().await;
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].status,
+            WorkUnitStatus::Ready
+        );
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id]
+                .current_assignment_id
+                .as_deref(),
+            Some(next_assignment.id.as_str())
+        );
+        assert_eq!(
+            state.collaboration.assignments[&assignment.id].status,
+            AssignmentStatus::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_create_persists_open_record_with_context_pack() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "create").await;
+        let response =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report).await;
 
         assert_eq!(response.proposal.status, SupervisorProposalStatus::Open);
         assert_eq!(
-            response.proposal.proposal.proposed_decision.decision_type,
-            DecisionType::Continue
+            response
+                .proposal
+                .proposal
+                .as_ref()
+                .expect("model proposal")
+                .proposed_decision
+                .decision_type,
+            DecisionType::Continue,
         );
         assert_eq!(
             response.proposal.context_pack.primary_work_unit.id,
@@ -4552,26 +4969,10 @@ mod tests {
         let service = test_service_with_reasoner(reasoner.clone()).await;
         let (_workstream, work_unit, assignment, report) =
             seed_awaiting_decision_fixture(&service, "approve").await;
-        reasoner
-            .set_proposal(sample_continue_proposal(
-                &work_unit.id,
-                &report.id,
-                &assignment.id,
-                &assignment.worker_id,
-            ))
-            .await;
-
-        let proposal = service
-            .proposal_create(ipc::ProposalCreateRequest {
-                work_unit_id: work_unit.id.clone(),
-                source_report_id: Some(report.id.clone()),
-                requested_by: Some("tester".to_string()),
-                note: None,
-                supersede_open: false,
-            })
-            .await
-            .expect("proposal create")
-            .proposal;
+        let proposal =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
 
         let response = service
             .proposal_approve(ipc::ProposalApproveRequest {
@@ -4602,7 +5003,31 @@ mod tests {
         assert!(
             next_assignment
                 .instructions
-                .contains("Objective: Resolve the remaining open question.")
+                .contains("Objective: Resolve the remaining bounded follow-up.")
+        );
+        assert_eq!(
+            response.proposal.approval_edits,
+            Some(SupervisorProposalEdits::default())
+        );
+        assert_eq!(
+            response
+                .proposal
+                .proposal
+                .as_ref()
+                .expect("original proposal")
+                .proposed_decision
+                .decision_type,
+            DecisionType::Continue
+        );
+        assert_eq!(
+            response
+                .proposal
+                .approved_proposal
+                .as_ref()
+                .expect("approved proposal")
+                .proposed_decision
+                .decision_type,
+            DecisionType::Continue
         );
 
         let state = service.state.read().await;
@@ -4632,26 +5057,10 @@ mod tests {
         let service = test_service_with_reasoner(reasoner.clone()).await;
         let (_workstream, work_unit, assignment, report) =
             seed_awaiting_decision_fixture(&service, "stale").await;
-        reasoner
-            .set_proposal(sample_continue_proposal(
-                &work_unit.id,
-                &report.id,
-                &assignment.id,
-                &assignment.worker_id,
-            ))
-            .await;
-
-        let proposal = service
-            .proposal_create(ipc::ProposalCreateRequest {
-                work_unit_id: work_unit.id.clone(),
-                source_report_id: Some(report.id.clone()),
-                requested_by: Some("tester".to_string()),
-                note: None,
-                supersede_open: false,
-            })
-            .await
-            .expect("proposal create")
-            .proposal;
+        let proposal =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
 
         {
             let newer_time = Utc::now();
@@ -4714,6 +5123,606 @@ mod tests {
             error
                 .to_string()
                 .contains("is not open and cannot be approved")
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_approve_accept_marks_work_unit_accepted() {
+        assert_terminal_approval_path(
+            DecisionType::Accept,
+            WorkUnitStatus::Accepted,
+            WorkstreamStatus::Active,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn proposal_approve_redirect_creates_next_assignment() {
+        assert_assignment_approval_path(DecisionType::Redirect).await;
+    }
+
+    #[tokio::test]
+    async fn proposal_approve_mark_complete_completes_workstream() {
+        assert_terminal_approval_path(
+            DecisionType::MarkComplete,
+            WorkUnitStatus::Completed,
+            WorkstreamStatus::Completed,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn proposal_approve_escalate_to_human_blocks_workstream() {
+        assert_terminal_approval_path(
+            DecisionType::EscalateToHuman,
+            WorkUnitStatus::NeedsHuman,
+            WorkstreamStatus::Blocked,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn proposal_reject_is_durable_and_blocks_later_approval() {
+        let base = std::env::temp_dir().join(format!("orcas-collab-reject-{}", Uuid::new_v4()));
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_at_with_reasoner(base.clone(), reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "reject").await;
+        let proposal =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
+
+        let reject_response = service
+            .proposal_reject(ipc::ProposalRejectRequest {
+                proposal_id: proposal.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("reject for now".to_string()),
+            })
+            .await
+            .expect("proposal reject");
+        assert_eq!(
+            reject_response.proposal.status,
+            SupervisorProposalStatus::Rejected
+        );
+
+        let approve_error = service
+            .proposal_approve(ipc::ProposalApproveRequest {
+                proposal_id: proposal.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+                edits: Default::default(),
+            })
+            .await
+            .expect_err("rejected proposal should not approve");
+        assert!(
+            approve_error
+                .to_string()
+                .contains("is not open and cannot be approved")
+        );
+
+        drop(service);
+        let restarted = test_service_at(base).await;
+        let stored = restarted
+            .proposal_get(ipc::ProposalGetRequest {
+                proposal_id: proposal.id.clone(),
+            })
+            .await
+            .expect("proposal get after restart");
+        assert_eq!(stored.proposal.status, SupervisorProposalStatus::Rejected);
+        assert_eq!(stored.proposal.reviewed_by.as_deref(), Some("reviewer"));
+    }
+
+    #[tokio::test]
+    async fn proposal_edit_before_approve_preserves_original_and_records_edits() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "edit").await;
+        let proposal =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
+
+        let edits = SupervisorProposalEdits {
+            decision_type: Some(DecisionType::Redirect),
+            decision_rationale: Some(
+                "Use redirect so the next pass is explicitly redirected.".to_string(),
+            ),
+            preferred_worker_id: Some(assignment.worker_id.clone()),
+            worker_kind: Some("codex".to_string()),
+            objective: Some("Verify the redirected reconnect branch only.".to_string()),
+            instructions: vec![
+                "Inspect only the redirected reconnect branch.".to_string(),
+                "Do not broaden beyond the reconnect decision point.".to_string(),
+            ],
+            acceptance_criteria: vec!["The redirected branch behavior is confirmed.".to_string()],
+            stop_conditions: vec!["Stop if product intent is unclear.".to_string()],
+            expected_report_fields: vec!["summary".to_string(), "findings".to_string()],
+        };
+        let response = approve_proposal(&service, &proposal.id, edits.clone()).await;
+
+        let next_assignment = response.next_assignment.expect("redirect assignment");
+        let original = response
+            .proposal
+            .proposal
+            .as_ref()
+            .expect("original model proposal");
+        let approved = response
+            .proposal
+            .approved_proposal
+            .as_ref()
+            .expect("approved proposal");
+
+        assert_eq!(
+            original.proposed_decision.decision_type,
+            DecisionType::Continue
+        );
+        assert_eq!(
+            approved.proposed_decision.decision_type,
+            DecisionType::Redirect
+        );
+        assert_eq!(response.proposal.approval_edits, Some(edits));
+        assert_eq!(response.decision.decision_type, DecisionType::Redirect);
+        assert!(
+            next_assignment
+                .instructions
+                .contains("Objective: Verify the redirected reconnect branch only.")
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_superseded_by_successor_cannot_be_approved() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "supersede").await;
+        let first = create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+            .await
+            .proposal;
+
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Continue,
+                &work_unit.id,
+                &report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+        let second = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: Some("resynthesize".to_string()),
+                supersede_open: true,
+            })
+            .await
+            .expect("second proposal")
+            .proposal;
+
+        let first_record = service
+            .proposal_get(ipc::ProposalGetRequest {
+                proposal_id: first.id.clone(),
+            })
+            .await
+            .expect("first proposal get");
+        assert_eq!(
+            first_record.proposal.status,
+            SupervisorProposalStatus::Superseded
+        );
+        let approve_error = service
+            .proposal_approve(ipc::ProposalApproveRequest {
+                proposal_id: first.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+                edits: Default::default(),
+            })
+            .await
+            .expect_err("superseded proposal should not approve");
+        assert!(
+            approve_error
+                .to_string()
+                .contains("is not open and cannot be approved")
+        );
+        assert_eq!(second.status, SupervisorProposalStatus::Open);
+    }
+
+    #[tokio::test]
+    async fn supersede_open_failure_keeps_existing_open_proposal() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "supersede-fail").await;
+        let first = create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+            .await
+            .proposal;
+
+        reasoner
+            .set_failure(
+                SupervisorProposalFailureStage::Backend,
+                "timeout contacting test provider",
+                None,
+            )
+            .await;
+        let error = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: Some("retry create".to_string()),
+                supersede_open: true,
+            })
+            .await
+            .expect_err("generation failure");
+        assert!(error.to_string().contains("inspect proposal"));
+
+        let first_record = service
+            .proposal_get(ipc::ProposalGetRequest {
+                proposal_id: first.id.clone(),
+            })
+            .await
+            .expect("first proposal get");
+        assert_eq!(first_record.proposal.status, SupervisorProposalStatus::Open);
+
+        let state = service.state.read().await;
+        let failed = state
+            .collaboration
+            .supervisor_proposals
+            .values()
+            .find(|proposal| proposal.status == SupervisorProposalStatus::GenerationFailed)
+            .expect("failed proposal record");
+        assert_eq!(
+            failed.generation_failure.as_ref().expect("failure").stage,
+            SupervisorProposalFailureStage::Backend
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_open_proposal_without_supersede_is_rejected() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "duplicate-create").await;
+        let _ = create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+            .await
+            .proposal;
+
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Continue,
+                &work_unit.id,
+                &report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+        let error = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect_err("duplicate open proposal should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("an open proposal already exists")
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_stales_after_authoritative_decision_and_cannot_be_rejected() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "decision-stale").await;
+        let proposal =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
+
+        let _ = service
+            .decision_apply(ipc::DecisionApplyRequest {
+                work_unit_id: work_unit.id.clone(),
+                report_id: Some(report.id.clone()),
+                decision_type: DecisionType::EscalateToHuman,
+                rationale: "a later authoritative decision was already applied".to_string(),
+                instructions: None,
+                worker_id: None,
+                worker_kind: None,
+            })
+            .await
+            .expect("authoritative decision");
+
+        let refreshed = service
+            .proposal_get(ipc::ProposalGetRequest {
+                proposal_id: proposal.id.clone(),
+            })
+            .await
+            .expect("proposal get");
+        assert_eq!(refreshed.proposal.status, SupervisorProposalStatus::Stale);
+
+        let reject_error = service
+            .proposal_reject(ipc::ProposalRejectRequest {
+                proposal_id: proposal.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("stale proposal should not reject");
+        assert!(
+            reject_error
+                .to_string()
+                .contains("is not open and cannot be rejected")
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_stales_after_current_assignment_changes() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "assignment-stale").await;
+        let proposal =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
+
+        {
+            let now = Utc::now();
+            let mut state = service.state.write().await;
+            let successor = Assignment {
+                id: format!("assignment-{}", Uuid::new_v4().simple()),
+                work_unit_id: work_unit.id.clone(),
+                worker_id: assignment.worker_id.clone(),
+                worker_session_id: assignment.worker_session_id.clone(),
+                instructions: "manual replacement".to_string(),
+                status: AssignmentStatus::Created,
+                attempt_number: assignment.attempt_number + 1,
+                created_at: now,
+                updated_at: now,
+            };
+            state
+                .collaboration
+                .assignments
+                .insert(successor.id.clone(), successor.clone());
+            let work_unit_entry = state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .expect("work unit");
+            work_unit_entry.current_assignment_id = Some(successor.id);
+            work_unit_entry.updated_at = now;
+        }
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist stale assignment");
+
+        let refreshed = service
+            .proposal_get(ipc::ProposalGetRequest {
+                proposal_id: proposal.id.clone(),
+            })
+            .await
+            .expect("proposal get");
+        assert_eq!(refreshed.proposal.status, SupervisorProposalStatus::Stale);
+    }
+
+    #[tokio::test]
+    async fn backend_generation_failure_persists_failed_record() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, _assignment, report) =
+            seed_awaiting_decision_fixture(&service, "backend-fail").await;
+
+        reasoner
+            .set_failure(
+                SupervisorProposalFailureStage::Backend,
+                "timeout contacting provider",
+                Some("provider timeout".to_string()),
+            )
+            .await;
+        let error = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect_err("backend failure");
+        assert!(error.to_string().contains("inspect proposal"));
+
+        let failed = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        assert_eq!(failed.status, SupervisorProposalStatus::GenerationFailed);
+        assert!(failed.proposal.is_none());
+        assert_eq!(
+            failed.generation_failure.as_ref().expect("failure").stage,
+            SupervisorProposalFailureStage::Backend
+        );
+        assert_eq!(
+            failed.reasoner_output_text.as_deref(),
+            Some("provider timeout")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_output_generation_failure_persists_failed_record() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, _assignment, report) =
+            seed_awaiting_decision_fixture(&service, "malformed-fail").await;
+
+        reasoner
+            .set_failure(
+                SupervisorProposalFailureStage::ProposalMalformed,
+                "failed to decode supervisor proposal JSON: missing field `summary`",
+                Some("{\"schema_version\":\"supervisor_proposal.v1\"}".to_string()),
+            )
+            .await;
+        let _ = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect_err("malformed output failure");
+
+        let failed = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        assert_eq!(failed.status, SupervisorProposalStatus::GenerationFailed);
+        assert_eq!(
+            failed.generation_failure.as_ref().expect("failure").stage,
+            SupervisorProposalFailureStage::ProposalMalformed
+        );
+        assert!(failed.proposal.is_none());
+    }
+
+    #[tokio::test]
+    async fn policy_invalid_decision_generation_failure_persists_failed_record() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "policy-fail").await;
+        {
+            let mut state = service.state.write().await;
+            let worker_session = state
+                .collaboration
+                .worker_sessions
+                .get_mut(&assignment.worker_session_id)
+                .expect("worker session");
+            worker_session.attachability = WorkerSessionAttachability::Unknown;
+        }
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist");
+
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::MarkComplete,
+                &work_unit.id,
+                &report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+        let _ = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect_err("policy validation failure");
+
+        let failed = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        assert_eq!(failed.status, SupervisorProposalStatus::GenerationFailed);
+        assert_eq!(
+            failed.generation_failure.as_ref().expect("failure").stage,
+            SupervisorProposalFailureStage::ProposalValidation
+        );
+        assert_eq!(
+            failed
+                .proposal
+                .as_ref()
+                .expect("invalid proposal kept for inspection")
+                .proposed_decision
+                .decision_type,
+            DecisionType::MarkComplete
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_draft_generation_failure_persists_failed_record() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "draft-fail").await;
+        let mut invalid = sample_proposal_for_decision(
+            DecisionType::Continue,
+            &work_unit.id,
+            &report.id,
+            &assignment.id,
+            &assignment.worker_id,
+        );
+        invalid
+            .draft_next_assignment
+            .as_mut()
+            .expect("draft")
+            .instructions
+            .clear();
+        reasoner.set_proposal(invalid).await;
+
+        let _ = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect_err("invalid draft failure");
+
+        let failed = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        assert_eq!(failed.status, SupervisorProposalStatus::GenerationFailed);
+        assert_eq!(
+            failed.generation_failure.as_ref().expect("failure").stage,
+            SupervisorProposalFailureStage::ProposalValidation
+        );
+    }
+
+    #[tokio::test]
+    async fn double_approve_and_reject_after_approve_fail_closed() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "double-approve").await;
+        let proposal =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
+
+        let _ = approve_proposal(&service, &proposal.id, SupervisorProposalEdits::default()).await;
+
+        let second_approve = service
+            .proposal_approve(ipc::ProposalApproveRequest {
+                proposal_id: proposal.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+                edits: Default::default(),
+            })
+            .await
+            .expect_err("second approve should fail");
+        assert!(
+            second_approve
+                .to_string()
+                .contains("is not open and cannot be approved")
+        );
+
+        let reject_after_approve = service
+            .proposal_reject(ipc::ProposalRejectRequest {
+                proposal_id: proposal.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("reject after approve should fail");
+        assert!(
+            reject_after_approve
+                .to_string()
+                .contains("is not open and cannot be rejected")
         );
     }
 
