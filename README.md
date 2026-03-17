@@ -1,3 +1,5 @@
+![ORCAS Logo](orcas_banner.png)
+
 # Orcas
 
 _Open Reasoning Context & Agent Supervisor_  
