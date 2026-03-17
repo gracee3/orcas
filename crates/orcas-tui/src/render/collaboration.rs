@@ -1,27 +1,28 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::app::{AppState, CollaborationFocus};
 use crate::view_model;
 
 use super::shared::{
     emphasis_style, focus_block_style, focus_title, key_value_line, label_style, metadata_style,
-    render_panel_with_focus, row_style, selection_marker, status_label_style, status_text_style,
+    render_panel_with_focus, row_style, selection_marker, selection_marker_style,
+    status_label_style, status_text_style,
 };
 
 pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     let compact = area.width < 138 || area.height < 30;
     let collaboration = view_model::collaboration_view(state);
-    let header_height = if compact { 5 } else { 4 };
+    let header_height = if compact { 5 } else { 6 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(header_height), Constraint::Min(12)])
         .split(area);
 
     frame.render_widget(
-        render_collaboration_status(collaboration.status.clone()),
+        render_collaboration_status(collaboration.status.clone(), compact),
         layout[0],
     );
 
@@ -43,6 +44,7 @@ pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
             render_workstreams(
                 collaboration.workstreams,
                 state.collaboration_focus == CollaborationFocus::Workstreams,
+                compact,
             ),
             body[0],
         );
@@ -61,6 +63,7 @@ pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
             render_work_units(
                 collaboration.work_units,
                 state.collaboration_focus == CollaborationFocus::WorkUnits,
+                compact,
             ),
             body[2],
         );
@@ -90,6 +93,7 @@ pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
             render_workstreams(
                 collaboration.workstreams,
                 state.collaboration_focus == CollaborationFocus::Workstreams,
+                compact,
             ),
             left[0],
         );
@@ -108,6 +112,7 @@ pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
             render_work_units(
                 collaboration.work_units,
                 state.collaboration_focus == CollaborationFocus::WorkUnits,
+                compact,
             ),
             columns[1],
         );
@@ -121,19 +126,35 @@ pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
 
 fn render_collaboration_status(
     status: view_model::CollaborationStatusViewModel,
+    compact: bool,
 ) -> Paragraph<'static> {
-    let lines = vec![
-        Line::styled(
-            format!(
-                "focus={}  workstreams={}  work_units={}  active_assignments={}  review={}",
-                view_model::collaboration_focus_label(status.focus),
-                status.workstream_count,
-                status.work_unit_count,
-                status.active_assignment_count,
-                status.review_count
-            ),
-            emphasis_style(),
+    let mut lines = vec![Line::styled(
+        format!(
+            "focus={}  workstreams={}  work_units={}  reviews={}",
+            view_model::collaboration_focus_label(status.focus),
+            status.workstream_count,
+            status.work_unit_count,
+            status.review_count
         ),
+        emphasis_style(),
+    )];
+
+    if compact {
+        lines.push(Line::from(vec![
+            Span::styled("active assignments: ", label_style()),
+            Span::styled(status.active_assignment_count.to_string(), metadata_style()),
+        ]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "active assignments={}  review={}",
+                status.active_assignment_count, status.review_count
+            ),
+            metadata_style(),
+        )]));
+    }
+
+    lines.extend(vec![
         key_value_line(
             "selected stream",
             &status
@@ -146,7 +167,7 @@ fn render_collaboration_status(
                 .selected_work_unit_title
                 .unwrap_or_else(|| "-".to_string()),
         ),
-    ];
+    ]);
 
     Paragraph::new(Text::from(lines))
         .block(
@@ -161,24 +182,33 @@ fn render_collaboration_status(
 fn render_workstreams(
     list: view_model::WorkstreamListViewModel,
     focused: bool,
+    compact: bool,
 ) -> Paragraph<'static> {
+    let row_limit = if compact { 6 } else { 10 };
     let lines = if list.rows.is_empty() {
         vec![Line::styled("No workstreams loaded.", metadata_style())]
     } else {
         list.rows
             .into_iter()
-            .take(10)
+            .take(row_limit)
             .map(|row| {
                 let marker = selection_marker(row.selected, focused);
                 let status_style = status_text_style(&row.status);
                 let counts = format!(" {}", row.counts);
                 Line::from(vec![
-                    Span::styled(format!("{marker}"), row_style(row.selected, focused)),
+                    Span::styled(
+                        format!("{marker}"),
+                        selection_marker_style(row.selected, focused),
+                    ),
                     Span::styled(format!(" {} ", row.title), row_style(row.selected, focused)),
                     Span::styled("[", metadata_style()),
                     Span::styled(row.status.to_string(), status_style),
                     Span::styled("]", metadata_style()),
-                    Span::styled(counts, metadata_style()),
+                    if compact {
+                        Span::styled(format!(" {}", row.counts), metadata_style())
+                    } else {
+                        Span::styled(counts, metadata_style())
+                    },
                 ])
             })
             .collect()
@@ -194,12 +224,17 @@ fn render_workstreams(
         .wrap(Wrap { trim: true })
 }
 
-fn render_work_units(list: view_model::WorkUnitListViewModel, focused: bool) -> Paragraph<'static> {
+fn render_work_units(
+    list: view_model::WorkUnitListViewModel,
+    focused: bool,
+    compact: bool,
+) -> Paragraph<'static> {
+    let row_limit = if compact { 6 } else { 8 };
     let lines = if list.rows.is_empty() {
         vec![Line::styled("No work units loaded.", metadata_style())]
     } else {
         let mut lines = Vec::new();
-        for row in list.rows.into_iter().take(8) {
+        for row in list.rows.into_iter().take(row_limit) {
             let marker = selection_marker(row.selected, focused);
             let review = if row.needs_supervisor_review {
                 " review"
@@ -207,27 +242,32 @@ fn render_work_units(list: view_model::WorkUnitListViewModel, focused: bool) -> 
                 ""
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("{marker}"), row_style(row.selected, focused)),
+                Span::styled(
+                    format!("{marker}"),
+                    selection_marker_style(row.selected, focused),
+                ),
                 Span::styled(format!(" {} ", row.title), row_style(row.selected, focused)),
                 Span::styled("[", metadata_style()),
                 Span::styled(row.status.clone(), status_text_style(&row.status)),
                 Span::styled("]", metadata_style()),
                 Span::styled(format!(" {}", review), status_label_style()),
             ]));
-            lines.push(Line::from(vec![
-                Span::styled("assignment=", label_style()),
-                Span::styled(row.current_assignment.clone(), metadata_style()),
-                Span::styled(
-                    format!("  decision={} ", row.latest_decision),
-                    metadata_style(),
-                ),
-                Span::styled("proposal=", label_style()),
-                Span::styled(row.proposal_status.clone(), metadata_style()),
-                Span::styled(
-                    format!(" parse={}", row.latest_report_parse_result),
-                    metadata_style(),
-                ),
-            ]));
+            if !compact || row.selected {
+                lines.push(Line::from(vec![
+                    Span::styled("assignment=", label_style()),
+                    Span::styled(row.current_assignment.clone(), metadata_style()),
+                    Span::styled(
+                        format!("  decision={} ", row.latest_decision),
+                        metadata_style(),
+                    ),
+                    Span::styled("proposal=", label_style()),
+                    Span::styled(row.proposal_status.clone(), metadata_style()),
+                    Span::styled(
+                        format!(" parse={}", row.latest_report_parse_result),
+                        metadata_style(),
+                    ),
+                ]));
+            }
         }
         lines
     };

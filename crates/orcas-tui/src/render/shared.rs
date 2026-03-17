@@ -46,12 +46,18 @@ pub(super) fn focus_title(base: &str, focused: bool) -> String {
 }
 
 pub(super) fn focus_block_style(focused: bool) -> Style {
+    focus_border_style(focused)
+}
+
+pub(super) fn focus_border_style(focused: bool) -> Style {
     if focused {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
     }
 }
 
@@ -61,7 +67,7 @@ pub(super) fn panel_title_style(focused: bool) -> Style {
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
     }
 }
 
@@ -76,31 +82,53 @@ pub(super) fn status_label_style() -> Style {
 }
 
 pub(super) fn selection_marker(selected: bool, _list_focused: bool) -> &'static str {
-    if selected {
-        ">"
-    } else {
-        " "
-    }
+    if selected { ">" } else { " " }
 }
 
 pub(super) fn row_style(selected: bool, list_has_focus: bool) -> Style {
     if selected {
+        selected_row_style(list_has_focus)
+    } else {
+        unselected_row_style(list_has_focus)
+    }
+}
+
+pub(super) fn selected_row_style(list_has_focus: bool) -> Style {
+    if list_has_focus {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+    }
+}
+
+pub(super) fn unselected_row_style(list_has_focus: bool) -> Style {
+    if list_has_focus {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    }
+}
+
+pub(super) fn selection_marker_style(selected: bool, list_has_focus: bool) -> Style {
+    if selected {
         if list_has_focus {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
         }
-    } else if list_has_focus {
-        Style::default().fg(Color::White)
     } else {
-        Style::default().fg(Color::DarkGray)
+        metadata_style()
     }
 }
 
 pub(super) fn metadata_style() -> Style {
-    muted_style()
+    muted_style().add_modifier(Modifier::DIM)
 }
 
 pub(super) fn muted_style() -> Style {
@@ -123,7 +151,7 @@ pub(super) fn emphasis_style() -> Style {
 
 pub(super) fn key_hint_style() -> Style {
     Style::default()
-        .fg(Color::Cyan)
+        .fg(Color::LightCyan)
         .add_modifier(Modifier::BOLD)
 }
 

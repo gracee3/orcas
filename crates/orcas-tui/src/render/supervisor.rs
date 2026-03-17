@@ -1,7 +1,7 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::app::{AppState, DaemonLifecycleState, TopLevelView};
 
@@ -36,8 +36,8 @@ pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     };
 
     frame.render_widget(render_daemon_status(state), layout[0]);
-    frame.render_widget(render_models(state), layout[1]);
-    frame.render_widget(render_controls(state), layout[2]);
+    frame.render_widget(render_models(state, compact), layout[1]);
+    frame.render_widget(render_controls(state, compact), layout[2]);
 }
 
 fn render_daemon_status(state: &AppState) -> Paragraph<'static> {
@@ -121,7 +121,7 @@ fn render_daemon_status(state: &AppState) -> Paragraph<'static> {
     )
 }
 
-fn render_models(state: &AppState) -> Paragraph<'static> {
+fn render_models(state: &AppState, compact: bool) -> Paragraph<'static> {
     let mut lines = Vec::new();
     let is_inflight = matches!(
         state.daemon_lifecycle,
@@ -155,7 +155,8 @@ fn render_models(state: &AppState) -> Paragraph<'static> {
             ));
         }
     } else {
-        for (index, model) in state.daemon_models.iter().take(18).enumerate() {
+        let model_limit = if compact { 10 } else { 18 };
+        for (index, model) in state.daemon_models.iter().take(model_limit).enumerate() {
             let status = if model.is_default {
                 "default"
             } else if model.hidden {
@@ -174,9 +175,9 @@ fn render_models(state: &AppState) -> Paragraph<'static> {
             ]);
             lines.push(row);
         }
-        if state.daemon_models.len() > 18 {
+        if state.daemon_models.len() > model_limit {
             lines.push(Line::styled(
-                format!("+ {} more models", state.daemon_models.len() - 18),
+                format!("+ {} more models", state.daemon_models.len() - model_limit),
                 emphasis_style(),
             ));
         }
@@ -192,7 +193,7 @@ fn render_models(state: &AppState) -> Paragraph<'static> {
         .wrap(Wrap { trim: true })
 }
 
-fn render_controls(state: &AppState) -> Paragraph<'static> {
+fn render_controls(state: &AppState, compact: bool) -> Paragraph<'static> {
     let mut lines = Vec::new();
     let in_flight = matches!(
         state.daemon_lifecycle,
@@ -217,22 +218,41 @@ fn render_controls(state: &AppState) -> Paragraph<'static> {
         Span::styled(" restart daemon", metadata_style()),
     ]));
 
-    lines.push(Line::styled(
-        if in_flight {
-            "daemon command in progress: repeated lifecycle keys are ignored"
-        } else if state.daemon_lifecycle == DaemonLifecycleState::Failed {
-            "daemon failure state: use restart (R) or stop/start again once fixed"
-        } else {
-            "lifecycle commands can be triggered at any time"
-        },
-        if in_flight {
-            emphasis_style()
-        } else if state.daemon_lifecycle == DaemonLifecycleState::Failed {
-            status_style(crate::app::BannerLevel::Error)
-        } else {
-            metadata_style()
-        },
-    ));
+    if compact {
+        lines.push(Line::styled(
+            if in_flight {
+                "daemon command in progress: lifecycle keys are ignored"
+            } else if state.daemon_lifecycle == DaemonLifecycleState::Failed {
+                "daemon failure: use restart (R) or stop/start again once fixed"
+            } else {
+                "press s/x/R to control daemon lifecycle"
+            },
+            if in_flight {
+                emphasis_style()
+            } else if state.daemon_lifecycle == DaemonLifecycleState::Failed {
+                status_style(crate::app::BannerLevel::Error)
+            } else {
+                metadata_style()
+            },
+        ));
+    } else {
+        lines.push(Line::styled(
+            if in_flight {
+                "daemon command in progress: repeated lifecycle keys are ignored"
+            } else if state.daemon_lifecycle == DaemonLifecycleState::Failed {
+                "daemon failure state: use restart (R) or stop/start again once fixed"
+            } else {
+                "lifecycle commands can be triggered at any time"
+            },
+            if in_flight {
+                emphasis_style()
+            } else if state.daemon_lifecycle == DaemonLifecycleState::Failed {
+                status_style(crate::app::BannerLevel::Error)
+            } else {
+                metadata_style()
+            },
+        ));
+    }
     if state.daemon_lifecycle == DaemonLifecycleState::Failed {
         if let Some(error) = state.daemon_lifecycle_error.as_deref() {
             lines.push(Line::styled(

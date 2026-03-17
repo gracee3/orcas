@@ -11,7 +11,7 @@ use super::shared::{
     value_style,
 };
 
-pub(super) fn render_shell_status(state: &AppState) -> Paragraph<'static> {
+pub(super) fn render_shell_status(state: &AppState, compact: bool) -> Paragraph<'static> {
     let connection = view_model::connection_status(state);
     let mut lines = vec![
         Line::styled(
@@ -26,13 +26,40 @@ pub(super) fn render_shell_status(state: &AppState) -> Paragraph<'static> {
             daemon_lifecycle_label(state.daemon_lifecycle),
             status_text_style(daemon_lifecycle_label(state.daemon_lifecycle)),
         ),
-        key_value_line("daemon", daemon_phase_label(connection.daemon_phase)),
-        status_line(
+    ];
+    if compact {
+        let daemon_phase = daemon_phase_label(connection.daemon_phase);
+        lines.push(status_line(
+            "daemon phase",
+            daemon_phase,
+            daemon_phase_to_status_style(daemon_phase),
+        ));
+        lines.push(Line::from(vec![
+            Span::styled("upstream: ", label_style()),
+            Span::styled(
+                connection.upstream_status.clone(),
+                daemon_phase_to_status_style(&connection.upstream_status),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("clients: ", label_style()),
+            Span::styled(connection.client_count.to_string(), value_style()),
+            Span::styled(" threads: ", label_style()),
+            Span::styled(connection.known_threads.to_string(), value_style()),
+            Span::styled(" reconnect: ", label_style()),
+            Span::styled(connection.reconnect_attempt.to_string(), metadata_style()),
+        ]));
+    } else {
+        lines.push(key_value_line(
+            "daemon",
+            daemon_phase_label(connection.daemon_phase),
+        ));
+        lines.push(status_line(
             "upstream",
             &connection.upstream_status,
             daemon_phase_to_status_style(&connection.upstream_status),
-        ),
-        Line::from(vec![
+        ));
+        lines.push(Line::from(vec![
             Span::styled(
                 format!(
                     "clients: {}  threads: {}",
@@ -44,18 +71,22 @@ pub(super) fn render_shell_status(state: &AppState) -> Paragraph<'static> {
                 format!("  reconnect: {}", connection.reconnect_attempt),
                 metadata_style(),
             ),
-        ]),
-    ];
-
-    lines.push(Line::from(vec![
-        Span::styled("socket: ", label_style()),
-        Span::styled(connection.socket_path.clone(), metadata_style()),
-    ]));
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("socket: ", label_style()),
+            Span::styled(connection.socket_path.clone(), metadata_style()),
+        ]));
+    }
 
     if let Some(detail) = connection.upstream_detail {
+        let upstream_style = if compact {
+            metadata_style()
+        } else {
+            daemon_phase_to_status_style(&connection.upstream_status)
+        };
         lines.push(Line::styled(
             format!("upstream detail: {detail}"),
-            daemon_phase_to_status_style(&connection.upstream_status),
+            upstream_style,
         ));
     } else if let Some(banner) = view_model::status_banner(state) {
         let color = status_style(banner.level);
@@ -76,13 +107,21 @@ pub(super) fn render_shell_status(state: &AppState) -> Paragraph<'static> {
     Paragraph::new(Text::from(lines)).block(Block::default().title("Shell").borders(Borders::ALL))
 }
 
-pub(super) fn render_footer(state: &AppState) -> Paragraph<'static> {
+pub(super) fn render_footer(state: &AppState, compact: bool) -> Paragraph<'static> {
     let mut lines = Vec::new();
     if state.show_help {
-        lines.push(Line::from(
-            "views: 1 overview  2 threads  3 collaboration  4 supervisor  tab next view",
-        ));
-        lines.push(Line::from(help_navigation_line(state.current_view)));
+        if compact {
+            lines.push(Line::from("views: 1/2/3/4  tab next  ? help  q quit"));
+            lines.push(Line::from(help_navigation_line_compact(state.current_view)));
+            if let Some(error) = state.daemon_lifecycle_error.as_deref() {
+                lines.push(Line::styled(format!("daemon: {error}"), metadata_style()));
+            }
+        } else {
+            lines.push(Line::from(
+                "views: 1 overview  2 threads  3 collaboration  4 supervisor  tab next view",
+            ));
+            lines.push(Line::from(help_navigation_line(state.current_view)));
+        }
     } else {
         let mut spans = vec![
             Span::styled("keys: ", label_style()),
@@ -105,6 +144,10 @@ pub(super) fn render_footer(state: &AppState) -> Paragraph<'static> {
             Span::styled("focus: ", label_style()),
             Span::styled(title_case_view_label(state.current_view), value_style()),
         ]));
+    }
+
+    if compact && lines.len() > 3 {
+        lines.truncate(3);
     }
 
     Paragraph::new(Text::from(lines))
@@ -149,6 +192,15 @@ fn help_navigation_line(view: TopLevelView) -> &'static str {
         TopLevelView::Supervisor => {
             "nav: m reload models  s start daemon  x request daemon stop  R restart daemon  r refresh  ? help  q quit"
         }
+    }
+}
+
+fn help_navigation_line_compact(view: TopLevelView) -> &'static str {
+    match view {
+        TopLevelView::Overview => "nav: r refresh",
+        TopLevelView::Threads => "nav: j/k move  r refresh",
+        TopLevelView::Collaboration => "nav: h/l focus  j/k move  r refresh",
+        TopLevelView::Supervisor => "nav: m/s/x/R  r",
     }
 }
 

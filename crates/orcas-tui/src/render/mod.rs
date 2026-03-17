@@ -27,12 +27,12 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
         ])
         .split(frame.area());
 
-    frame.render_widget(shell::render_shell_status(state), layout[0]);
+    frame.render_widget(shell::render_shell_status(state, compact), layout[0]);
     match state.current_view {
         TopLevelView::Overview => overview::render_view(frame, state, layout[1]),
         TopLevelView::Threads => threads::render_view(frame, state, layout[1]),
         TopLevelView::Collaboration => collaboration::render_view(frame, state, layout[1]),
         TopLevelView::Supervisor => supervisor::render_view(frame, state, layout[1]),
     }
-    frame.render_widget(shell::render_footer(state), layout[2]);
+    frame.render_widget(shell::render_footer(state, compact), layout[2]);
 }
