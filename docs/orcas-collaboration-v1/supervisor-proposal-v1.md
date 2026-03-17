@@ -41,6 +41,30 @@ Key design choices:
 - validated proposals are persisted as reviewable artifacts
 - only approved decisions and assignments become authoritative Orcas state
 
+## Current Milestone Status
+
+This narrow proposal loop is now implemented as the current Orcas supervisor slice.
+
+Implemented now:
+
+- canonical proposal types and persistence
+- daemon-side context-pack building
+- deterministic policy and validation
+- Responses-backed reasoner
+- CLI proposal create, get, list, approve, and reject flows
+- proposal lifecycle hardening and observability across snapshot, events, history, and read-only TUI
+- opt-in auto-proposal creation on `report_recorded`
+- fake-runtime confidence coverage for full completed and interrupted assignment runtime paths
+
+Current guarantees remain unchanged from the design:
+
+- Orcas state is authoritative
+- proposals remain review artifacts, not workflow truth
+- human approval is required before recording a `Decision` or creating a successor `Assignment`
+- auto-proposal remains opt-in, conservative, and fail-closed
+
+Deferred work remains intentionally out of scope for this slice. See [Milestone Closeout](./milestone-closeout.md) for the concise implemented-state and deferred-work summary.
+
 ## Scope
 
 V1 proposal generation is only for a work unit that is already at a decision point.
@@ -1108,6 +1132,10 @@ No write-heavy TUI work in the first slice.
 At most, later add read-only proposal visibility alongside reports and decisions.
 
 ## Smallest Implementation Slice After This Design
+
+Historical note:
+
+The implementation slice described below is complete. It remains here as design history. For the current implemented state and deferred follow-up work, see [Milestone Closeout](./milestone-closeout.md).
 
 The smallest convincing build slice is:
 

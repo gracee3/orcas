@@ -8,6 +8,7 @@
 - [Lifecycles](./lifecycles.md)
 - [Runtime Mapping](./runtime-mapping.md)
 - [Supervisor Proposal v1](./supervisor-proposal-v1.md)
+- [Milestone Closeout](./milestone-closeout.md)
 - [Next Implementation Cut](./next-implementation-cut.md)
 
 ## What Orcas Is At This Layer
@@ -30,6 +31,27 @@ At the collaboration layer, Orcas adds:
 - durable visibility over multi-worker progress
 
 Codex remains the execution substrate. Orcas is the workflow and coordination layer above it.
+
+## Current Milestone Status
+
+The current collaboration and supervisor-proposal milestone is implemented and in a clean stopping state.
+
+Today Orcas already has:
+
+- canonical collaboration state and persistence
+- bounded supervisor proposal generation and approval flow
+- proposal observability in snapshot, events, history, and read-only TUI surfaces
+- opt-in auto-proposal creation on `report_recorded`
+- real-path confidence coverage for completed and interrupted runtime outcomes
+
+Current control boundaries remain strict:
+
+- Orcas state is authoritative
+- proposals are review artifacts, not workflow truth
+- human approval is required before an authoritative `Decision` or successor `Assignment` exists
+- auto-proposal is opt-in, conservative, and fail-closed
+
+See [Milestone Closeout](./milestone-closeout.md) for the implemented scope, guarantees, and intentionally deferred follow-up work.
 
 ## Why This Is Not Just A Codex Client
 

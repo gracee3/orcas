@@ -1,5 +1,11 @@
 # Next Implementation Cut
 
+Historical note:
+
+The first implementation cut described in this document is complete.
+
+Use this page as design history only. For the current implemented state, guarantees, and deferred follow-up work, see [Milestone Closeout](./milestone-closeout.md).
+
 This document recommends the first implementation slice after the design phase.
 
 ## Recommendation

@@ -4983,18 +4983,50 @@ mod tests {
         threads: HashMap<String, types::Thread>,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum FakeCodexTerminalOutcome {
+        Completed,
+        Interrupted,
+    }
+
+    impl FakeCodexTerminalOutcome {
+        fn turn_status(self) -> types::TurnStatus {
+            match self {
+                Self::Completed => types::TurnStatus::Completed,
+                Self::Interrupted => types::TurnStatus::Interrupted,
+            }
+        }
+
+        fn turn_error(self) -> Option<types::TurnError> {
+            match self {
+                Self::Completed => None,
+                Self::Interrupted => Some(types::TurnError {
+                    message: "interrupted".to_string(),
+                    additional_details: None,
+                    codex_error_info: None,
+                }),
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct FakeCodexTransport {
         endpoint: String,
         turn_output: String,
+        terminal_outcome: FakeCodexTerminalOutcome,
         state: Arc<Mutex<FakeCodexRuntimeState>>,
     }
 
     impl FakeCodexTransport {
-        fn new(endpoint: impl Into<String>, turn_output: impl Into<String>) -> Self {
+        fn new(
+            endpoint: impl Into<String>,
+            turn_output: impl Into<String>,
+            terminal_outcome: FakeCodexTerminalOutcome,
+        ) -> Self {
             Self {
                 endpoint: endpoint.into(),
                 turn_output: turn_output.into(),
+                terminal_outcome,
                 state: Arc::new(Mutex::new(FakeCodexRuntimeState::default())),
             }
         }
@@ -5002,6 +5034,7 @@ mod tests {
         async fn handle_request(
             state: Arc<Mutex<FakeCodexRuntimeState>>,
             turn_output: String,
+            terminal_outcome: FakeCodexTerminalOutcome,
             inbound_tx: tokio::sync::mpsc::Sender<String>,
             request: codex_jsonrpc::JsonRpcRequest,
         ) -> OrcasResult<()> {
@@ -5190,8 +5223,8 @@ mod tests {
                             let completed_turn = types::Turn {
                                 id: turn.id.clone(),
                                 items: vec![completed_item],
-                                status: types::TurnStatus::Completed,
-                                error: None,
+                                status: terminal_outcome.turn_status(),
+                                error: terminal_outcome.turn_error(),
                             };
                             if let Some(existing_turn) = thread
                                 .turns
@@ -5283,6 +5316,7 @@ mod tests {
             let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<String>(256);
             let state = Arc::clone(&self.state);
             let turn_output = self.turn_output.clone();
+            let terminal_outcome = self.terminal_outcome;
 
             tokio::spawn(async move {
                 while let Some(raw) = outbound_rx.recv().await {
@@ -5295,6 +5329,7 @@ mod tests {
                             let _ = Self::handle_request(
                                 Arc::clone(&state),
                                 turn_output.clone(),
+                                terminal_outcome,
                                 inbound_tx.clone(),
                                 request,
                             )
@@ -5671,6 +5706,7 @@ mod tests {
         config: AppConfig,
         supervisor_reasoner: Arc<dyn SupervisorReasoner>,
         turn_output: &str,
+        terminal_outcome: FakeCodexTerminalOutcome,
     ) -> Arc<OrcasDaemonService> {
         let base = std::env::temp_dir().join(format!("orcas-collab-test-{}", Uuid::new_v4()));
         let paths = AppPaths {
@@ -5692,6 +5728,7 @@ mod tests {
             Arc::new(FakeCodexTransport::new(
                 config.codex.listen_url.clone(),
                 turn_output.to_string(),
+                terminal_outcome,
             )),
             config.codex.reconnect.clone(),
             Arc::new(RejectingApprovalRouter),
@@ -6960,6 +6997,7 @@ ORCAS_REPORT_END"#
             auto_proposal_config(true),
             reasoner.clone(),
             sample_runtime_report_output(),
+            FakeCodexTerminalOutcome::Completed,
         )
         .await;
         let mut events = service.event_tx.subscribe();
@@ -7083,6 +7121,7 @@ ORCAS_REPORT_END"#
             auto_proposal_config(false),
             reasoner.clone(),
             sample_runtime_report_output(),
+            FakeCodexTerminalOutcome::Completed,
         )
         .await;
         let workstream = service
@@ -7135,6 +7174,144 @@ ORCAS_REPORT_END"#
         let state = service.state.read().await;
         assert!(state.collaboration.decisions.is_empty());
         assert_eq!(state.collaboration.assignments.len(), 1);
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].latest_report_id,
+            Some(response.report.id.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn full_assignment_runtime_path_preserves_interrupted_turn_semantics_with_fake_codex_runtime()
+     {
+        let reasoner = Arc::new(PackDrivenSupervisorReasoner::new(DecisionType::Continue));
+        let service = test_service_with_fake_codex_runtime(
+            auto_proposal_config(true),
+            reasoner.clone(),
+            "partial raw output",
+            FakeCodexTerminalOutcome::Interrupted,
+        )
+        .await;
+        let mut events = service.event_tx.subscribe();
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Interrupted runtime".to_string(),
+                objective: "Exercise the interrupted assignment runtime path".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: "Interrupted runtime work unit".to_string(),
+                task_statement: "Run one bounded worker step and interrupt before completion."
+                    .to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+
+        let response = service
+            .assignment_start(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-runtime-interrupted".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Attempt one bounded step and stop if interrupted.".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment runtime");
+
+        let recorded_report = wait_for_report_recorded(&mut events).await;
+        let proposal_event =
+            wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::Created).await;
+
+        assert_eq!(response.assignment.work_unit_id, work_unit.id);
+        assert_eq!(response.assignment.status, AssignmentStatus::Interrupted);
+        assert_eq!(response.worker.id, "worker-runtime-interrupted");
+        assert_eq!(response.worker.status, WorkerStatus::Idle);
+        assert_eq!(response.worker.current_assignment_id, None);
+        assert_eq!(
+            response.assignment.worker_session_id,
+            response.worker_session.id
+        );
+        assert_eq!(response.worker_session.worker_id, response.worker.id);
+        assert!(response.worker_session.thread_id.is_some());
+        assert_eq!(response.worker_session.active_turn_id, None);
+        assert_eq!(
+            response.worker_session.runtime_status,
+            WorkerSessionRuntimeStatus::Interrupted
+        );
+        assert_eq!(
+            response.worker_session.attachability,
+            WorkerSessionAttachability::NotAttachable
+        );
+
+        assert_eq!(response.report.assignment_id, response.assignment.id);
+        assert_eq!(response.report.work_unit_id, work_unit.id);
+        assert_eq!(response.report.disposition, ReportDisposition::Interrupted);
+        assert_eq!(
+            response.report.summary,
+            "Execution was interrupted. Raw output was retained for supervisor review."
+        );
+        assert_eq!(response.report.parse_result, ReportParseResult::Invalid);
+        assert_eq!(response.report.confidence, ReportConfidence::Unknown);
+        assert!(response.report.needs_supervisor_review);
+        assert!(response.report.findings.is_empty());
+        assert!(response.report.blockers.is_empty());
+        assert!(response.report.questions.is_empty());
+        assert!(response.report.recommended_next_actions.is_empty());
+        assert_eq!(response.report.raw_output, "partial raw output");
+
+        assert_eq!(recorded_report.id, response.report.id);
+        assert_eq!(reasoner.propose_call_count(), 1);
+        assert_eq!(proposal_event.source_report_id, response.report.id);
+
+        let snapshot = service.snapshot().await.expect("snapshot");
+        let summary = snapshot
+            .collaboration
+            .work_units
+            .iter()
+            .find(|summary| summary.id == work_unit.id)
+            .and_then(|summary| summary.proposal.as_ref())
+            .expect("proposal summary");
+        assert!(summary.has_open_proposal);
+        assert_eq!(
+            summary.latest_proposed_decision_type,
+            Some(DecisionType::Continue)
+        );
+
+        let detail = service
+            .workunit_get(ipc::WorkunitGetRequest {
+                work_unit_id: work_unit.id.clone(),
+            })
+            .await
+            .expect("workunit detail");
+        assert_eq!(detail.reports.len(), 1);
+        assert_eq!(detail.proposals.len(), 1);
+
+        let proposal = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        assert_eq!(proposal.status, SupervisorProposalStatus::Open);
+        assert_eq!(
+            proposal.trigger.kind,
+            SupervisorProposalTriggerKind::ReportRecorded
+        );
+        assert_eq!(proposal.source_report_id, response.report.id);
+
+        let state = service.state.read().await;
+        assert!(state.collaboration.decisions.is_empty());
+        assert_eq!(state.collaboration.assignments.len(), 1);
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].status,
+            WorkUnitStatus::AwaitingDecision
+        );
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].current_assignment_id,
+            Some(response.assignment.id.clone())
+        );
         assert_eq!(
             state.collaboration.work_units[&work_unit.id].latest_report_id,
             Some(response.report.id.clone())
