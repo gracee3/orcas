@@ -897,6 +897,143 @@ async fn reused_worker_session_does_not_imply_same_assignment_continuity() {
 }
 
 #[tokio::test]
+async fn collaboration_history_shows_failed_interrupted_and_lost_states_explicitly() {
+    let mut snapshot = sample_snapshot();
+    snapshot.collaboration.work_units = vec![ipc::WorkUnitSummary {
+        id: "wu-f".to_string(),
+        workstream_id: "ws-1".to_string(),
+        title: "Runtime truth".to_string(),
+        status: WorkUnitStatus::AwaitingDecision,
+        dependency_count: 0,
+        current_assignment_id: Some("assignment-i".to_string()),
+        latest_report_id: Some("report-i".to_string()),
+        updated_at: Utc::now(),
+    }];
+    snapshot.collaboration.assignments = vec![ipc::AssignmentSummary {
+        id: "assignment-i".to_string(),
+        work_unit_id: "wu-f".to_string(),
+        worker_id: "worker-a".to_string(),
+        worker_session_id: "session-2".to_string(),
+        status: AssignmentStatus::Interrupted,
+        attempt_number: 2,
+        updated_at: Utc::now(),
+    }];
+    snapshot.collaboration.reports = vec![ipc::ReportSummary {
+        id: "report-i".to_string(),
+        work_unit_id: "wu-f".to_string(),
+        assignment_id: "assignment-i".to_string(),
+        worker_id: "worker-a".to_string(),
+        disposition: ReportDisposition::Interrupted,
+        summary: "Interrupted raw output retained.".to_string(),
+        confidence: ReportConfidence::Unknown,
+        parse_result: ReportParseResult::Invalid,
+        needs_supervisor_review: true,
+        created_at: Utc::now(),
+    }];
+    snapshot.collaboration.decisions = vec![ipc::DecisionSummary {
+        id: "decision-i".to_string(),
+        work_unit_id: "wu-f".to_string(),
+        report_id: Some("report-i".to_string()),
+        decision_type: DecisionType::EscalateToHuman,
+        rationale: "Supervisor review is required.".to_string(),
+        created_at: Utc::now(),
+    }];
+
+    let mut harness = AppHarness::new(snapshot).await.unwrap();
+    harness
+        .set_workunit_detail(ipc::WorkunitGetResponse {
+            work_unit: WorkUnit {
+                id: "wu-f".to_string(),
+                workstream_id: "ws-1".to_string(),
+                title: "Runtime truth".to_string(),
+                task_statement: "Show honest failure and interruption states.".to_string(),
+                status: WorkUnitStatus::AwaitingDecision,
+                dependencies: Vec::new(),
+                latest_report_id: Some("report-i".to_string()),
+                current_assignment_id: Some("assignment-i".to_string()),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            assignments: vec![
+                Assignment {
+                    id: "assignment-f".to_string(),
+                    work_unit_id: "wu-f".to_string(),
+                    worker_id: "worker-a".to_string(),
+                    worker_session_id: "session-1".to_string(),
+                    instructions: "Failed start".to_string(),
+                    status: AssignmentStatus::Failed,
+                    attempt_number: 1,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                Assignment {
+                    id: "assignment-i".to_string(),
+                    work_unit_id: "wu-f".to_string(),
+                    worker_id: "worker-a".to_string(),
+                    worker_session_id: "session-2".to_string(),
+                    instructions: "Interrupted run".to_string(),
+                    status: AssignmentStatus::Interrupted,
+                    attempt_number: 2,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            ],
+            reports: vec![Report {
+                id: "report-i".to_string(),
+                work_unit_id: "wu-f".to_string(),
+                assignment_id: "assignment-i".to_string(),
+                worker_id: "worker-a".to_string(),
+                disposition: ReportDisposition::Interrupted,
+                summary: "Interrupted raw output retained.".to_string(),
+                findings: Vec::new(),
+                blockers: vec!["Supervisor must decide the next step.".to_string()],
+                questions: Vec::new(),
+                recommended_next_actions: Vec::new(),
+                confidence: ReportConfidence::Unknown,
+                raw_output: "partial".to_string(),
+                parse_result: ReportParseResult::Invalid,
+                needs_supervisor_review: true,
+                created_at: Utc::now(),
+            }],
+            decisions: vec![Decision {
+                id: "decision-i".to_string(),
+                work_unit_id: "wu-f".to_string(),
+                report_id: Some("report-i".to_string()),
+                decision_type: DecisionType::EscalateToHuman,
+                rationale: "Supervisor review is required.".to_string(),
+                created_at: Utc::now(),
+            }],
+        })
+        .await;
+    harness.dispatch(UserAction::Refresh).await;
+
+    let detail = harness.collaboration_detail_vm();
+    let history = harness.collaboration_history_vm();
+
+    assert!(detail.lines.iter().any(|line| {
+        line.contains("assignment: assignment-i [interrupted] worker=worker-a session=session-2")
+    }));
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("parse_result: invalid"))
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| { line.contains("needs_supervisor_review: true") })
+    );
+    assert!(history.lines.iter().any(|line| {
+        line.contains("assignment-f [failed] attempt=1 worker=worker-a session=session-1")
+    }));
+    assert!(history.lines.iter().any(|line| line.contains(
+        "assignment-i [interrupted] attempt=2 worker=worker-a session=session-2 current"
+    )));
+}
+
+#[tokio::test]
 async fn focus_switches_collaboration_navigation_without_overwriting_thread_state() {
     let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
     harness.dispatch(UserAction::CycleFocus).await;
@@ -953,6 +1090,9 @@ async fn selected_work_unit_history_renders_assignment_report_and_decision_chain
 #[tokio::test]
 async fn reconnect_refreshes_history_for_selected_work_unit() {
     let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-1"))
+        .await;
     let mut recovered = sample_snapshot();
     recovered.collaboration.workstreams = vec![ipc::WorkstreamSummary {
         id: "ws-9".to_string(),
@@ -977,7 +1117,7 @@ async fn reconnect_refreshes_history_for_selected_work_unit() {
         work_unit_id: "wu-9".to_string(),
         worker_id: "worker-r".to_string(),
         worker_session_id: "session-9".to_string(),
-        status: AssignmentStatus::AwaitingDecision,
+        status: AssignmentStatus::Failed,
         attempt_number: 1,
         updated_at: Utc::now(),
     }];
@@ -986,10 +1126,10 @@ async fn reconnect_refreshes_history_for_selected_work_unit() {
         work_unit_id: "wu-9".to_string(),
         assignment_id: "assignment-9".to_string(),
         worker_id: "worker-r".to_string(),
-        disposition: ReportDisposition::Partial,
+        disposition: ReportDisposition::Failed,
         summary: "Recovered history summary.".to_string(),
-        confidence: ReportConfidence::Medium,
-        parse_result: ReportParseResult::Ambiguous,
+        confidence: ReportConfidence::Unknown,
+        parse_result: ReportParseResult::Invalid,
         needs_supervisor_review: true,
         created_at: Utc::now(),
     }];
@@ -1022,7 +1162,7 @@ async fn reconnect_refreshes_history_for_selected_work_unit() {
                 worker_id: "worker-r".to_string(),
                 worker_session_id: "session-9".to_string(),
                 instructions: "Recovered work".to_string(),
-                status: AssignmentStatus::AwaitingDecision,
+                status: AssignmentStatus::Failed,
                 attempt_number: 1,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -1032,15 +1172,15 @@ async fn reconnect_refreshes_history_for_selected_work_unit() {
                 work_unit_id: "wu-9".to_string(),
                 assignment_id: "assignment-9".to_string(),
                 worker_id: "worker-r".to_string(),
-                disposition: ReportDisposition::Partial,
+                disposition: ReportDisposition::Failed,
                 summary: "Recovered history summary.".to_string(),
                 findings: Vec::new(),
                 blockers: vec!["Needs operator review".to_string()],
                 questions: Vec::new(),
                 recommended_next_actions: Vec::new(),
-                confidence: ReportConfidence::Medium,
+                confidence: ReportConfidence::Unknown,
                 raw_output: "raw".to_string(),
-                parse_result: ReportParseResult::Ambiguous,
+                parse_result: ReportParseResult::Invalid,
                 needs_supervisor_review: true,
                 created_at: Utc::now(),
             }],
@@ -1062,17 +1202,32 @@ async fn reconnect_refreshes_history_for_selected_work_unit() {
 
     let history = harness.collaboration_history_vm();
     assert!(history.title.contains("Recovered unit"));
+    assert!(history.lines.iter().any(|line| {
+        line.contains("assignment-9 [failed] attempt=1 worker=worker-r session=session-9 current")
+    }));
     assert!(
         history
             .lines
             .iter()
-            .any(|line| line.contains("report-9 [partial ambiguous review=true]"))
+            .any(|line| line.contains("report-9 [failed invalid review=true]"))
     );
     assert!(
         history
             .lines
             .iter()
             .any(|line| line.contains("decision-9 [escalate_to_human]"))
+    );
+    assert!(
+        !history
+            .lines
+            .iter()
+            .any(|line| line.contains("assignment-2 [awaiting_decision]"))
+    );
+    assert!(
+        !history
+            .lines
+            .iter()
+            .any(|line| line.contains("report-2 [partial ambiguous review=true]"))
     );
 }
 

@@ -1073,12 +1073,25 @@ impl OrcasDaemonService {
             )
             .await;
         }
-        let worker_session = self
+        let worker_session = match self
             .ensure_worker_session_thread(&worker_session_id, session_model, session_cwd)
-            .await?;
-        let thread_id = worker_session.thread_id.clone().ok_or_else(|| {
-            OrcasError::Protocol("worker session has no backing thread".to_string())
-        })?;
+            .await
+        {
+            Ok(worker_session) => worker_session,
+            Err(error) => {
+                let _ = self
+                    .mark_assignment_start_failed(&assignment_id, &worker_id, &worker_session_id)
+                    .await;
+                return Err(error);
+            }
+        };
+        let Some(thread_id) = worker_session.thread_id.clone() else {
+            let error = OrcasError::Protocol("worker session has no backing thread".to_string());
+            let _ = self
+                .mark_assignment_start_failed(&assignment_id, &worker_id, &worker_session_id)
+                .await;
+            return Err(error);
+        };
 
         let instructions = {
             let state = self.state.read().await;
@@ -1093,14 +1106,23 @@ impl OrcasDaemonService {
         };
 
         let prompt = Self::build_worker_prompt(&instructions);
-        let turn = self
+        let turn = match self
             .turn_start(ipc::TurnStartRequest {
                 thread_id: thread_id.clone(),
                 text: prompt,
                 cwd: None,
                 model: None,
             })
-            .await?;
+            .await
+        {
+            Ok(turn) => turn,
+            Err(error) => {
+                let _ = self
+                    .mark_assignment_start_failed(&assignment_id, &worker_id, &worker_session_id)
+                    .await;
+                return Err(error);
+            }
+        };
 
         let (started_assignment, started_work_unit) = {
             let now = Utc::now();
@@ -1165,109 +1187,35 @@ impl OrcasDaemonService {
         )
         .await;
 
-        let turn_state = self
-            .wait_for_turn_terminal(&thread_id, &turn.turn_id)
-            .await?;
+        let turn_state = match self.wait_for_turn_terminal(&thread_id, &turn.turn_id).await {
+            Ok(turn_state) => turn_state,
+            Err(error) => {
+                let _ = self
+                    .mark_assignment_runtime_lost(&assignment_id, &worker_id, &worker_session_id)
+                    .await;
+                return Err(error);
+            }
+        };
         let raw_output = self
             .raw_output_for_turn(&thread_id, &turn.turn_id)
             .await
             .unwrap_or_default();
-        let parsed_report = Self::parse_worker_report(&raw_output);
-        let (report, assignment_after_report, work_unit_after_report) = {
-            let now = Utc::now();
-            let mut state = self.state.write().await;
-            let assignment = state
-                .collaboration
-                .assignments
-                .get_mut(&assignment_id)
-                .ok_or_else(|| {
-                    OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
-                })?;
-            let work_unit_id = assignment.work_unit_id.clone();
-            assignment.status = match turn_state.lifecycle {
-                ipc::TurnLifecycleState::Interrupted => AssignmentStatus::Interrupted,
-                ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
-                    AssignmentStatus::Lost
-                }
-                _ => AssignmentStatus::AwaitingDecision,
-            };
-            assignment.updated_at = now;
-
-            let report = Report {
-                id: Self::new_object_id("report"),
-                work_unit_id: work_unit_id.clone(),
-                assignment_id: assignment_id.clone(),
-                worker_id: worker_id.clone(),
-                disposition: parsed_report.disposition,
-                summary: parsed_report.summary,
-                findings: parsed_report.findings,
-                blockers: parsed_report.blockers,
-                questions: parsed_report.questions,
-                recommended_next_actions: parsed_report.recommended_next_actions,
-                confidence: parsed_report.confidence,
+        let (report, assignment_after_report, work_unit_after_report) = self
+            .record_assignment_turn_outcome(
+                &assignment_id,
+                &worker_id,
+                &worker_session_id,
+                turn_state,
                 raw_output,
-                parse_result: parsed_report.parse_result,
-                needs_supervisor_review: parsed_report.needs_supervisor_review,
-                created_at: now,
-            };
-            state
-                .collaboration
-                .reports
-                .insert(report.id.clone(), report.clone());
-            if let Some(work_unit) = state.collaboration.work_units.get_mut(&work_unit_id) {
-                work_unit.status = WorkUnitStatus::AwaitingDecision;
-                work_unit.latest_report_id = Some(report.id.clone());
-                work_unit.current_assignment_id = Some(assignment_id.clone());
-                work_unit.updated_at = now;
-            }
-            if let Some(worker) = state.collaboration.workers.get_mut(&worker_id) {
-                worker.status = WorkerStatus::Idle;
-                worker.current_assignment_id = None;
-            }
-            if let Some(session) = state
-                .collaboration
-                .worker_sessions
-                .get_mut(&worker_session_id)
-            {
-                session.active_turn_id = None;
-                session.runtime_status = match turn_state.lifecycle {
-                    ipc::TurnLifecycleState::Interrupted => WorkerSessionRuntimeStatus::Interrupted,
-                    ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
-                        WorkerSessionRuntimeStatus::Lost
-                    }
-                    _ => WorkerSessionRuntimeStatus::Completed,
-                };
-                session.attachability = if turn_state.attachable {
-                    WorkerSessionAttachability::Attachable
-                } else {
-                    WorkerSessionAttachability::NotAttachable
-                };
-                session.updated_at = now;
-            }
-            Self::refresh_workstream_statuses(&mut state.collaboration);
-            let assignment_after_report = state
-                .collaboration
-                .assignments
-                .get(&assignment_id)
-                .cloned()
-                .ok_or_else(|| {
-                    OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
-                })?;
-            let work_unit_after_report = state
-                .collaboration
-                .work_units
-                .get(&work_unit_id)
-                .cloned()
-                .ok_or_else(|| {
-                    OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`"))
-                })?;
-            (report, assignment_after_report, work_unit_after_report)
-        };
+            )
+            .await?;
         self.persist_collaboration_state().await?;
         self.emit_report_recorded(&report).await;
         let assignment_event_action = match assignment_after_report.status {
             AssignmentStatus::Interrupted => ipc::AssignmentLifecycleAction::Interrupted,
-            AssignmentStatus::Lost => ipc::AssignmentLifecycleAction::Failed,
+            AssignmentStatus::Failed | AssignmentStatus::Lost => {
+                ipc::AssignmentLifecycleAction::Failed
+            }
             AssignmentStatus::AwaitingDecision => ipc::AssignmentLifecycleAction::Reported,
             _ => ipc::AssignmentLifecycleAction::Reported,
         };
@@ -1314,6 +1262,248 @@ impl OrcasDaemonService {
             worker_session,
             report,
         })
+    }
+
+    async fn mark_assignment_start_failed(
+        &self,
+        assignment_id: &str,
+        worker_id: &str,
+        worker_session_id: &str,
+    ) -> OrcasResult<()> {
+        let session_anchor_lost = self
+            .worker_session_anchor_is_lost(worker_session_id)
+            .await
+            .unwrap_or(false);
+        let (assignment, work_unit) = {
+            let now = Utc::now();
+            let mut state = self.state.write().await;
+            let work_unit_id = state
+                .collaboration
+                .assignments
+                .get(assignment_id)
+                .map(|assignment| assignment.work_unit_id.clone())
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
+                })?;
+            if let Some(assignment) = state.collaboration.assignments.get_mut(assignment_id) {
+                assignment.status = AssignmentStatus::Failed;
+                assignment.updated_at = now;
+            }
+            if let Some(worker) = state.collaboration.workers.get_mut(worker_id) {
+                worker.status = WorkerStatus::Idle;
+                worker.current_assignment_id = None;
+            }
+            if let Some(session) = state
+                .collaboration
+                .worker_sessions
+                .get_mut(worker_session_id)
+            {
+                session.active_turn_id = None;
+                if session_anchor_lost {
+                    session.thread_id = None;
+                    session.runtime_status = WorkerSessionRuntimeStatus::Lost;
+                    session.attachability = WorkerSessionAttachability::NotAttachable;
+                } else {
+                    session.runtime_status = WorkerSessionRuntimeStatus::Failed;
+                    session.attachability = if session.thread_id.is_some() {
+                        WorkerSessionAttachability::Unknown
+                    } else {
+                        WorkerSessionAttachability::NotAttachable
+                    };
+                }
+                session.updated_at = now;
+            }
+            if let Some(work_unit) = state.collaboration.work_units.get_mut(&work_unit_id) {
+                work_unit.status = WorkUnitStatus::AwaitingDecision;
+                work_unit.current_assignment_id = Some(assignment_id.to_string());
+                work_unit.updated_at = now;
+            }
+            Self::refresh_workstream_statuses(&mut state.collaboration);
+            let assignment = state
+                .collaboration
+                .assignments
+                .get(assignment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
+                })?;
+            let work_unit = state
+                .collaboration
+                .work_units
+                .get(&work_unit_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`"))
+                })?;
+            (assignment, work_unit)
+        };
+        self.persist_collaboration_state().await?;
+        self.emit_assignment_lifecycle(ipc::AssignmentLifecycleAction::Failed, &assignment)
+            .await;
+        self.emit_work_unit_lifecycle(ipc::CollaborationLifecycleAction::Updated, &work_unit)
+            .await;
+        Ok(())
+    }
+
+    async fn mark_assignment_runtime_lost(
+        &self,
+        assignment_id: &str,
+        worker_id: &str,
+        worker_session_id: &str,
+    ) -> OrcasResult<()> {
+        let (assignment, work_unit) = {
+            let now = Utc::now();
+            let mut state = self.state.write().await;
+            let work_unit_id = state
+                .collaboration
+                .assignments
+                .get(assignment_id)
+                .map(|assignment| assignment.work_unit_id.clone())
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
+                })?;
+            if let Some(assignment) = state.collaboration.assignments.get_mut(assignment_id) {
+                assignment.status = AssignmentStatus::Lost;
+                assignment.updated_at = now;
+            }
+            if let Some(worker) = state.collaboration.workers.get_mut(worker_id) {
+                worker.status = WorkerStatus::Idle;
+                worker.current_assignment_id = None;
+            }
+            if let Some(session) = state
+                .collaboration
+                .worker_sessions
+                .get_mut(worker_session_id)
+            {
+                session.active_turn_id = None;
+                session.thread_id = None;
+                session.runtime_status = WorkerSessionRuntimeStatus::Lost;
+                session.attachability = WorkerSessionAttachability::NotAttachable;
+                session.updated_at = now;
+            }
+            if let Some(work_unit) = state.collaboration.work_units.get_mut(&work_unit_id) {
+                work_unit.status = WorkUnitStatus::AwaitingDecision;
+                work_unit.current_assignment_id = Some(assignment_id.to_string());
+                work_unit.updated_at = now;
+            }
+            Self::refresh_workstream_statuses(&mut state.collaboration);
+            let assignment = state
+                .collaboration
+                .assignments
+                .get(assignment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
+                })?;
+            let work_unit = state
+                .collaboration
+                .work_units
+                .get(&work_unit_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`"))
+                })?;
+            (assignment, work_unit)
+        };
+        self.persist_collaboration_state().await?;
+        self.emit_assignment_lifecycle(ipc::AssignmentLifecycleAction::Failed, &assignment)
+            .await;
+        self.emit_work_unit_lifecycle(ipc::CollaborationLifecycleAction::Updated, &work_unit)
+            .await;
+        Ok(())
+    }
+
+    async fn record_assignment_turn_outcome(
+        &self,
+        assignment_id: &str,
+        worker_id: &str,
+        worker_session_id: &str,
+        turn_state: ipc::TurnStateView,
+        raw_output: String,
+    ) -> OrcasResult<(Report, Assignment, WorkUnit)> {
+        let parsed_report = Self::parse_worker_report_for_turn(&raw_output, turn_state.lifecycle);
+        let now = Utc::now();
+        let mut state = self.state.write().await;
+        let assignment = state
+            .collaboration
+            .assignments
+            .get_mut(assignment_id)
+            .ok_or_else(|| OrcasError::Protocol(format!("unknown assignment `{assignment_id}`")))?;
+        let work_unit_id = assignment.work_unit_id.clone();
+        assignment.status = match turn_state.lifecycle {
+            ipc::TurnLifecycleState::Interrupted => AssignmentStatus::Interrupted,
+            ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
+                AssignmentStatus::Lost
+            }
+            _ => AssignmentStatus::AwaitingDecision,
+        };
+        assignment.updated_at = now;
+
+        let report = Report {
+            id: Self::new_object_id("report"),
+            work_unit_id: work_unit_id.clone(),
+            assignment_id: assignment_id.to_string(),
+            worker_id: worker_id.to_string(),
+            disposition: parsed_report.disposition,
+            summary: parsed_report.summary,
+            findings: parsed_report.findings,
+            blockers: parsed_report.blockers,
+            questions: parsed_report.questions,
+            recommended_next_actions: parsed_report.recommended_next_actions,
+            confidence: parsed_report.confidence,
+            raw_output,
+            parse_result: parsed_report.parse_result,
+            needs_supervisor_review: parsed_report.needs_supervisor_review,
+            created_at: now,
+        };
+        state
+            .collaboration
+            .reports
+            .insert(report.id.clone(), report.clone());
+        if let Some(work_unit) = state.collaboration.work_units.get_mut(&work_unit_id) {
+            work_unit.status = WorkUnitStatus::AwaitingDecision;
+            work_unit.latest_report_id = Some(report.id.clone());
+            work_unit.current_assignment_id = Some(assignment_id.to_string());
+            work_unit.updated_at = now;
+        }
+        if let Some(worker) = state.collaboration.workers.get_mut(worker_id) {
+            worker.status = WorkerStatus::Idle;
+            worker.current_assignment_id = None;
+        }
+        if let Some(session) = state
+            .collaboration
+            .worker_sessions
+            .get_mut(worker_session_id)
+        {
+            session.active_turn_id = None;
+            session.runtime_status = match turn_state.lifecycle {
+                ipc::TurnLifecycleState::Interrupted => WorkerSessionRuntimeStatus::Interrupted,
+                ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
+                    WorkerSessionRuntimeStatus::Lost
+                }
+                _ => WorkerSessionRuntimeStatus::Completed,
+            };
+            session.attachability = if turn_state.attachable {
+                WorkerSessionAttachability::Attachable
+            } else {
+                WorkerSessionAttachability::NotAttachable
+            };
+            session.updated_at = now;
+        }
+        Self::refresh_workstream_statuses(&mut state.collaboration);
+        let assignment_after_report = state
+            .collaboration
+            .assignments
+            .get(assignment_id)
+            .cloned()
+            .ok_or_else(|| OrcasError::Protocol(format!("unknown assignment `{assignment_id}`")))?;
+        let work_unit_after_report = state
+            .collaboration
+            .work_units
+            .get(&work_unit_id)
+            .cloned()
+            .ok_or_else(|| OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`")))?;
+        Ok((report, assignment_after_report, work_unit_after_report))
     }
 
     async fn assignment_get(
@@ -1492,7 +1682,7 @@ impl OrcasDaemonService {
                         .worker_id
                         .clone()
                         .unwrap_or_else(|| source_assignment.worker_id.clone());
-                    let worker_session_id = Self::ensure_worker_and_session_records(
+                    let worker_session_id = Self::select_worker_session_for_assignment(
                         &mut state.collaboration,
                         &worker_id,
                         params
@@ -1718,7 +1908,7 @@ impl OrcasDaemonService {
 
             // Reusing a worker session is allowed, but the assignment remains the execution-bearing
             // protocol object. A new execution segment always gets its own explicit assignment id.
-            let worker_session_id = Self::ensure_worker_and_session_records(
+            let worker_session_id = Self::select_worker_session_for_assignment(
                 &mut state.collaboration,
                 &params.worker_id,
                 params
@@ -2085,7 +2275,7 @@ impl OrcasDaemonService {
         }
     }
 
-    fn ensure_worker_and_session_records(
+    fn select_worker_session_for_assignment(
         collaboration: &mut CollaborationState,
         worker_id: &str,
         worker_kind: String,
@@ -2103,7 +2293,15 @@ impl OrcasDaemonService {
         if let Some(session_id) = collaboration
             .worker_sessions
             .values()
-            .find(|session| session.worker_id == worker_id)
+            .filter(|session| {
+                session.worker_id == worker_id
+                    && session.runtime_status != WorkerSessionRuntimeStatus::Lost
+            })
+            .max_by(|left, right| {
+                left.updated_at
+                    .cmp(&right.updated_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
             .map(|session| session.id.clone())
         {
             return session_id;
@@ -2124,6 +2322,24 @@ impl OrcasDaemonService {
             .worker_sessions
             .insert(session.id.clone(), session);
         session_id
+    }
+
+    async fn worker_session_anchor_is_lost(&self, worker_session_id: &str) -> OrcasResult<bool> {
+        let thread_id = self
+            .state
+            .read()
+            .await
+            .collaboration
+            .worker_sessions
+            .get(worker_session_id)
+            .and_then(|session| session.thread_id.clone());
+        let Some(thread_id) = thread_id else {
+            return Ok(false);
+        };
+        Ok(self
+            .thread_get(ipc::ThreadGetRequest { thread_id })
+            .await
+            .is_err())
     }
 
     fn build_worker_prompt(instructions: &str) -> String {
@@ -2205,6 +2421,58 @@ Assignment instructions:\n\
             confidence,
             needs_supervisor_review: parse_result != ReportParseResult::Parsed,
             parse_result,
+        }
+    }
+
+    fn parse_worker_report_for_turn(
+        raw_output: &str,
+        lifecycle: ipc::TurnLifecycleState,
+    ) -> ParsedWorkerReport {
+        let mut parsed = Self::parse_worker_report(raw_output);
+        match lifecycle {
+            ipc::TurnLifecycleState::Interrupted => {
+                parsed.disposition = ReportDisposition::Interrupted;
+                parsed.summary = if raw_output.trim().is_empty() {
+                    "Execution was interrupted before a valid Orcas report was produced."
+                        .to_string()
+                } else {
+                    "Execution was interrupted. Raw output was retained for supervisor review."
+                        .to_string()
+                };
+                parsed.findings.clear();
+                parsed.blockers.clear();
+                parsed.questions.clear();
+                parsed.recommended_next_actions.clear();
+                parsed.confidence = ReportConfidence::Unknown;
+                parsed.parse_result = match parsed.parse_result {
+                    ReportParseResult::Invalid => ReportParseResult::Invalid,
+                    _ => ReportParseResult::Ambiguous,
+                };
+                parsed.needs_supervisor_review = true;
+                parsed
+            }
+            ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
+                parsed.disposition = ReportDisposition::Failed;
+                parsed.summary = if raw_output.trim().is_empty() {
+                    "Execution lost runtime continuity before a valid Orcas report was produced."
+                        .to_string()
+                } else {
+                    "Execution lost runtime continuity. Raw output was retained for supervisor review."
+                        .to_string()
+                };
+                parsed.findings.clear();
+                parsed.blockers.clear();
+                parsed.questions.clear();
+                parsed.recommended_next_actions.clear();
+                parsed.confidence = ReportConfidence::Unknown;
+                parsed.parse_result = match parsed.parse_result {
+                    ReportParseResult::Invalid => ReportParseResult::Invalid,
+                    _ => ReportParseResult::Ambiguous,
+                };
+                parsed.needs_supervisor_review = true;
+                parsed
+            }
+            _ => parsed,
         }
     }
 
@@ -3478,6 +3746,7 @@ impl Drop for ClientGuard {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
@@ -3493,7 +3762,7 @@ mod tests {
     use orcas_core::{
         AppConfig, AppPaths, Assignment, AssignmentStatus, DecisionType, JsonSessionStore,
         OrcasSessionStore, Report, ReportConfidence, ReportDisposition, ReportParseResult,
-        WorkUnitStatus, WorkerStatus, WorkstreamStatus, ipc,
+        WorkUnitStatus, WorkerSessionRuntimeStatus, WorkerStatus, WorkstreamStatus, ipc,
     };
 
     fn sample_thread(id: &str, scope: &str, updated_at: i64) -> ipc::ThreadView {
@@ -3518,6 +3787,10 @@ mod tests {
 
     async fn test_service() -> Arc<OrcasDaemonService> {
         let base = std::env::temp_dir().join(format!("orcas-collab-test-{}", Uuid::new_v4()));
+        test_service_at(base).await
+    }
+
+    async fn test_service_at(base: PathBuf) -> Arc<OrcasDaemonService> {
         let paths = AppPaths {
             config_dir: base.join("config"),
             config_file: base.join("config/config.toml"),
@@ -3752,6 +4025,43 @@ ORCAS_REPORT_END"#;
         assert!(parsed.needs_supervisor_review);
     }
 
+    #[test]
+    fn interrupted_turn_report_is_downgraded_for_supervisor_review() {
+        let raw = r#"ORCAS_REPORT_BEGIN
+{
+  "disposition": "completed",
+  "summary": "finished the bounded task",
+  "findings": ["root cause isolated"],
+  "blockers": [],
+  "questions": [],
+  "recommended_next_actions": ["apply supervisor decision"],
+  "confidence": "high"
+}
+ORCAS_REPORT_END"#;
+
+        let parsed = OrcasDaemonService::parse_worker_report_for_turn(
+            raw,
+            ipc::TurnLifecycleState::Interrupted,
+        );
+        assert_eq!(parsed.disposition, ReportDisposition::Interrupted);
+        assert_eq!(parsed.confidence, ReportConfidence::Unknown);
+        assert_eq!(parsed.parse_result, ReportParseResult::Ambiguous);
+        assert!(parsed.needs_supervisor_review);
+        assert!(parsed.findings.is_empty());
+    }
+
+    #[test]
+    fn lost_turn_report_stays_invalid_when_no_contract_exists() {
+        let parsed = OrcasDaemonService::parse_worker_report_for_turn(
+            "partial raw output",
+            ipc::TurnLifecycleState::Lost,
+        );
+        assert_eq!(parsed.disposition, ReportDisposition::Failed);
+        assert_eq!(parsed.parse_result, ReportParseResult::Invalid);
+        assert!(parsed.needs_supervisor_review);
+        assert!(parsed.recommended_next_actions.is_empty());
+    }
+
     #[tokio::test]
     async fn collaboration_objects_persist_to_store() {
         let service = test_service().await;
@@ -3865,6 +4175,202 @@ ORCAS_REPORT_END"#;
         assert_eq!(
             state.collaboration.worker_sessions[&worker_session_id].worker_id,
             worker_id
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_failed_start_transition_marks_assignment_failed_without_report() {
+        let service = test_service().await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Failure".to_string(),
+                objective: "Exercise failed start".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id,
+                title: "Start assignment".to_string(),
+                task_statement: "Attempt a start without an available Codex runtime.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-a".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("This start should fail cleanly.".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment");
+        {
+            let now = Utc::now();
+            let mut state = service.state.write().await;
+            state
+                .collaboration
+                .workers
+                .get_mut(&prepared.assignment.worker_id)
+                .unwrap()
+                .current_assignment_id = Some(prepared.assignment.id.clone());
+            state
+                .collaboration
+                .workers
+                .get_mut(&prepared.assignment.worker_id)
+                .unwrap()
+                .status = WorkerStatus::Busy;
+            state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .unwrap()
+                .status = WorkUnitStatus::Running;
+            state
+                .collaboration
+                .worker_sessions
+                .get_mut(&prepared.assignment.worker_session_id)
+                .unwrap()
+                .updated_at = now;
+        }
+        service
+            .mark_assignment_start_failed(
+                &prepared.assignment.id,
+                &prepared.assignment.worker_id,
+                &prepared.assignment.worker_session_id,
+            )
+            .await
+            .expect("mark failed start");
+
+        let state = service.state.read().await;
+        let assignment = state
+            .collaboration
+            .assignments
+            .get(&prepared.assignment.id)
+            .expect("assignment");
+        assert_eq!(assignment.status, AssignmentStatus::Failed);
+        assert!(state.collaboration.reports.is_empty());
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].status,
+            WorkUnitStatus::AwaitingDecision
+        );
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id]
+                .current_assignment_id
+                .as_deref(),
+            Some(assignment.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_assignment_records_report_and_requires_supervisor_review() {
+        let service = test_service().await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Interrupt".to_string(),
+                objective: "Exercise interrupted execution".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id,
+                title: "Interrupt assignment".to_string(),
+                task_statement: "Simulate an interrupted bounded execution.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-a".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Simulate a single interrupted segment.".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment");
+        {
+            let now = Utc::now();
+            let mut state = service.state.write().await;
+            state
+                .collaboration
+                .assignments
+                .get_mut(&prepared.assignment.id)
+                .unwrap()
+                .status = AssignmentStatus::Running;
+            state
+                .collaboration
+                .workers
+                .get_mut(&prepared.assignment.worker_id)
+                .unwrap()
+                .status = WorkerStatus::Busy;
+            let session = state
+                .collaboration
+                .worker_sessions
+                .get_mut(&prepared.assignment.worker_session_id)
+                .unwrap();
+            session.active_turn_id = Some("turn-interrupted".to_string());
+            session.runtime_status = WorkerSessionRuntimeStatus::Running;
+            session.updated_at = now;
+            state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .unwrap()
+                .status = WorkUnitStatus::Running;
+        }
+
+        let turn_state = ipc::TurnStateView {
+            thread_id: "thread-interrupted".to_string(),
+            turn_id: "turn-interrupted".to_string(),
+            lifecycle: ipc::TurnLifecycleState::Interrupted,
+            status: "interrupted".to_string(),
+            attachable: false,
+            live_stream: false,
+            terminal: true,
+            recent_output: Some("partial raw output".to_string()),
+            recent_event: Some("turn interrupted".to_string()),
+            updated_at: Utc::now(),
+            error_message: Some("interrupted".to_string()),
+        };
+        let (report, assignment, updated_work_unit) = service
+            .record_assignment_turn_outcome(
+                &prepared.assignment.id,
+                &prepared.assignment.worker_id,
+                &prepared.assignment.worker_session_id,
+                turn_state,
+                "partial raw output".to_string(),
+            )
+            .await
+            .expect("record interrupted outcome");
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist interrupted outcome");
+
+        assert_eq!(assignment.status, AssignmentStatus::Interrupted);
+        assert_eq!(report.disposition, ReportDisposition::Interrupted);
+        assert_eq!(report.parse_result, ReportParseResult::Invalid);
+        assert!(report.needs_supervisor_review);
+        assert_eq!(updated_work_unit.status, WorkUnitStatus::AwaitingDecision);
+        assert_eq!(
+            service.state.read().await.collaboration.worker_sessions
+                [&prepared.assignment.worker_session_id]
+                .runtime_status,
+            WorkerSessionRuntimeStatus::Interrupted
         );
     }
 
@@ -4178,6 +4684,128 @@ ORCAS_REPORT_END"#;
     }
 
     #[tokio::test]
+    async fn lost_worker_session_gets_fresh_session_on_next_assignment() {
+        let service = test_service().await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Reconnect".to_string(),
+                objective: "Replace lost worker session".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id,
+                title: "Inspect continuity".to_string(),
+                task_statement: "Exercise lost worker-session replacement.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-a".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Initial assignment".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment");
+        let report = {
+            let now = Utc::now();
+            let mut state = service.state.write().await;
+            state
+                .collaboration
+                .assignments
+                .get_mut(&prepared.assignment.id)
+                .unwrap()
+                .status = AssignmentStatus::AwaitingDecision;
+            state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .unwrap()
+                .status = WorkUnitStatus::AwaitingDecision;
+            state
+                .collaboration
+                .worker_sessions
+                .get_mut(&prepared.assignment.worker_session_id)
+                .unwrap()
+                .runtime_status = WorkerSessionRuntimeStatus::Lost;
+            let report = Report {
+                id: "report-lost-session".to_string(),
+                work_unit_id: work_unit.id.clone(),
+                assignment_id: prepared.assignment.id.clone(),
+                worker_id: prepared.assignment.worker_id.clone(),
+                disposition: ReportDisposition::Failed,
+                summary: "Prior worker session anchor was lost.".to_string(),
+                findings: Vec::new(),
+                blockers: vec!["Need a fresh session".to_string()],
+                questions: Vec::new(),
+                recommended_next_actions: vec!["Continue with a fresh session".to_string()],
+                confidence: ReportConfidence::Medium,
+                raw_output: "raw".to_string(),
+                parse_result: ReportParseResult::Parsed,
+                needs_supervisor_review: true,
+                created_at: now,
+            };
+            state
+                .collaboration
+                .reports
+                .insert(report.id.clone(), report.clone());
+            state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .unwrap()
+                .latest_report_id = Some(report.id.clone());
+            report
+        };
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist");
+
+        let response = service
+            .decision_apply(ipc::DecisionApplyRequest {
+                work_unit_id: work_unit.id.clone(),
+                report_id: Some(report.id),
+                decision_type: DecisionType::Continue,
+                rationale: "Create a fresh execution segment.".to_string(),
+                instructions: Some("Run with a fresh runtime anchor.".to_string()),
+                worker_id: None,
+                worker_kind: None,
+            })
+            .await
+            .expect("decision");
+
+        let next_assignment = response.next_assignment.expect("next assignment");
+        assert_ne!(
+            next_assignment.worker_session_id,
+            prepared.assignment.worker_session_id
+        );
+        let state = service.state.read().await;
+        assert_eq!(
+            state.collaboration.assignments[&prepared.assignment.id].worker_session_id,
+            prepared.assignment.worker_session_id
+        );
+        assert_eq!(
+            state.collaboration.assignments[&next_assignment.id].worker_session_id,
+            next_assignment.worker_session_id
+        );
+        assert_eq!(
+            state.collaboration.worker_sessions[&prepared.assignment.worker_session_id]
+                .runtime_status,
+            WorkerSessionRuntimeStatus::Lost
+        );
+    }
+
+    #[tokio::test]
     async fn mark_complete_updates_work_unit_and_workstream() {
         let service = test_service().await;
         let workstream = service
@@ -4426,5 +5054,165 @@ ORCAS_REPORT_END"#;
         assert!(saw_assignment);
         assert!(saw_report);
         assert!(saw_decision);
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_failed_interrupted_and_lost_collaboration_truth() {
+        let base = std::env::temp_dir().join(format!("orcas-collab-restart-{}", Uuid::new_v4()));
+        let service = test_service_at(base.clone()).await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Restart truth".to_string(),
+                objective: "Keep failure state visible across restart.".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let failed_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: "Failed start".to_string(),
+                task_statement: "Persist failed state".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let interrupted_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: "Interrupted run".to_string(),
+                task_statement: "Persist interrupted state".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+
+        let failed_assignment = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: failed_unit.id.clone(),
+                worker_id: "worker-f".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("fail".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("failed assignment")
+            .assignment;
+        let interrupted_assignment = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: interrupted_unit.id.clone(),
+                worker_id: "worker-i".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("interrupt".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("interrupted assignment")
+            .assignment;
+        {
+            let now = Utc::now();
+            let mut state = service.state.write().await;
+            state
+                .collaboration
+                .assignments
+                .get_mut(&failed_assignment.id)
+                .unwrap()
+                .status = AssignmentStatus::Failed;
+            state
+                .collaboration
+                .work_units
+                .get_mut(&failed_unit.id)
+                .unwrap()
+                .status = WorkUnitStatus::AwaitingDecision;
+            state
+                .collaboration
+                .assignments
+                .get_mut(&interrupted_assignment.id)
+                .unwrap()
+                .status = AssignmentStatus::Interrupted;
+            state
+                .collaboration
+                .worker_sessions
+                .get_mut(&interrupted_assignment.worker_session_id)
+                .unwrap()
+                .runtime_status = WorkerSessionRuntimeStatus::Lost;
+            state
+                .collaboration
+                .work_units
+                .get_mut(&interrupted_unit.id)
+                .unwrap()
+                .status = WorkUnitStatus::AwaitingDecision;
+            let report = Report {
+                id: "report-restart".to_string(),
+                work_unit_id: interrupted_unit.id.clone(),
+                assignment_id: interrupted_assignment.id.clone(),
+                worker_id: interrupted_assignment.worker_id.clone(),
+                disposition: ReportDisposition::Interrupted,
+                summary: "Retained interrupted raw output.".to_string(),
+                findings: Vec::new(),
+                blockers: Vec::new(),
+                questions: Vec::new(),
+                recommended_next_actions: Vec::new(),
+                confidence: ReportConfidence::Unknown,
+                raw_output: "partial".to_string(),
+                parse_result: ReportParseResult::Invalid,
+                needs_supervisor_review: true,
+                created_at: now,
+            };
+            state
+                .collaboration
+                .reports
+                .insert(report.id.clone(), report.clone());
+            state
+                .collaboration
+                .work_units
+                .get_mut(&interrupted_unit.id)
+                .unwrap()
+                .latest_report_id = Some(report.id);
+        }
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist");
+        drop(service);
+
+        let restarted = test_service_at(base).await;
+        let snapshot = restarted.snapshot().await.expect("snapshot");
+        assert!(
+            snapshot
+                .collaboration
+                .assignments
+                .iter()
+                .any(|assignment| assignment.id == failed_assignment.id
+                    && assignment.status == AssignmentStatus::Failed)
+        );
+        assert!(
+            snapshot
+                .collaboration
+                .assignments
+                .iter()
+                .any(|assignment| assignment.id == interrupted_assignment.id
+                    && assignment.status == AssignmentStatus::Interrupted)
+        );
+        assert!(
+            snapshot
+                .collaboration
+                .reports
+                .iter()
+                .any(|report| report.work_unit_id == interrupted_unit.id
+                    && report.parse_result == ReportParseResult::Invalid
+                    && report.needs_supervisor_review)
+        );
+        assert_eq!(
+            restarted.state.read().await.collaboration.worker_sessions
+                [&interrupted_assignment.worker_session_id]
+                .runtime_status,
+            WorkerSessionRuntimeStatus::Lost
+        );
     }
 }

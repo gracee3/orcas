@@ -77,6 +77,7 @@ pub enum AssignmentStatus {
     Created,
     Running,
     AwaitingDecision,
+    Failed,
     Closed,
     Interrupted,
     Lost,
@@ -121,6 +122,7 @@ pub enum WorkerSessionRuntimeStatus {
     Idle,
     Running,
     Completed,
+    Failed,
     Interrupted,
     Lost,
 }

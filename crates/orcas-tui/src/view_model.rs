@@ -747,6 +747,7 @@ fn assignment_status_label(status: AssignmentStatus) -> String {
         AssignmentStatus::Created => "created".to_string(),
         AssignmentStatus::Running => "running".to_string(),
         AssignmentStatus::AwaitingDecision => "awaiting_decision".to_string(),
+        AssignmentStatus::Failed => "failed".to_string(),
         AssignmentStatus::Closed => "closed".to_string(),
         AssignmentStatus::Interrupted => "interrupted".to_string(),
         AssignmentStatus::Lost => "lost".to_string(),
