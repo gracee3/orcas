@@ -20,6 +20,13 @@ use orcas_tui::runtime::AppRuntime;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().any(|arg| matches!(arg.as_str(), "--help" | "-h")) {
+        println!("orcas-tui");
+        println!("Usage: orcas-tui");
+        println!("A terminal UI for Orcas daemon state inspection.");
+        return Ok(());
+    }
+
     tracing_subscriber::fmt().with_target(false).init();
 
     if !(io::stdout().is_terminal() && io::stdin().is_terminal()) {

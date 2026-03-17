@@ -21,7 +21,12 @@ impl AppHarness {
         let backend = FakeBackend::new(snapshot);
         let mut runtime = AppRuntime::new(Arc::new(backend.clone()));
         runtime.bootstrap().await;
+        runtime.process_until_idle(20).await;
         Ok(Self { backend, runtime })
+    }
+
+    async fn flush_runtime(&mut self) {
+        self.runtime.process_until_idle(20).await;
     }
 
     pub fn state(&self) -> &AppState {
@@ -30,22 +35,22 @@ impl AppHarness {
 
     pub async fn dispatch(&mut self, action: UserAction) {
         self.runtime.dispatch(Action::User(action));
-        self.runtime.process_all().await;
+        self.flush_runtime().await;
     }
 
     pub async fn inject_ui_event(&mut self, event: UiEvent) {
         self.runtime.dispatch(Action::Event(event));
-        self.runtime.process_all().await;
+        self.flush_runtime().await;
     }
 
     pub async fn inject_event(&mut self, event: ipc::DaemonEventEnvelope) -> Result<()> {
         self.backend.inject_event(event).await?;
-        self.runtime.process_all().await;
+        self.flush_runtime().await;
         Ok(())
     }
 
     pub async fn process(&mut self) {
-        self.runtime.process_all().await;
+        self.flush_runtime().await;
     }
 
     pub fn force_reconnect_now(&mut self) {

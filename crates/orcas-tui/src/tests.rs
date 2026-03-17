@@ -1609,6 +1609,37 @@ async fn supervisor_start_daemon_dispatches_start_request_command() {
 }
 
 #[tokio::test]
+async fn supervisor_restart_sequence_dispatches_stop_and_start_commands() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+
+    harness
+        .dispatch(UserAction::ShowView(TopLevelView::Supervisor))
+        .await;
+
+    harness.dispatch(UserAction::StartDaemon).await;
+    harness.dispatch(UserAction::StopDaemon).await;
+    harness.dispatch(UserAction::StartDaemon).await;
+
+    let commands = harness.recorded_commands().await;
+    assert!(commands.contains(&BackendCommand::StartDaemon));
+    assert!(commands.contains(&BackendCommand::StopDaemon));
+    let start_count = commands
+        .iter()
+        .filter(|command| **command == BackendCommand::StartDaemon)
+        .count();
+    assert_eq!(start_count, 2);
+    assert_eq!(
+        harness
+            .state()
+            .banner
+            .as_ref()
+            .map(|banner| banner.message.as_str()),
+        Some("Daemon start requested.")
+    );
+    assert_eq!(harness.current_view(), TopLevelView::Supervisor);
+}
+
+#[tokio::test]
 async fn supervisor_footer_shows_supervisor_actions_once_each() {
     let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
 

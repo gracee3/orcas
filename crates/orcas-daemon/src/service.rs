@@ -372,8 +372,20 @@ impl OrcasDaemonService {
         let message: JsonRpcMessage = serde_json::from_str(raw)?;
         match message {
             JsonRpcMessage::Request(request) => {
-                self.handle_request(request, outbound, subscription_task)
-                    .await?;
+                if let Err(error) = self
+                    .handle_request(request.clone(), outbound.clone(), subscription_task)
+                    .await
+                {
+                    warn!(%error, "ipc client message failed");
+                    let _ = Self::send_error(
+                        &outbound,
+                        Some(request.id),
+                        -32000,
+                        &error.to_string(),
+                        None,
+                    )
+                    .await;
+                }
             }
             JsonRpcMessage::Notification(_) => {}
             JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_) => {}

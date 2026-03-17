@@ -8,6 +8,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::time::{Duration, timeout};
 
 use orcas_core::ipc;
 use orcas_core::jsonrpc::{
@@ -27,6 +28,8 @@ pub struct OrcasIpcClient {
 }
 
 impl OrcasIpcClient {
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
     pub async fn connect(paths: &AppPaths) -> OrcasResult<Arc<Self>> {
         let stream = UnixStream::connect(&paths.socket_file)
             .await
@@ -424,9 +427,21 @@ impl OrcasIpcClient {
             )));
         }
 
-        let value = rx.await.map_err(|error| {
+        let response = timeout(Self::REQUEST_TIMEOUT, rx).await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => {
+                self.pending.lock().await.remove(&request_id);
+                return Err(OrcasError::Transport(format!(
+                    "timed out waiting for `{method}` response"
+                )));
+            }
+        };
+        let response = response.map_err(|error| {
             OrcasError::Transport(format!("response channel dropped for `{method}`: {error}"))
-        })??;
-        serde_json::from_value(value).map_err(Into::into)
+        })?;
+        let response = response?;
+
+        serde_json::from_value(response).map_err(Into::into)
     }
 }

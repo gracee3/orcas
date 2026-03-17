@@ -1,10 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
-use tokio::time::Instant;
+use tokio::time::{Instant, sleep};
 
 use crate::app::{Action, AppState, Effect, UiEvent, reduce};
 use crate::backend::{BackendCommand, BackendCommandResult, TuiBackend};
@@ -17,22 +17,69 @@ struct ReconnectSchedule {
     due_at: Instant,
 }
 
+#[derive(Debug)]
+struct EffectCompletion {
+    effect: Effect,
+    actions: Vec<Action>,
+    follow_up_effects: Vec<Effect>,
+    set_event_rx: Option<mpsc::Receiver<orcas_core::ipc::DaemonEventEnvelope>>,
+    clear_event_rx: bool,
+    clear_reconnect: bool,
+    schedule_reconnect: bool,
+    request_event_subscription: bool,
+}
+
+impl EffectCompletion {
+    fn success(effect: Effect, actions: Vec<Action>) -> Self {
+        Self {
+            effect,
+            actions,
+            follow_up_effects: Vec::new(),
+            set_event_rx: None,
+            clear_event_rx: false,
+            clear_reconnect: false,
+            schedule_reconnect: false,
+            request_event_subscription: false,
+        }
+    }
+
+    fn failure(effect: Effect, action: Action) -> Self {
+        Self {
+            effect,
+            actions: vec![action],
+            follow_up_effects: Vec::new(),
+            set_event_rx: None,
+            clear_event_rx: false,
+            clear_reconnect: false,
+            schedule_reconnect: false,
+            request_event_subscription: false,
+        }
+    }
+}
+
 pub struct AppRuntime<B: TuiBackend> {
     backend: Arc<B>,
     state: AppState,
     pending_effects: VecDeque<Effect>,
     event_rx: Option<mpsc::Receiver<orcas_core::ipc::DaemonEventEnvelope>>,
     reconnect: Option<ReconnectSchedule>,
+    running_effects: HashSet<Effect>,
+    effect_tx: mpsc::UnboundedSender<EffectCompletion>,
+    effect_rx: mpsc::UnboundedReceiver<EffectCompletion>,
 }
 
-impl<B: TuiBackend> AppRuntime<B> {
+impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
     pub fn new(backend: Arc<B>) -> Self {
+        let (effect_tx, effect_rx) = mpsc::unbounded_channel();
         Self {
             backend,
             state: AppState::default(),
             pending_effects: VecDeque::new(),
             event_rx: None,
             reconnect: None,
+            running_effects: HashSet::new(),
+            effect_tx,
+            effect_rx,
         }
     }
 
@@ -42,7 +89,9 @@ impl<B: TuiBackend> AppRuntime<B> {
 
     pub fn dispatch(&mut self, action: Action) {
         let effects = reduce(&mut self.state, action);
-        self.pending_effects.extend(effects);
+        for effect in effects {
+            self.enqueue_effect(effect);
+        }
     }
 
     pub async fn bootstrap(&mut self) {
@@ -52,11 +101,87 @@ impl<B: TuiBackend> AppRuntime<B> {
 
     pub async fn process_all(&mut self) {
         self.enqueue_due_reconnect();
+        self.drain_effect_completions();
         self.drain_backend_events();
+        self.enqueue_due_reconnect();
+
         while let Some(effect) = self.pending_effects.pop_front() {
-            self.run_effect(effect).await;
-            self.enqueue_due_reconnect();
-            self.drain_backend_events();
+            self.start_effect(effect);
+        }
+    }
+
+    pub async fn process_until_idle(&mut self, max_iterations: usize) {
+        let mut attempts = 0;
+        while attempts < max_iterations {
+            self.process_all().await;
+            if self.is_idle() {
+                return;
+            }
+            sleep(Duration::from_millis(5)).await;
+            attempts += 1;
+        }
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.pending_effects.is_empty() && self.running_effects.is_empty()
+    }
+
+    fn enqueue_effect(&mut self, effect: Effect) {
+        if self.running_effects.contains(&effect) {
+            return;
+        }
+        if self.pending_effects.contains(&effect) {
+            return;
+        }
+        self.pending_effects.push_back(effect);
+    }
+
+    fn start_effect(&mut self, effect: Effect) {
+        self.running_effects.insert(effect.clone());
+
+        let backend = Arc::clone(&self.backend);
+        let tx = self.effect_tx.clone();
+
+        tokio::spawn(async move {
+            let completion = AppRuntime::<B>::run_effect(backend, effect).await;
+            let _ = tx.send(completion);
+        });
+    }
+
+    fn apply_completion(&mut self, completion: EffectCompletion) {
+        self.running_effects.remove(&completion.effect);
+
+        if completion.clear_reconnect {
+            self.reconnect = None;
+        }
+        if completion.clear_event_rx {
+            self.event_rx = None;
+        }
+        if let Some(event_rx) = completion.set_event_rx {
+            self.event_rx = Some(event_rx);
+        }
+        if completion.schedule_reconnect {
+            self.schedule_reconnect();
+        }
+        if completion.request_event_subscription && self.event_rx.is_none() {
+            self.enqueue_effect(Effect::SubscribeEvents);
+        }
+
+        for action in completion.actions {
+            self.dispatch(action);
+        }
+        for effect in completion.follow_up_effects {
+            self.enqueue_effect(effect);
+        }
+    }
+
+    fn drain_effect_completions(&mut self) {
+        loop {
+            match self.effect_rx.try_recv() {
+                Ok(completion) => self.apply_completion(completion),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
         }
     }
 
@@ -98,6 +223,7 @@ impl<B: TuiBackend> AppRuntime<B> {
             .pending_effects
             .iter()
             .any(|effect| matches!(effect, Effect::RefreshSnapshot))
+            && !self.running_effects.contains(&Effect::RefreshSnapshot)
         {
             self.pending_effects.push_back(Effect::RefreshSnapshot);
         }
@@ -120,214 +246,260 @@ impl<B: TuiBackend> AppRuntime<B> {
         }));
     }
 
-    async fn run_effect(&mut self, effect: Effect) {
+    async fn run_effect(backend: Arc<B>, effect: Effect) -> EffectCompletion {
         match effect {
-            Effect::RefreshSnapshot => match self.backend.get_snapshot().await {
+            effect @ Effect::RefreshSnapshot => match backend.get_snapshot().await {
                 Ok(snapshot) => {
-                    self.reconnect = None;
-                    self.dispatch(Action::Event(UiEvent::SnapshotLoaded(snapshot)));
-                    if self.event_rx.is_none() {
-                        self.pending_effects.push_back(Effect::SubscribeEvents);
-                    }
+                    let mut completion = EffectCompletion::success(
+                        effect,
+                        vec![Action::Event(UiEvent::SnapshotLoaded(snapshot))],
+                    );
+                    completion.clear_reconnect = true;
+                    completion.request_event_subscription = true;
+                    completion
                 }
-                Err(error) => {
-                    self.dispatch(Action::Event(UiEvent::ConnectionLost(format!(
-                        "snapshot failed: {error}"
-                    ))));
-                }
+                Err(error) => EffectCompletion::failure(
+                    effect,
+                    Action::Event(UiEvent::ConnectionLost(format!("snapshot failed: {error}"))),
+                ),
             },
-            Effect::SubscribeEvents => match self.backend.subscribe_events().await {
+            effect @ Effect::SubscribeEvents => match backend.subscribe_events().await {
                 Ok(events) => {
-                    self.event_rx = Some(events);
+                    let mut completion = EffectCompletion::success(effect, Vec::new());
+                    completion.set_event_rx = Some(events);
+                    completion
                 }
                 Err(error) => {
-                    self.event_rx = None;
-                    self.dispatch(Action::Event(UiEvent::ConnectionLost(format!(
-                        "subscribe failed: {error}"
-                    ))));
+                    let mut completion = EffectCompletion::failure(
+                        effect,
+                        Action::Event(UiEvent::ConnectionLost(format!(
+                            "subscribe failed: {error}"
+                        ))),
+                    );
+                    completion.clear_event_rx = true;
+                    completion
                 }
             },
-            Effect::ScheduleReconnect => {
-                self.event_rx = None;
-                self.schedule_reconnect();
+            effect @ Effect::ScheduleReconnect => {
+                let mut completion = EffectCompletion::success(effect, Vec::new());
+                completion.clear_event_rx = true;
+                completion.schedule_reconnect = true;
+                completion
             }
-            Effect::LoadActiveTurns => {
-                match self.backend.execute(BackendCommand::GetActiveTurns).await {
-                    Ok(BackendCommandResult::ActiveTurns(turns)) => {
-                        self.dispatch(Action::Event(UiEvent::ActiveTurnsLoaded(turns)));
-                    }
-                    Ok(other) => {
-                        self.dispatch(Action::Event(UiEvent::Error(format!(
-                            "unexpected active-turn response: {other:?}"
-                        ))));
-                    }
-                    Err(error) => {
-                        if Self::is_disconnect_error(&error) {
-                            self.dispatch(Action::Event(UiEvent::ConnectionLost(format!(
-                                "active turn load failed: {error}"
-                            ))));
-                        } else {
-                            self.dispatch(Action::Event(UiEvent::Error(format!(
-                                "active turn load failed: {error}"
-                            ))));
+            effect @ Effect::LoadActiveTurns => {
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::GetActiveTurns,
+                    |response| match response {
+                        BackendCommandResult::ActiveTurns(turns) => {
+                            vec![Action::Event(UiEvent::ActiveTurnsLoaded(turns))]
                         }
-                    }
-                }
+                        other => {
+                            vec![Action::Event(UiEvent::Error(format!(
+                                "unexpected active-turn response: {other:?}"
+                            )))]
+                        }
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "active turn load failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!(
+                                "active turn load failed: {error}"
+                            )))
+                        }
+                    },
+                )
+                .await
             }
             Effect::LoadThread { thread_id } => {
-                match self
-                    .backend
-                    .execute(BackendCommand::GetThread {
+                let effect = Effect::LoadThread {
+                    thread_id: thread_id.clone(),
+                };
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::GetThread {
                         thread_id: thread_id.clone(),
-                    })
-                    .await
-                {
-                    Ok(BackendCommandResult::Thread(thread)) => {
-                        self.dispatch(Action::Event(UiEvent::ThreadLoaded(thread)));
-                    }
-                    Ok(other) => {
-                        self.dispatch(Action::Event(UiEvent::Error(format!(
-                            "unexpected thread response: {other:?}"
-                        ))));
-                    }
-                    Err(error) => {
-                        if Self::is_disconnect_error(&error) {
-                            self.dispatch(Action::Event(UiEvent::ConnectionLost(format!(
-                                "thread load failed for {thread_id}: {error}"
-                            ))));
-                        } else {
-                            self.dispatch(Action::Event(UiEvent::Error(format!(
-                                "thread load failed for {thread_id}: {error}"
-                            ))));
+                    },
+                    |response| match response {
+                        BackendCommandResult::Thread(thread) => {
+                            vec![Action::Event(UiEvent::ThreadLoaded(thread))]
                         }
-                    }
-                }
+                        other => {
+                            vec![Action::Event(UiEvent::Error(format!(
+                                "unexpected thread response: {other:?}"
+                            )))]
+                        }
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "thread load failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!("thread load failed: {error}")))
+                        }
+                    },
+                )
+                .await
             }
             Effect::LoadTurnState { thread_id, turn_id } => {
-                match self
-                    .backend
-                    .execute(BackendCommand::GetTurn {
+                let effect = Effect::LoadTurnState {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                };
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::GetTurn {
                         thread_id: thread_id.clone(),
                         turn_id: turn_id.clone(),
-                    })
-                    .await
-                {
-                    Ok(BackendCommandResult::Turn(turn)) => {
-                        self.dispatch(Action::Event(UiEvent::TurnStateLoaded(turn)));
-                    }
-                    Ok(other) => {
-                        self.dispatch(Action::Event(UiEvent::Error(format!(
-                            "unexpected turn response: {other:?}"
-                        ))));
-                    }
-                    Err(error) => {
-                        if Self::is_disconnect_error(&error) {
-                            self.dispatch(Action::Event(UiEvent::ConnectionLost(format!(
-                                "turn load failed for {thread_id}/{turn_id}: {error}"
-                            ))));
-                        } else {
-                            self.dispatch(Action::Event(UiEvent::Error(format!(
-                                "turn load failed for {thread_id}/{turn_id}: {error}"
-                            ))));
+                    },
+                    |response| match response {
+                        BackendCommandResult::Turn(turn) => {
+                            vec![Action::Event(UiEvent::TurnStateLoaded(turn))]
                         }
-                    }
-                }
+                        other => {
+                            vec![Action::Event(UiEvent::Error(format!(
+                                "unexpected turn response: {other:?}"
+                            )))]
+                        }
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "turn load failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!("turn load failed: {error}")))
+                        }
+                    },
+                )
+                .await
             }
             Effect::LoadWorkUnitDetail { work_unit_id } => {
-                match self
-                    .backend
-                    .execute(BackendCommand::GetWorkUnit {
+                let effect = Effect::LoadWorkUnitDetail {
+                    work_unit_id: work_unit_id.clone(),
+                };
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::GetWorkUnit {
                         work_unit_id: work_unit_id.clone(),
-                    })
-                    .await
-                {
-                    Ok(BackendCommandResult::WorkUnit(detail)) => {
-                        self.dispatch(Action::Event(UiEvent::WorkUnitDetailLoaded(detail)));
-                    }
-                    Ok(other) => {
-                        self.dispatch(Action::Event(UiEvent::Error(format!(
-                            "unexpected work-unit response: {other:?}"
-                        ))));
-                    }
-                    Err(error) => {
-                        if Self::is_disconnect_error(&error) {
-                            self.dispatch(Action::Event(UiEvent::ConnectionLost(format!(
-                                "work unit load failed for {work_unit_id}: {error}"
-                            ))));
-                        } else {
-                            self.dispatch(Action::Event(UiEvent::Error(format!(
-                                "work unit load failed for {work_unit_id}: {error}"
-                            ))));
+                    },
+                    |response| match response {
+                        BackendCommandResult::WorkUnit(detail) => {
+                            vec![Action::Event(UiEvent::WorkUnitDetailLoaded(detail))]
                         }
-                    }
-                }
+                        other => {
+                            vec![Action::Event(UiEvent::Error(format!(
+                                "unexpected work-unit response: {other:?}"
+                            )))]
+                        }
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "work unit load failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!("work unit load failed: {error}")))
+                        }
+                    },
+                )
+                .await
             }
-            Effect::LoadModels => match self.backend.execute(BackendCommand::LoadModels).await {
-                Ok(BackendCommandResult::Models(models)) => {
-                    self.dispatch(Action::Event(UiEvent::ModelsLoaded(models)));
-                }
-                Ok(other) => {
-                    self.dispatch(Action::Event(UiEvent::Error(format!(
-                        "unexpected load models response: {other:?}"
-                    ))));
-                }
-                Err(error) => {
-                    if Self::is_disconnect_error(&error) {
-                        self.dispatch(Action::Event(UiEvent::ConnectionLost(format!(
-                            "model load failed: {error}"
-                        ))));
-                    } else {
-                        self.dispatch(Action::Event(UiEvent::Error(format!(
-                            "model load failed: {error}"
-                        ))));
-                    }
-                }
-            },
-            Effect::StartDaemon => match self.backend.execute(BackendCommand::StartDaemon).await {
-                Ok(BackendCommandResult::DaemonStarted { connected }) => {
-                    self.dispatch(Action::Event(UiEvent::DaemonStarted { connected }));
-                }
-                Ok(other) => {
-                    self.dispatch(Action::Event(UiEvent::Error(format!(
-                        "unexpected start daemon response: {other:?}"
-                    ))));
-                }
-                Err(error) => {
-                    if Self::is_disconnect_error(&error) {
-                        self.dispatch(Action::Event(UiEvent::ConnectionLost(format!(
-                            "daemon start failed: {error}"
-                        ))));
-                    } else {
-                        self.dispatch(Action::Event(UiEvent::Error(format!(
-                            "daemon start failed: {error}"
-                        ))));
-                    }
-                }
-            },
-            Effect::StopDaemon => match self.backend.execute(BackendCommand::StopDaemon).await {
-                Ok(BackendCommandResult::DaemonStopped { stopping }) => {
-                    self.dispatch(Action::Event(UiEvent::DaemonStopped { stopping }));
-                }
-                Ok(other) => {
-                    self.dispatch(Action::Event(UiEvent::Error(format!(
-                        "unexpected stop-daemon response: {other:?}"
-                    ))));
-                }
-                Err(error) => {
-                    if Self::is_disconnect_error(&error) {
-                        self.dispatch(Action::Event(UiEvent::ConnectionLost(format!(
-                            "daemon stop failed: {error}"
-                        ))));
-                    } else {
-                        self.dispatch(Action::Event(UiEvent::Error(format!(
-                            "daemon stop failed: {error}"
-                        ))));
-                    }
-                }
-            },
+            effect @ Effect::LoadModels => {
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::LoadModels,
+                    |response| match response {
+                        BackendCommandResult::Models(models) => {
+                            vec![Action::Event(UiEvent::ModelsLoaded(models))]
+                        }
+                        other => {
+                            vec![Action::Event(UiEvent::Error(format!(
+                                "unexpected load models response: {other:?}"
+                            )))]
+                        }
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "model load failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!("model load failed: {error}")))
+                        }
+                    },
+                )
+                .await
+            }
+            effect @ Effect::StartDaemon => {
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::StartDaemon,
+                    |response| match response {
+                        BackendCommandResult::DaemonStarted { connected } => {
+                            vec![Action::Event(UiEvent::DaemonStarted { connected })]
+                        }
+                        other => {
+                            vec![Action::Event(UiEvent::Error(format!(
+                                "unexpected start daemon response: {other:?}"
+                            )))]
+                        }
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "daemon start failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!("daemon start failed: {error}")))
+                        }
+                    },
+                )
+                .await
+            }
+            effect @ Effect::StopDaemon => {
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::StopDaemon,
+                    |response| match response {
+                        BackendCommandResult::DaemonStopped { stopping } => {
+                            vec![Action::Event(UiEvent::DaemonStopped { stopping })]
+                        }
+                        other => {
+                            vec![Action::Event(UiEvent::Error(format!(
+                                "unexpected stop-daemon response: {other:?}"
+                            )))]
+                        }
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "daemon stop failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!("daemon stop failed: {error}")))
+                        }
+                    },
+                )
+                .await
+            }
             Effect::SubmitPrompt { thread_id, text } => {
-                match self
-                    .backend
+                let completion_effect = Effect::SubmitPrompt {
+                    thread_id: thread_id.clone(),
+                    text: text.clone(),
+                };
+                match backend
                     .execute(BackendCommand::SubmitPrompt {
                         thread_id: thread_id.clone(),
                         text,
@@ -335,26 +507,54 @@ impl<B: TuiBackend> AppRuntime<B> {
                     .await
                 {
                     Ok(BackendCommandResult::PromptStarted { thread_id, turn_id }) => {
-                        self.dispatch(Action::Event(UiEvent::PromptStarted { thread_id, turn_id }));
+                        EffectCompletion::success(
+                            completion_effect,
+                            vec![Action::Event(UiEvent::PromptStarted { thread_id, turn_id })],
+                        )
                     }
-                    Ok(other) => {
-                        self.dispatch(Action::Event(UiEvent::Error(format!(
+                    Ok(other) => EffectCompletion::failure(
+                        completion_effect,
+                        Action::Event(UiEvent::Error(format!(
                             "unexpected prompt response: {other:?}"
-                        ))));
-                    }
+                        ))),
+                    ),
                     Err(error) => {
+                        let message = error.to_string();
                         if Self::is_disconnect_error(&error) {
-                            self.dispatch(Action::Event(UiEvent::ConnectionLost(format!(
-                                "prompt submit failed: {error}"
-                            ))));
+                            EffectCompletion::failure(
+                                completion_effect,
+                                Action::Event(UiEvent::ConnectionLost(format!(
+                                    "prompt submit failed: {message}"
+                                ))),
+                            )
                         } else {
-                            self.dispatch(Action::Event(UiEvent::Error(format!(
-                                "prompt submit failed: {error}"
-                            ))));
+                            EffectCompletion::failure(
+                                completion_effect,
+                                Action::Event(UiEvent::Error(format!(
+                                    "prompt submit failed: {message}"
+                                ))),
+                            )
                         }
                     }
                 }
             }
+        }
+    }
+
+    async fn run_backend_effect<F, G>(
+        backend: Arc<B>,
+        effect: Effect,
+        command: BackendCommand,
+        on_success: F,
+        on_error: G,
+    ) -> EffectCompletion
+    where
+        F: FnOnce(BackendCommandResult) -> Vec<Action>,
+        G: FnOnce(anyhow::Error) -> Action,
+    {
+        match backend.execute(command).await {
+            Ok(result) => EffectCompletion::success(effect, on_success(result)),
+            Err(error) => EffectCompletion::failure(effect, on_error(error)),
         }
     }
 
@@ -375,7 +575,9 @@ impl<B: TuiBackend> AppRuntime<B> {
     }
 }
 
-pub async fn bootstrap_runtime<B: TuiBackend>(backend: Arc<B>) -> Result<AppRuntime<B>> {
+pub async fn bootstrap_runtime<B: TuiBackend + Send + Sync + 'static>(
+    backend: Arc<B>,
+) -> Result<AppRuntime<B>> {
     let mut runtime = AppRuntime::new(backend);
     runtime.bootstrap().await;
     Ok(runtime)

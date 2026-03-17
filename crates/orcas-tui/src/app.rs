@@ -57,6 +57,7 @@ pub struct AppState {
     pub collaboration: ipc::CollaborationSnapshot,
     pub threads: Vec<ipc::ThreadSummary>,
     pub daemon_models: Vec<ipc::ModelSummary>,
+    pub models_loading: bool,
     pub thread_details: HashMap<String, ipc::ThreadView>,
     pub turn_states: HashMap<String, ipc::TurnStateView>,
     pub current_view: TopLevelView,
@@ -233,7 +234,7 @@ impl UiEvent {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Effect {
     RefreshSnapshot,
     SubscribeEvents,
@@ -261,11 +262,15 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
         UserAction::Refresh => {
             let mut effects = vec![Effect::RefreshSnapshot];
             if state.current_view == TopLevelView::Supervisor {
+                state.models_loading = true;
                 effects.push(Effect::LoadModels);
             }
             effects
         }
-        UserAction::LoadModels => vec![Effect::LoadModels],
+        UserAction::LoadModels => {
+            state.models_loading = true;
+            vec![Effect::LoadModels]
+        }
         UserAction::StopDaemon => {
             state.confirming_daemon_stop = true;
             vec![Effect::StopDaemon]
@@ -281,6 +286,7 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
         UserAction::CycleView => {
             state.current_view = state.current_view.next();
             if state.current_view == TopLevelView::Supervisor {
+                state.models_loading = true;
                 vec![Effect::LoadModels]
             } else {
                 Vec::new()
@@ -289,6 +295,7 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
         UserAction::ShowView(view) => {
             state.current_view = view;
             if state.current_view == TopLevelView::Supervisor {
+                state.models_loading = true;
                 vec![Effect::LoadModels]
             } else {
                 Vec::new()
@@ -379,6 +386,7 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             });
         }
         UiEvent::ConnectionLost(message) => {
+            state.models_loading = false;
             state.daemon_phase = DaemonConnectionPhase::Reconnecting;
             state.prompt_in_flight = false;
             if let Some(daemon) = state.daemon.as_mut() {
@@ -434,6 +442,7 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::ModelsLoaded(models) => {
             state.daemon_models = models;
+            state.models_loading = false;
             state.confirming_daemon_stop = false;
         }
         UiEvent::DaemonStarted { connected } => {
@@ -611,6 +620,7 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             });
         }
         UiEvent::Error(message) => {
+            state.models_loading = false;
             state.prompt_in_flight = false;
             state.banner = Some(StatusBanner {
                 level: BannerLevel::Error,

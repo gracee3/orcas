@@ -7,6 +7,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use orcas_core::{
@@ -42,6 +43,8 @@ pub struct CodexClient {
 }
 
 impl CodexClient {
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
     pub fn new(
         transport: Arc<dyn CodexTransport>,
         reconnect_policy: ReconnectPolicy,
@@ -214,10 +217,20 @@ impl CodexClient {
             )));
         }
 
-        let value = rx.await.map_err(|error| {
+        let response = timeout(Self::REQUEST_TIMEOUT, rx).await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => {
+                self.pending.lock().await.remove(&request_id);
+                return Err(OrcasError::Transport(format!(
+                    "timed out waiting for `{method}` response"
+                )));
+            }
+        };
+        let response = response.map_err(|error| {
             OrcasError::Transport(format!("response channel dropped for `{method}`: {error}"))
         })??;
-        serde_json::from_value(value).map_err(Into::into)
+        serde_json::from_value(response).map_err(Into::into)
     }
 
     async fn notify(&self, method: &str, params: Option<Value>) -> OrcasResult<()> {

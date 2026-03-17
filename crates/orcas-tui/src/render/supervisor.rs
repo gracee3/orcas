@@ -74,10 +74,18 @@ fn render_daemon_status(state: &AppState) -> Paragraph<'static> {
 
 fn render_models(state: &AppState) -> Paragraph<'static> {
     let mut lines = Vec::new();
+    if state.models_loading {
+        lines.push(Line::from("loading models..."));
+    }
+
     if state.daemon_models.is_empty() {
-        lines.push(Line::from(
-            "No models loaded. Press m to refresh models.".to_string(),
-        ));
+        if state.models_loading {
+            lines.push(Line::from("no models loaded yet"));
+        } else {
+            lines.push(Line::from(
+                "No models loaded. Press m to refresh models.".to_string(),
+            ));
+        }
     } else {
         for model in state.daemon_models.iter().take(18) {
             let mut prefix = if model.is_default { "* " } else { "  " }.to_string();
