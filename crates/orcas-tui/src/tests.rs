@@ -121,6 +121,7 @@ fn sample_supervisor_turn_decision_summary_with_kind(
             "Please focus on the current bounded step and call out blockers before broadening scope."
                 .to_string(),
         ),
+        orcas_core::SupervisorTurnDecisionKind::NoAction => None,
         _ => Some("Please summarize status and take the next bounded step.".to_string()),
     };
     let rationale_summary = match kind {
@@ -130,12 +131,18 @@ fn sample_supervisor_turn_decision_summary_with_kind(
         orcas_core::SupervisorTurnDecisionKind::SteerActiveTurn => {
             "Operator requested review of steering the active turn.".to_string()
         }
+        orcas_core::SupervisorTurnDecisionKind::NoAction => {
+            "Operator deliberately chose to wait on the current idle-thread basis.".to_string()
+        }
         _ => "Thread is idle under an active assignment and needs bootstrap review.".to_string(),
     };
     ipc::SupervisorTurnDecisionSummary {
         decision_id: "std-1".to_string(),
         assignment_id: "cta-1".to_string(),
         codex_thread_id: thread_id.to_string(),
+        workstream_id: Some("ws-1".to_string()),
+        work_unit_id: Some("wu-1".to_string()),
+        supervisor_id: Some("supervisor-a".to_string()),
         basis_turn_id: Some("turn-1".to_string()),
         kind,
         proposal_kind,
@@ -982,7 +989,167 @@ async fn thread_list_and_detail_show_supervisor_decision_state() {
         detail
             .lines
             .iter()
-            .any(|line| line.contains("actions: a approve/send  d reject"))
+            .any(|line| line.contains("actions: w record no action  a approve/send  d reject"))
+    );
+}
+
+#[tokio::test]
+async fn pending_next_turn_decision_shows_record_no_action_action() {
+    let mut snapshot = sample_snapshot();
+    snapshot
+        .collaboration
+        .codex_thread_assignments
+        .push(sample_codex_assignment_summary(
+            "thread-1",
+            orcas_core::CodexThreadAssignmentStatus::Active,
+        ));
+    snapshot.collaboration.supervisor_turn_decisions.push(
+        sample_supervisor_turn_decision_summary_with_kind(
+            "thread-1",
+            orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman,
+            orcas_core::SupervisorTurnDecisionKind::NextTurn,
+            orcas_core::SupervisorTurnProposalKind::Bootstrap,
+        ),
+    );
+
+    let harness = AppHarness::new(snapshot).await.unwrap();
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("actions: w record no action  a approve/send  d reject"))
+    );
+}
+
+#[tokio::test]
+async fn record_no_action_dispatches_backend_command_for_pending_next_turn() {
+    let mut snapshot = sample_snapshot();
+    snapshot
+        .collaboration
+        .codex_thread_assignments
+        .push(sample_codex_assignment_summary(
+            "thread-1",
+            orcas_core::CodexThreadAssignmentStatus::Active,
+        ));
+    snapshot.collaboration.supervisor_turn_decisions.push(
+        sample_supervisor_turn_decision_summary_with_kind(
+            "thread-1",
+            orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman,
+            orcas_core::SupervisorTurnDecisionKind::NextTurn,
+            orcas_core::SupervisorTurnProposalKind::Bootstrap,
+        ),
+    );
+    let mut harness = AppHarness::new(snapshot).await.unwrap();
+
+    harness
+        .dispatch(UserAction::RecordNoActionForSelectedThread)
+        .await;
+
+    let commands = harness.recorded_commands().await;
+    assert!(commands.iter().any(|command| {
+        matches!(
+            command,
+            BackendCommand::RecordNoActionSupervisorDecision { decision_id }
+                if decision_id == "std-1"
+        )
+    }));
+
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("[waiting on current basis]"))
+    );
+}
+
+#[tokio::test]
+async fn recorded_no_action_shows_manual_refresh_action_when_valid() {
+    let mut snapshot = sample_snapshot();
+    snapshot
+        .collaboration
+        .codex_thread_assignments
+        .push(sample_codex_assignment_summary(
+            "thread-1",
+            orcas_core::CodexThreadAssignmentStatus::Active,
+        ));
+    snapshot.collaboration.supervisor_turn_decisions.push(
+        sample_supervisor_turn_decision_summary_with_kind(
+            "thread-1",
+            orcas_core::SupervisorTurnDecisionStatus::Recorded,
+            orcas_core::SupervisorTurnDecisionKind::NoAction,
+            orcas_core::SupervisorTurnProposalKind::Bootstrap,
+        ),
+    );
+
+    let harness = AppHarness::new(snapshot).await.unwrap();
+    let list = harness.thread_list_vm();
+    assert_eq!(
+        list.rows[0].decision_badge.as_deref(),
+        Some("waiting on current basis")
+    );
+
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("decision std-1 [waiting on current basis]"))
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("actions: m manual refresh"))
+    );
+}
+
+#[tokio::test]
+async fn manual_refresh_dispatches_backend_command_when_current_basis_is_waiting() {
+    let mut snapshot = sample_snapshot();
+    snapshot
+        .collaboration
+        .codex_thread_assignments
+        .push(sample_codex_assignment_summary(
+            "thread-1",
+            orcas_core::CodexThreadAssignmentStatus::Active,
+        ));
+    snapshot.collaboration.supervisor_turn_decisions.push(
+        sample_supervisor_turn_decision_summary_with_kind(
+            "thread-1",
+            orcas_core::SupervisorTurnDecisionStatus::Recorded,
+            orcas_core::SupervisorTurnDecisionKind::NoAction,
+            orcas_core::SupervisorTurnProposalKind::Bootstrap,
+        ),
+    );
+    let mut harness = AppHarness::new(snapshot).await.unwrap();
+
+    harness
+        .dispatch(UserAction::ManualRefreshForSelectedThread)
+        .await;
+
+    let commands = harness.recorded_commands().await;
+    assert!(commands.iter().any(|command| {
+        matches!(
+            command,
+            BackendCommand::ManualRefreshSupervisorDecision { assignment_id }
+                if assignment_id == "cta-1"
+        )
+    }));
+
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("[pending human approval]"))
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("proposal=manual refresh"))
     );
 }
 

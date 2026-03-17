@@ -142,6 +142,8 @@ fn action_for_key(state: &orcas_tui::app::AppState, key: KeyEvent) -> Option<Use
         KeyCode::Char('i') if in_threads_view => {
             Some(UserAction::ProposeInterruptForSelectedThread)
         }
+        KeyCode::Char('w') if in_threads_view => Some(UserAction::RecordNoActionForSelectedThread),
+        KeyCode::Char('m') if in_threads_view => Some(UserAction::ManualRefreshForSelectedThread),
         KeyCode::Down => Some(UserAction::SelectNextInView),
         KeyCode::Up => Some(UserAction::SelectPreviousInView),
         KeyCode::Left => Some(UserAction::ShowView(current_view.previous())),
@@ -265,6 +267,20 @@ mod tests {
                 key(KeyCode::Char('i'))
             ),
             Some(UserAction::ProposeInterruptForSelectedThread)
+        );
+        assert_eq!(
+            action_for_key(
+                &state_for_view(TopLevelView::Threads),
+                key(KeyCode::Char('w'))
+            ),
+            Some(UserAction::RecordNoActionForSelectedThread)
+        );
+        assert_eq!(
+            action_for_key(
+                &state_for_view(TopLevelView::Threads),
+                key(KeyCode::Char('m'))
+            ),
+            Some(UserAction::ManualRefreshForSelectedThread)
         );
     }
 

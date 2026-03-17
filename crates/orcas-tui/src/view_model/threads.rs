@@ -287,9 +287,16 @@ pub fn thread_detail(state: &AppState) -> ThreadDetailViewModel {
                         "  actions: e edit pending steer  a approve/send  d reject".to_string(),
                     );
                 }
+            } else if decision.kind == orcas_core::SupervisorTurnDecisionKind::NextTurn {
+                lines.push("  actions: w record no action  a approve/send  d reject".to_string());
             } else {
                 lines.push("  actions: a approve/send  d reject".to_string());
             }
+        } else if decision.kind == orcas_core::SupervisorTurnDecisionKind::NoAction
+            && decision.status == orcas_core::SupervisorTurnDecisionStatus::Recorded
+            && thread_manual_refreshable(state, thread_id)
+        {
+            lines.push("  actions: m manual refresh".to_string());
         }
         lines.push(String::new());
     } else {
@@ -534,10 +541,15 @@ fn supervisor_decision_status_label(decision: &ipc::SupervisorTurnDecisionSummar
             orcas_core::SupervisorTurnDecisionKind::InterruptActiveTurn,
             orcas_core::SupervisorTurnDecisionStatus::Stale,
         ) => "stale interrupt proposal",
+        (
+            orcas_core::SupervisorTurnDecisionKind::NoAction,
+            orcas_core::SupervisorTurnDecisionStatus::Recorded,
+        ) => "waiting on current basis",
         (_, orcas_core::SupervisorTurnDecisionStatus::Draft) => "draft",
         (_, orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman) => "pending human approval",
         (_, orcas_core::SupervisorTurnDecisionStatus::Approved) => "approved",
         (_, orcas_core::SupervisorTurnDecisionStatus::Rejected) => "rejected",
+        (_, orcas_core::SupervisorTurnDecisionStatus::Recorded) => "recorded",
         (_, orcas_core::SupervisorTurnDecisionStatus::Sent) => "sent",
         (_, orcas_core::SupervisorTurnDecisionStatus::Superseded) => "superseded",
         (_, orcas_core::SupervisorTurnDecisionStatus::Stale) => "stale proposal",
@@ -561,6 +573,67 @@ fn thread_steer_proposable(state: &AppState, thread_id: &str) -> bool {
 
 fn thread_interrupt_proposable(state: &AppState, thread_id: &str) -> bool {
     thread_active_turn_decision_proposable(state, thread_id)
+}
+
+fn thread_manual_refreshable(state: &AppState, thread_id: &str) -> bool {
+    let Some(assignment) = current_thread_assignment(state, thread_id) else {
+        return false;
+    };
+    if assignment.status != CodexThreadAssignmentStatus::Active {
+        return false;
+    }
+    let has_active_turn = state
+        .thread_details
+        .get(thread_id)
+        .map(|thread| thread.summary.active_turn_id.is_some())
+        .or_else(|| {
+            state
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .map(|thread| thread.active_turn_id.is_some())
+        })
+        .unwrap_or(false);
+    if has_active_turn {
+        return false;
+    }
+    if state
+        .collaboration
+        .supervisor_turn_decisions
+        .iter()
+        .any(|decision| decision.assignment_id == assignment.assignment_id && decision.open)
+    {
+        return false;
+    }
+    let basis_turn_id = state
+        .thread_details
+        .get(thread_id)
+        .map(|thread| thread.summary.last_seen_turn_id.clone())
+        .or_else(|| {
+            state
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .map(|thread| thread.last_seen_turn_id.clone())
+        })
+        .unwrap_or(None);
+    state
+        .collaboration
+        .supervisor_turn_decisions
+        .iter()
+        .filter(|decision| {
+            decision.assignment_id == assignment.assignment_id
+                && decision.basis_turn_id == basis_turn_id
+        })
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.decision_id.cmp(&right.decision_id))
+        })
+        .is_some_and(|decision| {
+            decision.kind == orcas_core::SupervisorTurnDecisionKind::NoAction
+                && decision.status == orcas_core::SupervisorTurnDecisionStatus::Recorded
+        })
 }
 
 fn thread_active_turn_decision_proposable(state: &AppState, thread_id: &str) -> bool {

@@ -197,7 +197,7 @@ fn help_navigation_line(view: TopLevelView) -> &'static str {
     match view {
         TopLevelView::Overview => "nav: left/right views  r refresh  ? help  q quit",
         TopLevelView::Threads => {
-            "nav: left/right views  up/down thread selection  s compose steer  e edit steer  i propose interrupt  a approve/send  d reject  r refresh  ? help  q quit"
+            "nav: left/right views  up/down thread selection  s compose steer  e edit steer  i propose interrupt  w no action  m manual refresh  a approve/send  d reject  r refresh  ? help  q quit"
         }
         TopLevelView::Collaboration => {
             "nav: left/right views  tab switch workstreams/work_units  up/down move selection  r refresh  ? help  q quit"
@@ -211,7 +211,7 @@ fn help_navigation_line(view: TopLevelView) -> &'static str {
 fn help_navigation_line_compact(view: TopLevelView) -> &'static str {
     match view {
         TopLevelView::Overview => "nav: left/right  r",
-        TopLevelView::Threads => "nav: left/right  up/down  s/e/i/a/d  r",
+        TopLevelView::Threads => "nav: left/right  up/down  s/e/i/w/m/a/d  r",
         TopLevelView::Collaboration => "nav: left/right  tab focus  up/down  r",
         TopLevelView::Supervisor => "nav: left/right  m/s/x/R  r",
     }
@@ -242,6 +242,10 @@ fn key_bindings_hint(state: &AppState) -> Vec<Span<'static>> {
             spans.extend(action_hint("e", "edit steer"));
             spans.push(Span::styled("  ", metadata_style()));
             spans.extend(action_hint("i", "propose interrupt"));
+            spans.push(Span::styled("  ", metadata_style()));
+            spans.extend(action_hint("w", "record no action"));
+            spans.push(Span::styled("  ", metadata_style()));
+            spans.extend(action_hint("m", "manual refresh"));
             spans.push(Span::styled("  ", metadata_style()));
             spans.extend(action_hint("a", "approve/send"));
             spans.push(Span::styled("  ", metadata_style()));

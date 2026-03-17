@@ -2,12 +2,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Error, Result};
+use anyhow::{Error, Result, anyhow, bail};
+use async_trait::async_trait;
 use tokio::time::sleep;
 
 use orcas_core::{
-    AppConfig, AppPaths, DecisionType, SupervisorProposalEdits, SupervisorProposalRecord,
-    ThreadReadRequest, ThreadResumeRequest, ThreadStartRequest, ipc,
+    AppConfig, AppPaths, CodexThreadAssignmentStatus, DecisionType, SupervisorProposalEdits,
+    SupervisorProposalRecord, SupervisorTurnDecision, SupervisorTurnDecisionKind,
+    SupervisorTurnDecisionStatus, ThreadReadRequest, ThreadResumeRequest, ThreadStartRequest, ipc,
 };
 use orcas_daemon::{
     OrcasDaemonLaunch, OrcasDaemonProcessManager, OrcasIpcClient, OrcasRuntimeOverrides,
@@ -20,6 +22,140 @@ use crate::streaming::{
 };
 
 pub use orcas_daemon::OrcasRuntimeOverrides as RuntimeOverrides;
+
+const SUPERVISOR_CLI_OPERATOR: &str = "supervisor_cli_operator";
+
+#[async_trait]
+trait SupervisorCodexBackend {
+    async fn codex_assignment_list(
+        &self,
+        params: &ipc::CodexAssignmentListRequest,
+    ) -> Result<ipc::CodexAssignmentListResponse>;
+
+    async fn supervisor_decision_list(
+        &self,
+        params: &ipc::SupervisorDecisionListRequest,
+    ) -> Result<ipc::SupervisorDecisionListResponse>;
+
+    async fn supervisor_decision_get(
+        &self,
+        params: &ipc::SupervisorDecisionGetRequest,
+    ) -> Result<ipc::SupervisorDecisionGetResponse>;
+
+    async fn supervisor_decision_propose_steer(
+        &self,
+        params: &ipc::SupervisorDecisionProposeSteerRequest,
+    ) -> Result<ipc::SupervisorDecisionProposeSteerResponse>;
+
+    async fn supervisor_decision_replace_pending_steer(
+        &self,
+        params: &ipc::SupervisorDecisionReplacePendingSteerRequest,
+    ) -> Result<ipc::SupervisorDecisionReplacePendingSteerResponse>;
+
+    async fn supervisor_decision_record_no_action(
+        &self,
+        params: &ipc::SupervisorDecisionRecordNoActionRequest,
+    ) -> Result<ipc::SupervisorDecisionRecordNoActionResponse>;
+
+    async fn supervisor_decision_manual_refresh(
+        &self,
+        params: &ipc::SupervisorDecisionManualRefreshRequest,
+    ) -> Result<ipc::SupervisorDecisionManualRefreshResponse>;
+
+    async fn supervisor_decision_approve_and_send(
+        &self,
+        params: &ipc::SupervisorDecisionApproveAndSendRequest,
+    ) -> Result<ipc::SupervisorDecisionApproveAndSendResponse>;
+
+    async fn supervisor_decision_reject(
+        &self,
+        params: &ipc::SupervisorDecisionRejectRequest,
+    ) -> Result<ipc::SupervisorDecisionRejectResponse>;
+}
+
+#[async_trait]
+impl SupervisorCodexBackend for OrcasIpcClient {
+    async fn codex_assignment_list(
+        &self,
+        params: &ipc::CodexAssignmentListRequest,
+    ) -> Result<ipc::CodexAssignmentListResponse> {
+        OrcasIpcClient::codex_assignment_list(self, params)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn supervisor_decision_list(
+        &self,
+        params: &ipc::SupervisorDecisionListRequest,
+    ) -> Result<ipc::SupervisorDecisionListResponse> {
+        OrcasIpcClient::supervisor_decision_list(self, params)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn supervisor_decision_get(
+        &self,
+        params: &ipc::SupervisorDecisionGetRequest,
+    ) -> Result<ipc::SupervisorDecisionGetResponse> {
+        OrcasIpcClient::supervisor_decision_get(self, params)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn supervisor_decision_propose_steer(
+        &self,
+        params: &ipc::SupervisorDecisionProposeSteerRequest,
+    ) -> Result<ipc::SupervisorDecisionProposeSteerResponse> {
+        OrcasIpcClient::supervisor_decision_propose_steer(self, params)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn supervisor_decision_replace_pending_steer(
+        &self,
+        params: &ipc::SupervisorDecisionReplacePendingSteerRequest,
+    ) -> Result<ipc::SupervisorDecisionReplacePendingSteerResponse> {
+        OrcasIpcClient::supervisor_decision_replace_pending_steer(self, params)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn supervisor_decision_record_no_action(
+        &self,
+        params: &ipc::SupervisorDecisionRecordNoActionRequest,
+    ) -> Result<ipc::SupervisorDecisionRecordNoActionResponse> {
+        OrcasIpcClient::supervisor_decision_record_no_action(self, params)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn supervisor_decision_manual_refresh(
+        &self,
+        params: &ipc::SupervisorDecisionManualRefreshRequest,
+    ) -> Result<ipc::SupervisorDecisionManualRefreshResponse> {
+        OrcasIpcClient::supervisor_decision_manual_refresh(self, params)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn supervisor_decision_approve_and_send(
+        &self,
+        params: &ipc::SupervisorDecisionApproveAndSendRequest,
+    ) -> Result<ipc::SupervisorDecisionApproveAndSendResponse> {
+        OrcasIpcClient::supervisor_decision_approve_and_send(self, params)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn supervisor_decision_reject(
+        &self,
+        params: &ipc::SupervisorDecisionRejectRequest,
+    ) -> Result<ipc::SupervisorDecisionRejectResponse> {
+        OrcasIpcClient::supervisor_decision_reject(self, params)
+            .await
+            .map_err(Into::into)
+    }
+}
 
 pub struct SupervisorService {
     pub paths: AppPaths,
@@ -697,6 +833,254 @@ impl SupervisorService {
         Ok(())
     }
 
+    pub async fn codex_decision_list(
+        &self,
+        thread_id: Option<&str>,
+        assignment_id: Option<&str>,
+        workstream_id: Option<&str>,
+        work_unit_id: Option<&str>,
+        supervisor_id: Option<&str>,
+        status: Option<SupervisorTurnDecisionStatus>,
+        kind: Option<SupervisorTurnDecisionKind>,
+        include_closed: bool,
+        include_superseded: bool,
+        actionable_only: bool,
+        limit: Option<usize>,
+    ) -> Result<()> {
+        let client = self.ready_client().await?;
+        let decisions = Self::codex_decision_list_with_backend(
+            client.as_ref(),
+            thread_id,
+            assignment_id,
+            workstream_id,
+            work_unit_id,
+            supervisor_id,
+            status,
+            kind,
+            include_closed,
+            include_superseded,
+            actionable_only,
+            limit,
+        )
+        .await?;
+
+        if decisions.is_empty() {
+            if actionable_only {
+                println!("no actionable codex supervisor decisions");
+            } else {
+                println!("no codex supervisor decisions");
+            }
+            return Ok(());
+        }
+
+        for decision in decisions {
+            println!(
+                "{}",
+                Self::format_supervisor_turn_decision_summary(&decision)
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn codex_decision_history(
+        &self,
+        thread_id: Option<&str>,
+        assignment_id: Option<&str>,
+        include_superseded: bool,
+        limit: Option<usize>,
+    ) -> Result<()> {
+        match (thread_id, assignment_id) {
+            (Some(_), Some(_)) => bail!("specify either --thread or --assignment, not both"),
+            (None, None) => bail!("history requires --thread or --assignment"),
+            _ => {}
+        }
+
+        let client = self.ready_client().await?;
+        let decisions = Self::codex_decision_list_with_backend(
+            client.as_ref(),
+            thread_id,
+            assignment_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            include_superseded,
+            false,
+            limit,
+        )
+        .await?;
+
+        if decisions.is_empty() {
+            println!("no codex supervisor decision history");
+            return Ok(());
+        }
+
+        if let Some(thread_id) = thread_id {
+            println!("history_for_thread: {thread_id}");
+        }
+        if let Some(assignment_id) = assignment_id {
+            println!("history_for_assignment: {assignment_id}");
+        }
+        for decision in &decisions {
+            println!(
+                "{}",
+                Self::format_supervisor_turn_decision_summary(decision)
+            );
+        }
+        let chains = Self::format_decision_revision_chains(&decisions);
+        if !chains.is_empty() {
+            println!("revision_chains:");
+            for chain in chains {
+                println!("  {chain}");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn codex_decision_get(&self, decision_id: &str) -> Result<()> {
+        let client = self.ready_client().await?;
+        let decision = Self::codex_decision_get_with_backend(client.as_ref(), decision_id).await?;
+        let related = Self::codex_decision_list_with_backend(
+            client.as_ref(),
+            None,
+            Some(&decision.assignment_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+            false,
+            None,
+        )
+        .await?;
+        Self::print_supervisor_turn_decision(
+            &decision,
+            related
+                .iter()
+                .find(|summary| summary.decision_id == decision.decision_id),
+            &related,
+        );
+        Ok(())
+    }
+
+    pub async fn codex_decision_propose_steer(
+        &self,
+        thread_id: &str,
+        proposed_text: &str,
+        requested_by: Option<String>,
+        rationale_note: Option<String>,
+    ) -> Result<()> {
+        let client = self.ready_client().await?;
+        let decision = Self::codex_decision_propose_steer_with_backend(
+            client.as_ref(),
+            thread_id,
+            proposed_text,
+            requested_by,
+            rationale_note,
+        )
+        .await?;
+        Self::print_supervisor_turn_decision(&decision, None, &[]);
+        Ok(())
+    }
+
+    pub async fn codex_decision_replace_pending_steer(
+        &self,
+        decision_id: &str,
+        proposed_text: &str,
+        requested_by: Option<String>,
+        rationale_note: Option<String>,
+    ) -> Result<()> {
+        let client = self.ready_client().await?;
+        let decision = Self::codex_decision_replace_pending_steer_with_backend(
+            client.as_ref(),
+            decision_id,
+            proposed_text,
+            requested_by,
+            rationale_note,
+        )
+        .await?;
+        Self::print_supervisor_turn_decision(&decision, None, &[]);
+        Ok(())
+    }
+
+    pub async fn codex_decision_record_no_action(
+        &self,
+        decision_id: &str,
+        reviewed_by: Option<String>,
+        review_note: Option<String>,
+    ) -> Result<()> {
+        let client = self.ready_client().await?;
+        let decision = Self::codex_decision_record_no_action_with_backend(
+            client.as_ref(),
+            decision_id,
+            reviewed_by,
+            review_note,
+        )
+        .await?;
+        Self::print_supervisor_turn_decision(&decision, None, &[]);
+        Ok(())
+    }
+
+    pub async fn codex_decision_manual_refresh(
+        &self,
+        thread_id: Option<&str>,
+        assignment_id: Option<&str>,
+        requested_by: Option<String>,
+        rationale_note: Option<String>,
+    ) -> Result<()> {
+        let client = self.ready_client().await?;
+        let decision = Self::codex_decision_manual_refresh_with_backend(
+            client.as_ref(),
+            thread_id,
+            assignment_id,
+            requested_by,
+            rationale_note,
+        )
+        .await?;
+        Self::print_supervisor_turn_decision(&decision, None, &[]);
+        Ok(())
+    }
+
+    pub async fn codex_decision_approve_and_send(
+        &self,
+        decision_id: &str,
+        reviewed_by: Option<String>,
+        review_note: Option<String>,
+    ) -> Result<()> {
+        let client = self.ready_client().await?;
+        let decision = Self::codex_decision_approve_and_send_with_backend(
+            client.as_ref(),
+            decision_id,
+            reviewed_by,
+            review_note,
+        )
+        .await?;
+        Self::print_supervisor_turn_decision(&decision, None, &[]);
+        Ok(())
+    }
+
+    pub async fn codex_decision_reject(
+        &self,
+        decision_id: &str,
+        reviewed_by: Option<String>,
+        review_note: Option<String>,
+    ) -> Result<()> {
+        let client = self.ready_client().await?;
+        let decision = Self::codex_decision_reject_with_backend(
+            client.as_ref(),
+            decision_id,
+            reviewed_by,
+            review_note,
+        )
+        .await?;
+        Self::print_supervisor_turn_decision(&decision, None, &[]);
+        Ok(())
+    }
+
     pub async fn thread_start(
         &self,
         cwd: Option<PathBuf>,
@@ -851,6 +1235,411 @@ impl SupervisorService {
             println!("[stream state: interrupted]");
         }
         Ok(outcome.final_text)
+    }
+
+    async fn codex_decision_propose_steer_with_backend<B: SupervisorCodexBackend + Sync>(
+        backend: &B,
+        thread_id: &str,
+        proposed_text: &str,
+        requested_by: Option<String>,
+        rationale_note: Option<String>,
+    ) -> Result<SupervisorTurnDecision> {
+        let assignment =
+            Self::resolve_active_codex_assignment_for_thread(backend, thread_id).await?;
+        let proposed_text = Self::require_non_empty_text("steer text", proposed_text)?;
+        let response = backend
+            .supervisor_decision_propose_steer(&ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some(Self::normalize_actor(requested_by, SUPERVISOR_CLI_OPERATOR)),
+                proposed_text: Some(proposed_text),
+                rationale_note,
+            })
+            .await?;
+        Ok(response.decision)
+    }
+
+    async fn codex_decision_list_with_backend<B: SupervisorCodexBackend + Sync>(
+        backend: &B,
+        thread_id: Option<&str>,
+        assignment_id: Option<&str>,
+        workstream_id: Option<&str>,
+        work_unit_id: Option<&str>,
+        supervisor_id: Option<&str>,
+        status: Option<SupervisorTurnDecisionStatus>,
+        kind: Option<SupervisorTurnDecisionKind>,
+        include_closed: bool,
+        include_superseded: bool,
+        actionable_only: bool,
+        limit: Option<usize>,
+    ) -> Result<Vec<ipc::SupervisorTurnDecisionSummary>> {
+        let response = backend
+            .supervisor_decision_list(&ipc::SupervisorDecisionListRequest {
+                assignment_id: assignment_id.map(ToOwned::to_owned),
+                codex_thread_id: thread_id.map(ToOwned::to_owned),
+                workstream_id: workstream_id.map(ToOwned::to_owned),
+                work_unit_id: work_unit_id.map(ToOwned::to_owned),
+                supervisor_id: supervisor_id.map(ToOwned::to_owned),
+                status,
+                kind,
+                include_closed,
+                include_superseded,
+                actionable_only,
+                limit,
+            })
+            .await?;
+        Ok(response.decisions)
+    }
+
+    async fn codex_decision_get_with_backend<B: SupervisorCodexBackend + Sync>(
+        backend: &B,
+        decision_id: &str,
+    ) -> Result<SupervisorTurnDecision> {
+        let response = backend
+            .supervisor_decision_get(&ipc::SupervisorDecisionGetRequest {
+                decision_id: decision_id.to_string(),
+            })
+            .await?;
+        Ok(response.decision)
+    }
+
+    async fn codex_decision_record_no_action_with_backend<B: SupervisorCodexBackend + Sync>(
+        backend: &B,
+        decision_id: &str,
+        reviewed_by: Option<String>,
+        review_note: Option<String>,
+    ) -> Result<SupervisorTurnDecision> {
+        let response = backend
+            .supervisor_decision_record_no_action(&ipc::SupervisorDecisionRecordNoActionRequest {
+                decision_id: decision_id.to_string(),
+                reviewed_by: Some(Self::normalize_actor(reviewed_by, SUPERVISOR_CLI_OPERATOR)),
+                review_note,
+            })
+            .await?;
+        Ok(response.decision)
+    }
+
+    async fn codex_decision_replace_pending_steer_with_backend<B: SupervisorCodexBackend + Sync>(
+        backend: &B,
+        decision_id: &str,
+        proposed_text: &str,
+        requested_by: Option<String>,
+        rationale_note: Option<String>,
+    ) -> Result<SupervisorTurnDecision> {
+        let proposed_text = Self::require_non_empty_text("steer text", proposed_text)?;
+        let response = backend
+            .supervisor_decision_replace_pending_steer(
+                &ipc::SupervisorDecisionReplacePendingSteerRequest {
+                    decision_id: decision_id.to_string(),
+                    requested_by: Some(Self::normalize_actor(
+                        requested_by,
+                        SUPERVISOR_CLI_OPERATOR,
+                    )),
+                    proposed_text,
+                    rationale_note,
+                },
+            )
+            .await?;
+        Ok(response.decision)
+    }
+
+    async fn codex_decision_manual_refresh_with_backend<B: SupervisorCodexBackend + Sync>(
+        backend: &B,
+        thread_id: Option<&str>,
+        assignment_id: Option<&str>,
+        requested_by: Option<String>,
+        rationale_note: Option<String>,
+    ) -> Result<SupervisorTurnDecision> {
+        let assignment_id = match (thread_id, assignment_id) {
+            (Some(thread_id), None) => {
+                Self::resolve_active_codex_assignment_for_thread(backend, thread_id)
+                    .await?
+                    .assignment_id
+            }
+            (None, Some(assignment_id)) => assignment_id.to_string(),
+            (Some(_), Some(_)) => bail!("specify either --thread or --assignment, not both"),
+            (None, None) => bail!("manual refresh requires --thread or --assignment"),
+        };
+        let response = backend
+            .supervisor_decision_manual_refresh(&ipc::SupervisorDecisionManualRefreshRequest {
+                assignment_id,
+                requested_by: Some(Self::normalize_actor(requested_by, SUPERVISOR_CLI_OPERATOR)),
+                rationale_note,
+            })
+            .await?;
+        Ok(response.decision)
+    }
+
+    async fn codex_decision_approve_and_send_with_backend<B: SupervisorCodexBackend + Sync>(
+        backend: &B,
+        decision_id: &str,
+        reviewed_by: Option<String>,
+        review_note: Option<String>,
+    ) -> Result<SupervisorTurnDecision> {
+        let response = backend
+            .supervisor_decision_approve_and_send(&ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: decision_id.to_string(),
+                reviewed_by: Some(Self::normalize_actor(reviewed_by, SUPERVISOR_CLI_OPERATOR)),
+                review_note,
+            })
+            .await?;
+        Ok(response.decision)
+    }
+
+    async fn codex_decision_reject_with_backend<B: SupervisorCodexBackend + Sync>(
+        backend: &B,
+        decision_id: &str,
+        reviewed_by: Option<String>,
+        review_note: Option<String>,
+    ) -> Result<SupervisorTurnDecision> {
+        let response = backend
+            .supervisor_decision_reject(&ipc::SupervisorDecisionRejectRequest {
+                decision_id: decision_id.to_string(),
+                reviewed_by: Some(Self::normalize_actor(reviewed_by, SUPERVISOR_CLI_OPERATOR)),
+                review_note,
+            })
+            .await?;
+        Ok(response.decision)
+    }
+
+    async fn resolve_active_codex_assignment_for_thread<B: SupervisorCodexBackend + Sync>(
+        backend: &B,
+        thread_id: &str,
+    ) -> Result<ipc::CodexThreadAssignmentSummary> {
+        let response = backend
+            .codex_assignment_list(&ipc::CodexAssignmentListRequest {
+                codex_thread_id: Some(thread_id.to_string()),
+                workstream_id: None,
+                work_unit_id: None,
+                include_inactive: false,
+            })
+            .await?;
+        let mut assignments = response.assignments.into_iter().filter(|assignment| {
+            assignment.codex_thread_id == thread_id
+                && assignment.status == CodexThreadAssignmentStatus::Active
+                && assignment.active
+        });
+        let assignment = assignments
+            .next()
+            .ok_or_else(|| anyhow!("no active Codex assignment for thread `{thread_id}`"))?;
+        if assignments.next().is_some() {
+            bail!("multiple active Codex assignments found for thread `{thread_id}`");
+        }
+        Ok(assignment)
+    }
+
+    fn require_non_empty_text(label: &str, text: &str) -> Result<String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            bail!("{label} must not be empty");
+        }
+        Ok(trimmed.to_string())
+    }
+
+    fn normalize_actor(actor: Option<String>, fallback: &str) -> String {
+        actor
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
+    fn print_supervisor_turn_decision(
+        decision: &SupervisorTurnDecision,
+        summary: Option<&ipc::SupervisorTurnDecisionSummary>,
+        related: &[ipc::SupervisorTurnDecisionSummary],
+    ) {
+        for line in Self::format_supervisor_turn_decision(decision, summary, related) {
+            println!("{line}");
+        }
+    }
+
+    fn format_supervisor_turn_decision(
+        decision: &SupervisorTurnDecision,
+        summary: Option<&ipc::SupervisorTurnDecisionSummary>,
+        related: &[ipc::SupervisorTurnDecisionSummary],
+    ) -> Vec<String> {
+        let mut lines = vec![
+            format!("decision_id: {}", decision.decision_id),
+            format!("assignment_id: {}", decision.assignment_id),
+            format!("thread_id: {}", decision.codex_thread_id),
+            format!("kind: {:?}", decision.kind),
+            format!("proposal_kind: {:?}", decision.proposal_kind),
+            format!("status: {:?}", decision.status),
+            format!(
+                "actionable: {}",
+                if decision.status == SupervisorTurnDecisionStatus::ProposedToHuman {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ),
+            format!(
+                "editable: {}",
+                if decision.kind == SupervisorTurnDecisionKind::SteerActiveTurn
+                    && decision.status == SupervisorTurnDecisionStatus::ProposedToHuman
+                {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ),
+            format!(
+                "basis_turn_id: {}",
+                decision.basis_turn_id.as_deref().unwrap_or("")
+            ),
+            format!("created_at: {}", decision.created_at),
+            format!("rationale_summary: {}", decision.rationale_summary),
+        ];
+
+        if let Some(summary) = summary {
+            lines.push(format!(
+                "workstream_id: {}",
+                summary.workstream_id.as_deref().unwrap_or("")
+            ));
+            lines.push(format!(
+                "work_unit_id: {}",
+                summary.work_unit_id.as_deref().unwrap_or("")
+            ));
+            lines.push(format!(
+                "supervisor_id: {}",
+                summary.supervisor_id.as_deref().unwrap_or("")
+            ));
+            lines.push(format!("open: {}", summary.open));
+        }
+
+        if let Some(approved_at) = decision.approved_at.as_ref() {
+            lines.push(format!("approved_at: {approved_at}"));
+        }
+        if let Some(rejected_at) = decision.rejected_at.as_ref() {
+            lines.push(format!("rejected_at: {rejected_at}"));
+        }
+        if let Some(sent_at) = decision.sent_at.as_ref() {
+            lines.push(format!("sent_at: {sent_at}"));
+        }
+        if let Some(sent_turn_id) = decision.sent_turn_id.as_ref() {
+            lines.push(format!("sent_turn_id: {sent_turn_id}"));
+        }
+        if let Some(superseded_by) = decision.superseded_by.as_ref() {
+            lines.push(format!("superseded_by: {superseded_by}"));
+        }
+        if let Some(notes) = decision.notes.as_ref() {
+            lines.push(format!("notes: {notes}"));
+        }
+        lines.extend(Self::format_text_block(
+            "proposed_text",
+            decision.proposed_text.as_deref(),
+        ));
+
+        let related_decisions = if related.is_empty() {
+            Vec::new()
+        } else {
+            related
+                .iter()
+                .map(Self::format_supervisor_turn_decision_summary)
+                .collect::<Vec<_>>()
+        };
+        if !related_decisions.is_empty() {
+            lines.push("related_history:".to_string());
+            lines.extend(
+                related_decisions
+                    .into_iter()
+                    .map(|line| format!("  {line}")),
+            );
+        }
+        let chains = Self::format_decision_revision_chains(related);
+        if !chains.is_empty() {
+            lines.push("revision_chains:".to_string());
+            lines.extend(chains.into_iter().map(|line| format!("  {line}")));
+        }
+
+        lines
+    }
+
+    fn format_supervisor_turn_decision_summary(
+        decision: &ipc::SupervisorTurnDecisionSummary,
+    ) -> String {
+        let text_preview = decision
+            .proposed_text
+            .as_deref()
+            .map(Self::single_line_preview)
+            .unwrap_or_else(|| "-".to_string());
+        let rationale_preview = Self::single_line_preview(&decision.rationale_summary);
+        let superseded_by = decision.superseded_by.as_deref().unwrap_or("-");
+        format!(
+            "{}\t{:?}\t{:?}/{:?}\tthread={}\tassignment={}\tws={}\twu={}\tsupervisor={}\tbasis={}\tcreated={}\tsuperseded_by={}\trationale={}\ttext={}",
+            decision.decision_id,
+            decision.status,
+            decision.kind,
+            decision.proposal_kind,
+            decision.codex_thread_id,
+            decision.assignment_id,
+            decision.workstream_id.as_deref().unwrap_or("-"),
+            decision.work_unit_id.as_deref().unwrap_or("-"),
+            decision.supervisor_id.as_deref().unwrap_or("-"),
+            decision.basis_turn_id.as_deref().unwrap_or("-"),
+            decision.created_at,
+            superseded_by,
+            rationale_preview,
+            text_preview
+        )
+    }
+
+    fn format_decision_revision_chains(
+        decisions: &[ipc::SupervisorTurnDecisionSummary],
+    ) -> Vec<String> {
+        use std::collections::{BTreeSet, HashMap};
+
+        let by_id = decisions
+            .iter()
+            .map(|decision| (decision.decision_id.as_str(), decision))
+            .collect::<HashMap<_, _>>();
+        let child_ids = decisions
+            .iter()
+            .filter_map(|decision| decision.superseded_by.as_deref())
+            .collect::<BTreeSet<_>>();
+
+        let mut chains = Vec::new();
+        for root in decisions.iter().filter(|decision| {
+            decision.superseded_by.is_some() && !child_ids.contains(decision.decision_id.as_str())
+        }) {
+            let mut chain = vec![root.decision_id.clone()];
+            let mut next_id = root.superseded_by.as_deref();
+            while let Some(id) = next_id {
+                chain.push(id.to_string());
+                next_id = by_id
+                    .get(id)
+                    .and_then(|decision| decision.superseded_by.as_deref());
+            }
+            if chain.len() > 1 {
+                chains.push(chain.join(" -> "));
+            }
+        }
+        chains.sort();
+        chains
+    }
+
+    fn format_text_block(label: &str, text: Option<&str>) -> Vec<String> {
+        match text {
+            Some(text) => {
+                let mut lines = vec![format!("{label}:")];
+                lines.extend(text.lines().map(|line| format!("  {line}")));
+                if text.ends_with('\n') {
+                    lines.push("  ".to_string());
+                }
+                lines
+            }
+            None => vec![format!("{label}:")],
+        }
+    }
+
+    fn single_line_preview(text: &str) -> String {
+        let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if preview.is_empty() {
+            "-".to_string()
+        } else {
+            preview
+        }
     }
 
     async fn ready_client(&self) -> Result<Arc<OrcasIpcClient>> {
@@ -1118,5 +1907,1442 @@ impl SupervisorService {
             "{prefix}_draft_assignment_boundedness_note: {}",
             draft.boundedness_note
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use chrono::Utc;
+    use orcas_core::{
+        CodexThreadBootstrapState, CodexThreadSendPolicy, SupervisorTurnProposalKind,
+    };
+
+    #[derive(Debug, Default)]
+    struct FakeSupervisorCodexBackend {
+        state: Mutex<FakeSupervisorCodexState>,
+        propose_error: Mutex<Option<String>>,
+        approve_error: Mutex<Option<String>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeSupervisorCodexState {
+        next_decision_id: usize,
+        assignments: Vec<ipc::CodexThreadAssignmentSummary>,
+        decisions: BTreeMap<String, SupervisorTurnDecision>,
+        last_approved_text: Option<String>,
+    }
+
+    #[async_trait]
+    impl SupervisorCodexBackend for FakeSupervisorCodexBackend {
+        async fn codex_assignment_list(
+            &self,
+            params: &ipc::CodexAssignmentListRequest,
+        ) -> Result<ipc::CodexAssignmentListResponse> {
+            let state = self.state.lock().expect("state");
+            let assignments = state
+                .assignments
+                .iter()
+                .filter(|assignment| {
+                    params
+                        .codex_thread_id
+                        .as_ref()
+                        .is_none_or(|thread_id| &assignment.codex_thread_id == thread_id)
+                        && (params.include_inactive || assignment.active)
+                })
+                .cloned()
+                .collect();
+            Ok(ipc::CodexAssignmentListResponse { assignments })
+        }
+
+        async fn supervisor_decision_list(
+            &self,
+            params: &ipc::SupervisorDecisionListRequest,
+        ) -> Result<ipc::SupervisorDecisionListResponse> {
+            let state = self.state.lock().expect("state");
+            let mut decisions = state
+                .decisions
+                .values()
+                .filter(|decision| {
+                    let assignment = state
+                        .assignments
+                        .iter()
+                        .find(|assignment| assignment.assignment_id == decision.assignment_id);
+                    params
+                        .assignment_id
+                        .as_ref()
+                        .is_none_or(|assignment_id| &decision.assignment_id == assignment_id)
+                        && params
+                            .codex_thread_id
+                            .as_ref()
+                            .is_none_or(|thread_id| &decision.codex_thread_id == thread_id)
+                        && params.workstream_id.as_ref().is_none_or(|workstream_id| {
+                            assignment
+                                .map(|assignment| &assignment.workstream_id == workstream_id)
+                                .unwrap_or(false)
+                        })
+                        && params.work_unit_id.as_ref().is_none_or(|work_unit_id| {
+                            assignment
+                                .map(|assignment| &assignment.work_unit_id == work_unit_id)
+                                .unwrap_or(false)
+                        })
+                        && params.supervisor_id.as_ref().is_none_or(|supervisor_id| {
+                            assignment
+                                .map(|assignment| &assignment.supervisor_id == supervisor_id)
+                                .unwrap_or(false)
+                        })
+                        && params.status.is_none_or(|status| decision.status == status)
+                        && params.kind.is_none_or(|kind| decision.kind == kind)
+                        && (!params.actionable_only
+                            || decision.status == SupervisorTurnDecisionStatus::ProposedToHuman)
+                        && (params.include_closed
+                            || params.status.is_some()
+                            || params.actionable_only
+                            || decision.status == SupervisorTurnDecisionStatus::ProposedToHuman)
+                        && (params.include_superseded
+                            || params.status == Some(SupervisorTurnDecisionStatus::Superseded)
+                            || decision.status != SupervisorTurnDecisionStatus::Superseded)
+                })
+                .map(|decision| {
+                    sample_decision_summary(
+                        decision,
+                        assignment_summary_for_decision(&state.assignments, decision),
+                    )
+                })
+                .collect::<Vec<_>>();
+            decisions.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then_with(|| left.decision_id.cmp(&right.decision_id))
+            });
+            if let Some(limit) = params.limit {
+                decisions.truncate(limit);
+            }
+            Ok(ipc::SupervisorDecisionListResponse { decisions })
+        }
+
+        async fn supervisor_decision_get(
+            &self,
+            params: &ipc::SupervisorDecisionGetRequest,
+        ) -> Result<ipc::SupervisorDecisionGetResponse> {
+            let state = self.state.lock().expect("state");
+            let decision = state
+                .decisions
+                .get(&params.decision_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown supervisor decision `{}`", params.decision_id))?;
+            Ok(ipc::SupervisorDecisionGetResponse { decision })
+        }
+
+        async fn supervisor_decision_propose_steer(
+            &self,
+            params: &ipc::SupervisorDecisionProposeSteerRequest,
+        ) -> Result<ipc::SupervisorDecisionProposeSteerResponse> {
+            if let Some(error) = self.propose_error.lock().expect("propose error").clone() {
+                bail!("{error}");
+            }
+
+            let proposed_text = params
+                .proposed_text
+                .as_deref()
+                .ok_or_else(|| anyhow!("steer proposal requires non-empty proposed_text"))?;
+            let proposed_text =
+                SupervisorService::require_non_empty_text("steer text", proposed_text)?;
+
+            let mut state = self.state.lock().expect("state");
+            let assignment = state
+                .assignments
+                .iter()
+                .find(|assignment| assignment.assignment_id == params.assignment_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown assignment `{}`", params.assignment_id))?;
+            let decision_id = format!("std-{}", state.next_decision_id);
+            state.next_decision_id += 1;
+            let decision = sample_decision(
+                &decision_id,
+                &assignment.assignment_id,
+                &assignment.codex_thread_id,
+                Some("turn-active-1"),
+                SupervisorTurnDecisionKind::SteerActiveTurn,
+                SupervisorTurnDecisionStatus::ProposedToHuman,
+                Some(&proposed_text),
+            );
+            state
+                .decisions
+                .insert(decision.decision_id.clone(), decision.clone());
+            Ok(ipc::SupervisorDecisionProposeSteerResponse { decision })
+        }
+
+        async fn supervisor_decision_replace_pending_steer(
+            &self,
+            params: &ipc::SupervisorDecisionReplacePendingSteerRequest,
+        ) -> Result<ipc::SupervisorDecisionReplacePendingSteerResponse> {
+            let proposed_text =
+                SupervisorService::require_non_empty_text("steer text", &params.proposed_text)?;
+            let mut state = self.state.lock().expect("state");
+            let existing = state
+                .decisions
+                .get(&params.decision_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown supervisor decision `{}`", params.decision_id))?;
+            if existing.kind != SupervisorTurnDecisionKind::SteerActiveTurn {
+                bail!(
+                    "supervisor decision `{}` is not a steer decision",
+                    params.decision_id
+                );
+            }
+            if existing.status != SupervisorTurnDecisionStatus::ProposedToHuman {
+                bail!(
+                    "supervisor decision `{}` is no longer editable",
+                    params.decision_id
+                );
+            }
+
+            let replacement_id = format!("std-{}", state.next_decision_id);
+            state.next_decision_id += 1;
+            let existing_decision = state
+                .decisions
+                .get_mut(&params.decision_id)
+                .expect("existing decision");
+            existing_decision.status = SupervisorTurnDecisionStatus::Superseded;
+            existing_decision.superseded_by = Some(replacement_id.clone());
+
+            let replacement = sample_decision(
+                &replacement_id,
+                &existing.assignment_id,
+                &existing.codex_thread_id,
+                existing.basis_turn_id.as_deref(),
+                SupervisorTurnDecisionKind::SteerActiveTurn,
+                SupervisorTurnDecisionStatus::ProposedToHuman,
+                Some(&proposed_text),
+            );
+            state
+                .decisions
+                .insert(replacement.decision_id.clone(), replacement.clone());
+            Ok(ipc::SupervisorDecisionReplacePendingSteerResponse {
+                decision: replacement,
+            })
+        }
+
+        async fn supervisor_decision_record_no_action(
+            &self,
+            params: &ipc::SupervisorDecisionRecordNoActionRequest,
+        ) -> Result<ipc::SupervisorDecisionRecordNoActionResponse> {
+            let mut state = self.state.lock().expect("state");
+            let existing = state
+                .decisions
+                .get(&params.decision_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown supervisor decision `{}`", params.decision_id))?;
+            if existing.kind != SupervisorTurnDecisionKind::NextTurn {
+                bail!(
+                    "supervisor decision `{}` is not a next-turn decision",
+                    params.decision_id
+                );
+            }
+            if existing.status != SupervisorTurnDecisionStatus::ProposedToHuman {
+                bail!(
+                    "supervisor decision `{}` is not pending human review",
+                    params.decision_id
+                );
+            }
+
+            let recorded_id = format!("std-{}", state.next_decision_id);
+            state.next_decision_id += 1;
+            let previous = state
+                .decisions
+                .get_mut(&params.decision_id)
+                .expect("existing decision");
+            previous.status = SupervisorTurnDecisionStatus::Superseded;
+            previous.superseded_by = Some(recorded_id.clone());
+
+            let recorded = sample_decision(
+                &recorded_id,
+                &existing.assignment_id,
+                &existing.codex_thread_id,
+                existing.basis_turn_id.as_deref(),
+                SupervisorTurnDecisionKind::NoAction,
+                SupervisorTurnDecisionStatus::Recorded,
+                None,
+            );
+            state
+                .decisions
+                .insert(recorded.decision_id.clone(), recorded.clone());
+            Ok(ipc::SupervisorDecisionRecordNoActionResponse { decision: recorded })
+        }
+
+        async fn supervisor_decision_manual_refresh(
+            &self,
+            params: &ipc::SupervisorDecisionManualRefreshRequest,
+        ) -> Result<ipc::SupervisorDecisionManualRefreshResponse> {
+            let mut state = self.state.lock().expect("state");
+            let assignment = state
+                .assignments
+                .iter()
+                .find(|assignment| assignment.assignment_id == params.assignment_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown assignment `{}`", params.assignment_id))?;
+            if assignment.status != CodexThreadAssignmentStatus::Active {
+                bail!(
+                    "Codex thread assignment `{}` is not active",
+                    assignment.assignment_id
+                );
+            }
+            if state.decisions.values().any(|decision| {
+                decision.assignment_id == assignment.assignment_id
+                    && decision.status == SupervisorTurnDecisionStatus::ProposedToHuman
+            }) {
+                bail!(
+                    "assignment `{}` already has open supervisor decision",
+                    assignment.assignment_id
+                );
+            }
+            let latest = state
+                .decisions
+                .values()
+                .filter(|decision| decision.assignment_id == assignment.assignment_id)
+                .max_by(|left, right| {
+                    left.created_at
+                        .cmp(&right.created_at)
+                        .then_with(|| left.decision_id.cmp(&right.decision_id))
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "assignment `{}` has no recorded no_action for the current basis",
+                        assignment.assignment_id
+                    )
+                })?;
+            if latest.kind != SupervisorTurnDecisionKind::NoAction
+                || latest.status != SupervisorTurnDecisionStatus::Recorded
+            {
+                bail!(
+                    "assignment `{}` has no recorded no_action for the current basis",
+                    assignment.assignment_id
+                );
+            }
+
+            let decision_id = format!("std-{}", state.next_decision_id);
+            state.next_decision_id += 1;
+            let decision = SupervisorTurnDecision {
+                decision_id,
+                assignment_id: assignment.assignment_id.clone(),
+                codex_thread_id: assignment.codex_thread_id.clone(),
+                basis_turn_id: latest.basis_turn_id.clone(),
+                kind: SupervisorTurnDecisionKind::NextTurn,
+                proposal_kind: SupervisorTurnProposalKind::ManualRefresh,
+                proposed_text: Some(
+                    "Continue under Orcas supervision for the assigned work unit.".to_string(),
+                ),
+                rationale_summary: "manual refresh requested from supervisor cli".to_string(),
+                status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                created_at: Utc::now(),
+                approved_at: None,
+                rejected_at: None,
+                sent_at: None,
+                superseded_by: None,
+                sent_turn_id: None,
+                notes: Some("from supervisor cli".to_string()),
+            };
+            state
+                .decisions
+                .insert(decision.decision_id.clone(), decision.clone());
+            Ok(ipc::SupervisorDecisionManualRefreshResponse { decision })
+        }
+
+        async fn supervisor_decision_approve_and_send(
+            &self,
+            params: &ipc::SupervisorDecisionApproveAndSendRequest,
+        ) -> Result<ipc::SupervisorDecisionApproveAndSendResponse> {
+            if let Some(error) = self.approve_error.lock().expect("approve error").clone() {
+                bail!("{error}");
+            }
+
+            let mut state = self.state.lock().expect("state");
+            let approved_text = state
+                .decisions
+                .get(&params.decision_id)
+                .ok_or_else(|| anyhow!("unknown supervisor decision `{}`", params.decision_id))?
+                .proposed_text
+                .clone();
+            let updated = {
+                let decision = state
+                    .decisions
+                    .get_mut(&params.decision_id)
+                    .ok_or_else(|| {
+                        anyhow!("unknown supervisor decision `{}`", params.decision_id)
+                    })?;
+                if decision.status != SupervisorTurnDecisionStatus::ProposedToHuman {
+                    bail!(
+                        "supervisor decision `{}` is not pending human review",
+                        params.decision_id
+                    );
+                }
+                decision.status = SupervisorTurnDecisionStatus::Sent;
+                decision.approved_at = Some(Utc::now());
+                decision.sent_at = Some(Utc::now());
+                decision.clone()
+            };
+            state.last_approved_text = approved_text;
+            Ok(ipc::SupervisorDecisionApproveAndSendResponse { decision: updated })
+        }
+
+        async fn supervisor_decision_reject(
+            &self,
+            params: &ipc::SupervisorDecisionRejectRequest,
+        ) -> Result<ipc::SupervisorDecisionRejectResponse> {
+            let mut state = self.state.lock().expect("state");
+            let decision = state
+                .decisions
+                .get_mut(&params.decision_id)
+                .ok_or_else(|| anyhow!("unknown supervisor decision `{}`", params.decision_id))?;
+            if decision.status != SupervisorTurnDecisionStatus::ProposedToHuman {
+                bail!(
+                    "supervisor decision `{}` is not pending human review",
+                    params.decision_id
+                );
+            }
+            decision.status = SupervisorTurnDecisionStatus::Rejected;
+            decision.rejected_at = Some(Utc::now());
+            Ok(ipc::SupervisorDecisionRejectResponse {
+                decision: decision.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_create_steer_with_authored_text() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_active_assignment(&backend, "assignment-1", "thread-1");
+
+        let decision = SupervisorService::codex_decision_propose_steer_with_backend(
+            &backend,
+            "thread-1",
+            "stay within the current bounded test slice",
+            None,
+            None,
+        )
+        .await
+        .expect("create steer decision");
+
+        assert_eq!(decision.assignment_id, "assignment-1");
+        assert_eq!(
+            decision.proposed_text.as_deref(),
+            Some("stay within the current bounded test slice")
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_create_steer_rejects_empty_text() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_active_assignment(&backend, "assignment-1", "thread-1");
+
+        let error = SupervisorService::codex_decision_propose_steer_with_backend(
+            &backend,
+            "thread-1",
+            "   \n\t  ",
+            None,
+            None,
+        )
+        .await
+        .expect_err("empty steer text must fail");
+
+        assert!(error.to_string().contains("steer text must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn cli_create_steer_rejects_unassigned_thread() {
+        let backend = FakeSupervisorCodexBackend::default();
+
+        let error = SupervisorService::codex_decision_propose_steer_with_backend(
+            &backend,
+            "thread-404",
+            "continue the active turn",
+            None,
+            None,
+        )
+        .await
+        .expect_err("unassigned thread must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no active Codex assignment for thread `thread-404`")
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_create_steer_rejects_idle_thread_backend_error() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_active_assignment(&backend, "assignment-1", "thread-1");
+        *backend.propose_error.lock().expect("propose error") =
+            Some("thread `thread-1` has no active turn".to_string());
+
+        let error = SupervisorService::codex_decision_propose_steer_with_backend(
+            &backend,
+            "thread-1",
+            "continue the active turn",
+            None,
+            None,
+        )
+        .await
+        .expect_err("idle thread must fail");
+
+        assert!(error.to_string().contains("no active turn"));
+    }
+
+    #[tokio::test]
+    async fn cli_replace_pending_steer_with_authored_text_supersedes_old_revision() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_active_assignment(&backend, "assignment-1", "thread-1");
+        let original = SupervisorService::codex_decision_propose_steer_with_backend(
+            &backend,
+            "thread-1",
+            "draft steer text",
+            None,
+            None,
+        )
+        .await
+        .expect("create steer decision");
+
+        let replacement = SupervisorService::codex_decision_replace_pending_steer_with_backend(
+            &backend,
+            &original.decision_id,
+            "replacement steer text",
+            None,
+            None,
+        )
+        .await
+        .expect("replace steer decision");
+
+        let state = backend.state.lock().expect("state");
+        let superseded = state
+            .decisions
+            .get(&original.decision_id)
+            .expect("superseded decision");
+        assert_eq!(superseded.status, SupervisorTurnDecisionStatus::Superseded);
+        assert_eq!(
+            superseded.superseded_by.as_deref(),
+            Some(replacement.decision_id.as_str())
+        );
+        assert_eq!(
+            replacement.proposed_text.as_deref(),
+            Some("replacement steer text")
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_replace_pending_steer_rejects_empty_text() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_active_assignment(&backend, "assignment-1", "thread-1");
+        let original = SupervisorService::codex_decision_propose_steer_with_backend(
+            &backend,
+            "thread-1",
+            "draft steer text",
+            None,
+            None,
+        )
+        .await
+        .expect("create steer decision");
+
+        let error = SupervisorService::codex_decision_replace_pending_steer_with_backend(
+            &backend,
+            &original.decision_id,
+            " \n ",
+            None,
+            None,
+        )
+        .await
+        .expect_err("empty replacement must fail");
+
+        assert!(error.to_string().contains("steer text must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn cli_cannot_replace_non_pending_steer_decisions() {
+        let backend = FakeSupervisorCodexBackend::default();
+        for status in [
+            SupervisorTurnDecisionStatus::Sent,
+            SupervisorTurnDecisionStatus::Rejected,
+            SupervisorTurnDecisionStatus::Stale,
+            SupervisorTurnDecisionStatus::Superseded,
+        ] {
+            let decision_id = format!("decision-{status:?}");
+            seed_decision(
+                &backend,
+                sample_decision(
+                    &decision_id,
+                    "assignment-1",
+                    "thread-1",
+                    Some("turn-active-1"),
+                    SupervisorTurnDecisionKind::SteerActiveTurn,
+                    status,
+                    Some("existing steer"),
+                ),
+            );
+
+            let error = SupervisorService::codex_decision_replace_pending_steer_with_backend(
+                &backend,
+                &decision_id,
+                "replacement steer text",
+                None,
+                None,
+            )
+            .await
+            .expect_err("non-pending steer must fail");
+
+            assert!(error.to_string().contains("no longer editable"));
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_approve_and_send_uses_current_pending_steer_text() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_active_assignment(&backend, "assignment-1", "thread-1");
+        let original = SupervisorService::codex_decision_propose_steer_with_backend(
+            &backend,
+            "thread-1",
+            "initial steer",
+            None,
+            None,
+        )
+        .await
+        .expect("create steer decision");
+        let replacement = SupervisorService::codex_decision_replace_pending_steer_with_backend(
+            &backend,
+            &original.decision_id,
+            "replacement steer",
+            None,
+            None,
+        )
+        .await
+        .expect("replace steer decision");
+
+        let response = backend
+            .supervisor_decision_approve_and_send(&ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: replacement.decision_id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect("approve replacement");
+
+        assert_eq!(response.decision.status, SupervisorTurnDecisionStatus::Sent);
+        let state = backend.state.lock().expect("state");
+        assert_eq!(
+            state.last_approved_text.as_deref(),
+            Some("replacement steer")
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_approve_and_send_reports_stale_basis_failures() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_active_assignment(&backend, "assignment-1", "thread-1");
+        let decision = SupervisorService::codex_decision_propose_steer_with_backend(
+            &backend,
+            "thread-1",
+            "keep working",
+            None,
+            None,
+        )
+        .await
+        .expect("create steer decision");
+        *backend.approve_error.lock().expect("approve error") =
+            Some("decision basis is stale: active turn changed".to_string());
+
+        let error = backend
+            .supervisor_decision_approve_and_send(&ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: decision.decision_id,
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("stale approval must fail");
+
+        assert!(error.to_string().contains("active turn changed"));
+    }
+
+    #[tokio::test]
+    async fn filtered_decision_listing_by_status_kind_thread_and_assignment() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_assignment_with_context(
+            &backend,
+            "assignment-1",
+            "thread-1",
+            "ws-1",
+            "wu-1",
+            "supervisor-a",
+            CodexThreadAssignmentStatus::Active,
+        );
+        seed_assignment_with_context(
+            &backend,
+            "assignment-2",
+            "thread-2",
+            "ws-2",
+            "wu-2",
+            "supervisor-b",
+            CodexThreadAssignmentStatus::Active,
+        );
+        seed_decision(
+            &backend,
+            SupervisorTurnDecision {
+                decision_id: "std-pending-next".to_string(),
+                assignment_id: "assignment-1".to_string(),
+                codex_thread_id: "thread-1".to_string(),
+                basis_turn_id: Some("turn-1".to_string()),
+                kind: SupervisorTurnDecisionKind::NextTurn,
+                proposal_kind: SupervisorTurnProposalKind::Bootstrap,
+                proposed_text: Some("summarize status".to_string()),
+                rationale_summary: "pending next turn".to_string(),
+                status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                created_at: Utc::now(),
+                approved_at: None,
+                rejected_at: None,
+                sent_at: None,
+                superseded_by: None,
+                sent_turn_id: None,
+                notes: None,
+            },
+        );
+        seed_decision(
+            &backend,
+            SupervisorTurnDecision {
+                decision_id: "std-recorded".to_string(),
+                assignment_id: "assignment-1".to_string(),
+                codex_thread_id: "thread-1".to_string(),
+                basis_turn_id: Some("turn-1".to_string()),
+                kind: SupervisorTurnDecisionKind::NoAction,
+                proposal_kind: SupervisorTurnProposalKind::Bootstrap,
+                proposed_text: None,
+                rationale_summary: "wait".to_string(),
+                status: SupervisorTurnDecisionStatus::Recorded,
+                created_at: Utc::now(),
+                approved_at: None,
+                rejected_at: None,
+                sent_at: None,
+                superseded_by: None,
+                sent_turn_id: None,
+                notes: None,
+            },
+        );
+        seed_decision(
+            &backend,
+            SupervisorTurnDecision {
+                decision_id: "std-steer".to_string(),
+                assignment_id: "assignment-2".to_string(),
+                codex_thread_id: "thread-2".to_string(),
+                basis_turn_id: Some("turn-2".to_string()),
+                kind: SupervisorTurnDecisionKind::SteerActiveTurn,
+                proposal_kind: SupervisorTurnProposalKind::OperatorSteer,
+                proposed_text: Some("focus logs".to_string()),
+                rationale_summary: "pending steer".to_string(),
+                status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                created_at: Utc::now(),
+                approved_at: None,
+                rejected_at: None,
+                sent_at: None,
+                superseded_by: None,
+                sent_turn_id: None,
+                notes: None,
+            },
+        );
+
+        let by_status = SupervisorService::codex_decision_list_with_backend(
+            &backend,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(SupervisorTurnDecisionStatus::Recorded),
+            None,
+            true,
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect("status filter");
+        assert_eq!(by_status.len(), 1);
+        assert_eq!(by_status[0].decision_id, "std-recorded");
+
+        let by_kind = SupervisorService::codex_decision_list_with_backend(
+            &backend,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(SupervisorTurnDecisionKind::SteerActiveTurn),
+            true,
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect("kind filter");
+        assert_eq!(by_kind.len(), 1);
+        assert_eq!(by_kind[0].decision_id, "std-steer");
+
+        let by_thread = SupervisorService::codex_decision_list_with_backend(
+            &backend,
+            Some("thread-1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect("thread filter");
+        assert_eq!(by_thread.len(), 2);
+        assert!(
+            by_thread
+                .iter()
+                .all(|decision| decision.codex_thread_id == "thread-1")
+        );
+
+        let by_assignment = SupervisorService::codex_decision_list_with_backend(
+            &backend,
+            None,
+            Some("assignment-2"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect("assignment filter");
+        assert_eq!(by_assignment.len(), 1);
+        assert_eq!(by_assignment[0].decision_id, "std-steer");
+    }
+
+    #[tokio::test]
+    async fn actionable_queue_excludes_non_pending_decisions_and_supports_workflow_filters() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_assignment_with_context(
+            &backend,
+            "assignment-1",
+            "thread-1",
+            "ws-1",
+            "wu-1",
+            "supervisor-a",
+            CodexThreadAssignmentStatus::Active,
+        );
+        seed_assignment_with_context(
+            &backend,
+            "assignment-2",
+            "thread-2",
+            "ws-2",
+            "wu-2",
+            "supervisor-b",
+            CodexThreadAssignmentStatus::Active,
+        );
+        seed_decision(
+            &backend,
+            sample_decision(
+                "std-pending",
+                "assignment-1",
+                "thread-1",
+                Some("turn-1"),
+                SupervisorTurnDecisionKind::NextTurn,
+                SupervisorTurnDecisionStatus::ProposedToHuman,
+                Some("continue"),
+            ),
+        );
+        seed_decision(
+            &backend,
+            SupervisorTurnDecision {
+                decision_id: "std-recorded".to_string(),
+                assignment_id: "assignment-1".to_string(),
+                codex_thread_id: "thread-1".to_string(),
+                basis_turn_id: Some("turn-1".to_string()),
+                kind: SupervisorTurnDecisionKind::NoAction,
+                proposal_kind: SupervisorTurnProposalKind::Bootstrap,
+                proposed_text: None,
+                rationale_summary: "wait".to_string(),
+                status: SupervisorTurnDecisionStatus::Recorded,
+                created_at: Utc::now(),
+                approved_at: None,
+                rejected_at: None,
+                sent_at: None,
+                superseded_by: None,
+                sent_turn_id: None,
+                notes: None,
+            },
+        );
+        seed_decision(
+            &backend,
+            sample_decision(
+                "std-other",
+                "assignment-2",
+                "thread-2",
+                Some("turn-2"),
+                SupervisorTurnDecisionKind::InterruptActiveTurn,
+                SupervisorTurnDecisionStatus::ProposedToHuman,
+                None,
+            ),
+        );
+
+        let queue = SupervisorService::codex_decision_list_with_backend(
+            &backend,
+            None,
+            None,
+            Some("ws-1"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            true,
+            None,
+        )
+        .await
+        .expect("actionable queue");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].decision_id, "std-pending");
+        assert_eq!(queue[0].workstream_id.as_deref(), Some("ws-1"));
+    }
+
+    #[tokio::test]
+    async fn history_view_includes_superseded_steer_revisions_and_no_action_entries() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_assignment_with_context(
+            &backend,
+            "assignment-1",
+            "thread-1",
+            "ws-1",
+            "wu-1",
+            "supervisor-a",
+            CodexThreadAssignmentStatus::Active,
+        );
+        seed_decision(
+            &backend,
+            SupervisorTurnDecision {
+                superseded_by: Some("std-2".to_string()),
+                ..sample_decision(
+                    "std-1",
+                    "assignment-1",
+                    "thread-1",
+                    Some("turn-1"),
+                    SupervisorTurnDecisionKind::SteerActiveTurn,
+                    SupervisorTurnDecisionStatus::Superseded,
+                    Some("first steer"),
+                )
+            },
+        );
+        seed_decision(
+            &backend,
+            sample_decision(
+                "std-2",
+                "assignment-1",
+                "thread-1",
+                Some("turn-1"),
+                SupervisorTurnDecisionKind::SteerActiveTurn,
+                SupervisorTurnDecisionStatus::ProposedToHuman,
+                Some("second steer"),
+            ),
+        );
+        seed_decision(
+            &backend,
+            SupervisorTurnDecision {
+                decision_id: "std-wait".to_string(),
+                assignment_id: "assignment-1".to_string(),
+                codex_thread_id: "thread-1".to_string(),
+                basis_turn_id: Some("turn-2".to_string()),
+                kind: SupervisorTurnDecisionKind::NoAction,
+                proposal_kind: SupervisorTurnProposalKind::ManualRefresh,
+                proposed_text: None,
+                rationale_summary: "wait on current basis".to_string(),
+                status: SupervisorTurnDecisionStatus::Recorded,
+                created_at: Utc::now(),
+                approved_at: None,
+                rejected_at: None,
+                sent_at: None,
+                superseded_by: None,
+                sent_turn_id: None,
+                notes: None,
+            },
+        );
+
+        let history = SupervisorService::codex_decision_list_with_backend(
+            &backend,
+            Some("thread-1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect("history");
+        let rendered = history
+            .iter()
+            .map(SupervisorService::format_supervisor_turn_decision_summary)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chains = SupervisorService::format_decision_revision_chains(&history).join("\n");
+
+        assert!(rendered.contains("std-1"));
+        assert!(rendered.contains("std-2"));
+        assert!(rendered.contains("std-wait"));
+        assert!(rendered.contains("superseded_by=std-2"));
+        assert!(chains.contains("std-1 -> std-2"));
+    }
+
+    #[tokio::test]
+    async fn queue_and_get_formatting_include_operator_useful_fields() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_assignment_with_context(
+            &backend,
+            "assignment-1",
+            "thread-1",
+            "ws-1",
+            "wu-1",
+            "supervisor-a",
+            CodexThreadAssignmentStatus::Active,
+        );
+        let decision = sample_decision(
+            "std-queue",
+            "assignment-1",
+            "thread-1",
+            Some("turn-1"),
+            SupervisorTurnDecisionKind::NextTurn,
+            SupervisorTurnDecisionStatus::ProposedToHuman,
+            Some("Continue with the next bounded step."),
+        );
+        seed_decision(&backend, decision.clone());
+        let listed = SupervisorService::codex_decision_list_with_backend(
+            &backend,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+            false,
+            Some(10),
+        )
+        .await
+        .expect("list");
+        let summary_line = SupervisorService::format_supervisor_turn_decision_summary(&listed[0]);
+        assert!(summary_line.contains("thread=thread-1"));
+        assert!(summary_line.contains("assignment=assignment-1"));
+        assert!(summary_line.contains("ws=ws-1"));
+        assert!(summary_line.contains("wu=wu-1"));
+        assert!(summary_line.contains("supervisor=supervisor-a"));
+        assert!(summary_line.contains("rationale="));
+        assert!(summary_line.contains("text=Continue with the next bounded step."));
+
+        let detail_lines =
+            SupervisorService::format_supervisor_turn_decision(&decision, listed.first(), &listed)
+                .join("\n");
+        assert!(detail_lines.contains("workstream_id: ws-1"));
+        assert!(detail_lines.contains("work_unit_id: wu-1"));
+        assert!(detail_lines.contains("supervisor_id: supervisor-a"));
+        assert!(detail_lines.contains("actionable: yes"));
+        assert!(detail_lines.contains("related_history:"));
+    }
+
+    #[tokio::test]
+    async fn approve_and_reject_continue_to_work_with_decisions_surfaced_from_queue() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_active_assignment(&backend, "assignment-1", "thread-1");
+        let pending = sample_decision(
+            "std-pending",
+            "assignment-1",
+            "thread-1",
+            Some("turn-1"),
+            SupervisorTurnDecisionKind::NextTurn,
+            SupervisorTurnDecisionStatus::ProposedToHuman,
+            Some("continue"),
+        );
+        seed_decision(&backend, pending.clone());
+
+        let queue = SupervisorService::codex_decision_list_with_backend(
+            &backend, None, None, None, None, None, None, None, false, false, true, None,
+        )
+        .await
+        .expect("queue");
+        let approved = SupervisorService::codex_decision_approve_and_send_with_backend(
+            &backend,
+            &queue[0].decision_id,
+            None,
+            None,
+        )
+        .await
+        .expect("approve");
+        assert_eq!(approved.status, SupervisorTurnDecisionStatus::Sent);
+
+        let replacement = sample_decision(
+            "std-pending-reject",
+            "assignment-1",
+            "thread-1",
+            Some("turn-2"),
+            SupervisorTurnDecisionKind::NextTurn,
+            SupervisorTurnDecisionStatus::ProposedToHuman,
+            Some("continue"),
+        );
+        seed_decision(&backend, replacement.clone());
+        let queue = SupervisorService::codex_decision_list_with_backend(
+            &backend, None, None, None, None, None, None, None, false, false, true, None,
+        )
+        .await
+        .expect("queue after replacement");
+        let rejected = SupervisorService::codex_decision_reject_with_backend(
+            &backend,
+            &queue[0].decision_id,
+            None,
+            None,
+        )
+        .await
+        .expect("reject");
+        assert_eq!(rejected.status, SupervisorTurnDecisionStatus::Rejected);
+    }
+
+    #[tokio::test]
+    async fn cli_record_no_action_from_pending_next_turn() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_active_assignment(&backend, "assignment-1", "thread-1");
+        seed_decision(
+            &backend,
+            SupervisorTurnDecision {
+                decision_id: "std-next".to_string(),
+                assignment_id: "assignment-1".to_string(),
+                codex_thread_id: "thread-1".to_string(),
+                basis_turn_id: Some("turn-1".to_string()),
+                kind: SupervisorTurnDecisionKind::NextTurn,
+                proposal_kind: SupervisorTurnProposalKind::Bootstrap,
+                proposed_text: Some("summarize status".to_string()),
+                rationale_summary: "pending next-turn review".to_string(),
+                status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                created_at: Utc::now(),
+                approved_at: None,
+                rejected_at: None,
+                sent_at: None,
+                superseded_by: None,
+                sent_turn_id: None,
+                notes: None,
+            },
+        );
+
+        let decision = SupervisorService::codex_decision_record_no_action_with_backend(
+            &backend,
+            "std-next",
+            None,
+            Some("wait for more context".to_string()),
+        )
+        .await
+        .expect("record no_action");
+
+        assert_eq!(decision.kind, SupervisorTurnDecisionKind::NoAction);
+        assert_eq!(decision.status, SupervisorTurnDecisionStatus::Recorded);
+
+        let state = backend.state.lock().expect("state");
+        let previous = state.decisions.get("std-next").expect("previous decision");
+        assert_eq!(previous.status, SupervisorTurnDecisionStatus::Superseded);
+        assert_eq!(
+            previous.superseded_by.as_deref(),
+            Some(decision.decision_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_manual_refresh_creates_pending_next_turn_from_recorded_no_action() {
+        let backend = FakeSupervisorCodexBackend::default();
+        seed_active_assignment(&backend, "assignment-1", "thread-1");
+        seed_decision(
+            &backend,
+            SupervisorTurnDecision {
+                decision_id: "std-wait".to_string(),
+                assignment_id: "assignment-1".to_string(),
+                codex_thread_id: "thread-1".to_string(),
+                basis_turn_id: Some("turn-1".to_string()),
+                kind: SupervisorTurnDecisionKind::NoAction,
+                proposal_kind: SupervisorTurnProposalKind::Bootstrap,
+                proposed_text: None,
+                rationale_summary: "wait on the current basis".to_string(),
+                status: SupervisorTurnDecisionStatus::Recorded,
+                created_at: Utc::now(),
+                approved_at: None,
+                rejected_at: None,
+                sent_at: None,
+                superseded_by: None,
+                sent_turn_id: None,
+                notes: Some("operator chose not to send".to_string()),
+            },
+        );
+
+        let decision = SupervisorService::codex_decision_manual_refresh_with_backend(
+            &backend,
+            Some("thread-1"),
+            None,
+            None,
+            Some("check again now".to_string()),
+        )
+        .await
+        .expect("manual refresh");
+
+        assert_eq!(decision.kind, SupervisorTurnDecisionKind::NextTurn);
+        assert_eq!(
+            decision.proposal_kind,
+            SupervisorTurnProposalKind::ManualRefresh
+        );
+        assert_eq!(
+            decision.status,
+            SupervisorTurnDecisionStatus::ProposedToHuman
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_manual_refresh_rejects_missing_target_selection() {
+        let backend = FakeSupervisorCodexBackend::default();
+
+        let error = SupervisorService::codex_decision_manual_refresh_with_backend(
+            &backend, None, None, None, None,
+        )
+        .await
+        .expect_err("manual refresh requires thread or assignment");
+
+        assert!(
+            error
+                .to_string()
+                .contains("manual refresh requires --thread or --assignment")
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_output_surfaces_no_action_and_manual_refresh_details() {
+        let lines = SupervisorService::format_supervisor_turn_decision(
+            &SupervisorTurnDecision {
+                decision_id: "std-wait".to_string(),
+                assignment_id: "assignment-1".to_string(),
+                codex_thread_id: "thread-1".to_string(),
+                basis_turn_id: Some("turn-1".to_string()),
+                kind: SupervisorTurnDecisionKind::NoAction,
+                proposal_kind: SupervisorTurnProposalKind::ManualRefresh,
+                proposed_text: None,
+                rationale_summary: "operator deliberately chose to wait".to_string(),
+                status: SupervisorTurnDecisionStatus::Recorded,
+                created_at: Utc::now(),
+                approved_at: None,
+                rejected_at: None,
+                sent_at: None,
+                superseded_by: None,
+                sent_turn_id: None,
+                notes: Some("waiting on current basis".to_string()),
+            },
+            None,
+            &[],
+        );
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("kind: NoAction"));
+        assert!(rendered.contains("proposal_kind: ManualRefresh"));
+        assert!(rendered.contains("status: Recorded"));
+        assert!(rendered.contains("basis_turn_id: turn-1"));
+        assert!(rendered.contains("notes: waiting on current basis"));
+    }
+
+    #[test]
+    fn cli_output_surfaces_steer_decision_details() {
+        let decision = sample_decision(
+            "std-9",
+            "assignment-1",
+            "thread-1",
+            Some("turn-active-1"),
+            SupervisorTurnDecisionKind::SteerActiveTurn,
+            SupervisorTurnDecisionStatus::ProposedToHuman,
+            Some("first line\nsecond line"),
+        );
+
+        let lines = SupervisorService::format_supervisor_turn_decision(&decision, None, &[]);
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("decision_id: std-9"));
+        assert!(rendered.contains("thread_id: thread-1"));
+        assert!(rendered.contains("kind: SteerActiveTurn"));
+        assert!(rendered.contains("status: ProposedToHuman"));
+        assert!(rendered.contains("basis_turn_id: turn-active-1"));
+        assert!(rendered.contains("rationale_summary: operator supplied steer guidance"));
+        assert!(rendered.contains("proposed_text:"));
+        assert!(rendered.contains("  first line"));
+        assert!(rendered.contains("  second line"));
+    }
+
+    #[test]
+    fn cli_decision_list_summary_surfaces_supersession_chain() {
+        let summary = sample_decision_summary(
+            &SupervisorTurnDecision {
+                superseded_by: Some("std-2".to_string()),
+                ..sample_decision(
+                    "std-1",
+                    "assignment-1",
+                    "thread-1",
+                    Some("turn-active-1"),
+                    SupervisorTurnDecisionKind::SteerActiveTurn,
+                    SupervisorTurnDecisionStatus::Superseded,
+                    Some("first line\nsecond line"),
+                )
+            },
+            None,
+        );
+
+        let rendered = SupervisorService::format_supervisor_turn_decision_summary(&summary);
+
+        assert!(rendered.contains("std-1"));
+        assert!(rendered.contains("Superseded"));
+        assert!(rendered.contains("superseded_by=std-2"));
+        assert!(rendered.contains("first line second line"));
+    }
+
+    fn seed_active_assignment(
+        backend: &FakeSupervisorCodexBackend,
+        assignment_id: &str,
+        thread_id: &str,
+    ) {
+        seed_assignment_with_context(
+            backend,
+            assignment_id,
+            thread_id,
+            "workstream-1",
+            "work-unit-1",
+            "supervisor-1",
+            CodexThreadAssignmentStatus::Active,
+        );
+    }
+
+    fn seed_assignment_with_context(
+        backend: &FakeSupervisorCodexBackend,
+        assignment_id: &str,
+        thread_id: &str,
+        workstream_id: &str,
+        work_unit_id: &str,
+        supervisor_id: &str,
+        status: CodexThreadAssignmentStatus,
+    ) {
+        backend
+            .state
+            .lock()
+            .expect("state")
+            .assignments
+            .push(ipc::CodexThreadAssignmentSummary {
+                assignment_id: assignment_id.to_string(),
+                codex_thread_id: thread_id.to_string(),
+                workstream_id: workstream_id.to_string(),
+                work_unit_id: work_unit_id.to_string(),
+                supervisor_id: supervisor_id.to_string(),
+                assigned_by: "tester".to_string(),
+                assigned_at: Utc::now(),
+                updated_at: Utc::now(),
+                status,
+                send_policy: CodexThreadSendPolicy::HumanApprovalRequired,
+                bootstrap_state: CodexThreadBootstrapState::Sent,
+                latest_basis_turn_id: Some("turn-active-1".to_string()),
+                latest_decision_id: None,
+                notes: None,
+                active: status == CodexThreadAssignmentStatus::Active,
+            });
+    }
+
+    fn seed_decision(backend: &FakeSupervisorCodexBackend, decision: SupervisorTurnDecision) {
+        backend
+            .state
+            .lock()
+            .expect("state")
+            .decisions
+            .insert(decision.decision_id.clone(), decision);
+    }
+
+    fn sample_decision(
+        decision_id: &str,
+        assignment_id: &str,
+        codex_thread_id: &str,
+        basis_turn_id: Option<&str>,
+        kind: SupervisorTurnDecisionKind,
+        status: SupervisorTurnDecisionStatus,
+        proposed_text: Option<&str>,
+    ) -> SupervisorTurnDecision {
+        SupervisorTurnDecision {
+            decision_id: decision_id.to_string(),
+            assignment_id: assignment_id.to_string(),
+            codex_thread_id: codex_thread_id.to_string(),
+            basis_turn_id: basis_turn_id.map(ToOwned::to_owned),
+            kind,
+            proposal_kind: SupervisorTurnProposalKind::OperatorSteer,
+            proposed_text: proposed_text.map(ToOwned::to_owned),
+            rationale_summary: "operator supplied steer guidance".to_string(),
+            status,
+            created_at: Utc::now(),
+            approved_at: None,
+            rejected_at: None,
+            sent_at: None,
+            superseded_by: None,
+            sent_turn_id: None,
+            notes: Some("from supervisor cli".to_string()),
+        }
+    }
+
+    fn assignment_summary_for_decision<'a>(
+        assignments: &'a [ipc::CodexThreadAssignmentSummary],
+        decision: &SupervisorTurnDecision,
+    ) -> Option<&'a ipc::CodexThreadAssignmentSummary> {
+        assignments
+            .iter()
+            .find(|assignment| assignment.assignment_id == decision.assignment_id)
+    }
+
+    fn sample_decision_summary(
+        decision: &SupervisorTurnDecision,
+        assignment: Option<&ipc::CodexThreadAssignmentSummary>,
+    ) -> ipc::SupervisorTurnDecisionSummary {
+        ipc::SupervisorTurnDecisionSummary {
+            decision_id: decision.decision_id.clone(),
+            assignment_id: decision.assignment_id.clone(),
+            codex_thread_id: decision.codex_thread_id.clone(),
+            workstream_id: assignment.map(|assignment| assignment.workstream_id.clone()),
+            work_unit_id: assignment.map(|assignment| assignment.work_unit_id.clone()),
+            supervisor_id: assignment.map(|assignment| assignment.supervisor_id.clone()),
+            basis_turn_id: decision.basis_turn_id.clone(),
+            kind: decision.kind,
+            proposal_kind: decision.proposal_kind,
+            proposed_text: decision.proposed_text.clone(),
+            rationale_summary: decision.rationale_summary.clone(),
+            status: decision.status,
+            created_at: decision.created_at,
+            approved_at: decision.approved_at,
+            rejected_at: decision.rejected_at,
+            sent_at: decision.sent_at,
+            superseded_by: decision.superseded_by.clone(),
+            sent_turn_id: decision.sent_turn_id.clone(),
+            notes: decision.notes.clone(),
+            open: decision.status == SupervisorTurnDecisionStatus::ProposedToHuman,
+        }
     }
 }

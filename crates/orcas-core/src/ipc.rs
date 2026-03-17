@@ -62,6 +62,8 @@ pub mod methods {
     pub const SUPERVISOR_DECISION_REPLACE_PENDING_STEER: &str =
         "supervisor_decision/replace_pending_steer";
     pub const SUPERVISOR_DECISION_PROPOSE_INTERRUPT: &str = "supervisor_decision/propose_interrupt";
+    pub const SUPERVISOR_DECISION_RECORD_NO_ACTION: &str = "supervisor_decision/record_no_action";
+    pub const SUPERVISOR_DECISION_MANUAL_REFRESH: &str = "supervisor_decision/manual_refresh";
     pub const SUPERVISOR_DECISION_APPROVE_AND_SEND: &str = "supervisor_decision/approve_and_send";
     pub const SUPERVISOR_DECISION_REJECT: &str = "supervisor_decision/reject";
     pub const REPORT_GET: &str = "report/get";
@@ -412,6 +414,12 @@ pub struct SupervisorTurnDecisionSummary {
     pub decision_id: String,
     pub assignment_id: String,
     pub codex_thread_id: String,
+    #[serde(default)]
+    pub workstream_id: Option<String>,
+    #[serde(default)]
+    pub work_unit_id: Option<String>,
+    #[serde(default)]
+    pub supervisor_id: Option<String>,
     pub basis_turn_id: Option<String>,
     pub kind: SupervisorTurnDecisionKind,
     pub proposal_kind: SupervisorTurnProposalKind,
@@ -1053,7 +1061,23 @@ pub struct SupervisorDecisionListRequest {
     #[serde(default)]
     pub codex_thread_id: Option<String>,
     #[serde(default)]
+    pub workstream_id: Option<String>,
+    #[serde(default)]
+    pub work_unit_id: Option<String>,
+    #[serde(default)]
+    pub supervisor_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<SupervisorTurnDecisionStatus>,
+    #[serde(default)]
+    pub kind: Option<SupervisorTurnDecisionKind>,
+    #[serde(default)]
     pub include_closed: bool,
+    #[serde(default)]
+    pub include_superseded: bool,
+    #[serde(default)]
+    pub actionable_only: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1110,6 +1134,34 @@ pub struct SupervisorDecisionProposeInterruptRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorDecisionProposeInterruptResponse {
+    pub decision: SupervisorTurnDecision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionRecordNoActionRequest {
+    pub decision_id: String,
+    #[serde(default)]
+    pub reviewed_by: Option<String>,
+    #[serde(default)]
+    pub review_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionRecordNoActionResponse {
+    pub decision: SupervisorTurnDecision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionManualRefreshRequest {
+    pub assignment_id: String,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    #[serde(default)]
+    pub rationale_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionManualRefreshResponse {
     pub decision: SupervisorTurnDecision,
 }
 

@@ -160,6 +160,8 @@ pub enum UserAction {
     SubmitSteerCompose,
     CancelSteerCompose,
     ProposeInterruptForSelectedThread,
+    RecordNoActionForSelectedThread,
+    ManualRefreshForSelectedThread,
     ApproveSelectedSupervisorDecision,
     RejectSelectedSupervisorDecision,
 }
@@ -335,6 +337,12 @@ pub enum Effect {
         proposed_text: String,
     },
     ProposeInterruptDecision {
+        assignment_id: String,
+    },
+    RecordNoActionDecision {
+        decision_id: String,
+    },
+    ManualRefreshDecision {
         assignment_id: String,
     },
     ApproveSupervisorDecision {
@@ -664,6 +672,44 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
                 ),
             });
             vec![Effect::ProposeInterruptDecision { assignment_id }]
+        }
+        UserAction::RecordNoActionForSelectedThread => {
+            let Some(decision_id) = selected_thread_record_no_action_decision_id(state) else {
+                state.banner = Some(StatusBanner {
+                    level: BannerLevel::Warning,
+                    message:
+                        "Selected thread has no pending next-turn proposal to record as no action."
+                            .to_string(),
+                });
+                return Vec::new();
+            };
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Info,
+                message: format!(
+                    "Recording no_action for supervisor proposal {}...",
+                    decision_id
+                ),
+            });
+            vec![Effect::RecordNoActionDecision { decision_id }]
+        }
+        UserAction::ManualRefreshForSelectedThread => {
+            let Some(assignment_id) = selected_thread_manual_refresh_assignment_id(state) else {
+                state.banner = Some(StatusBanner {
+                    level: BannerLevel::Warning,
+                    message:
+                        "Selected thread cannot manual-refresh a next-turn proposal right now."
+                            .to_string(),
+                });
+                return Vec::new();
+            };
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Info,
+                message: format!(
+                    "Regenerating next-turn proposal for assignment {}...",
+                    assignment_id
+                ),
+            });
+            vec![Effect::ManualRefreshDecision { assignment_id }]
         }
         UserAction::ApproveSelectedSupervisorDecision => {
             let Some(decision_id) = selected_thread_pending_supervisor_decision(state)
@@ -1751,6 +1797,79 @@ fn selected_thread_pending_steer_decision(
 ) -> Option<&ipc::SupervisorTurnDecisionSummary> {
     selected_thread_pending_supervisor_decision(state)
         .filter(|decision| decision.kind == orcas_core::SupervisorTurnDecisionKind::SteerActiveTurn)
+}
+
+fn selected_thread_record_no_action_decision_id(state: &AppState) -> Option<String> {
+    selected_thread_pending_supervisor_decision(state)
+        .filter(|decision| decision.kind == orcas_core::SupervisorTurnDecisionKind::NextTurn)
+        .map(|decision| decision.decision_id.clone())
+}
+
+fn selected_thread_manual_refresh_assignment_id(state: &AppState) -> Option<String> {
+    let thread_id = state.selected_thread_id.as_deref()?;
+    let assignment = state
+        .collaboration
+        .codex_thread_assignments
+        .iter()
+        .find(|assignment| {
+            assignment.codex_thread_id == thread_id
+                && assignment.status == orcas_core::CodexThreadAssignmentStatus::Active
+        })?;
+    let has_active_turn = state
+        .thread_details
+        .get(thread_id)
+        .map(|thread| thread.summary.active_turn_id.is_some())
+        .or_else(|| {
+            state
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .map(|thread| thread.active_turn_id.is_some())
+        })
+        .unwrap_or(false);
+    if has_active_turn {
+        return None;
+    }
+    if state
+        .collaboration
+        .supervisor_turn_decisions
+        .iter()
+        .any(|decision| decision.assignment_id == assignment.assignment_id && decision.open)
+    {
+        return None;
+    }
+    let basis_turn_id = state
+        .thread_details
+        .get(thread_id)
+        .map(|thread| thread.summary.last_seen_turn_id.clone())
+        .or_else(|| {
+            state
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .and_then(|thread| thread.last_seen_turn_id.clone())
+                .map(Some)
+        })
+        .unwrap_or(None);
+    let latest_basis_decision = state
+        .collaboration
+        .supervisor_turn_decisions
+        .iter()
+        .filter(|decision| {
+            decision.assignment_id == assignment.assignment_id
+                && decision.basis_turn_id == basis_turn_id
+        })
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.decision_id.cmp(&right.decision_id))
+        })?;
+    if latest_basis_decision.kind != orcas_core::SupervisorTurnDecisionKind::NoAction
+        || latest_basis_decision.status != orcas_core::SupervisorTurnDecisionStatus::Recorded
+    {
+        return None;
+    }
+    Some(assignment.assignment_id.clone())
 }
 
 fn selected_thread_interrupt_assignment_id(state: &AppState) -> Option<String> {

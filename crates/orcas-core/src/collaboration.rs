@@ -114,6 +114,7 @@ pub enum SupervisorTurnDecisionStatus {
     ProposedToHuman,
     Approved,
     Rejected,
+    Recorded,
     Sent,
     Superseded,
     Stale,

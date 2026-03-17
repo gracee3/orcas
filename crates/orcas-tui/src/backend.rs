@@ -44,6 +44,12 @@ pub enum BackendCommand {
     ProposeInterruptSupervisorDecision {
         assignment_id: String,
     },
+    RecordNoActionSupervisorDecision {
+        decision_id: String,
+    },
+    ManualRefreshSupervisorDecision {
+        assignment_id: String,
+    },
     ApproveSupervisorDecision {
         decision_id: String,
     },
@@ -269,6 +275,34 @@ impl OrcasDaemonBackend {
                     client
                         .supervisor_decision_propose_interrupt(
                             &ipc::SupervisorDecisionProposeInterruptRequest {
+                                assignment_id,
+                                requested_by: Some("tui_operator".to_string()),
+                                rationale_note: None,
+                            },
+                        )
+                        .await?
+                        .decision,
+                ))
+            }
+            BackendCommand::RecordNoActionSupervisorDecision { decision_id } => {
+                Ok(BackendCommandResult::SupervisorDecision(
+                    client
+                        .supervisor_decision_record_no_action(
+                            &ipc::SupervisorDecisionRecordNoActionRequest {
+                                decision_id,
+                                reviewed_by: Some("tui_operator".to_string()),
+                                review_note: None,
+                            },
+                        )
+                        .await?
+                        .decision,
+                ))
+            }
+            BackendCommand::ManualRefreshSupervisorDecision { assignment_id } => {
+                Ok(BackendCommandResult::SupervisorDecision(
+                    client
+                        .supervisor_decision_manual_refresh(
+                            &ipc::SupervisorDecisionManualRefreshRequest {
                                 assignment_id,
                                 requested_by: Some("tui_operator".to_string()),
                                 rationale_note: None,
@@ -669,6 +703,9 @@ impl TuiBackend for FakeBackend {
                     decision_id: format!("std-{}", guard.next_submit_id),
                     assignment_id: assignment_snapshot.assignment_id.clone(),
                     codex_thread_id: assignment_snapshot.codex_thread_id.clone(),
+                    workstream_id: Some(assignment_snapshot.workstream_id.clone()),
+                    work_unit_id: Some(assignment_snapshot.work_unit_id.clone()),
+                    supervisor_id: Some(assignment_snapshot.supervisor_id.clone()),
                     basis_turn_id: Some(active_turn_id.clone()),
                     kind: orcas_core::SupervisorTurnDecisionKind::SteerActiveTurn,
                     proposal_kind: orcas_core::SupervisorTurnProposalKind::OperatorSteer,
@@ -788,6 +825,9 @@ impl TuiBackend for FakeBackend {
                     decision_id: replacement_id.clone(),
                     assignment_id: existing.assignment_id.clone(),
                     codex_thread_id: existing.codex_thread_id.clone(),
+                    workstream_id: existing.workstream_id.clone(),
+                    work_unit_id: existing.work_unit_id.clone(),
+                    supervisor_id: existing.supervisor_id.clone(),
                     basis_turn_id: existing.basis_turn_id.clone(),
                     kind: orcas_core::SupervisorTurnDecisionKind::SteerActiveTurn,
                     proposal_kind: orcas_core::SupervisorTurnProposalKind::OperatorSteer,
@@ -885,6 +925,9 @@ impl TuiBackend for FakeBackend {
                     decision_id,
                     assignment_id: assignment_snapshot.assignment_id.clone(),
                     codex_thread_id: assignment_snapshot.codex_thread_id.clone(),
+                    workstream_id: Some(assignment_snapshot.workstream_id.clone()),
+                    work_unit_id: Some(assignment_snapshot.work_unit_id.clone()),
+                    supervisor_id: Some(assignment_snapshot.supervisor_id.clone()),
                     basis_turn_id: Some(active_turn_id.clone()),
                     kind: orcas_core::SupervisorTurnDecisionKind::InterruptActiveTurn,
                     proposal_kind: orcas_core::SupervisorTurnProposalKind::OperatorInterrupt,
@@ -911,6 +954,239 @@ impl TuiBackend for FakeBackend {
                 {
                     assignment.latest_decision_id = Some(decision.decision_id.clone());
                     assignment.latest_basis_turn_id = decision.basis_turn_id.clone();
+                    assignment.updated_at = now;
+                }
+                guard
+                    .snapshot
+                    .collaboration
+                    .supervisor_turn_decisions
+                    .push(decision.clone());
+                Ok(BackendCommandResult::SupervisorDecision(
+                    SupervisorTurnDecision {
+                        decision_id: decision.decision_id,
+                        assignment_id: decision.assignment_id,
+                        codex_thread_id: decision.codex_thread_id,
+                        basis_turn_id: decision.basis_turn_id,
+                        kind: decision.kind,
+                        proposal_kind: decision.proposal_kind,
+                        proposed_text: decision.proposed_text,
+                        rationale_summary: decision.rationale_summary,
+                        status: decision.status,
+                        created_at: decision.created_at,
+                        approved_at: decision.approved_at,
+                        rejected_at: decision.rejected_at,
+                        sent_at: decision.sent_at,
+                        superseded_by: decision.superseded_by,
+                        sent_turn_id: decision.sent_turn_id,
+                        notes: decision.notes,
+                    },
+                ))
+            }
+            BackendCommand::RecordNoActionSupervisorDecision { decision_id } => {
+                let decision_index = guard
+                    .snapshot
+                    .collaboration
+                    .supervisor_turn_decisions
+                    .iter()
+                    .position(|decision| decision.decision_id == decision_id)
+                    .ok_or_else(|| anyhow!("unknown supervisor decision `{decision_id}`"))?;
+                let existing =
+                    guard.snapshot.collaboration.supervisor_turn_decisions[decision_index].clone();
+                if existing.kind != orcas_core::SupervisorTurnDecisionKind::NextTurn {
+                    return Err(anyhow!(
+                        "supervisor decision `{decision_id}` is not a next-turn decision"
+                    ));
+                }
+                if existing.status != orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman {
+                    return Err(anyhow!(
+                        "supervisor decision `{decision_id}` is not pending human review"
+                    ));
+                }
+                let now = chrono::Utc::now();
+                let replacement_id = format!("std-{}", guard.next_submit_id);
+                guard.next_submit_id += 1;
+                let previous = guard
+                    .snapshot
+                    .collaboration
+                    .supervisor_turn_decisions
+                    .get_mut(decision_index)
+                    .expect("existing decision");
+                previous.status = orcas_core::SupervisorTurnDecisionStatus::Superseded;
+                previous.open = false;
+                previous.superseded_by = Some(replacement_id.clone());
+                let recorded = ipc::SupervisorTurnDecisionSummary {
+                    decision_id: replacement_id.clone(),
+                    assignment_id: existing.assignment_id.clone(),
+                    codex_thread_id: existing.codex_thread_id.clone(),
+                    workstream_id: existing.workstream_id.clone(),
+                    work_unit_id: existing.work_unit_id.clone(),
+                    supervisor_id: existing.supervisor_id.clone(),
+                    basis_turn_id: existing.basis_turn_id.clone(),
+                    kind: orcas_core::SupervisorTurnDecisionKind::NoAction,
+                    proposal_kind: existing.proposal_kind,
+                    proposed_text: None,
+                    rationale_summary: "Operator chose to wait on the current idle-thread basis."
+                        .to_string(),
+                    status: orcas_core::SupervisorTurnDecisionStatus::Recorded,
+                    created_at: now,
+                    approved_at: None,
+                    rejected_at: None,
+                    sent_at: None,
+                    superseded_by: None,
+                    sent_turn_id: None,
+                    notes: Some("no_action recorded by tui_operator".to_string()),
+                    open: false,
+                };
+                if let Some(assignment) = guard
+                    .snapshot
+                    .collaboration
+                    .codex_thread_assignments
+                    .iter_mut()
+                    .find(|assignment| assignment.assignment_id == existing.assignment_id)
+                {
+                    assignment.latest_decision_id = Some(replacement_id);
+                    assignment.latest_basis_turn_id = existing.basis_turn_id.clone();
+                    assignment.updated_at = now;
+                    if existing.proposal_kind == orcas_core::SupervisorTurnProposalKind::Bootstrap {
+                        assignment.bootstrap_state =
+                            orcas_core::CodexThreadBootstrapState::NotNeeded;
+                    }
+                }
+                guard
+                    .snapshot
+                    .collaboration
+                    .supervisor_turn_decisions
+                    .push(recorded.clone());
+                Ok(BackendCommandResult::SupervisorDecision(
+                    SupervisorTurnDecision {
+                        decision_id: recorded.decision_id,
+                        assignment_id: recorded.assignment_id,
+                        codex_thread_id: recorded.codex_thread_id,
+                        basis_turn_id: recorded.basis_turn_id,
+                        kind: recorded.kind,
+                        proposal_kind: recorded.proposal_kind,
+                        proposed_text: recorded.proposed_text,
+                        rationale_summary: recorded.rationale_summary,
+                        status: recorded.status,
+                        created_at: recorded.created_at,
+                        approved_at: recorded.approved_at,
+                        rejected_at: recorded.rejected_at,
+                        sent_at: recorded.sent_at,
+                        superseded_by: recorded.superseded_by,
+                        sent_turn_id: recorded.sent_turn_id,
+                        notes: recorded.notes,
+                    },
+                ))
+            }
+            BackendCommand::ManualRefreshSupervisorDecision { assignment_id } => {
+                let assignment_index = guard
+                    .snapshot
+                    .collaboration
+                    .codex_thread_assignments
+                    .iter()
+                    .position(|assignment| assignment.assignment_id == assignment_id)
+                    .ok_or_else(|| anyhow!("unknown Codex assignment `{assignment_id}`"))?;
+                let assignment_snapshot =
+                    guard.snapshot.collaboration.codex_thread_assignments[assignment_index].clone();
+                if assignment_snapshot.status != orcas_core::CodexThreadAssignmentStatus::Active {
+                    return Err(anyhow!(
+                        "Codex thread assignment `{assignment_id}` is not active"
+                    ));
+                }
+                if guard
+                    .snapshot
+                    .threads
+                    .iter()
+                    .find(|thread| thread.id == assignment_snapshot.codex_thread_id)
+                    .and_then(|thread| thread.active_turn_id.as_ref())
+                    .is_some()
+                {
+                    return Err(anyhow!(
+                        "thread `{}` has an active turn and cannot manual-refresh a next-turn proposal",
+                        assignment_snapshot.codex_thread_id
+                    ));
+                }
+                if guard
+                    .snapshot
+                    .collaboration
+                    .supervisor_turn_decisions
+                    .iter()
+                    .any(|decision| decision.assignment_id == assignment_id && decision.open)
+                {
+                    return Err(anyhow!(
+                        "assignment `{assignment_id}` already has an open supervisor decision"
+                    ));
+                }
+                let basis_turn_id = guard
+                    .snapshot
+                    .threads
+                    .iter()
+                    .find(|thread| thread.id == assignment_snapshot.codex_thread_id)
+                    .and_then(|thread| thread.last_seen_turn_id.clone());
+                let latest_basis_decision = guard
+                    .snapshot
+                    .collaboration
+                    .supervisor_turn_decisions
+                    .iter()
+                    .filter(|decision| {
+                        decision.assignment_id == assignment_id
+                            && decision.basis_turn_id == basis_turn_id
+                    })
+                    .max_by(|left, right| {
+                        left.created_at
+                            .cmp(&right.created_at)
+                            .then_with(|| left.decision_id.cmp(&right.decision_id))
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "assignment `{assignment_id}` has no recorded no_action for the current basis"
+                        )
+                    })?;
+                if latest_basis_decision.kind != orcas_core::SupervisorTurnDecisionKind::NoAction
+                    || latest_basis_decision.status
+                        != orcas_core::SupervisorTurnDecisionStatus::Recorded
+                {
+                    return Err(anyhow!(
+                        "assignment `{assignment_id}` has no recorded no_action for the current basis"
+                    ));
+                }
+                let now = chrono::Utc::now();
+                let decision_id = format!("std-{}", guard.next_submit_id);
+                guard.next_submit_id += 1;
+                let decision = ipc::SupervisorTurnDecisionSummary {
+                    decision_id,
+                    assignment_id: assignment_snapshot.assignment_id.clone(),
+                    codex_thread_id: assignment_snapshot.codex_thread_id.clone(),
+                    workstream_id: Some(assignment_snapshot.workstream_id.clone()),
+                    work_unit_id: Some(assignment_snapshot.work_unit_id.clone()),
+                    supervisor_id: Some(assignment_snapshot.supervisor_id.clone()),
+                    basis_turn_id: basis_turn_id.clone(),
+                    kind: orcas_core::SupervisorTurnDecisionKind::NextTurn,
+                    proposal_kind: orcas_core::SupervisorTurnProposalKind::ManualRefresh,
+                    proposed_text: Some(
+                        "Continue under Orcas supervision for the assigned work unit.".to_string(),
+                    ),
+                    rationale_summary:
+                        "Operator requested manual refresh of the next-turn proposal.".to_string(),
+                    status: orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman,
+                    created_at: now,
+                    approved_at: None,
+                    rejected_at: None,
+                    sent_at: None,
+                    superseded_by: None,
+                    sent_turn_id: None,
+                    notes: Some("manual refresh requested by tui_operator".to_string()),
+                    open: true,
+                };
+                if let Some(assignment) = guard
+                    .snapshot
+                    .collaboration
+                    .codex_thread_assignments
+                    .get_mut(assignment_index)
+                {
+                    assignment.latest_decision_id = Some(decision.decision_id.clone());
+                    assignment.latest_basis_turn_id = basis_turn_id;
                     assignment.updated_at = now;
                 }
                 guard

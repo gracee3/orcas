@@ -231,6 +231,22 @@ impl OrcasIpcClient {
             .await
     }
 
+    pub async fn supervisor_decision_record_no_action(
+        &self,
+        params: &ipc::SupervisorDecisionRecordNoActionRequest,
+    ) -> OrcasResult<ipc::SupervisorDecisionRecordNoActionResponse> {
+        self.request(ipc::methods::SUPERVISOR_DECISION_RECORD_NO_ACTION, params)
+            .await
+    }
+
+    pub async fn supervisor_decision_manual_refresh(
+        &self,
+        params: &ipc::SupervisorDecisionManualRefreshRequest,
+    ) -> OrcasResult<ipc::SupervisorDecisionManualRefreshResponse> {
+        self.request(ipc::methods::SUPERVISOR_DECISION_MANUAL_REFRESH, params)
+            .await
+    }
+
     pub async fn supervisor_decision_propose_steer(
         &self,
         params: &ipc::SupervisorDecisionProposeSteerRequest,

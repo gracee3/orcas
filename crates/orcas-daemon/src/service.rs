@@ -618,6 +618,16 @@ impl OrcasDaemonService {
                     Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.supervisor_decision_propose_interrupt(params).await?)?
             }
+            ipc::methods::SUPERVISOR_DECISION_RECORD_NO_ACTION => {
+                let params: ipc::SupervisorDecisionRecordNoActionRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.supervisor_decision_record_no_action(params).await?)?
+            }
+            ipc::methods::SUPERVISOR_DECISION_MANUAL_REFRESH => {
+                let params: ipc::SupervisorDecisionManualRefreshRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.supervisor_decision_manual_refresh(params).await?)?
+            }
             ipc::methods::SUPERVISOR_DECISION_APPROVE_AND_SEND => {
                 let params: ipc::SupervisorDecisionApproveAndSendRequest =
                     Self::decode_params(request.params.clone())?;
@@ -2320,6 +2330,10 @@ impl OrcasDaemonService {
             .supervisor_turn_decisions
             .values()
             .filter(|decision| {
+                let assignment = state
+                    .collaboration
+                    .codex_thread_assignments
+                    .get(&decision.assignment_id);
                 params
                     .assignment_id
                     .as_ref()
@@ -2330,9 +2344,52 @@ impl OrcasDaemonService {
                         .as_ref()
                         .map(|thread_id| &decision.codex_thread_id == thread_id)
                         .unwrap_or(true)
-                    && (params.include_closed || Self::supervisor_decision_is_open(decision.status))
+                    && params
+                        .workstream_id
+                        .as_ref()
+                        .map(|workstream_id| {
+                            assignment
+                                .map(|assignment| &assignment.workstream_id == workstream_id)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(true)
+                    && params
+                        .work_unit_id
+                        .as_ref()
+                        .map(|work_unit_id| {
+                            assignment
+                                .map(|assignment| &assignment.work_unit_id == work_unit_id)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(true)
+                    && params
+                        .supervisor_id
+                        .as_ref()
+                        .map(|supervisor_id| {
+                            assignment
+                                .map(|assignment| &assignment.supervisor_id == supervisor_id)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(true)
+                    && params
+                        .status
+                        .map(|status| decision.status == status)
+                        .unwrap_or(true)
+                    && params
+                        .kind
+                        .map(|kind| decision.kind == kind)
+                        .unwrap_or(true)
+                    && (!params.actionable_only
+                        || decision.status == SupervisorTurnDecisionStatus::ProposedToHuman)
+                    && (params.include_closed
+                        || params.status.is_some()
+                        || params.actionable_only
+                        || Self::supervisor_decision_is_open(decision.status))
+                    && (params.include_superseded
+                        || params.status == Some(SupervisorTurnDecisionStatus::Superseded)
+                        || decision.status != SupervisorTurnDecisionStatus::Superseded)
             })
-            .map(Self::supervisor_turn_decision_summary)
+            .map(|decision| Self::supervisor_turn_decision_summary(&state.collaboration, decision))
             .collect::<Vec<_>>();
         decisions.sort_by(|left, right| {
             right
@@ -2340,6 +2397,9 @@ impl OrcasDaemonService {
                 .cmp(&left.created_at)
                 .then_with(|| left.decision_id.cmp(&right.decision_id))
         });
+        if let Some(limit) = params.limit {
+            decisions.truncate(limit);
+        }
         Ok(ipc::SupervisorDecisionListResponse { decisions })
     }
 
@@ -2853,6 +2913,380 @@ impl OrcasDaemonService {
         )
         .await;
         Ok(ipc::SupervisorDecisionProposeInterruptResponse { decision })
+    }
+
+    async fn supervisor_decision_record_no_action(
+        &self,
+        params: ipc::SupervisorDecisionRecordNoActionRequest,
+    ) -> OrcasResult<ipc::SupervisorDecisionRecordNoActionResponse> {
+        enum RecordNoActionOutcome {
+            Recorded {
+                superseded: SupervisorTurnDecision,
+                recorded: SupervisorTurnDecision,
+                updated_assignment: Option<CodexThreadAssignment>,
+            },
+            Stale {
+                decision: SupervisorTurnDecision,
+                updated_assignment: Option<CodexThreadAssignment>,
+                reason: String,
+            },
+        }
+
+        let outcome = {
+            let now = Utc::now();
+            let reviewed_by = params
+                .reviewed_by
+                .clone()
+                .unwrap_or_else(|| "orcas_operator".to_string());
+            let mut state = self.state.write().await;
+            let existing = state
+                .collaboration
+                .supervisor_turn_decisions
+                .get(&params.decision_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "unknown supervisor decision `{}`",
+                        params.decision_id
+                    ))
+                })?;
+            if existing.kind != SupervisorTurnDecisionKind::NextTurn {
+                return Err(OrcasError::Protocol(format!(
+                    "supervisor decision `{}` is not a next-turn decision",
+                    existing.decision_id
+                )));
+            }
+            if existing.status != SupervisorTurnDecisionStatus::ProposedToHuman {
+                return Err(OrcasError::Protocol(format!(
+                    "supervisor decision `{}` is not pending human review",
+                    existing.decision_id
+                )));
+            }
+
+            let assignment = state
+                .collaboration
+                .codex_thread_assignments
+                .get(&existing.assignment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "assignment `{}` no longer exists",
+                        existing.assignment_id
+                    ))
+                })?;
+            let thread = state
+                .threads
+                .get(&existing.codex_thread_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "thread `{}` is not loaded in Orcas state",
+                        existing.codex_thread_id
+                    ))
+                })?;
+
+            if let Some(reason) =
+                Self::next_turn_decision_basis_reason(&assignment, &thread, &existing)
+            {
+                let stale = {
+                    let decision = state
+                        .collaboration
+                        .supervisor_turn_decisions
+                        .get_mut(&existing.decision_id)
+                        .expect("decision exists");
+                    decision.status = SupervisorTurnDecisionStatus::Stale;
+                    Self::merge_assignment_notes(
+                        &mut decision.notes,
+                        Some(format!(
+                            "record no_action rejected because the decision became stale: {reason}"
+                        )),
+                    );
+                    decision.clone()
+                };
+                let updated_assignment = if existing.proposal_kind
+                    == SupervisorTurnProposalKind::Bootstrap
+                {
+                    state
+                        .collaboration
+                        .codex_thread_assignments
+                        .get_mut(&existing.assignment_id)
+                        .and_then(|assignment| {
+                            if assignment.bootstrap_state == CodexThreadBootstrapState::Proposed {
+                                assignment.bootstrap_state = CodexThreadBootstrapState::Pending;
+                                assignment.updated_at = now;
+                                Some(assignment.clone())
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    None
+                };
+                RecordNoActionOutcome::Stale {
+                    decision: stale,
+                    updated_assignment,
+                    reason,
+                }
+            } else {
+                let new_decision_id = Self::new_object_id("std");
+                let superseded = {
+                    let decision = state
+                        .collaboration
+                        .supervisor_turn_decisions
+                        .get_mut(&existing.decision_id)
+                        .expect("decision exists");
+                    decision.status = SupervisorTurnDecisionStatus::Superseded;
+                    decision.superseded_by = Some(new_decision_id.clone());
+                    Self::merge_assignment_notes(
+                        &mut decision.notes,
+                        Some(format!(
+                            "superseded by no_action recorded from {reviewed_by}"
+                        )),
+                    );
+                    decision.clone()
+                };
+                let rationale_summary = params
+                    .review_note
+                    .as_ref()
+                    .map(|note| note.trim())
+                    .filter(|note| !note.is_empty())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "Operator `{reviewed_by}` chose to wait on the current idle-thread basis for assignment `{}`.",
+                            existing.assignment_id
+                        )
+                    });
+                let recorded = SupervisorTurnDecision {
+                    decision_id: new_decision_id,
+                    assignment_id: existing.assignment_id.clone(),
+                    codex_thread_id: existing.codex_thread_id.clone(),
+                    basis_turn_id: existing.basis_turn_id.clone(),
+                    kind: SupervisorTurnDecisionKind::NoAction,
+                    proposal_kind: existing.proposal_kind,
+                    proposed_text: None,
+                    rationale_summary,
+                    status: SupervisorTurnDecisionStatus::Recorded,
+                    created_at: now,
+                    approved_at: None,
+                    rejected_at: None,
+                    sent_at: None,
+                    superseded_by: None,
+                    sent_turn_id: None,
+                    notes: Some(format!("no_action recorded by {reviewed_by}")),
+                };
+                state
+                    .collaboration
+                    .supervisor_turn_decisions
+                    .insert(recorded.decision_id.clone(), recorded.clone());
+                let updated_assignment = state
+                    .collaboration
+                    .codex_thread_assignments
+                    .get_mut(&existing.assignment_id)
+                    .map(|assignment| {
+                        assignment.latest_decision_id = Some(recorded.decision_id.clone());
+                        assignment.latest_basis_turn_id = recorded.basis_turn_id.clone();
+                        assignment.updated_at = now;
+                        if existing.proposal_kind == SupervisorTurnProposalKind::Bootstrap {
+                            assignment.bootstrap_state = CodexThreadBootstrapState::NotNeeded;
+                        }
+                        assignment.clone()
+                    });
+                RecordNoActionOutcome::Recorded {
+                    superseded,
+                    recorded,
+                    updated_assignment,
+                }
+            }
+        };
+
+        match outcome {
+            RecordNoActionOutcome::Recorded {
+                superseded,
+                recorded,
+                updated_assignment,
+            } => {
+                self.persist_collaboration_state().await?;
+                if let Some(assignment) = updated_assignment.as_ref() {
+                    self.emit_codex_assignment_lifecycle(
+                        ipc::CodexAssignmentLifecycleAction::Updated,
+                        assignment,
+                    )
+                    .await;
+                }
+                self.emit_supervisor_decision_lifecycle(
+                    ipc::SupervisorDecisionLifecycleAction::Superseded,
+                    &superseded,
+                )
+                .await;
+                self.emit_supervisor_decision_lifecycle(
+                    ipc::SupervisorDecisionLifecycleAction::Created,
+                    &recorded,
+                )
+                .await;
+                Ok(ipc::SupervisorDecisionRecordNoActionResponse { decision: recorded })
+            }
+            RecordNoActionOutcome::Stale {
+                decision,
+                updated_assignment,
+                reason,
+            } => {
+                self.persist_collaboration_state().await?;
+                if let Some(assignment) = updated_assignment.as_ref() {
+                    self.emit_codex_assignment_lifecycle(
+                        ipc::CodexAssignmentLifecycleAction::Updated,
+                        assignment,
+                    )
+                    .await;
+                }
+                self.emit_supervisor_decision_lifecycle(
+                    ipc::SupervisorDecisionLifecycleAction::Stale,
+                    &decision,
+                )
+                .await;
+                Err(OrcasError::Protocol(format!(
+                    "supervisor decision `{}` became stale and no_action was not recorded: {reason}",
+                    decision.decision_id
+                )))
+            }
+        }
+    }
+
+    async fn supervisor_decision_manual_refresh(
+        &self,
+        params: ipc::SupervisorDecisionManualRefreshRequest,
+    ) -> OrcasResult<ipc::SupervisorDecisionManualRefreshResponse> {
+        let (decision, updated_assignment) = {
+            let now = Utc::now();
+            let requested_by = params
+                .requested_by
+                .clone()
+                .unwrap_or_else(|| "orcas_operator".to_string());
+            let mut state = self.state.write().await;
+            let assignment = state
+                .collaboration
+                .codex_thread_assignments
+                .get(&params.assignment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "unknown Codex thread assignment `{}`",
+                        params.assignment_id
+                    ))
+                })?;
+            if !Self::codex_assignment_supports_decisions(assignment.status) {
+                return Err(OrcasError::Protocol(format!(
+                    "Codex thread assignment `{}` is not active",
+                    assignment.assignment_id
+                )));
+            }
+            if let Some(conflict_id) = Self::open_supervisor_decision_id_for_assignment(
+                &state.collaboration,
+                &assignment.assignment_id,
+            ) {
+                return Err(OrcasError::Protocol(format!(
+                    "assignment `{}` already has open supervisor decision `{}`",
+                    assignment.assignment_id, conflict_id
+                )));
+            }
+            let thread = state
+                .threads
+                .get(&assignment.codex_thread_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "thread `{}` is not loaded in Orcas state",
+                        assignment.codex_thread_id
+                    ))
+                })?;
+            if thread.summary.active_turn_id.is_some() {
+                return Err(OrcasError::Protocol(format!(
+                    "thread `{}` has an active turn and cannot manual-refresh a next-turn proposal",
+                    thread.summary.id
+                )));
+            }
+            let basis_turn_id = thread.summary.last_seen_turn_id.clone();
+            if Self::latest_current_basis_recorded_no_action(
+                &state.collaboration,
+                &assignment.assignment_id,
+                basis_turn_id.as_deref(),
+            )
+            .is_none()
+            {
+                return Err(OrcasError::Protocol(format!(
+                    "assignment `{}` has no recorded no_action for the current basis",
+                    assignment.assignment_id
+                )));
+            }
+
+            let rationale_summary = params
+                .rationale_note
+                .as_ref()
+                .map(|note| note.trim())
+                .filter(|note| !note.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Operator `{requested_by}` requested a manual refresh of the next-turn proposal for assignment `{}` on the current idle-thread basis.",
+                        assignment.assignment_id
+                    )
+                });
+            let decision = SupervisorTurnDecision {
+                decision_id: Self::new_object_id("std"),
+                assignment_id: assignment.assignment_id.clone(),
+                codex_thread_id: assignment.codex_thread_id.clone(),
+                basis_turn_id: basis_turn_id.clone(),
+                kind: SupervisorTurnDecisionKind::NextTurn,
+                proposal_kind: SupervisorTurnProposalKind::ManualRefresh,
+                proposed_text: Some(Self::generate_continue_turn_text(
+                    &assignment,
+                    state
+                        .collaboration
+                        .workstreams
+                        .get(&assignment.workstream_id),
+                    state.collaboration.work_units.get(&assignment.work_unit_id),
+                    basis_turn_id.as_deref(),
+                )),
+                rationale_summary,
+                status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                created_at: now,
+                approved_at: None,
+                rejected_at: None,
+                sent_at: None,
+                superseded_by: None,
+                sent_turn_id: None,
+                notes: Some(format!("manual refresh requested by {requested_by}")),
+            };
+            state
+                .collaboration
+                .supervisor_turn_decisions
+                .insert(decision.decision_id.clone(), decision.clone());
+            let updated_assignment = state
+                .collaboration
+                .codex_thread_assignments
+                .get_mut(&assignment.assignment_id)
+                .map(|assignment| {
+                    assignment.latest_decision_id = Some(decision.decision_id.clone());
+                    assignment.latest_basis_turn_id = basis_turn_id;
+                    assignment.updated_at = now;
+                    assignment.clone()
+                });
+            (decision, updated_assignment)
+        };
+        self.persist_collaboration_state().await?;
+        if let Some(assignment) = updated_assignment.as_ref() {
+            self.emit_codex_assignment_lifecycle(
+                ipc::CodexAssignmentLifecycleAction::Updated,
+                assignment,
+            )
+            .await;
+        }
+        self.emit_supervisor_decision_lifecycle(
+            ipc::SupervisorDecisionLifecycleAction::Created,
+            &decision,
+        )
+        .await;
+        Ok(ipc::SupervisorDecisionManualRefreshResponse { decision })
     }
 
     async fn supervisor_decision_approve_and_send(
@@ -4817,11 +5251,12 @@ impl OrcasDaemonService {
         action: ipc::SupervisorDecisionLifecycleAction,
         decision: &SupervisorTurnDecision,
     ) {
-        self.emit(ipc::DaemonEvent::SupervisorDecisionLifecycle {
-            action,
-            decision: Self::supervisor_turn_decision_summary(decision),
-        })
-        .await;
+        let decision = {
+            let state = self.state.read().await;
+            Self::supervisor_turn_decision_summary(&state.collaboration, decision)
+        };
+        self.emit(ipc::DaemonEvent::SupervisorDecisionLifecycle { action, decision })
+            .await;
     }
 
     async fn emit_report_recorded(&self, report: &Report) {
@@ -4950,7 +5385,7 @@ impl OrcasDaemonService {
         let mut supervisor_turn_decisions = collaboration
             .supervisor_turn_decisions
             .values()
-            .map(Self::supervisor_turn_decision_summary)
+            .map(|decision| Self::supervisor_turn_decision_summary(collaboration, decision))
             .collect::<Vec<_>>();
         supervisor_turn_decisions.sort_by(|left, right| {
             right
@@ -5097,12 +5532,19 @@ impl OrcasDaemonService {
     }
 
     fn supervisor_turn_decision_summary(
+        collaboration: &CollaborationState,
         decision: &SupervisorTurnDecision,
     ) -> ipc::SupervisorTurnDecisionSummary {
+        let assignment = collaboration
+            .codex_thread_assignments
+            .get(&decision.assignment_id);
         ipc::SupervisorTurnDecisionSummary {
             decision_id: decision.decision_id.clone(),
             assignment_id: decision.assignment_id.clone(),
             codex_thread_id: decision.codex_thread_id.clone(),
+            workstream_id: assignment.map(|assignment| assignment.workstream_id.clone()),
+            work_unit_id: assignment.map(|assignment| assignment.work_unit_id.clone()),
+            supervisor_id: assignment.map(|assignment| assignment.supervisor_id.clone()),
             basis_turn_id: decision.basis_turn_id.clone(),
             kind: decision.kind,
             proposal_kind: decision.proposal_kind,
@@ -5261,10 +5703,20 @@ impl OrcasDaemonService {
                         "assignment `{}` is not active",
                         assignment.assignment_id
                     ))
-                } else if decision.status != SupervisorTurnDecisionStatus::ProposedToHuman {
+                } else if decision.status != SupervisorTurnDecisionStatus::Recorded {
                     Some(format!(
-                        "decision `{}` is no longer pending human review",
+                        "decision `{}` is not a recorded no_action decision",
                         decision.decision_id
+                    ))
+                } else if thread.summary.active_turn_id.is_some() {
+                    Some(format!(
+                        "thread `{}` has an active turn and is not idle",
+                        thread.summary.id
+                    ))
+                } else if thread.summary.last_seen_turn_id != decision.basis_turn_id {
+                    Some(format!(
+                        "thread basis changed from {:?} to {:?}",
+                        decision.basis_turn_id, thread.summary.last_seen_turn_id
                     ))
                 } else {
                     None
@@ -5312,6 +5764,37 @@ impl OrcasDaemonService {
                     .then_with(|| left.decision_id.cmp(&right.decision_id))
             })
             .map(|decision| decision.decision_id.clone())
+    }
+
+    fn latest_decision_for_assignment_basis<'a>(
+        collaboration: &'a CollaborationState,
+        assignment_id: &str,
+        basis_turn_id: Option<&str>,
+    ) -> Option<&'a SupervisorTurnDecision> {
+        collaboration
+            .supervisor_turn_decisions
+            .values()
+            .filter(|decision| {
+                decision.assignment_id == assignment_id
+                    && decision.basis_turn_id.as_deref() == basis_turn_id
+            })
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.decision_id.cmp(&right.decision_id))
+            })
+    }
+
+    fn latest_current_basis_recorded_no_action<'a>(
+        collaboration: &'a CollaborationState,
+        assignment_id: &str,
+        basis_turn_id: Option<&str>,
+    ) -> Option<&'a SupervisorTurnDecision> {
+        Self::latest_decision_for_assignment_basis(collaboration, assignment_id, basis_turn_id)
+            .filter(|decision| {
+                decision.kind == SupervisorTurnDecisionKind::NoAction
+                    && decision.status == SupervisorTurnDecisionStatus::Recorded
+            })
     }
 
     fn generate_bootstrap_turn_text(
@@ -5530,6 +6013,16 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     else {
                         continue;
                     };
+                    let basis_turn_id = thread.summary.last_seen_turn_id.clone();
+                    if Self::latest_current_basis_recorded_no_action(
+                        &state.collaboration,
+                        &assignment_snapshot.assignment_id,
+                        basis_turn_id.as_deref(),
+                    )
+                    .is_some()
+                    {
+                        continue;
+                    }
 
                     let proposal_kind = if assignment_snapshot.bootstrap_state
                         == CodexThreadBootstrapState::Pending
@@ -5538,7 +6031,6 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     } else {
                         SupervisorTurnProposalKind::ContinueAfterTurn
                     };
-                    let basis_turn_id = thread.summary.last_seen_turn_id.clone();
                     let proposed_text = Some(match proposal_kind {
                         SupervisorTurnProposalKind::Bootstrap => {
                             Self::generate_bootstrap_turn_text(
@@ -12092,6 +12584,7 @@ ORCAS_REPORT_END"#
                 assignment_id: Some(created.assignment_id.clone()),
                 codex_thread_id: None,
                 include_closed: true,
+                ..Default::default()
             })
             .await
             .expect("decision list");
@@ -12147,6 +12640,7 @@ ORCAS_REPORT_END"#
                 assignment_id: None,
                 codex_thread_id: Some(thread.summary.id.clone()),
                 include_closed: true,
+                ..Default::default()
             })
             .await
             .expect("decision list");
@@ -12177,6 +12671,7 @@ ORCAS_REPORT_END"#
                 assignment_id: Some(created.assignment_id.clone()),
                 codex_thread_id: None,
                 include_closed: true,
+                ..Default::default()
             })
             .await
             .expect("decision list");
@@ -12198,6 +12693,7 @@ ORCAS_REPORT_END"#
                 assignment_id: Some(created.assignment_id),
                 codex_thread_id: None,
                 include_closed: true,
+                ..Default::default()
             })
             .await
             .expect("decision list after idle");
@@ -12238,10 +12734,802 @@ ORCAS_REPORT_END"#
                 assignment_id: Some(created.assignment_id),
                 codex_thread_id: None,
                 include_closed: true,
+                ..Default::default()
             })
             .await
             .expect("decision list");
         assert_eq!(decisions.decisions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn record_no_action_succeeds_from_pending_next_turn_and_supersedes_it() {
+        let service = test_service().await;
+        let mut thread = sample_thread("thread-idle", "live_observed", 200);
+        thread.summary.last_seen_turn_id = Some("turn-1".to_string());
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let pending =
+            latest_supervisor_turn_decision_for_assignment(&service, &assignment.assignment_id)
+                .await;
+
+        let recorded = service
+            .supervisor_decision_record_no_action(ipc::SupervisorDecisionRecordNoActionRequest {
+                decision_id: pending.decision_id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("wait on the current basis".to_string()),
+            })
+            .await
+            .expect("record no_action")
+            .decision;
+
+        assert_eq!(recorded.kind, SupervisorTurnDecisionKind::NoAction);
+        assert_eq!(recorded.status, SupervisorTurnDecisionStatus::Recorded);
+        assert_eq!(recorded.basis_turn_id.as_deref(), Some("turn-1"));
+
+        let previous = service
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: pending.decision_id,
+            })
+            .await
+            .expect("previous decision get")
+            .decision;
+        assert_eq!(previous.status, SupervisorTurnDecisionStatus::Superseded);
+        assert_eq!(
+            previous.superseded_by.as_deref(),
+            Some(recorded.decision_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn record_no_action_rejects_non_next_turn_decisions() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let interrupt = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("interrupt proposal")
+            .decision;
+
+        let error = service
+            .supervisor_decision_record_no_action(ipc::SupervisorDecisionRecordNoActionRequest {
+                decision_id: interrupt.decision_id,
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("non-next-turn decision should fail");
+        assert!(error.to_string().contains("is not a next-turn decision"));
+    }
+
+    #[tokio::test]
+    async fn recording_no_action_against_bootstrap_sets_bootstrap_state_not_needed() {
+        let service = test_service().await;
+        let thread = sample_thread("thread-idle", "live_observed", 200);
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let pending =
+            latest_supervisor_turn_decision_for_assignment(&service, &assignment.assignment_id)
+                .await;
+        assert_eq!(pending.proposal_kind, SupervisorTurnProposalKind::Bootstrap);
+
+        service
+            .supervisor_decision_record_no_action(ipc::SupervisorDecisionRecordNoActionRequest {
+                decision_id: pending.decision_id,
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("bootstrap not needed".to_string()),
+            })
+            .await
+            .expect("record no_action");
+
+        let assignment = service
+            .codex_assignment_get(ipc::CodexAssignmentGetRequest {
+                assignment_id: assignment.assignment_id,
+            })
+            .await
+            .expect("assignment get")
+            .assignment;
+        assert_eq!(
+            assignment.bootstrap_state,
+            CodexThreadBootstrapState::NotNeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_no_action_suppresses_auto_generation_until_basis_changes() {
+        let service = test_service().await;
+        let mut thread = sample_thread("thread-idle", "live_observed", 200);
+        thread.summary.last_seen_turn_id = Some("turn-1".to_string());
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let pending =
+            latest_supervisor_turn_decision_for_assignment(&service, &assignment.assignment_id)
+                .await;
+        let recorded = service
+            .supervisor_decision_record_no_action(ipc::SupervisorDecisionRecordNoActionRequest {
+                decision_id: pending.decision_id,
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("wait".to_string()),
+            })
+            .await
+            .expect("record no_action")
+            .decision;
+
+        service
+            .refresh_codex_supervisor_state_for_thread(&thread.summary.id)
+            .await
+            .expect("refresh same basis");
+
+        let decisions = service
+            .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
+                assignment_id: Some(assignment.assignment_id.clone()),
+                codex_thread_id: None,
+                include_closed: true,
+                include_superseded: true,
+                ..Default::default()
+            })
+            .await
+            .expect("decision list");
+        assert_eq!(decisions.decisions.len(), 2);
+        assert_eq!(decisions.decisions[0].decision_id, recorded.decision_id);
+        assert_eq!(
+            decisions.decisions[0].status,
+            SupervisorTurnDecisionStatus::Recorded
+        );
+
+        {
+            let mut state = service.state.write().await;
+            let thread = state.threads.get_mut("thread-idle").expect("thread exists");
+            thread.summary.last_seen_turn_id = Some("turn-2".to_string());
+            thread.summary.updated_at += 1;
+        }
+
+        service
+            .refresh_codex_supervisor_state_for_thread("thread-idle")
+            .await
+            .expect("refresh after basis change");
+
+        let decisions = service
+            .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
+                assignment_id: Some(assignment.assignment_id),
+                codex_thread_id: None,
+                include_closed: true,
+                include_superseded: true,
+                ..Default::default()
+            })
+            .await
+            .expect("decision list after basis change");
+        assert_eq!(decisions.decisions.len(), 3);
+        assert_eq!(
+            decisions.decisions[0].kind,
+            SupervisorTurnDecisionKind::NextTurn
+        );
+        assert_eq!(
+            decisions.decisions[0].status,
+            SupervisorTurnDecisionStatus::ProposedToHuman
+        );
+        assert_eq!(
+            decisions.decisions[0].basis_turn_id.as_deref(),
+            Some("turn-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_refresh_creates_fresh_pending_next_turn_proposal() {
+        let service = test_service().await;
+        let mut thread = sample_thread("thread-idle", "live_observed", 200);
+        thread.summary.last_seen_turn_id = Some("turn-1".to_string());
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let pending =
+            latest_supervisor_turn_decision_for_assignment(&service, &assignment.assignment_id)
+                .await;
+        service
+            .supervisor_decision_record_no_action(ipc::SupervisorDecisionRecordNoActionRequest {
+                decision_id: pending.decision_id,
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("wait".to_string()),
+            })
+            .await
+            .expect("record no_action");
+
+        let refreshed = service
+            .supervisor_decision_manual_refresh(ipc::SupervisorDecisionManualRefreshRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: Some("try again now".to_string()),
+            })
+            .await
+            .expect("manual refresh")
+            .decision;
+        assert_eq!(refreshed.kind, SupervisorTurnDecisionKind::NextTurn);
+        assert_eq!(
+            refreshed.proposal_kind,
+            SupervisorTurnProposalKind::ManualRefresh
+        );
+        assert_eq!(
+            refreshed.status,
+            SupervisorTurnDecisionStatus::ProposedToHuman
+        );
+        assert_eq!(refreshed.basis_turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[tokio::test]
+    async fn manual_refresh_rejects_when_thread_is_active_assignment_inactive_open_or_missing_wait()
+    {
+        let service = test_service().await;
+        let mut idle_thread = sample_thread("thread-idle", "live_observed", 200);
+        idle_thread.summary.last_seen_turn_id = Some("turn-1".to_string());
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, idle_thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: idle_thread.summary.id.clone(),
+                workstream_id: workstream.id.clone(),
+                work_unit_id: work_unit.id.clone(),
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let pending =
+            latest_supervisor_turn_decision_for_assignment(&service, &assignment.assignment_id)
+                .await;
+        service
+            .supervisor_decision_record_no_action(ipc::SupervisorDecisionRecordNoActionRequest {
+                decision_id: pending.decision_id,
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect("record no_action");
+        {
+            let mut state = service.state.write().await;
+            let thread = state.threads.get_mut("thread-idle").expect("thread exists");
+            thread.summary.active_turn_id = Some("turn-live".to_string());
+            thread.summary.loaded_status = ipc::ThreadLoadedStatus::Active;
+            thread.summary.status = "active".to_string();
+            thread.summary.turn_in_flight = true;
+        }
+        let active_error = service
+            .supervisor_decision_manual_refresh(ipc::SupervisorDecisionManualRefreshRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("active thread should block manual refresh");
+        assert!(active_error.to_string().contains("has an active turn"));
+        {
+            let mut state = service.state.write().await;
+            let thread = state.threads.get_mut("thread-idle").expect("thread exists");
+            thread.summary.active_turn_id = None;
+            thread.summary.loaded_status = ipc::ThreadLoadedStatus::Idle;
+            thread.summary.status = "idle".to_string();
+            thread.summary.turn_in_flight = false;
+        }
+
+        let refreshed = service
+            .supervisor_decision_manual_refresh(ipc::SupervisorDecisionManualRefreshRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("manual refresh")
+            .decision;
+        let open_error = service
+            .supervisor_decision_manual_refresh(ipc::SupervisorDecisionManualRefreshRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("open decision should block manual refresh");
+        assert!(
+            open_error
+                .to_string()
+                .contains("already has open supervisor decision")
+        );
+        assert_eq!(
+            refreshed.status,
+            SupervisorTurnDecisionStatus::ProposedToHuman
+        );
+
+        let paused = service
+            .codex_assignment_pause(ipc::CodexAssignmentPauseRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                notes: Some("pause".to_string()),
+            })
+            .await
+            .expect("pause")
+            .assignment;
+        let inactive_error = service
+            .supervisor_decision_manual_refresh(ipc::SupervisorDecisionManualRefreshRequest {
+                assignment_id: paused.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("inactive assignment should block manual refresh");
+        assert!(inactive_error.to_string().contains("is not active"));
+
+        let thread_two = sample_thread("thread-two", "live_observed", 220);
+        let (workstream_two, work_unit_two) =
+            seed_codex_thread_assignment_fixture(&service, thread_two.clone()).await;
+        let assignment_two = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread_two.summary.id.clone(),
+                workstream_id: workstream_two.id,
+                work_unit_id: work_unit_two.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("second assignment create")
+            .assignment;
+        let pending_two =
+            latest_supervisor_turn_decision_for_assignment(&service, &assignment_two.assignment_id)
+                .await;
+        service
+            .supervisor_decision_reject(ipc::SupervisorDecisionRejectRequest {
+                decision_id: pending_two.decision_id,
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("not refreshing yet".to_string()),
+            })
+            .await
+            .expect("reject bootstrap for second assignment");
+        let missing_wait_error = service
+            .supervisor_decision_manual_refresh(ipc::SupervisorDecisionManualRefreshRequest {
+                assignment_id: assignment_two.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("manual refresh requires recorded no_action");
+        assert!(
+            missing_wait_error
+                .to_string()
+                .contains("has no recorded no_action for the current basis")
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_no_action_and_suppression_persist_across_restart() {
+        let base =
+            std::env::temp_dir().join(format!("orcas-supervisor-no-action-{}", Uuid::new_v4()));
+        let service = test_service_at(base.clone()).await;
+        let mut thread = sample_thread("thread-idle", "live_observed", 200);
+        thread.summary.last_seen_turn_id = Some("turn-1".to_string());
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let pending =
+            latest_supervisor_turn_decision_for_assignment(&service, &assignment.assignment_id)
+                .await;
+        let recorded = service
+            .supervisor_decision_record_no_action(ipc::SupervisorDecisionRecordNoActionRequest {
+                decision_id: pending.decision_id,
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("wait".to_string()),
+            })
+            .await
+            .expect("record no_action")
+            .decision;
+
+        let restarted = test_service_at(base).await;
+        restarted
+            .refresh_codex_supervisor_state_for_thread("thread-idle")
+            .await
+            .expect("refresh after restart");
+
+        let stored = restarted
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: recorded.decision_id,
+            })
+            .await
+            .expect("recorded decision get")
+            .decision;
+        assert_eq!(stored.kind, SupervisorTurnDecisionKind::NoAction);
+        assert_eq!(stored.status, SupervisorTurnDecisionStatus::Recorded);
+
+        let decisions = restarted
+            .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
+                assignment_id: Some(assignment.assignment_id),
+                codex_thread_id: None,
+                include_closed: true,
+                include_superseded: true,
+                ..Default::default()
+            })
+            .await
+            .expect("decision list after restart");
+        assert_eq!(decisions.decisions.len(), 2);
+        assert_eq!(
+            decisions.decisions[0].kind,
+            SupervisorTurnDecisionKind::NoAction
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_decision_list_supports_cross_thread_filters_and_actionable_queue() {
+        let service = test_service().await;
+        let thread_one = sample_thread("thread-1", "live_observed", 200);
+        let thread_two = sample_active_thread("thread-2", "live_observed", 220, "turn-2");
+        let (ws_one, wu_one) =
+            seed_codex_thread_assignment_fixture(&service, thread_one.clone()).await;
+        let (ws_two, wu_two) =
+            seed_codex_thread_assignment_fixture(&service, thread_two.clone()).await;
+        let assignment_one = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread_one.summary.id.clone(),
+                workstream_id: ws_one.id.clone(),
+                work_unit_id: wu_one.id.clone(),
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment one")
+            .assignment;
+        let assignment_two = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread_two.summary.id.clone(),
+                workstream_id: ws_two.id.clone(),
+                work_unit_id: wu_two.id.clone(),
+                supervisor_id: "supervisor-b".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment two")
+            .assignment;
+        {
+            let mut state = service.state.write().await;
+            state.collaboration.supervisor_turn_decisions.clear();
+            state.collaboration.supervisor_turn_decisions.insert(
+                "std-next".to_string(),
+                SupervisorTurnDecision {
+                    decision_id: "std-next".to_string(),
+                    assignment_id: assignment_one.assignment_id.clone(),
+                    codex_thread_id: thread_one.summary.id.clone(),
+                    basis_turn_id: Some("turn-1".to_string()),
+                    kind: SupervisorTurnDecisionKind::NextTurn,
+                    proposal_kind: SupervisorTurnProposalKind::ManualRefresh,
+                    proposed_text: Some("continue".to_string()),
+                    rationale_summary: "pending next turn".to_string(),
+                    status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                    created_at: Utc::now(),
+                    approved_at: None,
+                    rejected_at: None,
+                    sent_at: None,
+                    superseded_by: None,
+                    sent_turn_id: None,
+                    notes: None,
+                },
+            );
+            state.collaboration.supervisor_turn_decisions.insert(
+                "std-no-action".to_string(),
+                SupervisorTurnDecision {
+                    decision_id: "std-no-action".to_string(),
+                    assignment_id: assignment_one.assignment_id.clone(),
+                    codex_thread_id: thread_one.summary.id.clone(),
+                    basis_turn_id: Some("turn-1".to_string()),
+                    kind: SupervisorTurnDecisionKind::NoAction,
+                    proposal_kind: SupervisorTurnProposalKind::Bootstrap,
+                    proposed_text: None,
+                    rationale_summary: "wait".to_string(),
+                    status: SupervisorTurnDecisionStatus::Recorded,
+                    created_at: Utc::now(),
+                    approved_at: None,
+                    rejected_at: None,
+                    sent_at: None,
+                    superseded_by: None,
+                    sent_turn_id: None,
+                    notes: None,
+                },
+            );
+            state.collaboration.supervisor_turn_decisions.insert(
+                "std-steer".to_string(),
+                SupervisorTurnDecision {
+                    decision_id: "std-steer".to_string(),
+                    assignment_id: assignment_two.assignment_id.clone(),
+                    codex_thread_id: thread_two.summary.id.clone(),
+                    basis_turn_id: Some("turn-2".to_string()),
+                    kind: SupervisorTurnDecisionKind::SteerActiveTurn,
+                    proposal_kind: SupervisorTurnProposalKind::OperatorSteer,
+                    proposed_text: Some("focus logs".to_string()),
+                    rationale_summary: "pending steer".to_string(),
+                    status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                    created_at: Utc::now(),
+                    approved_at: None,
+                    rejected_at: None,
+                    sent_at: None,
+                    superseded_by: None,
+                    sent_turn_id: None,
+                    notes: None,
+                },
+            );
+        }
+
+        let by_status = service
+            .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
+                assignment_id: None,
+                codex_thread_id: None,
+                workstream_id: None,
+                work_unit_id: None,
+                supervisor_id: None,
+                status: Some(SupervisorTurnDecisionStatus::Recorded),
+                kind: None,
+                include_closed: true,
+                include_superseded: true,
+                actionable_only: false,
+                limit: None,
+            })
+            .await
+            .expect("status filter");
+        assert_eq!(by_status.decisions.len(), 1);
+        assert_eq!(by_status.decisions[0].decision_id, "std-no-action");
+
+        let by_kind = service
+            .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
+                assignment_id: None,
+                codex_thread_id: None,
+                workstream_id: None,
+                work_unit_id: None,
+                supervisor_id: None,
+                status: None,
+                kind: Some(SupervisorTurnDecisionKind::SteerActiveTurn),
+                include_closed: true,
+                include_superseded: true,
+                actionable_only: false,
+                limit: None,
+            })
+            .await
+            .expect("kind filter");
+        assert_eq!(by_kind.decisions.len(), 1);
+        assert_eq!(by_kind.decisions[0].decision_id, "std-steer");
+        assert_eq!(
+            by_kind.decisions[0].workstream_id.as_deref(),
+            Some(ws_two.id.as_str())
+        );
+        assert_eq!(
+            by_kind.decisions[0].work_unit_id.as_deref(),
+            Some(wu_two.id.as_str())
+        );
+        assert_eq!(
+            by_kind.decisions[0].supervisor_id.as_deref(),
+            Some("supervisor-b")
+        );
+
+        let by_thread = service
+            .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
+                assignment_id: None,
+                codex_thread_id: Some("thread-1".to_string()),
+                workstream_id: None,
+                work_unit_id: None,
+                supervisor_id: None,
+                status: None,
+                kind: None,
+                include_closed: true,
+                include_superseded: true,
+                actionable_only: false,
+                limit: None,
+            })
+            .await
+            .expect("thread filter");
+        assert_eq!(by_thread.decisions.len(), 2);
+
+        let actionable = service
+            .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
+                assignment_id: None,
+                codex_thread_id: None,
+                workstream_id: Some(ws_one.id),
+                work_unit_id: None,
+                supervisor_id: None,
+                status: None,
+                kind: None,
+                include_closed: false,
+                include_superseded: false,
+                actionable_only: true,
+                limit: None,
+            })
+            .await
+            .expect("actionable queue");
+        assert_eq!(actionable.decisions.len(), 1);
+        assert_eq!(actionable.decisions[0].decision_id, "std-next");
+    }
+
+    #[tokio::test]
+    async fn supervisor_decision_list_honors_include_superseded_and_limit() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        {
+            let mut state = service.state.write().await;
+            state.collaboration.supervisor_turn_decisions.clear();
+            state.collaboration.supervisor_turn_decisions.insert(
+                "std-1".to_string(),
+                SupervisorTurnDecision {
+                    decision_id: "std-1".to_string(),
+                    assignment_id: assignment.assignment_id.clone(),
+                    codex_thread_id: thread.summary.id.clone(),
+                    basis_turn_id: Some("turn-live".to_string()),
+                    kind: SupervisorTurnDecisionKind::SteerActiveTurn,
+                    proposal_kind: SupervisorTurnProposalKind::OperatorSteer,
+                    proposed_text: Some("first".to_string()),
+                    rationale_summary: "first".to_string(),
+                    status: SupervisorTurnDecisionStatus::Superseded,
+                    created_at: Utc::now(),
+                    approved_at: None,
+                    rejected_at: None,
+                    sent_at: None,
+                    superseded_by: Some("std-2".to_string()),
+                    sent_turn_id: None,
+                    notes: None,
+                },
+            );
+            state.collaboration.supervisor_turn_decisions.insert(
+                "std-2".to_string(),
+                SupervisorTurnDecision {
+                    decision_id: "std-2".to_string(),
+                    assignment_id: assignment.assignment_id.clone(),
+                    codex_thread_id: thread.summary.id.clone(),
+                    basis_turn_id: Some("turn-live".to_string()),
+                    kind: SupervisorTurnDecisionKind::SteerActiveTurn,
+                    proposal_kind: SupervisorTurnProposalKind::OperatorSteer,
+                    proposed_text: Some("second".to_string()),
+                    rationale_summary: "second".to_string(),
+                    status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                    created_at: Utc::now(),
+                    approved_at: None,
+                    rejected_at: None,
+                    sent_at: None,
+                    superseded_by: None,
+                    sent_turn_id: None,
+                    notes: None,
+                },
+            );
+        }
+
+        let without_superseded = service
+            .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
+                assignment_id: Some(assignment.assignment_id.clone()),
+                codex_thread_id: None,
+                workstream_id: None,
+                work_unit_id: None,
+                supervisor_id: None,
+                status: None,
+                kind: None,
+                include_closed: true,
+                include_superseded: false,
+                actionable_only: false,
+                limit: None,
+            })
+            .await
+            .expect("without superseded");
+        assert_eq!(without_superseded.decisions.len(), 1);
+        assert_eq!(without_superseded.decisions[0].decision_id, "std-2");
+
+        let limited = service
+            .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
+                assignment_id: Some(assignment.assignment_id),
+                codex_thread_id: None,
+                workstream_id: None,
+                work_unit_id: None,
+                supervisor_id: None,
+                status: None,
+                kind: None,
+                include_closed: true,
+                include_superseded: true,
+                actionable_only: false,
+                limit: Some(1),
+            })
+            .await
+            .expect("limit");
+        assert_eq!(limited.decisions.len(), 1);
     }
 
     #[tokio::test]
@@ -12342,6 +13630,7 @@ ORCAS_REPORT_END"#
                 assignment_id: Some(assignment.assignment_id),
                 codex_thread_id: None,
                 include_closed: true,
+                ..Default::default()
             })
             .await
             .expect("decision list");
@@ -12558,6 +13847,7 @@ ORCAS_REPORT_END"#
                 assignment_id: Some(assignment.assignment_id),
                 codex_thread_id: None,
                 include_closed: true,
+                ..Default::default()
             })
             .await
             .expect("decision list");

@@ -86,6 +86,10 @@ enum SupervisorCommand {
         #[command(subcommand)]
         command: ProposalsCommand,
     },
+    Codex {
+        #[command(subcommand)]
+        command: CodexCommand,
+    },
     Prompt(PromptArgs),
     Quickstart(QuickstartArgs),
 }
@@ -156,6 +160,28 @@ enum ProposalsCommand {
     ListForWorkunit(WorkunitRefArgs),
     Approve(ProposalApproveArgs),
     Reject(ProposalRejectArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum CodexCommand {
+    Decisions {
+        #[command(subcommand)]
+        command: CodexDecisionsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CodexDecisionsCommand {
+    List(CodexDecisionListArgs),
+    Queue(CodexDecisionQueueArgs),
+    History(CodexDecisionHistoryArgs),
+    Get(CodexDecisionRefArgs),
+    ProposeSteer(CodexDecisionProposeSteerArgs),
+    ReplacePendingSteer(CodexDecisionReplacePendingSteerArgs),
+    RecordNoAction(CodexDecisionRecordNoActionArgs),
+    ManualRefresh(CodexDecisionManualRefreshArgs),
+    Approve(CodexDecisionApproveArgs),
+    Reject(CodexDecisionRejectArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -318,6 +344,126 @@ struct ProposalRejectArgs {
     reviewed_by: Option<String>,
 }
 
+#[derive(Debug, Clone, Args, Default)]
+struct CodexDecisionFilterArgs {
+    #[arg(long)]
+    thread: Option<String>,
+    #[arg(long)]
+    assignment: Option<String>,
+    #[arg(long)]
+    workstream: Option<String>,
+    #[arg(long)]
+    workunit: Option<String>,
+    #[arg(long)]
+    supervisor: Option<String>,
+    #[arg(long, value_enum)]
+    status: Option<CodexDecisionStatusArg>,
+    #[arg(long, value_enum)]
+    kind: Option<CodexDecisionKindArg>,
+    #[arg(long, default_value_t = false)]
+    include_superseded: bool,
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+struct CodexDecisionListArgs {
+    #[command(flatten)]
+    filters: CodexDecisionFilterArgs,
+    #[arg(long, default_value_t = false)]
+    include_closed: bool,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+struct CodexDecisionQueueArgs {
+    #[command(flatten)]
+    filters: CodexDecisionFilterArgs,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+struct CodexDecisionHistoryArgs {
+    #[arg(long)]
+    thread: Option<String>,
+    #[arg(long)]
+    assignment: Option<String>,
+    #[arg(long, default_value_t = true)]
+    include_superseded: bool,
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CodexDecisionRefArgs {
+    #[arg(long)]
+    decision: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CodexDecisionProposeSteerArgs {
+    #[arg(long)]
+    thread: String,
+    #[arg(long)]
+    text: String,
+    #[arg(long)]
+    requested_by: Option<String>,
+    #[arg(long)]
+    rationale_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CodexDecisionReplacePendingSteerArgs {
+    #[arg(long)]
+    decision: String,
+    #[arg(long)]
+    text: String,
+    #[arg(long)]
+    requested_by: Option<String>,
+    #[arg(long)]
+    rationale_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CodexDecisionRecordNoActionArgs {
+    #[arg(long)]
+    decision: String,
+    #[arg(long)]
+    reviewed_by: Option<String>,
+    #[arg(long)]
+    review_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CodexDecisionManualRefreshArgs {
+    #[arg(long)]
+    thread: Option<String>,
+    #[arg(long)]
+    assignment: Option<String>,
+    #[arg(long)]
+    requested_by: Option<String>,
+    #[arg(long)]
+    rationale_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CodexDecisionApproveArgs {
+    #[arg(long)]
+    decision: String,
+    #[arg(long)]
+    reviewed_by: Option<String>,
+    #[arg(long)]
+    review_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CodexDecisionRejectArgs {
+    #[arg(long)]
+    decision: String,
+    #[arg(long)]
+    reviewed_by: Option<String>,
+    #[arg(long)]
+    review_note: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DecisionTypeArg {
     Accept,
@@ -325,6 +471,48 @@ enum DecisionTypeArg {
     Redirect,
     MarkComplete,
     EscalateToHuman,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CodexDecisionStatusArg {
+    ProposedToHuman,
+    Recorded,
+    Sent,
+    Rejected,
+    Stale,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CodexDecisionKindArg {
+    NextTurn,
+    SteerActiveTurn,
+    InterruptActiveTurn,
+    NoAction,
+}
+
+impl From<CodexDecisionStatusArg> for orcas_core::SupervisorTurnDecisionStatus {
+    fn from(value: CodexDecisionStatusArg) -> Self {
+        match value {
+            CodexDecisionStatusArg::ProposedToHuman => Self::ProposedToHuman,
+            CodexDecisionStatusArg::Recorded => Self::Recorded,
+            CodexDecisionStatusArg::Sent => Self::Sent,
+            CodexDecisionStatusArg::Rejected => Self::Rejected,
+            CodexDecisionStatusArg::Stale => Self::Stale,
+            CodexDecisionStatusArg::Superseded => Self::Superseded,
+        }
+    }
+}
+
+impl From<CodexDecisionKindArg> for orcas_core::SupervisorTurnDecisionKind {
+    fn from(value: CodexDecisionKindArg) -> Self {
+        match value {
+            CodexDecisionKindArg::NextTurn => Self::NextTurn,
+            CodexDecisionKindArg::SteerActiveTurn => Self::SteerActiveTurn,
+            CodexDecisionKindArg::InterruptActiveTurn => Self::InterruptActiveTurn,
+            CodexDecisionKindArg::NoAction => Self::NoAction,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -527,6 +715,114 @@ async fn main() -> Result<()> {
                         .await?;
                 }
             },
+            SupervisorCommand::Codex { command } => match command {
+                CodexCommand::Decisions { command } => match command {
+                    CodexDecisionsCommand::List(args) => {
+                        service
+                            .codex_decision_list(
+                                args.filters.thread.as_deref(),
+                                args.filters.assignment.as_deref(),
+                                args.filters.workstream.as_deref(),
+                                args.filters.workunit.as_deref(),
+                                args.filters.supervisor.as_deref(),
+                                args.filters.status.map(Into::into),
+                                args.filters.kind.map(Into::into),
+                                args.include_closed,
+                                args.filters.include_superseded,
+                                false,
+                                args.filters.limit,
+                            )
+                            .await?;
+                    }
+                    CodexDecisionsCommand::Queue(args) => {
+                        service
+                            .codex_decision_list(
+                                args.filters.thread.as_deref(),
+                                args.filters.assignment.as_deref(),
+                                args.filters.workstream.as_deref(),
+                                args.filters.workunit.as_deref(),
+                                args.filters.supervisor.as_deref(),
+                                args.filters.status.map(Into::into),
+                                args.filters.kind.map(Into::into),
+                                false,
+                                args.filters.include_superseded,
+                                true,
+                                args.filters.limit,
+                            )
+                            .await?;
+                    }
+                    CodexDecisionsCommand::History(args) => {
+                        service
+                            .codex_decision_history(
+                                args.thread.as_deref(),
+                                args.assignment.as_deref(),
+                                args.include_superseded,
+                                args.limit,
+                            )
+                            .await?;
+                    }
+                    CodexDecisionsCommand::Get(args) => {
+                        service.codex_decision_get(&args.decision).await?;
+                    }
+                    CodexDecisionsCommand::ProposeSteer(args) => {
+                        service
+                            .codex_decision_propose_steer(
+                                &args.thread,
+                                &args.text,
+                                args.requested_by,
+                                args.rationale_note,
+                            )
+                            .await?;
+                    }
+                    CodexDecisionsCommand::ReplacePendingSteer(args) => {
+                        service
+                            .codex_decision_replace_pending_steer(
+                                &args.decision,
+                                &args.text,
+                                args.requested_by,
+                                args.rationale_note,
+                            )
+                            .await?;
+                    }
+                    CodexDecisionsCommand::RecordNoAction(args) => {
+                        service
+                            .codex_decision_record_no_action(
+                                &args.decision,
+                                args.reviewed_by,
+                                args.review_note,
+                            )
+                            .await?;
+                    }
+                    CodexDecisionsCommand::ManualRefresh(args) => {
+                        service
+                            .codex_decision_manual_refresh(
+                                args.thread.as_deref(),
+                                args.assignment.as_deref(),
+                                args.requested_by,
+                                args.rationale_note,
+                            )
+                            .await?;
+                    }
+                    CodexDecisionsCommand::Approve(args) => {
+                        service
+                            .codex_decision_approve_and_send(
+                                &args.decision,
+                                args.reviewed_by,
+                                args.review_note,
+                            )
+                            .await?;
+                    }
+                    CodexDecisionsCommand::Reject(args) => {
+                        service
+                            .codex_decision_reject(
+                                &args.decision,
+                                args.reviewed_by,
+                                args.review_note,
+                            )
+                            .await?;
+                    }
+                },
+            },
             SupervisorCommand::Prompt(args) => {
                 let _ = service.prompt(&args.thread, &args.text).await?;
             }
@@ -537,4 +833,207 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_codex_decision_propose_steer_command() {
+        let cli = Cli::parse_from([
+            "orcas",
+            "supervisor",
+            "codex",
+            "decisions",
+            "propose-steer",
+            "--thread",
+            "thread-1",
+            "--text",
+            "stay focused",
+            "--requested-by",
+            "cli_user",
+        ]);
+
+        match cli.command {
+            TopCommand::Supervisor {
+                command:
+                    SupervisorCommand::Codex {
+                        command:
+                            CodexCommand::Decisions {
+                                command: CodexDecisionsCommand::ProposeSteer(args),
+                            },
+                    },
+            } => {
+                assert_eq!(args.thread, "thread-1");
+                assert_eq!(args.text, "stay focused");
+                assert_eq!(args.requested_by.as_deref(), Some("cli_user"));
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_codex_decision_replace_pending_steer_command() {
+        let cli = Cli::parse_from([
+            "orcas",
+            "supervisor",
+            "codex",
+            "decisions",
+            "replace-pending-steer",
+            "--decision",
+            "std-7",
+            "--text",
+            "updated steer text",
+        ]);
+
+        match cli.command {
+            TopCommand::Supervisor {
+                command:
+                    SupervisorCommand::Codex {
+                        command:
+                            CodexCommand::Decisions {
+                                command: CodexDecisionsCommand::ReplacePendingSteer(args),
+                            },
+                    },
+            } => {
+                assert_eq!(args.decision, "std-7");
+                assert_eq!(args.text, "updated steer text");
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_codex_decision_record_no_action_command() {
+        let cli = Cli::parse_from([
+            "orcas",
+            "supervisor",
+            "codex",
+            "decisions",
+            "record-no-action",
+            "--decision",
+            "std-7",
+            "--reviewed-by",
+            "cli_user",
+        ]);
+
+        match cli.command {
+            TopCommand::Supervisor {
+                command:
+                    SupervisorCommand::Codex {
+                        command:
+                            CodexCommand::Decisions {
+                                command: CodexDecisionsCommand::RecordNoAction(args),
+                            },
+                    },
+            } => {
+                assert_eq!(args.decision, "std-7");
+                assert_eq!(args.reviewed_by.as_deref(), Some("cli_user"));
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_codex_decision_manual_refresh_command() {
+        let cli = Cli::parse_from([
+            "orcas",
+            "supervisor",
+            "codex",
+            "decisions",
+            "manual-refresh",
+            "--thread",
+            "thread-1",
+            "--requested-by",
+            "cli_user",
+        ]);
+
+        match cli.command {
+            TopCommand::Supervisor {
+                command:
+                    SupervisorCommand::Codex {
+                        command:
+                            CodexCommand::Decisions {
+                                command: CodexDecisionsCommand::ManualRefresh(args),
+                            },
+                    },
+            } => {
+                assert_eq!(args.thread.as_deref(), Some("thread-1"));
+                assert_eq!(args.assignment, None);
+                assert_eq!(args.requested_by.as_deref(), Some("cli_user"));
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_codex_decision_queue_command_with_filters() {
+        let cli = Cli::parse_from([
+            "orcas",
+            "supervisor",
+            "codex",
+            "decisions",
+            "queue",
+            "--workstream",
+            "ws-1",
+            "--kind",
+            "steer-active-turn",
+            "--limit",
+            "5",
+        ]);
+
+        match cli.command {
+            TopCommand::Supervisor {
+                command:
+                    SupervisorCommand::Codex {
+                        command:
+                            CodexCommand::Decisions {
+                                command: CodexDecisionsCommand::Queue(args),
+                            },
+                    },
+            } => {
+                assert_eq!(args.filters.workstream.as_deref(), Some("ws-1"));
+                assert!(matches!(
+                    args.filters.kind,
+                    Some(CodexDecisionKindArg::SteerActiveTurn)
+                ));
+                assert_eq!(args.filters.limit, Some(5));
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_codex_decision_history_command() {
+        let cli = Cli::parse_from([
+            "orcas",
+            "supervisor",
+            "codex",
+            "decisions",
+            "history",
+            "--assignment",
+            "cta-1",
+            "--limit",
+            "20",
+        ]);
+
+        match cli.command {
+            TopCommand::Supervisor {
+                command:
+                    SupervisorCommand::Codex {
+                        command:
+                            CodexCommand::Decisions {
+                                command: CodexDecisionsCommand::History(args),
+                            },
+                    },
+            } => {
+                assert_eq!(args.assignment.as_deref(), Some("cta-1"));
+                assert_eq!(args.limit, Some(20));
+                assert!(args.include_superseded);
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
 }

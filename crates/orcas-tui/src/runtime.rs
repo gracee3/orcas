@@ -784,6 +784,64 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                 )
                 .await
             }
+            Effect::RecordNoActionDecision { decision_id } => {
+                let effect = Effect::RecordNoActionDecision {
+                    decision_id: decision_id.clone(),
+                };
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::RecordNoActionSupervisorDecision { decision_id },
+                    |response| match response {
+                        BackendCommandResult::SupervisorDecision(_) => {
+                            vec![Action::User(UserAction::Refresh)]
+                        }
+                        other => vec![Action::Event(UiEvent::Error(format!(
+                            "unexpected supervisor no_action response: {other:?}"
+                        )))],
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "record no_action failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!(
+                                "record no_action failed: {error}"
+                            )))
+                        }
+                    },
+                )
+                .await
+            }
+            Effect::ManualRefreshDecision { assignment_id } => {
+                let effect = Effect::ManualRefreshDecision {
+                    assignment_id: assignment_id.clone(),
+                };
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::ManualRefreshSupervisorDecision { assignment_id },
+                    |response| match response {
+                        BackendCommandResult::SupervisorDecision(_) => {
+                            vec![Action::User(UserAction::Refresh)]
+                        }
+                        other => vec![Action::Event(UiEvent::Error(format!(
+                            "unexpected manual refresh response: {other:?}"
+                        )))],
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "manual refresh failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!("manual refresh failed: {error}")))
+                        }
+                    },
+                )
+                .await
+            }
             Effect::ApproveSupervisorDecision { decision_id } => {
                 let effect = Effect::ApproveSupervisorDecision {
                     decision_id: decision_id.clone(),
