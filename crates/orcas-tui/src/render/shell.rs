@@ -2,11 +2,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::app::{AppState, BannerLevel, TopLevelView};
+use crate::app::{AppState, TopLevelView};
 use crate::view_model;
-use crate::view_model::shared::daemon_phase_label;
+use crate::view_model::shared::{daemon_lifecycle_label, daemon_phase_label};
 
-use super::shared::title_case_view_label;
+use super::shared::{status_style, title_case_view_label};
 
 pub(super) fn render_shell_status(state: &AppState) -> Paragraph<'static> {
     let connection = view_model::connection_status(state);
@@ -18,6 +18,13 @@ pub(super) fn render_shell_status(state: &AppState) -> Paragraph<'static> {
             ),
             Style::default().add_modifier(Modifier::BOLD),
         ),
+        Line::styled(
+            format!(
+                "daemon lifecycle: {}",
+                daemon_lifecycle_label(state.daemon_lifecycle)
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Line::from(format!(
             "daemon: {}  upstream: {}  clients: {}  threads: {}  reconnect: {}",
             daemon_phase_label(connection.daemon_phase),
@@ -26,23 +33,34 @@ pub(super) fn render_shell_status(state: &AppState) -> Paragraph<'static> {
             connection.known_threads,
             connection.reconnect_attempt
         )),
-        Line::from(format!("socket: {}", connection.socket_path)),
+        Line::styled(
+            format!("socket: {}", connection.socket_path),
+            Style::default().fg(Color::DarkGray),
+        ),
     ];
 
     if let Some(detail) = connection.upstream_detail {
-        lines.push(Line::from(format!("detail: {detail}")));
-    } else if let Some(banner) = view_model::status_banner(state) {
-        let color = match banner.level {
-            BannerLevel::Info => Color::Green,
-            BannerLevel::Warning => Color::Yellow,
-            BannerLevel::Error => Color::Red,
-        };
         lines.push(Line::styled(
-            banner.message,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            format!("upstream detail: {detail}"),
+            Style::default().fg(Color::LightYellow),
         ));
+    } else if let Some(banner) = view_model::status_banner(state) {
+        let color = status_style(banner.level);
+        lines.push(Line::styled(banner.message, color));
+        if let Some(lifecycle_error) = state.daemon_lifecycle_error.as_deref() {
+            lines.push(Line::styled(
+                format!("daemon: {lifecycle_error}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     } else {
         lines.push(Line::from(selection_summary(state)));
+        if let Some(error) = state.daemon_lifecycle_error.as_deref() {
+            lines.push(Line::styled(
+                format!("daemon: {error}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
 
     Paragraph::new(Text::from(lines)).block(Block::default().title("Shell").borders(Borders::ALL))
@@ -56,17 +74,32 @@ pub(super) fn render_footer(state: &AppState) -> Paragraph<'static> {
         ));
         lines.push(Line::from(help_navigation_line(state.current_view)));
     } else {
-        lines.push(Line::from(format!(
-            "keys: 1/2/3/4 views  tab next  {}  r refresh  ? help  q quit",
-            match state.current_view {
-                TopLevelView::Overview => "j/k no-op",
-                TopLevelView::Threads => "j/k threads",
-                TopLevelView::Collaboration => "j/k selection  h/l list focus",
-                TopLevelView::Supervisor => {
-                    "m refresh models  s start daemon  x stop daemon  R restart daemon"
+        lines.push(Line::styled(
+            format!(
+                "keys: 1/2/3/4 views  tab next  {}  r refresh  ? help  q quit",
+                match state.current_view {
+                    TopLevelView::Overview => "j/k no-op",
+                    TopLevelView::Threads => "j/k threads",
+                    TopLevelView::Collaboration => "j/k selection  h/l list focus",
+                    TopLevelView::Supervisor => {
+                        "m refresh models  s start daemon  x stop daemon  R restart daemon"
+                    }
                 }
-            }
-        )));
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if let Some(error) = state.daemon_lifecycle_error.as_deref() {
+            lines.push(Line::styled(
+                format!("daemon: {error}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::styled(
+            format!("focus: {}", title_case_view_label(state.current_view)),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
 
     Paragraph::new(Text::from(lines))

@@ -1,13 +1,16 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::app::AppState;
+use crate::app::{AppState, DaemonLifecycleState};
 
-use crate::view_model::shared::daemon_phase_label;
+use crate::view_model::shared::{daemon_lifecycle_label, daemon_phase_label};
 
-use super::shared::render_panel;
+use super::shared::{
+    emphasis_style, focus_block_style, lifecycle_style, metadata_style, row_style, status_style,
+};
 
 pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     let compact = area.width < 130 || area.height < 30;
@@ -16,7 +19,7 @@ pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8),
+                Constraint::Length(10),
                 Constraint::Length(10),
                 Constraint::Min(8),
             ])
@@ -25,7 +28,7 @@ pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8),
+                Constraint::Length(11),
                 Constraint::Length(12),
                 Constraint::Min(10),
             ])
@@ -39,51 +42,109 @@ pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
 
 fn render_daemon_status(state: &AppState) -> Paragraph<'static> {
     let daemon = state.daemon.as_ref();
-    let mut lines = vec![Line::from(format!(
-        "daemon: {}  upstream: {}  clients: {}  threads: {}  reconnect: {}",
-        daemon_phase_label(state.daemon_phase),
-        daemon
-            .map(|daemon| daemon.upstream.status.clone())
-            .unwrap_or_else(|| "disconnected".to_string()),
-        daemon.map_or(0, |daemon| daemon.client_count),
-        daemon.map_or(state.threads.len(), |daemon| daemon.known_threads),
-        state.reconnect_attempt
-    ))];
-    lines.push(Line::from(format!(
-        "socket: {}",
-        daemon
-            .map(|daemon| daemon.socket_path.clone())
-            .unwrap_or_else(|| "unavailable".to_string())
-    )));
-    lines.push(Line::from(format!(
-        "codex: {}",
-        daemon
-            .map(|daemon| daemon.codex_endpoint.clone())
-            .unwrap_or_else(|| "unknown".to_string())
-    )));
+    let has_focus = state.current_view == crate::app::TopLevelView::Supervisor;
+    let mut lines = Vec::new();
+    let lifecycle = daemon_lifecycle_label(state.daemon_lifecycle);
+    lines.push(Line::styled(
+        format!("Daemon lifecycle: {lifecycle}"),
+        lifecycle_style(state.daemon_lifecycle),
+    ));
+    lines.push(Line::styled(
+        format!(
+            "daemon: {}  upstream: {}  clients: {}  threads: {}  reconnect: {}",
+            daemon_phase_label(state.daemon_phase),
+            daemon
+                .map(|daemon| daemon.upstream.status.clone())
+                .unwrap_or_else(|| "disconnected".to_string()),
+            daemon.map_or(0, |daemon| daemon.client_count),
+            daemon.map_or(state.threads.len(), |daemon| daemon.known_threads),
+            state.reconnect_attempt,
+        ),
+        metadata_style(),
+    ));
+    lines.push(Line::styled(
+        format!(
+            "socket: {}",
+            daemon
+                .map(|daemon| daemon.socket_path.clone())
+                .unwrap_or_else(|| "unavailable".to_string()),
+        ),
+        metadata_style(),
+    ));
     if let Some(detail) = daemon.and_then(|daemon| daemon.upstream.detail.as_ref()) {
-        lines.push(Line::from(format!("detail: {detail}")));
+        lines.push(Line::styled(
+            format!("upstream detail: {detail}"),
+            Style::default().fg(Color::LightYellow),
+        ));
+    }
+    if let Some(error) = state.daemon_lifecycle_error.as_deref() {
+        lines.push(Line::styled(
+            format!("status detail: {error}"),
+            status_style(
+                if matches!(state.daemon_lifecycle, DaemonLifecycleState::Failed) {
+                    crate::app::BannerLevel::Error
+                } else {
+                    crate::app::BannerLevel::Warning
+                },
+            ),
+        ));
+    }
+    if let Some(runtime) = daemon.map(|daemon| &daemon.runtime) {
+        lines.push(Line::styled(
+            format!(
+                "runtime: {} {} {}",
+                runtime.version, runtime.build_fingerprint, runtime.binary_path
+            ),
+            metadata_style(),
+        ));
+        lines.push(Line::styled(
+            format!("metadata path: {}", runtime.metadata_path),
+            metadata_style(),
+        ));
     }
 
     Paragraph::new(Text::from(lines)).block(
         Block::default()
             .title("Supervisor Daemon")
-            .borders(Borders::ALL),
+            .borders(Borders::ALL)
+            .border_style(focus_block_style(has_focus)),
     )
 }
 
 fn render_models(state: &AppState) -> Paragraph<'static> {
     let mut lines = Vec::new();
+    let is_inflight = matches!(
+        state.daemon_lifecycle,
+        DaemonLifecycleState::Starting
+            | DaemonLifecycleState::Stopping
+            | DaemonLifecycleState::Restarting
+    );
+
+    if is_inflight {
+        lines.push(Line::styled(
+            "model update deferred during daemon transition",
+            emphasis_style(),
+        ));
+    }
     if state.models_loading {
-        lines.push(Line::from("loading models..."));
+        lines.push(Line::styled("loading models...", emphasis_style()));
     }
 
-    if state.daemon_models.is_empty() {
+    if state.daemon_lifecycle == DaemonLifecycleState::Stopped {
+        lines.push(Line::styled(
+            "No models loaded. Start daemon to refresh model list.".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else if state.daemon_models.is_empty() {
         if state.models_loading {
-            lines.push(Line::from("no models loaded yet"));
+            lines.push(Line::styled(
+                "no models loaded yet".to_string(),
+                metadata_style(),
+            ));
         } else {
-            lines.push(Line::from(
+            lines.push(Line::styled(
                 "No models loaded. Press m to refresh models.".to_string(),
+                metadata_style(),
             ));
         }
     } else {
@@ -92,18 +153,22 @@ fn render_models(state: &AppState) -> Paragraph<'static> {
             if model.hidden {
                 prefix.push_str("h ");
             }
-            lines.push(Line::from(format!(
-                "{prefix}{} [{}]{}",
-                model.id,
-                model.display_name,
-                if model.is_default { " (default)" } else { "" }
-            )));
+            let row = Line::styled(
+                format!(
+                    "{prefix}{} [{}]{}",
+                    model.id,
+                    model.display_name,
+                    if model.is_default { " (default)" } else { "" }
+                ),
+                row_style(false),
+            );
+            lines.push(row);
         }
         if state.daemon_models.len() > 18 {
-            lines.push(Line::from(format!(
-                "+ {} more models",
-                state.daemon_models.len() - 18
-            )));
+            lines.push(Line::styled(
+                format!("+ {} more models", state.daemon_models.len() - 18),
+                emphasis_style(),
+            ));
         }
     }
 
@@ -111,47 +176,86 @@ fn render_models(state: &AppState) -> Paragraph<'static> {
         .block(
             Block::default()
                 .title("Available Models")
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(focus_block_style(matches!(
+                    state.current_view,
+                    crate::app::TopLevelView::Supervisor
+                ))),
         )
         .wrap(Wrap { trim: true })
 }
 
 fn render_controls(state: &AppState) -> Paragraph<'static> {
-    let mut lines = vec![Line::from("status: ready")];
-    if let Some(daemon) = state.daemon.as_ref() {
-        let is_connected = daemon.upstream.status == "connected";
-        let start_hint = if is_connected {
-            "daemon already connected"
+    let mut lines = Vec::new();
+    let in_flight = matches!(
+        state.daemon_lifecycle,
+        DaemonLifecycleState::Starting
+            | DaemonLifecycleState::Stopping
+            | DaemonLifecycleState::Restarting
+    );
+    let lifecycle = daemon_lifecycle_label(state.daemon_lifecycle);
+    lines.push(Line::styled(
+        format!("status: {lifecycle}"),
+        lifecycle_style(state.daemon_lifecycle),
+    ));
+    lines.push(Line::styled(
+        "actions: m refresh models  s start daemon  x stop daemon  R restart daemon",
+        metadata_style(),
+    ));
+    lines.push(Line::styled(
+        if in_flight {
+            "daemon command in progress: repeated lifecycle keys are ignored".to_string()
+        } else if state.daemon_lifecycle == DaemonLifecycleState::Failed {
+            "daemon failure state: use restart (R) or stop/start again once fixed".to_string()
         } else {
-            "s start daemon"
-        };
-        let stop_hint = if is_connected {
-            "x stop daemon"
+            "lifecycle commands can be triggered at any time".to_string()
+        },
+        if in_flight {
+            emphasis_style()
+        } else if state.daemon_lifecycle == DaemonLifecycleState::Failed {
+            status_style(crate::app::BannerLevel::Error)
         } else {
-            "daemon not connected"
-        };
-        let restart_hint = "R restart daemon";
-        lines.push(Line::from(format!(
-            "actions: {}  {}  {}  m refresh models",
-            start_hint, stop_hint, restart_hint
-        )));
-        lines.push(Line::from(format!(
-            "runtime: {} {} {}",
-            daemon.runtime.version, daemon.runtime.build_fingerprint, daemon.runtime.binary_path
-        )));
-        lines.push(Line::from(format!(
-            "metadata: {}",
-            daemon.runtime.metadata_path
-        )));
+            metadata_style()
+        },
+    ));
+    if state.daemon_lifecycle == DaemonLifecycleState::Failed {
+        if let Some(error) = state.daemon_lifecycle_error.as_deref() {
+            lines.push(Line::styled(
+                format!("last failure: {error}"),
+                status_style(crate::app::BannerLevel::Error),
+            ));
+        }
+    } else if let Some(daemon) = state.daemon.as_ref() {
+        if in_flight {
+            lines.push(Line::styled(
+                format!(
+                    "endpoint={}  codex={}",
+                    daemon.upstream.endpoint, daemon.codex_endpoint
+                ),
+                metadata_style(),
+            ));
+        } else {
+            lines.push(Line::styled(
+                format!(
+                    "runtime pid={}  codex={}",
+                    daemon.runtime.pid, daemon.codex_endpoint
+                ),
+                metadata_style(),
+            ));
+        }
     } else {
-        lines.push(Line::from("daemon status not loaded yet."));
+        lines.push(Line::styled(
+            "daemon metadata not loaded yet.".to_string(),
+            metadata_style(),
+        ));
     }
 
-    render_panel(
-        crate::view_model::PanelViewModel {
-            title: "Controls".to_string(),
-            lines: lines.into_iter().map(|line| line.to_string()).collect(),
-        },
-        true,
-    )
+    Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .title("Controls")
+                .borders(Borders::ALL)
+                .border_style(focus_block_style(true)),
+        )
+        .wrap(Wrap { trim: true })
 }

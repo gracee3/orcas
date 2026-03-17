@@ -38,9 +38,17 @@ impl AppHarness {
         self.flush_runtime().await;
     }
 
+    pub fn dispatch_no_wait(&mut self, action: UserAction) {
+        self.runtime.dispatch(Action::User(action));
+    }
+
     pub async fn inject_ui_event(&mut self, event: UiEvent) {
         self.runtime.dispatch(Action::Event(event));
         self.flush_runtime().await;
+    }
+
+    pub fn inject_ui_event_no_wait(&mut self, event: UiEvent) {
+        self.runtime.dispatch(Action::Event(event));
     }
 
     pub async fn inject_event(&mut self, event: ipc::DaemonEventEnvelope) -> Result<()> {

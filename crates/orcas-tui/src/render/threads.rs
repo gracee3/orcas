@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::app::AppState;
 use crate::view_model;
 
-use super::shared::render_panel;
+use super::shared::{focus_block_style, metadata_style, render_panel, row_style};
 
 pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     let compact = area.width < 120 || area.height < 26;
@@ -39,6 +39,7 @@ pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
 }
 
 fn render_thread_list(list: view_model::ThreadListViewModel) -> Paragraph<'static> {
+    let has_selected = list.rows.iter().any(|row| row.selected);
     let lines = if list.rows.is_empty() {
         vec![Line::from("No threads loaded.")]
     } else {
@@ -52,23 +53,40 @@ fn render_thread_list(list: view_model::ThreadListViewModel) -> Paragraph<'stati
                     .as_ref()
                     .map(|badge| format!(" turn={badge}"))
                     .unwrap_or_default();
-                Line::from(format!(
-                    "{prefix} {} [{}]{} {}",
-                    row.id, row.status, badge, row.preview
-                ))
+                Line::styled(
+                    format!(
+                        "{prefix} {} [{}]{} {}",
+                        row.id, row.status, badge, row.preview
+                    ),
+                    row_style(row.selected),
+                )
             })
             .collect()
     };
 
     Paragraph::new(Text::from(lines))
-        .block(Block::default().title("Threads").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Threads")
+                .borders(Borders::ALL)
+                .border_style(focus_block_style(has_selected)),
+        )
         .wrap(Wrap { trim: true })
 }
 
 fn render_thread_detail(detail: view_model::ThreadDetailViewModel) -> Paragraph<'static> {
     Paragraph::new(Text::from(
-        detail.lines.into_iter().map(Line::from).collect::<Vec<_>>(),
+        detail
+            .lines
+            .into_iter()
+            .map(|line| Line::styled(line, metadata_style()))
+            .collect::<Vec<_>>(),
     ))
-    .block(Block::default().title(detail.title).borders(Borders::ALL))
+    .block(
+        Block::default()
+            .title(detail.title)
+            .borders(Borders::ALL)
+            .border_style(metadata_style()),
+    )
     .wrap(Wrap { trim: false })
 }

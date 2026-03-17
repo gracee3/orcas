@@ -483,7 +483,7 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                                 "daemon start failed: {error}"
                             )))
                         } else {
-                            Action::Event(UiEvent::Error(format!("daemon start failed: {error}")))
+                            Action::Event(UiEvent::DaemonStartFailed(error.to_string()))
                         }
                     },
                 )
@@ -511,7 +511,7 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                                 "daemon stop failed: {error}"
                             )))
                         } else {
-                            Action::Event(UiEvent::Error(format!("daemon stop failed: {error}")))
+                            Action::Event(UiEvent::DaemonStopFailed(error.to_string()))
                         }
                     },
                 )
@@ -520,7 +520,6 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
             effect @ Effect::RestartDaemon => {
                 debug!(?effect, "starting restart-daemon effect");
                 let mut actions = Vec::new();
-
                 let stop_completion = Self::run_backend_effect(
                     Arc::clone(&backend),
                     Effect::StopDaemon,
@@ -541,12 +540,21 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                                 "daemon stop failed: {error}"
                             )))
                         } else {
-                            Action::Event(UiEvent::Error(format!("daemon stop failed: {error}")))
+                            Action::Event(UiEvent::DaemonStopFailed(error.to_string()))
                         }
                     },
                 )
                 .await;
+                let stop_succeeded = stop_completion.actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        Action::Event(UiEvent::DaemonStopped { stopping: true })
+                    )
+                });
                 actions.extend(stop_completion.actions);
+                if !stop_succeeded {
+                    return EffectCompletion::success(effect, actions);
+                }
                 let start_completion = Self::run_backend_effect(
                     backend,
                     Effect::StartDaemon,
@@ -567,7 +575,7 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                                 "daemon restart start failed: {error}"
                             )))
                         } else {
-                            Action::Event(UiEvent::Error(format!(
+                            Action::Event(UiEvent::DaemonStartFailed(format!(
                                 "daemon restart start failed: {error}"
                             )))
                         }

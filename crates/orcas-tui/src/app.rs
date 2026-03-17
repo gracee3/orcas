@@ -48,10 +48,24 @@ pub enum DaemonConnectionPhase {
     Connected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DaemonLifecycleState {
+    #[default]
+    Unknown,
+    Stopped,
+    Starting,
+    Stopping,
+    Restarting,
+    Running,
+    Failed,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
     pub daemon: Option<ipc::DaemonStatusResponse>,
     pub daemon_phase: DaemonConnectionPhase,
+    pub daemon_lifecycle: DaemonLifecycleState,
+    pub daemon_lifecycle_error: Option<String>,
     pub reconnect_attempt: u32,
     pub session: ipc::SessionState,
     pub collaboration: ipc::CollaborationSnapshot,
@@ -70,7 +84,6 @@ pub struct AppState {
     pub prompt_in_flight: bool,
     pub banner: Option<StatusBanner>,
     pub show_help: bool,
-    pub confirming_daemon_stop: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +147,8 @@ pub enum UiEvent {
     DaemonStopped {
         stopping: bool,
     },
+    DaemonStartFailed(String),
+    DaemonStopFailed(String),
     PromptStarted {
         thread_id: String,
         turn_id: String,
@@ -274,15 +289,68 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
             vec![Effect::LoadModels]
         }
         UserAction::StopDaemon => {
-            state.confirming_daemon_stop = true;
+            if is_daemon_action_in_flight(state) {
+                state.banner = Some(StatusBanner {
+                    level: BannerLevel::Warning,
+                    message: "Daemon action in progress. Please wait.".to_string(),
+                });
+                return Vec::new();
+            }
+            if !daemon_is_connected(state) {
+                state.daemon_lifecycle = DaemonLifecycleState::Stopped;
+                state.daemon_lifecycle_error = Some("daemon already stopped".to_string());
+                state.banner = Some(StatusBanner {
+                    level: BannerLevel::Info,
+                    message: "Daemon already stopped.".to_string(),
+                });
+                return Vec::new();
+            }
+            state.daemon_lifecycle_error = None;
+            state.daemon_lifecycle = DaemonLifecycleState::Stopping;
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Info,
+                message: "Stopping daemon...".to_string(),
+            });
             vec![Effect::StopDaemon]
         }
         UserAction::StartDaemon => {
-            state.confirming_daemon_stop = true;
+            if is_daemon_action_in_flight(state) {
+                state.banner = Some(StatusBanner {
+                    level: BannerLevel::Warning,
+                    message: "Daemon action in progress. Please wait.".to_string(),
+                });
+                return Vec::new();
+            }
+            if daemon_is_connected(state) {
+                state.daemon_lifecycle = DaemonLifecycleState::Running;
+                state.banner = Some(StatusBanner {
+                    level: BannerLevel::Info,
+                    message: "Daemon already running.".to_string(),
+                });
+                return Vec::new();
+            }
+            state.daemon_lifecycle_error = None;
+            state.daemon_lifecycle = DaemonLifecycleState::Starting;
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Info,
+                message: "Starting daemon...".to_string(),
+            });
             vec![Effect::StartDaemon]
         }
         UserAction::RestartDaemon => {
-            state.confirming_daemon_stop = true;
+            if is_daemon_action_in_flight(state) {
+                state.banner = Some(StatusBanner {
+                    level: BannerLevel::Warning,
+                    message: "Daemon action in progress. Please wait.".to_string(),
+                });
+                return Vec::new();
+            }
+            state.daemon_lifecycle_error = None;
+            state.daemon_lifecycle = DaemonLifecycleState::Restarting;
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Info,
+                message: "Restarting daemon...".to_string(),
+            });
             vec![Effect::RestartDaemon]
         }
         UserAction::ToggleHelp => {
@@ -344,6 +412,9 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             let preserved_thread_selection = state.selected_thread_id.clone();
             state.daemon_phase = DaemonConnectionPhase::Connected;
             state.reconnect_attempt = 0;
+            state.daemon_lifecycle =
+                lifecycle_from_upstream_status(&snapshot.daemon.upstream.status);
+            state.daemon_lifecycle_error = None;
             state.daemon = Some(snapshot.daemon);
             state.session = snapshot.session;
             state.collaboration = snapshot.collaboration;
@@ -399,6 +470,8 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
                 daemon.upstream.status = "disconnected".to_string();
                 daemon.upstream.detail = Some(message.clone());
             }
+            state.daemon_lifecycle = DaemonLifecycleState::Failed;
+            state.daemon_lifecycle_error = Some(format!("daemon unavailable: {message}"));
             state.banner = Some(StatusBanner {
                 level: BannerLevel::Warning,
                 message: format!("Daemon unavailable: {message}"),
@@ -439,7 +512,7 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
         UiEvent::PromptStarted { thread_id, turn_id } => {
             state.selected_thread_id = Some(thread_id.clone());
             state.prompt_in_flight = true;
-            state.confirming_daemon_stop = false;
+            state.daemon_lifecycle_error = None;
             state.banner = Some(StatusBanner {
                 level: BannerLevel::Info,
                 message: "Prompt submitted.".to_string(),
@@ -449,10 +522,19 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
         UiEvent::ModelsLoaded(models) => {
             state.daemon_models = models;
             state.models_loading = false;
-            state.confirming_daemon_stop = false;
+            state.daemon_lifecycle_error = None;
         }
         UiEvent::DaemonStarted { connected } => {
-            state.confirming_daemon_stop = false;
+            state.daemon_lifecycle = if connected {
+                DaemonLifecycleState::Running
+            } else {
+                DaemonLifecycleState::Failed
+            };
+            state.daemon_lifecycle_error = if connected {
+                None
+            } else {
+                Some("daemon start was not accepted".to_string())
+            };
             state.banner = Some(StatusBanner {
                 level: if connected {
                     BannerLevel::Info
@@ -460,14 +542,26 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
                     BannerLevel::Warning
                 },
                 message: if connected {
-                    "Daemon start requested.".to_string()
+                    "Daemon start completed.".to_string()
                 } else {
                     "Daemon start was not accepted.".to_string()
                 },
             });
+            effects.push(Effect::RefreshSnapshot);
+            if state.current_view == TopLevelView::Supervisor {
+                state.models_loading = true;
+                effects.push(Effect::LoadModels);
+            }
         }
         UiEvent::DaemonStopped { stopping } => {
-            state.confirming_daemon_stop = false;
+            if stopping {
+                state.daemon_lifecycle = DaemonLifecycleState::Stopping;
+                state.daemon_lifecycle_error = None;
+            } else {
+                state.daemon_lifecycle = DaemonLifecycleState::Failed;
+                state.daemon_lifecycle_error = Some("daemon stop was not accepted".to_string());
+            }
+            state.daemon_models.clear();
             state.banner = Some(StatusBanner {
                 level: if stopping {
                     BannerLevel::Info
@@ -475,17 +569,37 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
                     BannerLevel::Warning
                 },
                 message: if stopping {
-                    "Daemon stop requested.".to_string()
+                    "Stopping daemon...".to_string()
                 } else {
                     "Daemon stop was not accepted.".to_string()
                 },
             });
+            if stopping {
+                effects.push(Effect::RefreshSnapshot);
+            }
+        }
+        UiEvent::DaemonStartFailed(message) => {
+            state.daemon_lifecycle = DaemonLifecycleState::Failed;
+            state.daemon_lifecycle_error = Some(message.clone());
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Error,
+                message: format!("Daemon start failed: {message}"),
+            });
+        }
+        UiEvent::DaemonStopFailed(message) => {
+            state.daemon_lifecycle = DaemonLifecycleState::Failed;
+            state.daemon_lifecycle_error = Some(message.clone());
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Error,
+                message: format!("Daemon stop failed: {message}"),
+            });
         }
         UiEvent::UpstreamChanged(upstream) => {
-            state.confirming_daemon_stop = false;
             if let Some(daemon) = state.daemon.as_mut() {
                 daemon.upstream = upstream.clone();
             }
+            state.daemon_lifecycle = lifecycle_from_upstream_status(&upstream.status);
+            state.daemon_lifecycle_error = None;
             if upstream.status != "connected" {
                 state.prompt_in_flight = false;
             }
@@ -897,6 +1011,30 @@ fn refresh_prompt_in_flight(state: &mut AppState) {
     };
 }
 
+fn is_daemon_action_in_flight(state: &AppState) -> bool {
+    matches!(
+        state.daemon_lifecycle,
+        DaemonLifecycleState::Starting
+            | DaemonLifecycleState::Stopping
+            | DaemonLifecycleState::Restarting
+    )
+}
+
+fn daemon_is_connected(state: &AppState) -> bool {
+    state
+        .daemon
+        .as_ref()
+        .is_some_and(|daemon| daemon.upstream.status == "connected")
+}
+
+fn lifecycle_from_upstream_status(status: &str) -> DaemonLifecycleState {
+    match status {
+        "connected" => DaemonLifecycleState::Running,
+        "disconnected" | "stopped" => DaemonLifecycleState::Stopped,
+        _ => DaemonLifecycleState::Unknown,
+    }
+}
+
 fn ensure_turn<'a>(thread: &'a mut ipc::ThreadView, turn_id: &str) -> &'a mut ipc::TurnView {
     if let Some(index) = thread.turns.iter().position(|turn| turn.id == turn_id) {
         return &mut thread.turns[index];
@@ -1121,6 +1259,12 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
         UiEvent::ModelsLoaded(_) => return None,
         UiEvent::DaemonStarted { .. } => return None,
         UiEvent::DaemonStopped { .. } => return None,
+        UiEvent::DaemonStartFailed(_) | UiEvent::DaemonStopFailed(_) => (
+            "daemon",
+            "daemon lifecycle command failed".to_string(),
+            None,
+            None,
+        ),
         UiEvent::UpstreamChanged(upstream) => (
             "upstream",
             format!("upstream {}", upstream.status),

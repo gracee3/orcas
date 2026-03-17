@@ -456,9 +456,15 @@ impl TuiBackend for FakeBackend {
             )),
             BackendCommand::LoadModels => Ok(BackendCommandResult::Models(guard.models.clone())),
             BackendCommand::StartDaemon => {
+                let daemon = &mut guard.snapshot.daemon;
+                daemon.upstream.status = "connected".to_string();
+                daemon.upstream.detail = None;
                 Ok(BackendCommandResult::DaemonStarted { connected: true })
             }
             BackendCommand::StopDaemon => {
+                let daemon = &mut guard.snapshot.daemon;
+                daemon.upstream.status = "disconnected".to_string();
+                daemon.upstream.detail = Some("stop requested".to_string());
                 Ok(BackendCommandResult::DaemonStopped { stopping: true })
             }
             BackendCommand::SubmitPrompt { thread_id, .. } => {

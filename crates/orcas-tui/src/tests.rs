@@ -1,7 +1,8 @@
 use chrono::Utc;
 
 use crate::app::{
-    BannerLevel, CollaborationFocus, DaemonConnectionPhase, TopLevelView, UiEvent, UserAction,
+    BannerLevel, CollaborationFocus, DaemonConnectionPhase, DaemonLifecycleState, TopLevelView,
+    UiEvent, UserAction,
 };
 use crate::backend::BackendCommand;
 use crate::test_harness::AppHarness;
@@ -479,6 +480,12 @@ fn sample_snapshot() -> ipc::StateSnapshot {
             turn_id: None,
         }],
     }
+}
+
+fn sample_disconnected_snapshot() -> ipc::StateSnapshot {
+    let mut snapshot = sample_snapshot();
+    snapshot.daemon.upstream.status = "disconnected".to_string();
+    snapshot
 }
 
 fn sample_workunit_detail(work_unit_id: &str) -> ipc::WorkunitGetResponse {
@@ -1567,56 +1574,69 @@ async fn supervisor_view_loads_models_and_renders_available_models() {
 }
 
 #[tokio::test]
-async fn supervisor_stop_daemon_dispatches_stop_request_command() {
+async fn supervisor_stop_daemon_transition_stops_daemon() {
     let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
 
     harness
         .dispatch(UserAction::ShowView(TopLevelView::Supervisor))
         .await;
-    harness.dispatch(UserAction::StopDaemon).await;
-
-    let commands = harness.recorded_commands().await;
-    assert!(commands.contains(&BackendCommand::StopDaemon));
+    harness.dispatch_no_wait(UserAction::StopDaemon);
     assert_eq!(
-        harness
-            .state()
-            .banner
-            .as_ref()
-            .map(|banner| banner.message.as_str()),
-        Some("Daemon stop requested.")
+        harness.state().daemon_lifecycle,
+        DaemonLifecycleState::Stopping
+    );
+
+    harness.process().await;
+    assert_eq!(
+        harness.state().daemon_lifecycle,
+        DaemonLifecycleState::Stopped
     );
 }
 
 #[tokio::test]
-async fn supervisor_start_daemon_dispatches_start_request_command() {
-    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+async fn supervisor_start_daemon_transition_starts_daemon() {
+    let mut harness = AppHarness::new(sample_disconnected_snapshot())
+        .await
+        .unwrap();
 
     harness
         .dispatch(UserAction::ShowView(TopLevelView::Supervisor))
         .await;
-    harness.dispatch(UserAction::StartDaemon).await;
-
+    harness.dispatch_no_wait(UserAction::StartDaemon);
+    assert_eq!(
+        harness.state().daemon_lifecycle,
+        DaemonLifecycleState::Starting
+    );
+    assert_eq!(
+        harness.state().daemon_lifecycle_error.as_deref().is_none(),
+        true
+    );
+    harness.process().await;
+    assert_eq!(
+        harness.state().daemon_lifecycle,
+        DaemonLifecycleState::Running
+    );
     let commands = harness.recorded_commands().await;
     assert!(commands.contains(&BackendCommand::StartDaemon));
-    assert_eq!(
-        harness
-            .state()
-            .banner
-            .as_ref()
-            .map(|banner| banner.message.as_str()),
-        Some("Daemon start requested.")
-    );
 }
 
 #[tokio::test]
 async fn supervisor_restart_daemon_dispatches_restart_request_sequence() {
     let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
-
     harness
         .dispatch(UserAction::ShowView(TopLevelView::Supervisor))
         .await;
-    harness.dispatch(UserAction::RestartDaemon).await;
+    harness.dispatch_no_wait(UserAction::RestartDaemon);
+    assert_eq!(
+        harness.state().daemon_lifecycle,
+        DaemonLifecycleState::Restarting
+    );
 
+    harness.process().await;
+    assert_eq!(
+        harness.state().daemon_lifecycle,
+        DaemonLifecycleState::Running
+    );
     let commands = harness.recorded_commands().await;
     let stop_index = commands
         .iter()
@@ -1632,40 +1652,121 @@ async fn supervisor_restart_daemon_dispatches_restart_request_sequence() {
 }
 
 #[tokio::test]
-async fn supervisor_restart_sequence_dispatches_stop_and_start_commands() {
-    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
-
+async fn supervisor_start_failure_surfaces_error_state() {
+    let mut harness = AppHarness::new(sample_disconnected_snapshot())
+        .await
+        .unwrap();
     harness
         .dispatch(UserAction::ShowView(TopLevelView::Supervisor))
         .await;
 
-    harness.dispatch(UserAction::StartDaemon).await;
-    harness.dispatch(UserAction::StopDaemon).await;
+    harness.fail_next_command("start failed").await;
     harness.dispatch(UserAction::StartDaemon).await;
 
-    let commands = harness.recorded_commands().await;
-    assert!(commands.contains(&BackendCommand::StartDaemon));
-    assert!(commands.contains(&BackendCommand::StopDaemon));
-    let start_count = commands
-        .iter()
-        .filter(|command| **command == BackendCommand::StartDaemon)
-        .count();
-    assert_eq!(start_count, 2);
     assert_eq!(
+        harness.state().daemon_lifecycle,
+        DaemonLifecycleState::Failed
+    );
+    assert!(
+        harness
+            .state()
+            .daemon_lifecycle_error
+            .as_deref()
+            .is_some_and(|error| error.contains("start failed"))
+    );
+    assert!(
         harness
             .state()
             .banner
             .as_ref()
-            .map(|banner| banner.message.as_str()),
-        Some("Daemon start requested.")
+            .is_some_and(|banner| banner.message.contains("Daemon start failed"))
     );
-    assert_eq!(harness.current_view(), TopLevelView::Supervisor);
+}
+
+#[tokio::test]
+async fn supervisor_restart_start_failure_surfaces_error_state() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness
+        .dispatch(UserAction::ShowView(TopLevelView::Supervisor))
+        .await;
+
+    harness.dispatch_no_wait(UserAction::RestartDaemon);
+    assert_eq!(
+        harness.state().daemon_lifecycle,
+        DaemonLifecycleState::Restarting
+    );
+    harness
+        .inject_ui_event(UiEvent::DaemonStopped { stopping: true })
+        .await;
+    harness
+        .inject_ui_event(UiEvent::DaemonStartFailed("start timed out".to_string()))
+        .await;
+    assert_eq!(
+        harness.state().daemon_lifecycle,
+        DaemonLifecycleState::Failed
+    );
+    assert!(
+        harness
+            .state()
+            .daemon_lifecycle_error
+            .as_deref()
+            .is_some_and(|error| error == "start timed out")
+    );
+}
+
+#[tokio::test]
+async fn supervisor_stop_rejected_on_already_stopped_keeps_state() {
+    let mut harness = AppHarness::new(sample_disconnected_snapshot())
+        .await
+        .unwrap();
+    harness
+        .dispatch(UserAction::ShowView(TopLevelView::Supervisor))
+        .await;
+    harness.dispatch(UserAction::StopDaemon).await;
+
+    assert_eq!(
+        harness.state().daemon_lifecycle,
+        DaemonLifecycleState::Stopped
+    );
+    assert_eq!(
+        harness.state().daemon_lifecycle_error.as_deref(),
+        Some("daemon already stopped")
+    );
+}
+
+#[tokio::test]
+async fn supervisor_redundant_lifecycle_keys_are_ignored_while_inflight() {
+    let mut harness = AppHarness::new(sample_disconnected_snapshot())
+        .await
+        .unwrap();
+    harness
+        .dispatch(UserAction::ShowView(TopLevelView::Supervisor))
+        .await;
+
+    harness.dispatch_no_wait(UserAction::StartDaemon);
+    harness.dispatch_no_wait(UserAction::StopDaemon);
+    harness.dispatch_no_wait(UserAction::RestartDaemon);
+    assert_eq!(
+        harness.state().daemon_lifecycle,
+        DaemonLifecycleState::Starting
+    );
+
+    harness.process().await;
+    assert_eq!(
+        harness.state().daemon_lifecycle,
+        DaemonLifecycleState::Running
+    );
+    let commands = harness.recorded_commands().await;
+    let start_count = commands
+        .iter()
+        .filter(|command| **command == BackendCommand::StartDaemon)
+        .count();
+    assert_eq!(start_count, 1);
 }
 
 #[tokio::test]
 async fn supervisor_footer_shows_supervisor_actions_once_each() {
     let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
-
     harness
         .dispatch(UserAction::ShowView(TopLevelView::Supervisor))
         .await;
@@ -1676,7 +1777,6 @@ async fn supervisor_footer_shows_supervisor_actions_once_each() {
         .find(|line| line.contains("keys:"))
         .map(str::to_string)
         .unwrap_or_default();
-
     assert_eq!(keys_line.matches("x stop daemon").count(), 1);
     assert!(keys_line.contains("s start daemon"));
     assert!(keys_line.contains("R restart daemon"));

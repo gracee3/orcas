@@ -6,7 +6,9 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::app::{AppState, CollaborationFocus};
 use crate::view_model;
 
-use super::shared::{focus_title, render_panel};
+use super::shared::{
+    emphasis_style, focus_block_style, focus_title, metadata_style, render_panel, row_style,
+};
 
 pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
     let compact = area.width < 138 || area.height < 30;
@@ -105,32 +107,42 @@ pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
 fn render_collaboration_status(
     status: view_model::CollaborationStatusViewModel,
 ) -> Paragraph<'static> {
-    let mut lines = vec![Line::from(format!(
-        "focus={}  workstreams={}  work_units={}  active_assignments={}  review={}",
-        view_model::collaboration_focus_label(status.focus),
-        status.workstream_count,
-        status.work_unit_count,
-        status.active_assignment_count,
-        status.review_count
-    ))];
-    lines.push(Line::from(format!(
-        "selected stream: {}",
-        status
-            .selected_workstream_title
-            .unwrap_or_else(|| "-".to_string())
-    )));
-    lines.push(Line::from(format!(
-        "selected unit: {}",
-        status
-            .selected_work_unit_title
-            .unwrap_or_else(|| "-".to_string())
-    )));
+    let mut lines = vec![Line::styled(
+        format!(
+            "focus={}  workstreams={}  work_units={}  active_assignments={}  review={}",
+            view_model::collaboration_focus_label(status.focus),
+            status.workstream_count,
+            status.work_unit_count,
+            status.active_assignment_count,
+            status.review_count
+        ),
+        emphasis_style(),
+    )];
+    lines.push(Line::styled(
+        format!(
+            "selected stream: {}",
+            status
+                .selected_workstream_title
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        metadata_style(),
+    ));
+    lines.push(Line::styled(
+        format!(
+            "selected unit: {}",
+            status
+                .selected_work_unit_title
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        metadata_style(),
+    ));
 
     Paragraph::new(Text::from(lines))
         .block(
             Block::default()
                 .title("Collaboration")
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(focus_block_style(true)),
         )
         .wrap(Wrap { trim: true })
 }
@@ -147,10 +159,10 @@ fn render_workstreams(
             .take(10)
             .map(|row| {
                 let prefix = if row.selected { ">" } else { " " };
-                Line::from(format!(
-                    "{prefix} {} [{}] {}",
-                    row.title, row.status, row.counts
-                ))
+                Line::styled(
+                    format!("{prefix} {} [{}] {}", row.title, row.status, row.counts),
+                    row_style(row.selected),
+                )
             })
             .collect()
     };
@@ -159,7 +171,8 @@ fn render_workstreams(
         .block(
             Block::default()
                 .title(focus_title("Workstreams", focused))
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(focus_block_style(focused)),
         )
         .wrap(Wrap { trim: true })
 }
@@ -186,18 +199,21 @@ fn render_work_units(list: view_model::WorkUnitListViewModel, focused: bool) -> 
             } else {
                 ""
             };
-            lines.push(Line::from(format!(
-                "{prefix} {} [{}]",
-                row.title, row.status
-            )));
-            lines.push(Line::from(format!(
-                "  assignment={} decision={} proposal={} parse={}{}",
-                row.current_assignment,
-                row.latest_decision,
-                row.proposal_status,
-                row.latest_report_parse_result,
-                review
-            )));
+            lines.push(Line::styled(
+                format!("{prefix} {} [{}]", row.title, row.status),
+                row_style(row.selected),
+            ));
+            lines.push(Line::styled(
+                format!(
+                    "  assignment={} decision={} proposal={} parse={}{}",
+                    row.current_assignment,
+                    row.latest_decision,
+                    row.proposal_status,
+                    row.latest_report_parse_result,
+                    review
+                ),
+                metadata_style(),
+            ));
         }
         lines
     };
@@ -206,7 +222,8 @@ fn render_work_units(list: view_model::WorkUnitListViewModel, focused: bool) -> 
         .block(
             Block::default()
                 .title(focus_title("Work Units", focused))
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(focus_block_style(focused)),
         )
         .wrap(Wrap { trim: true })
 }

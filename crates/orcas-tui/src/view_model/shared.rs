@@ -1,4 +1,6 @@
-use crate::app::{AppState, BannerLevel, CollaborationFocus, DaemonConnectionPhase};
+use crate::app::{
+    AppState, BannerLevel, CollaborationFocus, DaemonConnectionPhase, DaemonLifecycleState,
+};
 use orcas_core::ipc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +85,18 @@ pub(crate) fn daemon_phase_label(phase: DaemonConnectionPhase) -> &'static str {
         DaemonConnectionPhase::Connected => "connected",
         DaemonConnectionPhase::Reconnecting => "reconnecting",
         DaemonConnectionPhase::Disconnected => "disconnected",
+    }
+}
+
+pub(crate) fn daemon_lifecycle_label(lifecycle: DaemonLifecycleState) -> &'static str {
+    match lifecycle {
+        DaemonLifecycleState::Unknown => "unknown",
+        DaemonLifecycleState::Stopped => "stopped",
+        DaemonLifecycleState::Starting => "starting",
+        DaemonLifecycleState::Stopping => "stopping",
+        DaemonLifecycleState::Restarting => "restarting",
+        DaemonLifecycleState::Running => "running",
+        DaemonLifecycleState::Failed => "failed",
     }
 }
 
