@@ -1,8 +1,8 @@
 use std::fs::OpenOptions;
 use std::path::Path;
 
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use tracing_subscriber::util::TryInitError;
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::OrcasResult;
 
