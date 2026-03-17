@@ -1,7 +1,7 @@
 # Codex Thread Supervision v1
 
 This slice adds Orcas-side mirror and monitoring support for Codex app-server threads.
-It now also includes Orcas-native assignment metadata for binding a Codex thread to Orcas workflow objects, plus Orcas-native next-turn supervisor decisions with explicit human review.
+It now also includes Orcas-native assignment metadata for binding a Codex thread to Orcas workflow objects, plus Orcas-native next-turn, steer, and interrupt supervisor decisions with explicit human review.
 
 ## Canonical Boundaries
 
@@ -20,6 +20,8 @@ Orcas remains canonical for:
 - thread-to-workflow assignment metadata
 - supervisor proposal state for Codex threads
 - human approval workflow for Codex next-turn sends
+- human approval workflow for Codex active-turn steer sends
+- human approval workflow for Codex active-turn interrupt sends
 - stale-basis validation before Orcas sends into a Codex thread
 
 This slice does not store Orcas workflow metadata inside Codex thread history.
@@ -34,6 +36,10 @@ This slice does not store Orcas workflow metadata inside Codex thread history.
 - pause, resume, and release Orcas-native Codex-thread assignments
 - auto-generate a single human-reviewable next-turn proposal for an active assigned idle thread
 - approve and send that proposal through documented `turn/start`
+- let an operator propose a steer message for an active assigned thread
+- approve and send that steer through documented `turn/steer`
+- let an operator propose an interrupt for an active assigned thread
+- approve and send that interrupt through documented `turn/interrupt`
 - reject a proposal without sending
 - mark a proposal stale when the assignment or Codex thread basis changes before send
 - persist thread mirror state and turn state across Orcas restart
@@ -43,8 +49,8 @@ This slice does not store Orcas workflow metadata inside Codex thread history.
   - loaded status
   - live attach status
   - assignment badge / assignment panel
-  - pending human approval / stale / sent / rejected decision state
-  - latest next-turn proposal text and rationale
+  - pending human approval / pending steer approval / pending interrupt approval / stale / sent / rejected decision state
+  - latest next-turn, steer, or interrupt proposal rationale
   - persisted turn history
   - aggregated item text
   - turn lifecycle snapshots
@@ -123,6 +129,26 @@ Decision status meanings:
 - `stale`: basis changed before Orcas could send
 - `superseded`: defined in the model, but not yet a primary path in this slice
 
+Interrupt decisions reuse the same Orcas-native object with:
+
+- `kind = interrupt_active_turn`
+- `proposal_kind = operator_interrupt`
+- `basis_turn_id` required
+- no proposed text payload
+- documented send path limited to `turn/interrupt`
+
+Interrupt proposals are operator-initiated only in this slice. Orcas does not auto-generate them just because a thread is active.
+
+Steer decisions reuse the same Orcas-native object with:
+
+- `kind = steer_active_turn`
+- `proposal_kind = operator_steer`
+- `basis_turn_id` required
+- `proposed_text` required
+- documented send path limited to `turn/steer`
+
+Steer proposals are operator-initiated only in this slice. Orcas does not auto-generate them just because a thread is active.
+
 ## Basis / Stale Validation
 
 For Codex-thread next-turn proposals, Orcas uses a conservative basis:
@@ -136,6 +162,55 @@ For Codex-thread next-turn proposals, Orcas uses a conservative basis:
   - the decision is still pending human review
 
 If any of those checks fail, Orcas does not send. The decision is marked stale and remains Orcas-native audit state.
+
+For interrupt proposals, Orcas uses a conservative active-turn basis:
+
+- proposals are created only when the assignment is active and the thread currently has an active turn
+- the basis is the active `active_turn_id` at proposal time
+- `approve_and_send` re-checks that:
+  - the assignment is still active
+  - the decision is still pending human review
+  - the thread still has an active turn
+  - the current `active_turn_id` still matches `basis_turn_id`
+
+If any of those checks fail, Orcas does not interrupt. The decision is marked stale and the upstream Codex thread is left unchanged.
+
+For steer proposals, Orcas uses the same conservative active-turn basis:
+
+- proposals are created only when the assignment is active and the thread currently has an active turn
+- the basis is the active `active_turn_id` at proposal time
+- `approve_and_send` re-checks that:
+  - the assignment is still active
+  - the decision is still pending human review
+  - the thread still has an active turn
+  - the current `active_turn_id` still matches `basis_turn_id`
+  - `proposed_text` is still non-empty
+
+If any of those checks fail, Orcas does not steer. The decision is marked stale and the upstream Codex thread is left unchanged.
+
+## Steer Proposal Semantics
+
+- Steer proposals are only available for assigned active threads with a current active turn.
+- Orcas keeps the one-open-decision-per-assignment invariant.
+- If an open next-turn decision already exists, Orcas rejects steer proposal creation as conflicting in this slice.
+- If an open interrupt decision already exists, Orcas rejects steer proposal creation as conflicting in this slice.
+- If an assignment pauses or releases while a steer proposal is pending, the proposal becomes stale and cannot be sent.
+- If the active turn changes or completes naturally before approval, the steer proposal becomes stale.
+- A successful steer send does not start a new turn. Orcas waits for normal Codex event ingestion to reflect the continued in-flight turn state.
+- Orcas uses documented `turn/steer` constraints only:
+  - `expectedTurnId` is required and must match the active turn
+  - steer fails if there is no active turn
+  - steer does not start a new turn
+  - steer does not accept turn-level overrides such as model, cwd, sandbox policy, or output schema
+
+## Interrupt Proposal Semantics
+
+- Interrupt proposals are only available for assigned active threads with a current active turn.
+- Orcas keeps the one-open-decision-per-assignment invariant.
+- If an open next-turn decision already exists, Orcas rejects interrupt proposal creation as conflicting in this slice.
+- If an assignment pauses or releases while an interrupt proposal is pending, the proposal becomes stale and cannot be sent.
+- If the active turn completes naturally before approval, the interrupt proposal becomes stale.
+- A successful interrupt send does not invent a new turn id. Orcas waits for normal Codex event ingestion to reflect the interrupted terminal state.
 
 ## Bootstrap Proposal Semantics
 
@@ -156,8 +231,6 @@ Bootstrap text is deterministic and template-based in this slice. Orcas does not
 - exact replay of transient deltas Orcas missed before attach
 - whole-thread kill semantics
 - process-tree kill semantics
-- steer proposal/send workflow
-- interrupt proposal/send workflow
 - automatic supervisor writing into Codex threads
 - mutation of app-server’s persisted thread log format
 - autonomous sending without human approval
@@ -169,7 +242,7 @@ Bootstrap text is deterministic and template-based in this slice. Orcas does not
 - `thread/attach`
 - `thread/detach`
 
-Existing `thread/start`, `thread/read`, `thread/get`, `thread/resume`, `turn/start`, and `turn/interrupt` remain in place.
+Existing `thread/start`, `thread/read`, `thread/get`, `thread/resume`, `turn/start`, `turn/steer`, and `turn/interrupt` remain in place.
 
 Assignment IPC added:
 
@@ -184,5 +257,7 @@ Supervisor decision IPC added:
 
 - `supervisor_decision/list`
 - `supervisor_decision/get`
+- `supervisor_decision/propose_steer`
+- `supervisor_decision/propose_interrupt`
 - `supervisor_decision/approve_and_send`
 - `supervisor_decision/reject`

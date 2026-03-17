@@ -107,7 +107,7 @@ pub fn thread_summary(state: &AppState) -> PanelViewModel {
         lines.push(format!(
             "decision: {} [{}]",
             decision.decision_id,
-            supervisor_decision_status_label(decision.status)
+            supervisor_decision_status_label(decision)
         ));
         lines.push(format!(
             "review: {}  proposal: {}",
@@ -223,7 +223,7 @@ pub fn thread_detail(state: &AppState) -> ThreadDetailViewModel {
         lines.push(format!(
             "decision {} [{}]",
             decision.decision_id,
-            supervisor_decision_status_label(decision.status)
+            supervisor_decision_status_label(decision)
         ));
         lines.push(format!(
             "  kind={}  proposal={}  basis={}",
@@ -269,6 +269,11 @@ pub fn thread_detail(state: &AppState) -> ThreadDetailViewModel {
         lines.push(String::new());
     } else {
         lines.push("Decision: none".to_string());
+        if thread_steer_proposable(state, thread_id)
+            || thread_interrupt_proposable(state, thread_id)
+        {
+            lines.push("  actions: s propose steer  i propose interrupt".to_string());
+        }
         lines.push(String::new());
     }
 
@@ -354,7 +359,7 @@ fn thread_assignment_badge(state: &AppState, thread_id: &str) -> Option<String> 
 
 fn thread_decision_badge(state: &AppState, thread_id: &str) -> Option<String> {
     let decision = thread_decision_for_display(state, thread_id)?;
-    Some(supervisor_decision_status_label(decision.status).to_string())
+    Some(supervisor_decision_status_label(decision).to_string())
 }
 
 fn loaded_status_label(status: ipc::ThreadLoadedStatus) -> &'static str {
@@ -405,6 +410,8 @@ fn codex_bootstrap_state_label(state: CodexThreadBootstrapState) -> &'static str
 fn supervisor_decision_kind_label(kind: orcas_core::SupervisorTurnDecisionKind) -> &'static str {
     match kind {
         orcas_core::SupervisorTurnDecisionKind::NextTurn => "next turn",
+        orcas_core::SupervisorTurnDecisionKind::SteerActiveTurn => "steer active turn",
+        orcas_core::SupervisorTurnDecisionKind::InterruptActiveTurn => "interrupt active turn",
         orcas_core::SupervisorTurnDecisionKind::NoAction => "no action",
     }
 }
@@ -414,21 +421,74 @@ fn supervisor_proposal_kind_label(kind: orcas_core::SupervisorTurnProposalKind) 
         orcas_core::SupervisorTurnProposalKind::Bootstrap => "bootstrap",
         orcas_core::SupervisorTurnProposalKind::ContinueAfterTurn => "continue after turn",
         orcas_core::SupervisorTurnProposalKind::ManualRefresh => "manual refresh",
+        orcas_core::SupervisorTurnProposalKind::OperatorSteer => "operator steer",
+        orcas_core::SupervisorTurnProposalKind::OperatorInterrupt => "operator interrupt",
     }
 }
 
-fn supervisor_decision_status_label(
-    status: orcas_core::SupervisorTurnDecisionStatus,
-) -> &'static str {
-    match status {
-        orcas_core::SupervisorTurnDecisionStatus::Draft => "draft",
-        orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman => "pending human approval",
-        orcas_core::SupervisorTurnDecisionStatus::Approved => "approved",
-        orcas_core::SupervisorTurnDecisionStatus::Rejected => "rejected",
-        orcas_core::SupervisorTurnDecisionStatus::Sent => "sent",
-        orcas_core::SupervisorTurnDecisionStatus::Superseded => "superseded",
-        orcas_core::SupervisorTurnDecisionStatus::Stale => "stale proposal",
+fn supervisor_decision_status_label(decision: &ipc::SupervisorTurnDecisionSummary) -> &'static str {
+    match (decision.kind, decision.status) {
+        (
+            orcas_core::SupervisorTurnDecisionKind::SteerActiveTurn,
+            orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman,
+        ) => "pending steer approval",
+        (
+            orcas_core::SupervisorTurnDecisionKind::SteerActiveTurn,
+            orcas_core::SupervisorTurnDecisionStatus::Stale,
+        ) => "stale steer proposal",
+        (
+            orcas_core::SupervisorTurnDecisionKind::InterruptActiveTurn,
+            orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman,
+        ) => "pending interrupt approval",
+        (
+            orcas_core::SupervisorTurnDecisionKind::InterruptActiveTurn,
+            orcas_core::SupervisorTurnDecisionStatus::Stale,
+        ) => "stale interrupt proposal",
+        (_, orcas_core::SupervisorTurnDecisionStatus::Draft) => "draft",
+        (_, orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman) => "pending human approval",
+        (_, orcas_core::SupervisorTurnDecisionStatus::Approved) => "approved",
+        (_, orcas_core::SupervisorTurnDecisionStatus::Rejected) => "rejected",
+        (_, orcas_core::SupervisorTurnDecisionStatus::Sent) => "sent",
+        (_, orcas_core::SupervisorTurnDecisionStatus::Superseded) => "superseded",
+        (_, orcas_core::SupervisorTurnDecisionStatus::Stale) => "stale proposal",
     }
+}
+
+fn thread_steer_proposable(state: &AppState, thread_id: &str) -> bool {
+    thread_active_turn_decision_proposable(state, thread_id)
+}
+
+fn thread_interrupt_proposable(state: &AppState, thread_id: &str) -> bool {
+    thread_active_turn_decision_proposable(state, thread_id)
+}
+
+fn thread_active_turn_decision_proposable(state: &AppState, thread_id: &str) -> bool {
+    let Some(assignment) = current_thread_assignment(state, thread_id) else {
+        return false;
+    };
+    if assignment.status != CodexThreadAssignmentStatus::Active {
+        return false;
+    }
+    let has_active_turn = state
+        .thread_details
+        .get(thread_id)
+        .map(|thread| thread.summary.active_turn_id.is_some())
+        .or_else(|| {
+            state
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .map(|thread| thread.active_turn_id.is_some())
+        })
+        .unwrap_or(false);
+    if !has_active_turn {
+        return false;
+    }
+    !state
+        .collaboration
+        .supervisor_turn_decisions
+        .iter()
+        .any(|decision| decision.assignment_id == assignment.assignment_id && decision.open)
 }
 
 fn current_thread_assignment<'a>(

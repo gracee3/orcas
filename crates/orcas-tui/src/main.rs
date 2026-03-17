@@ -116,6 +116,10 @@ fn action_for_key(current_view: TopLevelView, code: KeyCode) -> Option<UserActio
             Some(UserAction::ApproveSelectedSupervisorDecision)
         }
         KeyCode::Char('d') if in_threads_view => Some(UserAction::RejectSelectedSupervisorDecision),
+        KeyCode::Char('s') if in_threads_view => Some(UserAction::ProposeSteerForSelectedThread),
+        KeyCode::Char('i') if in_threads_view => {
+            Some(UserAction::ProposeInterruptForSelectedThread)
+        }
         KeyCode::Down => Some(UserAction::SelectNextInView),
         KeyCode::Up => Some(UserAction::SelectPreviousInView),
         KeyCode::Left => Some(UserAction::ShowView(current_view.previous())),
@@ -194,6 +198,14 @@ mod tests {
         assert_eq!(
             action_for_key(TopLevelView::Threads, KeyCode::Char('d')),
             Some(UserAction::RejectSelectedSupervisorDecision)
+        );
+        assert_eq!(
+            action_for_key(TopLevelView::Threads, KeyCode::Char('s')),
+            Some(UserAction::ProposeSteerForSelectedThread)
+        );
+        assert_eq!(
+            action_for_key(TopLevelView::Threads, KeyCode::Char('i')),
+            Some(UserAction::ProposeInterruptForSelectedThread)
         );
     }
 }

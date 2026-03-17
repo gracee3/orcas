@@ -513,6 +513,10 @@ impl OrcasDaemonService {
                 let params: ipc::TurnStartRequest = Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.turn_start(params).await?)?
             }
+            ipc::methods::TURN_STEER => {
+                let params: ipc::TurnSteerRequest = Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.turn_steer(params).await?)?
+            }
             ipc::methods::TURN_INTERRUPT => {
                 let params: ipc::TurnInterruptRequest =
                     Self::decode_params(request.params.clone())?;
@@ -595,6 +599,16 @@ impl OrcasDaemonService {
                 let params: ipc::SupervisorDecisionGetRequest =
                     Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.supervisor_decision_get(params).await?)?
+            }
+            ipc::methods::SUPERVISOR_DECISION_PROPOSE_STEER => {
+                let params: ipc::SupervisorDecisionProposeSteerRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.supervisor_decision_propose_steer(params).await?)?
+            }
+            ipc::methods::SUPERVISOR_DECISION_PROPOSE_INTERRUPT => {
+                let params: ipc::SupervisorDecisionProposeInterruptRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.supervisor_decision_propose_interrupt(params).await?)?
             }
             ipc::methods::SUPERVISOR_DECISION_APPROVE_AND_SEND => {
                 let params: ipc::SupervisorDecisionApproveAndSendRequest =
@@ -1099,6 +1113,33 @@ impl OrcasDaemonService {
             .await;
         Ok(ipc::TurnStartResponse {
             turn_id: response.turn.id,
+            thread_id: params.thread_id,
+        })
+    }
+
+    async fn turn_steer(
+        &self,
+        params: ipc::TurnSteerRequest,
+    ) -> OrcasResult<ipc::TurnSteerResponse> {
+        if params.text.trim().is_empty() {
+            return Err(OrcasError::Protocol(
+                "turn/steer requires non-empty text".to_string(),
+            ));
+        }
+        self.connect_upstream().await?;
+        let response = self
+            .codex_client
+            .turn_steer(types::TurnSteerParams {
+                thread_id: params.thread_id.clone(),
+                input: vec![types::UserInput::Text {
+                    text: params.text,
+                    text_elements: Vec::new(),
+                }],
+                expected_turn_id: params.expected_turn_id.clone(),
+            })
+            .await?;
+        Ok(ipc::TurnSteerResponse {
+            turn_id: response.turn_id,
             thread_id: params.thread_id,
         })
     }
@@ -2315,6 +2356,271 @@ impl OrcasDaemonService {
         Ok(ipc::SupervisorDecisionGetResponse { decision })
     }
 
+    async fn supervisor_decision_propose_steer(
+        &self,
+        params: ipc::SupervisorDecisionProposeSteerRequest,
+    ) -> OrcasResult<ipc::SupervisorDecisionProposeSteerResponse> {
+        let (decision, updated_assignment) = {
+            let now = Utc::now();
+            let requested_by = params
+                .requested_by
+                .clone()
+                .unwrap_or_else(|| "orcas_operator".to_string());
+            let mut state = self.state.write().await;
+            let assignment = state
+                .collaboration
+                .codex_thread_assignments
+                .get(&params.assignment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "unknown Codex thread assignment `{}`",
+                        params.assignment_id
+                    ))
+                })?;
+            if !Self::codex_assignment_supports_decisions(assignment.status) {
+                return Err(OrcasError::Protocol(format!(
+                    "Codex thread assignment `{}` is not active",
+                    assignment.assignment_id
+                )));
+            }
+            if let Some(conflict_id) = Self::open_supervisor_decision_id_for_assignment(
+                &state.collaboration,
+                &assignment.assignment_id,
+            ) {
+                return Err(OrcasError::Protocol(format!(
+                    "assignment `{}` already has open supervisor decision `{}`",
+                    assignment.assignment_id, conflict_id
+                )));
+            }
+            let thread = state
+                .threads
+                .get(&assignment.codex_thread_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "thread `{}` is not loaded in Orcas state",
+                        assignment.codex_thread_id
+                    ))
+                })?;
+            let active_turn_id = thread.summary.active_turn_id.clone().ok_or_else(|| {
+                OrcasError::Protocol(format!(
+                    "thread `{}` has no active turn to steer",
+                    assignment.codex_thread_id
+                ))
+            })?;
+            let workstream = state
+                .collaboration
+                .workstreams
+                .get(&assignment.workstream_id);
+            let work_unit = state.collaboration.work_units.get(&assignment.work_unit_id);
+            let proposed_text = match params.proposed_text.as_ref() {
+                Some(text) => {
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        return Err(OrcasError::Protocol(
+                            "steer proposal requires non-empty proposed_text".to_string(),
+                        ));
+                    }
+                    trimmed.to_string()
+                }
+                None => Self::generate_steer_turn_text(&assignment, workstream, work_unit),
+            };
+            let workstream_title = workstream
+                .map(|workstream| workstream.title.clone())
+                .unwrap_or_else(|| assignment.workstream_id.clone());
+            let work_unit_title = work_unit
+                .map(|work_unit| work_unit.title.clone())
+                .unwrap_or_else(|| assignment.work_unit_id.clone());
+            let rationale_summary = params
+                .rationale_note
+                .as_ref()
+                .map(|note| note.trim())
+                .filter(|note| !note.is_empty())
+                .map(|note| note.to_string())
+                .unwrap_or_else(|| {
+                    format!(
+                        "Operator `{requested_by}` requested review of steering active turn `{active_turn_id}` for assigned workstream `{}` and work unit `{}`.",
+                        workstream_title, work_unit_title
+                    )
+                });
+            let decision = SupervisorTurnDecision {
+                decision_id: Self::new_object_id("std"),
+                assignment_id: assignment.assignment_id.clone(),
+                codex_thread_id: assignment.codex_thread_id.clone(),
+                basis_turn_id: Some(active_turn_id.clone()),
+                kind: SupervisorTurnDecisionKind::SteerActiveTurn,
+                proposal_kind: SupervisorTurnProposalKind::OperatorSteer,
+                proposed_text: Some(proposed_text),
+                rationale_summary,
+                status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                created_at: now,
+                approved_at: None,
+                rejected_at: None,
+                sent_at: None,
+                superseded_by: None,
+                sent_turn_id: None,
+                notes: Some(format!("steer proposal requested by {requested_by}")),
+            };
+            state
+                .collaboration
+                .supervisor_turn_decisions
+                .insert(decision.decision_id.clone(), decision.clone());
+            let updated_assignment = state
+                .collaboration
+                .codex_thread_assignments
+                .get_mut(&assignment.assignment_id)
+                .map(|assignment| {
+                    assignment.latest_decision_id = Some(decision.decision_id.clone());
+                    assignment.latest_basis_turn_id = Some(active_turn_id);
+                    assignment.updated_at = now;
+                    assignment.clone()
+                });
+            (decision, updated_assignment)
+        };
+        self.persist_collaboration_state().await?;
+        if let Some(assignment) = updated_assignment.as_ref() {
+            self.emit_codex_assignment_lifecycle(
+                ipc::CodexAssignmentLifecycleAction::Updated,
+                assignment,
+            )
+            .await;
+        }
+        self.emit_supervisor_decision_lifecycle(
+            ipc::SupervisorDecisionLifecycleAction::Created,
+            &decision,
+        )
+        .await;
+        Ok(ipc::SupervisorDecisionProposeSteerResponse { decision })
+    }
+
+    async fn supervisor_decision_propose_interrupt(
+        &self,
+        params: ipc::SupervisorDecisionProposeInterruptRequest,
+    ) -> OrcasResult<ipc::SupervisorDecisionProposeInterruptResponse> {
+        let (decision, updated_assignment) = {
+            let now = Utc::now();
+            let requested_by = params
+                .requested_by
+                .clone()
+                .unwrap_or_else(|| "orcas_operator".to_string());
+            let mut state = self.state.write().await;
+            let assignment = state
+                .collaboration
+                .codex_thread_assignments
+                .get(&params.assignment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "unknown Codex thread assignment `{}`",
+                        params.assignment_id
+                    ))
+                })?;
+            if !Self::codex_assignment_supports_decisions(assignment.status) {
+                return Err(OrcasError::Protocol(format!(
+                    "Codex thread assignment `{}` is not active",
+                    assignment.assignment_id
+                )));
+            }
+            if let Some(conflict_id) = Self::open_supervisor_decision_id_for_assignment(
+                &state.collaboration,
+                &assignment.assignment_id,
+            ) {
+                return Err(OrcasError::Protocol(format!(
+                    "assignment `{}` already has open supervisor decision `{}`",
+                    assignment.assignment_id, conflict_id
+                )));
+            }
+            let thread = state
+                .threads
+                .get(&assignment.codex_thread_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "thread `{}` is not loaded in Orcas state",
+                        assignment.codex_thread_id
+                    ))
+                })?;
+            let active_turn_id = thread.summary.active_turn_id.clone().ok_or_else(|| {
+                OrcasError::Protocol(format!(
+                    "thread `{}` has no active turn to interrupt",
+                    assignment.codex_thread_id
+                ))
+            })?;
+            let workstream_title = state
+                .collaboration
+                .workstreams
+                .get(&assignment.workstream_id)
+                .map(|workstream| workstream.title.clone())
+                .unwrap_or_else(|| assignment.workstream_id.clone());
+            let work_unit_title = state
+                .collaboration
+                .work_units
+                .get(&assignment.work_unit_id)
+                .map(|work_unit| work_unit.title.clone())
+                .unwrap_or_else(|| assignment.work_unit_id.clone());
+            let rationale_summary = params
+                .rationale_note
+                .as_ref()
+                .map(|note| note.trim())
+                .filter(|note| !note.is_empty())
+                .map(|note| note.to_string())
+                .unwrap_or_else(|| {
+                    format!(
+                        "Operator `{requested_by}` requested review of interrupting active turn `{active_turn_id}` for assigned workstream `{}` and work unit `{}`.",
+                        workstream_title, work_unit_title
+                    )
+                });
+            let decision = SupervisorTurnDecision {
+                decision_id: Self::new_object_id("std"),
+                assignment_id: assignment.assignment_id.clone(),
+                codex_thread_id: assignment.codex_thread_id.clone(),
+                basis_turn_id: Some(active_turn_id.clone()),
+                kind: SupervisorTurnDecisionKind::InterruptActiveTurn,
+                proposal_kind: SupervisorTurnProposalKind::OperatorInterrupt,
+                proposed_text: None,
+                rationale_summary,
+                status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                created_at: now,
+                approved_at: None,
+                rejected_at: None,
+                sent_at: None,
+                superseded_by: None,
+                sent_turn_id: None,
+                notes: Some(format!("interrupt proposal requested by {requested_by}")),
+            };
+            state
+                .collaboration
+                .supervisor_turn_decisions
+                .insert(decision.decision_id.clone(), decision.clone());
+            let updated_assignment = state
+                .collaboration
+                .codex_thread_assignments
+                .get_mut(&assignment.assignment_id)
+                .map(|assignment| {
+                    assignment.latest_decision_id = Some(decision.decision_id.clone());
+                    assignment.latest_basis_turn_id = Some(active_turn_id);
+                    assignment.updated_at = now;
+                    assignment.clone()
+                });
+            (decision, updated_assignment)
+        };
+        self.persist_collaboration_state().await?;
+        if let Some(assignment) = updated_assignment.as_ref() {
+            self.emit_codex_assignment_lifecycle(
+                ipc::CodexAssignmentLifecycleAction::Updated,
+                assignment,
+            )
+            .await;
+        }
+        self.emit_supervisor_decision_lifecycle(
+            ipc::SupervisorDecisionLifecycleAction::Created,
+            &decision,
+        )
+        .await;
+        Ok(ipc::SupervisorDecisionProposeInterruptResponse { decision })
+    }
+
     async fn supervisor_decision_approve_and_send(
         &self,
         params: ipc::SupervisorDecisionApproveAndSendRequest,
@@ -2339,16 +2645,7 @@ impl OrcasDaemonService {
                 decision.decision_id
             )));
         }
-        let proposed_text = decision.proposed_text.clone().ok_or_else(|| {
-            OrcasError::Protocol(format!(
-                "supervisor decision `{}` has no proposed text to send",
-                decision.decision_id
-            ))
-        })?;
-        if let Err(reason) = self
-            .validate_supervisor_send_basis(&decision.assignment_id, &decision)
-            .await
-        {
+        if let Err(reason) = self.validate_supervisor_send_basis(&decision).await {
             let stale = self
                 .mark_supervisor_decision_stale(&decision.decision_id, &reason)
                 .await?;
@@ -2379,17 +2676,114 @@ impl OrcasDaemonService {
             decision_record.status = SupervisorTurnDecisionStatus::Approved;
         }
 
-        let response = match self
-            .turn_start(ipc::TurnStartRequest {
-                thread_id: decision.codex_thread_id.clone(),
-                text: proposed_text,
-                cwd: None,
-                model: None,
-            })
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
+        let sent_turn_id = match decision.kind {
+            SupervisorTurnDecisionKind::NextTurn => {
+                let proposed_text = decision.proposed_text.clone().ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "supervisor decision `{}` has no proposed text to send",
+                        decision.decision_id
+                    ))
+                })?;
+                match self
+                    .turn_start(ipc::TurnStartRequest {
+                        thread_id: decision.codex_thread_id.clone(),
+                        text: proposed_text,
+                        cwd: None,
+                        model: None,
+                    })
+                    .await
+                {
+                    Ok(response) => Some(response),
+                    Err(error) => {
+                        let mut state = self.state.write().await;
+                        if let Some(decision_record) = state
+                            .collaboration
+                            .supervisor_turn_decisions
+                            .get_mut(&params.decision_id)
+                            && decision_record.status == SupervisorTurnDecisionStatus::Approved
+                            && decision_record.sent_at.is_none()
+                        {
+                            decision_record.status = SupervisorTurnDecisionStatus::ProposedToHuman;
+                        }
+                        return Err(error);
+                    }
+                }
+                .map(|response| response.turn_id)
+            }
+            SupervisorTurnDecisionKind::SteerActiveTurn => {
+                let basis_turn_id = decision.basis_turn_id.clone().ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "steer decision `{}` is missing basis_turn_id",
+                        decision.decision_id
+                    ))
+                })?;
+                let proposed_text = decision
+                    .proposed_text
+                    .as_ref()
+                    .map(|text| text.trim())
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| {
+                        OrcasError::Protocol(format!(
+                            "steer decision `{}` has no proposed text to send",
+                            decision.decision_id
+                        ))
+                    })?
+                    .to_string();
+                match self
+                    .turn_steer(ipc::TurnSteerRequest {
+                        thread_id: decision.codex_thread_id.clone(),
+                        expected_turn_id: basis_turn_id,
+                        text: proposed_text,
+                    })
+                    .await
+                {
+                    Ok(_response) => None,
+                    Err(error) => {
+                        let mut state = self.state.write().await;
+                        if let Some(decision_record) = state
+                            .collaboration
+                            .supervisor_turn_decisions
+                            .get_mut(&params.decision_id)
+                            && decision_record.status == SupervisorTurnDecisionStatus::Approved
+                            && decision_record.sent_at.is_none()
+                        {
+                            decision_record.status = SupervisorTurnDecisionStatus::ProposedToHuman;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            SupervisorTurnDecisionKind::InterruptActiveTurn => {
+                let basis_turn_id = decision.basis_turn_id.clone().ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "interrupt decision `{}` is missing basis_turn_id",
+                        decision.decision_id
+                    ))
+                })?;
+                match self
+                    .turn_interrupt(ipc::TurnInterruptRequest {
+                        thread_id: decision.codex_thread_id.clone(),
+                        turn_id: basis_turn_id,
+                    })
+                    .await
+                {
+                    Ok(()) => None,
+                    Err(error) => {
+                        let mut state = self.state.write().await;
+                        if let Some(decision_record) = state
+                            .collaboration
+                            .supervisor_turn_decisions
+                            .get_mut(&params.decision_id)
+                            && decision_record.status == SupervisorTurnDecisionStatus::Approved
+                            && decision_record.sent_at.is_none()
+                        {
+                            decision_record.status = SupervisorTurnDecisionStatus::ProposedToHuman;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            SupervisorTurnDecisionKind::NoAction => {
                 let mut state = self.state.write().await;
                 if let Some(decision_record) = state
                     .collaboration
@@ -2400,7 +2794,9 @@ impl OrcasDaemonService {
                 {
                     decision_record.status = SupervisorTurnDecisionStatus::ProposedToHuman;
                 }
-                return Err(error);
+                return Err(OrcasError::Protocol(
+                    "no_action decisions are not sendable in this slice".to_string(),
+                ));
             }
         };
 
@@ -2441,7 +2837,12 @@ impl OrcasDaemonService {
 
             decision_record.status = SupervisorTurnDecisionStatus::Sent;
             decision_record.sent_at = Some(now);
-            decision_record.sent_turn_id = Some(response.turn_id.clone());
+            decision_record.sent_turn_id = match decision.kind {
+                SupervisorTurnDecisionKind::NextTurn => sent_turn_id,
+                SupervisorTurnDecisionKind::SteerActiveTurn
+                | SupervisorTurnDecisionKind::InterruptActiveTurn
+                | SupervisorTurnDecisionKind::NoAction => None,
+            };
             let sent = decision_record.clone();
 
             let updated_assignment = if let Some(assignment) = state
@@ -4489,7 +4890,7 @@ impl OrcasDaemonService {
         status == CodexThreadAssignmentStatus::Active
     }
 
-    fn supervisor_decision_basis_reason(
+    fn next_turn_decision_basis_reason(
         assignment: &CodexThreadAssignment,
         thread: &ipc::ThreadView,
         decision: &SupervisorTurnDecision,
@@ -4521,17 +4922,133 @@ impl OrcasDaemonService {
         None
     }
 
+    fn interrupt_decision_basis_reason(
+        assignment: &CodexThreadAssignment,
+        thread: &ipc::ThreadView,
+        decision: &SupervisorTurnDecision,
+    ) -> Option<String> {
+        if !Self::codex_assignment_supports_decisions(assignment.status) {
+            return Some(format!(
+                "assignment `{}` is not active",
+                assignment.assignment_id
+            ));
+        }
+        let active_turn_id = thread.summary.active_turn_id.as_ref().ok_or_else(|| {
+            format!(
+                "thread `{}` has no active turn to interrupt",
+                thread.summary.id
+            )
+        });
+        let active_turn_id = match active_turn_id {
+            Ok(turn_id) => turn_id,
+            Err(reason) => return Some(reason),
+        };
+        if decision.basis_turn_id.as_deref() != Some(active_turn_id.as_str()) {
+            return Some(format!(
+                "active turn changed from {:?} to {:?}",
+                decision.basis_turn_id,
+                Some(active_turn_id)
+            ));
+        }
+        if decision.status != SupervisorTurnDecisionStatus::ProposedToHuman {
+            return Some(format!(
+                "decision `{}` is no longer pending human review",
+                decision.decision_id
+            ));
+        }
+        None
+    }
+
+    fn steer_decision_basis_reason(
+        assignment: &CodexThreadAssignment,
+        thread: &ipc::ThreadView,
+        decision: &SupervisorTurnDecision,
+    ) -> Option<String> {
+        if !Self::codex_assignment_supports_decisions(assignment.status) {
+            return Some(format!(
+                "assignment `{}` is not active",
+                assignment.assignment_id
+            ));
+        }
+        let active_turn_id =
+            thread.summary.active_turn_id.as_ref().ok_or_else(|| {
+                format!("thread `{}` has no active turn to steer", thread.summary.id)
+            });
+        let active_turn_id = match active_turn_id {
+            Ok(turn_id) => turn_id,
+            Err(reason) => return Some(reason),
+        };
+        if decision.basis_turn_id.as_deref() != Some(active_turn_id.as_str()) {
+            return Some(format!(
+                "active turn changed from {:?} to {:?}",
+                decision.basis_turn_id,
+                Some(active_turn_id)
+            ));
+        }
+        if decision
+            .proposed_text
+            .as_ref()
+            .map(|text| text.trim())
+            .filter(|text| !text.is_empty())
+            .is_none()
+        {
+            return Some(format!(
+                "steer decision `{}` has no proposed text to send",
+                decision.decision_id
+            ));
+        }
+        if decision.status != SupervisorTurnDecisionStatus::ProposedToHuman {
+            return Some(format!(
+                "decision `{}` is no longer pending human review",
+                decision.decision_id
+            ));
+        }
+        None
+    }
+
+    fn supervisor_decision_basis_reason(
+        assignment: &CodexThreadAssignment,
+        thread: &ipc::ThreadView,
+        decision: &SupervisorTurnDecision,
+    ) -> Option<String> {
+        match decision.kind {
+            SupervisorTurnDecisionKind::NextTurn => {
+                Self::next_turn_decision_basis_reason(assignment, thread, decision)
+            }
+            SupervisorTurnDecisionKind::SteerActiveTurn => {
+                Self::steer_decision_basis_reason(assignment, thread, decision)
+            }
+            SupervisorTurnDecisionKind::InterruptActiveTurn => {
+                Self::interrupt_decision_basis_reason(assignment, thread, decision)
+            }
+            SupervisorTurnDecisionKind::NoAction => {
+                if !Self::codex_assignment_supports_decisions(assignment.status) {
+                    Some(format!(
+                        "assignment `{}` is not active",
+                        assignment.assignment_id
+                    ))
+                } else if decision.status != SupervisorTurnDecisionStatus::ProposedToHuman {
+                    Some(format!(
+                        "decision `{}` is no longer pending human review",
+                        decision.decision_id
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     async fn validate_supervisor_send_basis(
         &self,
-        assignment_id: &str,
         decision: &SupervisorTurnDecision,
     ) -> Result<(), String> {
         let state = self.state.read().await;
         let assignment = state
             .collaboration
             .codex_thread_assignments
-            .get(assignment_id)
-            .ok_or_else(|| format!("assignment `{assignment_id}` no longer exists"))?;
+            .get(&decision.assignment_id)
+            .ok_or_else(|| format!("assignment `{}` no longer exists", decision.assignment_id))?;
         let thread = state
             .threads
             .get(&decision.codex_thread_id)
@@ -4602,6 +5119,24 @@ Then continue with the next bounded step for this assigned work unit."
 Briefly summarize what the prior turn completed{basis_clause}.\n\
 State the next bounded step, then proceed with that step.\n\
 Call out blockers, uncertainty, or risky/destructive changes before taking them."
+        )
+    }
+
+    fn generate_steer_turn_text(
+        assignment: &CodexThreadAssignment,
+        workstream: Option<&Workstream>,
+        work_unit: Option<&WorkUnit>,
+    ) -> String {
+        let workstream_label = workstream
+            .map(|workstream| format!("{} ({})", workstream.id, workstream.title))
+            .unwrap_or_else(|| assignment.workstream_id.clone());
+        let work_unit_label = work_unit
+            .map(|work_unit| format!("{} ({})", work_unit.id, work_unit.title))
+            .unwrap_or_else(|| assignment.work_unit_id.clone());
+        format!(
+            "Continue the current turn under Orcas supervision for workstream {workstream_label} and work unit {work_unit_label}.\n\
+Briefly re-anchor on the assigned objective, summarize any blocker or uncertainty, and focus only on the next bounded step already in progress.\n\
+Do not broaden scope without calling it out first."
         )
     }
 
@@ -4817,6 +5352,12 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                                 basis_turn_id.as_deref(),
                             )
                         }
+                        SupervisorTurnProposalKind::OperatorSteer => {
+                            unreachable!("operator steer proposals are only created explicitly")
+                        }
+                        SupervisorTurnProposalKind::OperatorInterrupt => {
+                            unreachable!("operator interrupt proposals are only created explicitly")
+                        }
                     });
                     let rationale_summary = match proposal_kind {
                         SupervisorTurnProposalKind::Bootstrap => format!(
@@ -4828,6 +5369,12 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                             "Assignment `{}` remains active and thread `{}` is idle after basis turn {:?}.",
                             assignment_snapshot.assignment_id, thread.summary.id, basis_turn_id
                         ),
+                        SupervisorTurnProposalKind::OperatorSteer => {
+                            unreachable!("operator steer proposals are only created explicitly")
+                        }
+                        SupervisorTurnProposalKind::OperatorInterrupt => {
+                            unreachable!("operator interrupt proposals are only created explicitly")
+                        }
                     };
                     let decision = SupervisorTurnDecision {
                         decision_id: Self::new_object_id("std"),
@@ -6844,9 +7391,9 @@ mod tests {
         Report, ReportConfidence, ReportDisposition, ReportParseResult, SupervisorContextPack,
         SupervisorProposal, SupervisorProposalEdits, SupervisorProposalFailureStage,
         SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorSummary,
-        SupervisorTurnDecision, SupervisorTurnDecisionStatus, SupervisorTurnProposalKind, WorkUnit,
-        WorkUnitStatus, WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus,
-        Workstream, WorkstreamStatus, ipc,
+        SupervisorTurnDecision, SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus,
+        SupervisorTurnProposalKind, WorkUnit, WorkUnitStatus, WorkerSessionAttachability,
+        WorkerSessionRuntimeStatus, WorkerStatus, Workstream, WorkstreamStatus, ipc,
     };
 
     #[derive(Debug)]
@@ -6880,6 +7427,11 @@ mod tests {
         next_turn_id: usize,
         threads: HashMap<String, types::Thread>,
         last_turn_start_text: Option<String>,
+        last_turn_steer_thread_id: Option<String>,
+        last_turn_steer_expected_turn_id: Option<String>,
+        last_turn_steer_text: Option<String>,
+        last_turn_interrupt_thread_id: Option<String>,
+        last_turn_interrupt_turn_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -7185,9 +7737,120 @@ mod tests {
                         .await;
                     });
                 }
+                methods::TURN_STEER => {
+                    let params: types::TurnSteerParams =
+                        serde_json::from_value(request.params.unwrap_or(Value::Null))?;
+                    let steer_text = params.input.iter().find_map(|input| match input {
+                        types::UserInput::Text { text, .. } => Some(text.clone()),
+                    });
+                    let active_turn_id = {
+                        let mut state = state.lock().await;
+                        let thread = state.threads.get(&params.thread_id).ok_or_else(|| {
+                            OrcasError::Protocol(format!(
+                                "fake codex runtime missing thread `{}`",
+                                params.thread_id
+                            ))
+                        })?;
+                        let active_turn_id = match &thread.status {
+                            types::ThreadStatus::Active { .. } => {
+                                thread.turns.last().map(|turn| turn.id.clone())
+                            }
+                            _ => None,
+                        };
+                        if active_turn_id.is_none() {
+                            Self::send_rpc_error(
+                                &inbound_tx,
+                                request.id,
+                                -32600,
+                                "no active turn to steer",
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        if active_turn_id.as_deref() != Some(params.expected_turn_id.as_str()) {
+                            Self::send_rpc_error(
+                                &inbound_tx,
+                                request.id,
+                                -32600,
+                                "no active turn to steer",
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        state.last_turn_steer_thread_id = Some(params.thread_id.clone());
+                        state.last_turn_steer_expected_turn_id =
+                            Some(params.expected_turn_id.clone());
+                        state.last_turn_steer_text = steer_text;
+                        active_turn_id.expect("checked above")
+                    };
+                    Self::send_response(
+                        &inbound_tx,
+                        request.id,
+                        &types::TurnSteerResponse {
+                            turn_id: active_turn_id,
+                        },
+                    )
+                    .await?;
+                }
                 methods::TURN_INTERRUPT => {
+                    let params: types::TurnInterruptParams =
+                        serde_json::from_value(request.params.unwrap_or(Value::Null))?;
+                    {
+                        let mut state = state.lock().await;
+                        state.last_turn_interrupt_thread_id = Some(params.thread_id.clone());
+                        state.last_turn_interrupt_turn_id = Some(params.turn_id.clone());
+                    }
                     Self::send_response(&inbound_tx, request.id, &types::TurnInterruptResponse {})
                         .await?;
+                    let state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        let completed_turn = {
+                            let mut state = state.lock().await;
+                            let Some(thread) = state.threads.get_mut(&params.thread_id) else {
+                                return;
+                            };
+                            if let Some(turn) = thread
+                                .turns
+                                .iter_mut()
+                                .find(|turn| turn.id == params.turn_id)
+                            {
+                                turn.status = types::TurnStatus::Interrupted;
+                                turn.error = Some(types::TurnError {
+                                    message: "interrupted".to_string(),
+                                    additional_details: None,
+                                    codex_error_info: None,
+                                });
+                            }
+                            let completed_turn = thread
+                                .turns
+                                .iter()
+                                .find(|turn| turn.id == params.turn_id)
+                                .cloned()
+                                .unwrap_or(types::Turn {
+                                    id: params.turn_id.clone(),
+                                    items: Vec::new(),
+                                    status: types::TurnStatus::Interrupted,
+                                    error: Some(types::TurnError {
+                                        message: "interrupted".to_string(),
+                                        additional_details: None,
+                                        codex_error_info: None,
+                                    }),
+                                });
+                            thread.status = types::ThreadStatus::Idle;
+                            thread.updated_at = Utc::now().timestamp();
+                            completed_turn
+                        };
+                        let _ = Self::send_notification(
+                            &inbound_tx,
+                            methods::TURN_COMPLETED,
+                            &types::TurnCompletedNotification {
+                                thread_id: params.thread_id.clone(),
+                                turn: completed_turn,
+                            },
+                        )
+                        .await;
+                    });
                 }
                 methods::MODEL_LIST => {
                     Self::send_response(
@@ -7222,6 +7885,28 @@ mod tests {
             inbound_tx.send(raw).await.map_err(|error| {
                 OrcasError::Transport(format!(
                     "failed to send fake codex response to client: {error}"
+                ))
+            })
+        }
+
+        async fn send_rpc_error(
+            inbound_tx: &tokio::sync::mpsc::Sender<String>,
+            id: codex_jsonrpc::RequestId,
+            code: i64,
+            message: &str,
+        ) -> OrcasResult<()> {
+            let raw = serde_json::to_string(&codex_jsonrpc::JsonRpcError {
+                jsonrpc: "2.0".to_string(),
+                id,
+                error: codex_jsonrpc::JsonRpcErrorObject {
+                    code,
+                    message: message.to_string(),
+                    data: None,
+                },
+            })?;
+            inbound_tx.send(raw).await.map_err(|error| {
+                OrcasError::Transport(format!(
+                    "failed to send fake codex rpc error to client: {error}"
                 ))
             })
         }
@@ -7556,6 +8241,33 @@ mod tests {
             history_loaded: false,
             turns: Vec::new(),
         }
+    }
+
+    fn sample_active_thread(
+        id: &str,
+        scope: &str,
+        updated_at: i64,
+        turn_id: &str,
+    ) -> ipc::ThreadView {
+        let mut thread = sample_thread(id, scope, updated_at);
+        thread.summary.status = "active".to_string();
+        thread.summary.loaded_status = ipc::ThreadLoadedStatus::Active;
+        thread.summary.active_turn_id = Some(turn_id.to_string());
+        thread.summary.last_seen_turn_id = Some(turn_id.to_string());
+        thread.summary.turn_in_flight = true;
+        thread.turns.push(ipc::TurnView {
+            id: turn_id.to_string(),
+            status: "in_progress".to_string(),
+            error_message: None,
+            error_summary: None,
+            started_at: Some(Utc::now()),
+            completed_at: None,
+            latest_diff: None,
+            latest_plan_snapshot: None,
+            token_usage_snapshot: None,
+            items: Vec::new(),
+        });
+        thread
     }
 
     async fn seed_codex_thread_assignment_fixture(
@@ -11228,24 +11940,7 @@ ORCAS_REPORT_END"#
     #[tokio::test]
     async fn assigned_active_thread_does_not_generate_proposal_until_idle() {
         let service = test_service().await;
-        let mut thread = sample_thread("thread-active", "live_observed", 200);
-        thread.summary.status = "active".to_string();
-        thread.summary.loaded_status = ipc::ThreadLoadedStatus::Active;
-        thread.summary.active_turn_id = Some("turn-live".to_string());
-        thread.summary.last_seen_turn_id = Some("turn-live".to_string());
-        thread.summary.turn_in_flight = true;
-        thread.turns.push(ipc::TurnView {
-            id: "turn-live".to_string(),
-            status: "in_progress".to_string(),
-            error_message: None,
-            error_summary: None,
-            started_at: Some(Utc::now()),
-            completed_at: None,
-            latest_diff: None,
-            latest_plan_snapshot: None,
-            token_usage_snapshot: None,
-            items: Vec::new(),
-        });
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
         let (workstream, work_unit) =
             seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
         let created = service
@@ -11334,6 +12029,511 @@ ORCAS_REPORT_END"#
     }
 
     #[tokio::test]
+    async fn interrupt_proposal_requires_active_assignment() {
+        let service = test_service().await;
+        let error = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: "missing".to_string(),
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("unknown assignment should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown Codex thread assignment")
+        );
+    }
+
+    #[tokio::test]
+    async fn assigned_idle_thread_cannot_create_interrupt_proposal() {
+        let service = test_service().await;
+        let thread = sample_thread("thread-idle", "live_observed", 200);
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        {
+            let mut state = service.state.write().await;
+            state.collaboration.supervisor_turn_decisions.clear();
+        }
+
+        let error = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("idle thread cannot propose interrupt");
+        assert!(error.to_string().contains("has no active turn"));
+    }
+
+    #[tokio::test]
+    async fn operator_can_create_interrupt_proposal_for_assigned_active_thread() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+
+        let proposed = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: Some("interrupt for review".to_string()),
+            })
+            .await
+            .expect("interrupt proposal")
+            .decision;
+        assert_eq!(
+            proposed.kind,
+            SupervisorTurnDecisionKind::InterruptActiveTurn
+        );
+        assert_eq!(
+            proposed.proposal_kind,
+            SupervisorTurnProposalKind::OperatorInterrupt
+        );
+        assert_eq!(proposed.basis_turn_id.as_deref(), Some("turn-live"));
+        assert!(proposed.proposed_text.is_none());
+
+        let listed = service
+            .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
+                assignment_id: Some(assignment.assignment_id),
+                codex_thread_id: None,
+                include_closed: true,
+            })
+            .await
+            .expect("decision list");
+        assert_eq!(listed.decisions.len(), 1);
+        assert_eq!(
+            listed.decisions[0].status,
+            SupervisorTurnDecisionStatus::ProposedToHuman
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_interrupt_proposals_are_rejected() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+
+        service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("first interrupt proposal");
+        let error = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("duplicate interrupt proposal should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("already has open supervisor decision")
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_proposal_conflicts_with_existing_open_next_turn_decision() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        {
+            let mut state = service.state.write().await;
+            state.collaboration.supervisor_turn_decisions.insert(
+                "std-open".to_string(),
+                SupervisorTurnDecision {
+                    decision_id: "std-open".to_string(),
+                    assignment_id: assignment.assignment_id.clone(),
+                    codex_thread_id: thread.summary.id.clone(),
+                    basis_turn_id: Some("turn-prev".to_string()),
+                    kind: SupervisorTurnDecisionKind::NextTurn,
+                    proposal_kind: SupervisorTurnProposalKind::ManualRefresh,
+                    proposed_text: Some("continue".to_string()),
+                    rationale_summary: "existing open decision".to_string(),
+                    status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                    created_at: Utc::now(),
+                    approved_at: None,
+                    rejected_at: None,
+                    sent_at: None,
+                    superseded_by: None,
+                    sent_turn_id: None,
+                    notes: None,
+                },
+            );
+        }
+
+        let error = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("conflicting open decision should block interrupt");
+        assert!(
+            error
+                .to_string()
+                .contains("already has open supervisor decision")
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_proposal_requires_active_assignment() {
+        let service = test_service().await;
+        let error = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: "missing".to_string(),
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("focus on tests".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("unknown assignment should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown Codex thread assignment")
+        );
+    }
+
+    #[tokio::test]
+    async fn assigned_idle_thread_cannot_create_steer_proposal() {
+        let service = test_service().await;
+        let thread = sample_thread("thread-idle", "live_observed", 200);
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        {
+            let mut state = service.state.write().await;
+            state.collaboration.supervisor_turn_decisions.clear();
+        }
+
+        let error = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("focus on tests".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("idle thread cannot propose steer");
+        assert!(error.to_string().contains("has no active turn"));
+    }
+
+    #[tokio::test]
+    async fn operator_can_create_steer_proposal_for_assigned_active_thread() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+
+        let proposed = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: None,
+                rationale_note: Some("steer for review".to_string()),
+            })
+            .await
+            .expect("steer proposal")
+            .decision;
+        assert_eq!(proposed.kind, SupervisorTurnDecisionKind::SteerActiveTurn);
+        assert_eq!(
+            proposed.proposal_kind,
+            SupervisorTurnProposalKind::OperatorSteer
+        );
+        assert_eq!(proposed.basis_turn_id.as_deref(), Some("turn-live"));
+        assert!(
+            proposed
+                .proposed_text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Continue the current turn")
+        );
+
+        let listed = service
+            .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
+                assignment_id: Some(assignment.assignment_id),
+                codex_thread_id: None,
+                include_closed: true,
+            })
+            .await
+            .expect("decision list");
+        assert_eq!(listed.decisions.len(), 1);
+        assert_eq!(
+            listed.decisions[0].status,
+            SupervisorTurnDecisionStatus::ProposedToHuman
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_proposal_requires_non_empty_text_when_supplied() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+
+        let error = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("   ".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("blank steer text should fail");
+        assert!(error.to_string().contains("non-empty proposed_text"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_steer_proposals_are_rejected() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+
+        service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("focus on tests".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("first steer proposal");
+        let error = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("focus on logs".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("duplicate steer proposal should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("already has open supervisor decision")
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_proposal_conflicts_with_existing_open_next_turn_decision() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        {
+            let mut state = service.state.write().await;
+            state.collaboration.supervisor_turn_decisions.insert(
+                "std-open".to_string(),
+                SupervisorTurnDecision {
+                    decision_id: "std-open".to_string(),
+                    assignment_id: assignment.assignment_id.clone(),
+                    codex_thread_id: thread.summary.id.clone(),
+                    basis_turn_id: Some("turn-prev".to_string()),
+                    kind: SupervisorTurnDecisionKind::NextTurn,
+                    proposal_kind: SupervisorTurnProposalKind::ManualRefresh,
+                    proposed_text: Some("continue".to_string()),
+                    rationale_summary: "existing open decision".to_string(),
+                    status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                    created_at: Utc::now(),
+                    approved_at: None,
+                    rejected_at: None,
+                    sent_at: None,
+                    superseded_by: None,
+                    sent_turn_id: None,
+                    notes: None,
+                },
+            );
+        }
+
+        let error = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("focus on tests".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("conflicting next-turn decision should block steer");
+        assert!(
+            error
+                .to_string()
+                .contains("already has open supervisor decision")
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_proposal_conflicts_with_existing_open_interrupt_decision() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("interrupt proposal");
+
+        let error = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("focus on tests".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect_err("conflicting interrupt decision should block steer");
+        assert!(
+            error
+                .to_string()
+                .contains("already has open supervisor decision")
+        );
+    }
+
+    #[tokio::test]
     async fn approve_and_send_starts_new_turn_and_records_sent_state() {
         let (service, runtime) = test_service_with_fake_codex_runtime_capture(
             AppConfig::default(),
@@ -11414,6 +12614,179 @@ ORCAS_REPORT_END"#
     }
 
     #[tokio::test]
+    async fn approve_and_send_interrupt_maps_to_turn_interrupt() {
+        let (service, runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        runtime.lock().await.threads.insert(
+            thread.summary.id.clone(),
+            types::Thread {
+                id: thread.summary.id.clone(),
+                preview: thread.summary.preview.clone(),
+                ephemeral: false,
+                model_provider: "openai".to_string(),
+                created_at: thread.summary.created_at,
+                updated_at: thread.summary.updated_at,
+                status: types::ThreadStatus::Active {
+                    active_flags: vec!["turn_running".to_string()],
+                },
+                path: None,
+                cwd: thread.summary.cwd.clone(),
+                cli_version: "test".to_string(),
+                source: None,
+                name: thread.summary.name.clone(),
+                turns: vec![types::Turn {
+                    id: "turn-live".to_string(),
+                    items: Vec::new(),
+                    status: types::TurnStatus::InProgress,
+                    error: None,
+                }],
+                extra: Map::new(),
+            },
+        );
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let decision = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("interrupt proposal")
+            .decision;
+
+        let sent = service
+            .supervisor_decision_approve_and_send(ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: decision.decision_id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("interrupt now".to_string()),
+            })
+            .await
+            .expect("approve and send interrupt")
+            .decision;
+        assert_eq!(sent.status, SupervisorTurnDecisionStatus::Sent);
+        assert!(sent.sent_turn_id.is_none());
+
+        let runtime_state = runtime.lock().await;
+        assert_eq!(
+            runtime_state.last_turn_interrupt_thread_id.as_deref(),
+            Some("thread-active")
+        );
+        assert_eq!(
+            runtime_state.last_turn_interrupt_turn_id.as_deref(),
+            Some("turn-live")
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_and_send_steer_maps_to_turn_steer() {
+        let (service, runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        runtime.lock().await.threads.insert(
+            thread.summary.id.clone(),
+            types::Thread {
+                id: thread.summary.id.clone(),
+                preview: thread.summary.preview.clone(),
+                ephemeral: false,
+                model_provider: "openai".to_string(),
+                created_at: thread.summary.created_at,
+                updated_at: thread.summary.updated_at,
+                status: types::ThreadStatus::Active {
+                    active_flags: vec!["turn_running".to_string()],
+                },
+                path: None,
+                cwd: thread.summary.cwd.clone(),
+                cli_version: "test".to_string(),
+                source: None,
+                name: thread.summary.name.clone(),
+                turns: vec![types::Turn {
+                    id: "turn-live".to_string(),
+                    items: Vec::new(),
+                    status: types::TurnStatus::InProgress,
+                    error: None,
+                }],
+                extra: Map::new(),
+            },
+        );
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let decision = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("Focus on the current test failure only.".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("steer proposal")
+            .decision;
+
+        let sent = service
+            .supervisor_decision_approve_and_send(ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: decision.decision_id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("steer now".to_string()),
+            })
+            .await
+            .expect("approve and send steer")
+            .decision;
+        assert_eq!(sent.status, SupervisorTurnDecisionStatus::Sent);
+        assert!(sent.sent_turn_id.is_none());
+
+        let runtime_state = runtime.lock().await;
+        assert_eq!(
+            runtime_state.last_turn_steer_thread_id.as_deref(),
+            Some("thread-active")
+        );
+        assert_eq!(
+            runtime_state.last_turn_steer_expected_turn_id.as_deref(),
+            Some("turn-live")
+        );
+        assert_eq!(
+            runtime_state.last_turn_steer_text.as_deref(),
+            Some("Focus on the current test failure only.")
+        );
+    }
+
+    #[tokio::test]
     async fn stale_validation_prevents_send_if_newer_turn_state_exists() {
         let service = test_service().await;
         let thread = sample_thread("thread-idle", "live_observed", 200);
@@ -11451,6 +12824,244 @@ ORCAS_REPORT_END"#
             error.to_string().contains("became stale")
                 || error.to_string().contains("pending human review")
         );
+
+        let stored = service
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: decision.decision_id,
+            })
+            .await
+            .expect("decision get")
+            .decision;
+        assert_eq!(stored.status, SupervisorTurnDecisionStatus::Stale);
+    }
+
+    #[tokio::test]
+    async fn interrupt_send_stales_if_active_turn_changes_before_send() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let decision = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("interrupt proposal")
+            .decision;
+        {
+            let mut state = service.state.write().await;
+            let thread = state
+                .threads
+                .get_mut("thread-active")
+                .expect("thread exists");
+            thread.summary.active_turn_id = Some("turn-new".to_string());
+            thread.summary.last_seen_turn_id = Some("turn-new".to_string());
+        }
+
+        let error = service
+            .supervisor_decision_approve_and_send(ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: decision.decision_id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("changed active turn should stale interrupt");
+        assert!(error.to_string().contains("became stale"));
+
+        let stored = service
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: decision.decision_id,
+            })
+            .await
+            .expect("decision get")
+            .decision;
+        assert_eq!(stored.status, SupervisorTurnDecisionStatus::Stale);
+    }
+
+    #[tokio::test]
+    async fn interrupt_send_stales_if_thread_becomes_idle_before_send() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let decision = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("interrupt proposal")
+            .decision;
+        {
+            let mut state = service.state.write().await;
+            let thread = state
+                .threads
+                .get_mut("thread-active")
+                .expect("thread exists");
+            thread.summary.status = "idle".to_string();
+            thread.summary.loaded_status = ipc::ThreadLoadedStatus::Idle;
+            thread.summary.active_turn_id = None;
+            thread.summary.turn_in_flight = false;
+        }
+
+        let error = service
+            .supervisor_decision_approve_and_send(ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: decision.decision_id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("idle thread should stale interrupt");
+        assert!(error.to_string().contains("became stale"));
+
+        let stored = service
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: decision.decision_id,
+            })
+            .await
+            .expect("decision get")
+            .decision;
+        assert_eq!(stored.status, SupervisorTurnDecisionStatus::Stale);
+    }
+
+    #[tokio::test]
+    async fn steer_send_stales_if_active_turn_changes_before_send() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let decision = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("stay on the current bounded step".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("steer proposal")
+            .decision;
+        {
+            let mut state = service.state.write().await;
+            let thread = state
+                .threads
+                .get_mut("thread-active")
+                .expect("thread exists");
+            thread.summary.active_turn_id = Some("turn-new".to_string());
+            thread.summary.last_seen_turn_id = Some("turn-new".to_string());
+        }
+
+        let error = service
+            .supervisor_decision_approve_and_send(ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: decision.decision_id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("changed active turn should stale steer");
+        assert!(error.to_string().contains("became stale"));
+
+        let stored = service
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: decision.decision_id,
+            })
+            .await
+            .expect("decision get")
+            .decision;
+        assert_eq!(stored.status, SupervisorTurnDecisionStatus::Stale);
+    }
+
+    #[tokio::test]
+    async fn steer_send_stales_if_thread_becomes_idle_before_send() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let decision = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("stay on the current bounded step".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("steer proposal")
+            .decision;
+        {
+            let mut state = service.state.write().await;
+            let thread = state
+                .threads
+                .get_mut("thread-active")
+                .expect("thread exists");
+            thread.summary.status = "idle".to_string();
+            thread.summary.loaded_status = ipc::ThreadLoadedStatus::Idle;
+            thread.summary.active_turn_id = None;
+            thread.summary.turn_in_flight = false;
+        }
+
+        let error = service
+            .supervisor_decision_approve_and_send(ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: decision.decision_id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("idle thread should stale steer");
+        assert!(error.to_string().contains("became stale"));
 
         let stored = service
             .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
@@ -11561,6 +13172,212 @@ ORCAS_REPORT_END"#
     }
 
     #[tokio::test]
+    async fn paused_or_released_assignment_prevents_interrupt_send() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let paused_decision = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("interrupt proposal")
+            .decision;
+
+        service
+            .codex_assignment_pause(ipc::CodexAssignmentPauseRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                notes: Some("pause automation".to_string()),
+            })
+            .await
+            .expect("pause");
+        let paused_error = service
+            .supervisor_decision_approve_and_send(ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: paused_decision.decision_id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("paused assignment should prevent interrupt send");
+        assert!(
+            paused_error.to_string().contains("pending human review")
+                || paused_error.to_string().contains("became stale")
+        );
+        let paused_stored = service
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: paused_decision.decision_id,
+            })
+            .await
+            .expect("paused decision get")
+            .decision;
+        assert_eq!(paused_stored.status, SupervisorTurnDecisionStatus::Stale);
+
+        service
+            .codex_assignment_resume(ipc::CodexAssignmentResumeRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                notes: Some("resume automation".to_string()),
+            })
+            .await
+            .expect("resume");
+        let released_decision = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("interrupt proposal after resume")
+            .decision;
+        service
+            .codex_assignment_release(ipc::CodexAssignmentReleaseRequest {
+                assignment_id: assignment.assignment_id,
+                notes: Some("release management".to_string()),
+            })
+            .await
+            .expect("release");
+        let released_error = service
+            .supervisor_decision_approve_and_send(ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: released_decision.decision_id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("released assignment should prevent interrupt send");
+        assert!(
+            released_error.to_string().contains("pending human review")
+                || released_error.to_string().contains("became stale")
+        );
+        let released_stored = service
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: released_decision.decision_id,
+            })
+            .await
+            .expect("released decision get")
+            .decision;
+        assert_eq!(released_stored.status, SupervisorTurnDecisionStatus::Stale);
+    }
+
+    #[tokio::test]
+    async fn paused_or_released_assignment_prevents_steer_send() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let paused_decision = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("focus on the current bounded step".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("steer proposal")
+            .decision;
+
+        service
+            .codex_assignment_pause(ipc::CodexAssignmentPauseRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                notes: Some("pause automation".to_string()),
+            })
+            .await
+            .expect("pause");
+        let paused_error = service
+            .supervisor_decision_approve_and_send(ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: paused_decision.decision_id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("paused assignment should prevent steer send");
+        assert!(
+            paused_error.to_string().contains("pending human review")
+                || paused_error.to_string().contains("became stale")
+        );
+        let paused_stored = service
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: paused_decision.decision_id,
+            })
+            .await
+            .expect("paused decision get")
+            .decision;
+        assert_eq!(paused_stored.status, SupervisorTurnDecisionStatus::Stale);
+
+        service
+            .codex_assignment_resume(ipc::CodexAssignmentResumeRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                notes: Some("resume automation".to_string()),
+            })
+            .await
+            .expect("resume");
+        let released_decision = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("focus on the current bounded step".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("steer proposal after resume")
+            .decision;
+        service
+            .codex_assignment_release(ipc::CodexAssignmentReleaseRequest {
+                assignment_id: assignment.assignment_id,
+                notes: Some("release management".to_string()),
+            })
+            .await
+            .expect("release");
+        let released_error = service
+            .supervisor_decision_approve_and_send(ipc::SupervisorDecisionApproveAndSendRequest {
+                decision_id: released_decision.decision_id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("released assignment should prevent steer send");
+        assert!(
+            released_error.to_string().contains("pending human review")
+                || released_error.to_string().contains("became stale")
+        );
+        let released_stored = service
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: released_decision.decision_id,
+            })
+            .await
+            .expect("released decision get")
+            .decision;
+        assert_eq!(released_stored.status, SupervisorTurnDecisionStatus::Stale);
+    }
+
+    #[tokio::test]
     async fn supervisor_decisions_persist_across_restart() {
         let base =
             std::env::temp_dir().join(format!("orcas-supervisor-decision-{}", Uuid::new_v4()));
@@ -11599,6 +13416,197 @@ ORCAS_REPORT_END"#
         assert_eq!(
             decision_after.proposal_kind,
             SupervisorTurnProposalKind::Bootstrap
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_interrupt_proposal_stales_when_active_turn_completes_naturally() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let decision = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("interrupt proposal")
+            .decision;
+
+        service
+            .apply_codex_event(EventEnvelope::new(
+                "test",
+                OrcasEvent::TurnCompleted {
+                    thread_id: thread.summary.id.clone(),
+                    turn_id: "turn-live".to_string(),
+                    status: "completed".to_string(),
+                },
+            ))
+            .await;
+
+        let stored = service
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: decision.decision_id,
+            })
+            .await
+            .expect("decision get")
+            .decision;
+        assert_eq!(stored.status, SupervisorTurnDecisionStatus::Stale);
+    }
+
+    #[tokio::test]
+    async fn pending_steer_proposal_stales_when_active_turn_completes_naturally() {
+        let service = test_service().await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let decision = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("focus on the current bounded step".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("steer proposal")
+            .decision;
+
+        service
+            .apply_codex_event(EventEnvelope::new(
+                "test",
+                OrcasEvent::TurnCompleted {
+                    thread_id: thread.summary.id.clone(),
+                    turn_id: "turn-live".to_string(),
+                    status: "completed".to_string(),
+                },
+            ))
+            .await;
+
+        let stored = service
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: decision.decision_id,
+            })
+            .await
+            .expect("decision get")
+            .decision;
+        assert_eq!(stored.status, SupervisorTurnDecisionStatus::Stale);
+    }
+
+    #[tokio::test]
+    async fn interrupt_decisions_persist_across_restart() {
+        let base =
+            std::env::temp_dir().join(format!("orcas-supervisor-interrupt-{}", Uuid::new_v4()));
+        let service = test_service_at(base.clone()).await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let decision = service
+            .supervisor_decision_propose_interrupt(ipc::SupervisorDecisionProposeInterruptRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("interrupt proposal")
+            .decision;
+
+        let restarted = test_service_at(base).await;
+        let stored = restarted
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: decision.decision_id,
+            })
+            .await
+            .expect("decision get after restart")
+            .decision;
+        assert_eq!(stored.kind, SupervisorTurnDecisionKind::InterruptActiveTurn);
+        assert_eq!(stored.status, SupervisorTurnDecisionStatus::ProposedToHuman);
+    }
+
+    #[tokio::test]
+    async fn steer_decisions_persist_across_restart() {
+        let base = std::env::temp_dir().join(format!("orcas-supervisor-steer-{}", Uuid::new_v4()));
+        let service = test_service_at(base.clone()).await;
+        let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let decision = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id,
+                requested_by: Some("reviewer".to_string()),
+                proposed_text: Some("focus on the current bounded step".to_string()),
+                rationale_note: None,
+            })
+            .await
+            .expect("steer proposal")
+            .decision;
+
+        let restarted = test_service_at(base).await;
+        let stored = restarted
+            .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
+                decision_id: decision.decision_id,
+            })
+            .await
+            .expect("decision get after restart")
+            .decision;
+        assert_eq!(stored.kind, SupervisorTurnDecisionKind::SteerActiveTurn);
+        assert_eq!(stored.status, SupervisorTurnDecisionStatus::ProposedToHuman);
+        assert_eq!(
+            stored.proposed_text.as_deref(),
+            Some("focus on the current bounded step")
         );
     }
 

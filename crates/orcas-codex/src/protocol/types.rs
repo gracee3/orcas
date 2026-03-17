@@ -186,6 +186,14 @@ pub struct TurnStartParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TurnSteerParams {
+    pub thread_id: String,
+    pub input: Vec<UserInput>,
+    pub expected_turn_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnInterruptParams {
     pub thread_id: String,
     pub turn_id: String,
@@ -313,6 +321,12 @@ pub struct ThreadListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnStartResponse {
     pub turn: Turn,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnSteerResponse {
+    pub turn_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

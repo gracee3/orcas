@@ -664,6 +664,70 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                     }
                 }
             }
+            Effect::ProposeSteerDecision { assignment_id } => {
+                let effect = Effect::ProposeSteerDecision {
+                    assignment_id: assignment_id.clone(),
+                };
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::ProposeSteerSupervisorDecision { assignment_id },
+                    |response| match response {
+                        BackendCommandResult::SupervisorDecision(_) => {
+                            vec![Action::User(UserAction::Refresh)]
+                        }
+                        other => {
+                            vec![Action::Event(UiEvent::Error(format!(
+                                "unexpected supervisor steer response: {other:?}"
+                            )))]
+                        }
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "supervisor steer proposal failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!(
+                                "supervisor steer proposal failed: {error}"
+                            )))
+                        }
+                    },
+                )
+                .await
+            }
+            Effect::ProposeInterruptDecision { assignment_id } => {
+                let effect = Effect::ProposeInterruptDecision {
+                    assignment_id: assignment_id.clone(),
+                };
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::ProposeInterruptSupervisorDecision { assignment_id },
+                    |response| match response {
+                        BackendCommandResult::SupervisorDecision(_) => {
+                            vec![Action::User(UserAction::Refresh)]
+                        }
+                        other => {
+                            vec![Action::Event(UiEvent::Error(format!(
+                                "unexpected supervisor interrupt response: {other:?}"
+                            )))]
+                        }
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "supervisor interrupt proposal failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!(
+                                "supervisor interrupt proposal failed: {error}"
+                            )))
+                        }
+                    },
+                )
+                .await
+            }
             Effect::ApproveSupervisorDecision { decision_id } => {
                 let effect = Effect::ApproveSupervisorDecision {
                     decision_id: decision_id.clone(),

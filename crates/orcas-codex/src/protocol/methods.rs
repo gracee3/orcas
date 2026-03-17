@@ -5,6 +5,7 @@ pub const THREAD_RESUME: &str = "thread/resume";
 pub const THREAD_READ: &str = "thread/read";
 pub const THREAD_LIST: &str = "thread/list";
 pub const TURN_START: &str = "turn/start";
+pub const TURN_STEER: &str = "turn/steer";
 pub const TURN_INTERRUPT: &str = "turn/interrupt";
 pub const MODEL_LIST: &str = "model/list";
 

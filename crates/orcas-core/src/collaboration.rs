@@ -90,6 +90,8 @@ pub struct CodexThreadAssignment {
 pub enum SupervisorTurnDecisionKind {
     #[default]
     NextTurn,
+    SteerActiveTurn,
+    InterruptActiveTurn,
     NoAction,
 }
 
@@ -100,6 +102,8 @@ pub enum SupervisorTurnProposalKind {
     Bootstrap,
     ContinueAfterTurn,
     ManualRefresh,
+    OperatorSteer,
+    OperatorInterrupt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

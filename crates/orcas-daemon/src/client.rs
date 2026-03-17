@@ -195,6 +195,13 @@ impl OrcasIpcClient {
         self.request(ipc::methods::TURN_START, params).await
     }
 
+    pub async fn turn_steer(
+        &self,
+        params: &ipc::TurnSteerRequest,
+    ) -> OrcasResult<ipc::TurnSteerResponse> {
+        self.request(ipc::methods::TURN_STEER, params).await
+    }
+
     pub async fn turn_interrupt(&self, params: &ipc::TurnInterruptRequest) -> OrcasResult<()> {
         let _: ipc::Empty = self.request(ipc::methods::TURN_INTERRUPT, params).await?;
         Ok(())
@@ -213,6 +220,22 @@ impl OrcasIpcClient {
         params: &ipc::SupervisorDecisionGetRequest,
     ) -> OrcasResult<ipc::SupervisorDecisionGetResponse> {
         self.request(ipc::methods::SUPERVISOR_DECISION_GET, params)
+            .await
+    }
+
+    pub async fn supervisor_decision_propose_interrupt(
+        &self,
+        params: &ipc::SupervisorDecisionProposeInterruptRequest,
+    ) -> OrcasResult<ipc::SupervisorDecisionProposeInterruptResponse> {
+        self.request(ipc::methods::SUPERVISOR_DECISION_PROPOSE_INTERRUPT, params)
+            .await
+    }
+
+    pub async fn supervisor_decision_propose_steer(
+        &self,
+        params: &ipc::SupervisorDecisionProposeSteerRequest,
+    ) -> OrcasResult<ipc::SupervisorDecisionProposeSteerResponse> {
+        self.request(ipc::methods::SUPERVISOR_DECISION_PROPOSE_STEER, params)
             .await
     }
 

@@ -101,16 +101,46 @@ fn sample_supervisor_turn_decision_summary(
     thread_id: &str,
     status: orcas_core::SupervisorTurnDecisionStatus,
 ) -> ipc::SupervisorTurnDecisionSummary {
+    sample_supervisor_turn_decision_summary_with_kind(
+        thread_id,
+        status,
+        orcas_core::SupervisorTurnDecisionKind::NextTurn,
+        orcas_core::SupervisorTurnProposalKind::Bootstrap,
+    )
+}
+
+fn sample_supervisor_turn_decision_summary_with_kind(
+    thread_id: &str,
+    status: orcas_core::SupervisorTurnDecisionStatus,
+    kind: orcas_core::SupervisorTurnDecisionKind,
+    proposal_kind: orcas_core::SupervisorTurnProposalKind,
+) -> ipc::SupervisorTurnDecisionSummary {
+    let proposed_text = match kind {
+        orcas_core::SupervisorTurnDecisionKind::InterruptActiveTurn => None,
+        orcas_core::SupervisorTurnDecisionKind::SteerActiveTurn => Some(
+            "Please focus on the current bounded step and call out blockers before broadening scope."
+                .to_string(),
+        ),
+        _ => Some("Please summarize status and take the next bounded step.".to_string()),
+    };
+    let rationale_summary = match kind {
+        orcas_core::SupervisorTurnDecisionKind::InterruptActiveTurn => {
+            "Operator requested review of interrupting the active turn.".to_string()
+        }
+        orcas_core::SupervisorTurnDecisionKind::SteerActiveTurn => {
+            "Operator requested review of steering the active turn.".to_string()
+        }
+        _ => "Thread is idle under an active assignment and needs bootstrap review.".to_string(),
+    };
     ipc::SupervisorTurnDecisionSummary {
         decision_id: "std-1".to_string(),
         assignment_id: "cta-1".to_string(),
         codex_thread_id: thread_id.to_string(),
         basis_turn_id: Some("turn-1".to_string()),
-        kind: orcas_core::SupervisorTurnDecisionKind::NextTurn,
-        proposal_kind: orcas_core::SupervisorTurnProposalKind::Bootstrap,
-        proposed_text: Some("Please summarize status and take the next bounded step.".to_string()),
-        rationale_summary: "Thread is idle under an active assignment and needs bootstrap review."
-            .to_string(),
+        kind,
+        proposal_kind,
+        proposed_text,
+        rationale_summary,
         status,
         created_at: Utc::now(),
         approved_at: None,
@@ -998,6 +1028,266 @@ async fn reject_selected_supervisor_decision_refreshes_thread_state() {
             .lines
             .iter()
             .any(|line| line.contains("decision std-1 [rejected]"))
+    );
+}
+
+#[tokio::test]
+async fn assigned_active_thread_without_open_decision_shows_propose_interrupt_action() {
+    let mut snapshot = sample_snapshot();
+    snapshot.threads[0].status = "active".to_string();
+    snapshot.threads[0].loaded_status = ipc::ThreadLoadedStatus::Active;
+    snapshot.threads[0].active_turn_id = Some("turn-1".to_string());
+    snapshot.threads[0].turn_in_flight = true;
+    snapshot.active_thread = Some(sample_thread_view("thread-1", "hello", "turn output"));
+    if let Some(active_thread) = snapshot.active_thread.as_mut() {
+        active_thread.summary.status = "active".to_string();
+        active_thread.summary.loaded_status = ipc::ThreadLoadedStatus::Active;
+        active_thread.summary.active_turn_id = Some("turn-1".to_string());
+        active_thread.summary.turn_in_flight = true;
+        active_thread.turns[0].status = "in_progress".to_string();
+    }
+    snapshot
+        .collaboration
+        .codex_thread_assignments
+        .push(sample_codex_assignment_summary(
+            "thread-1",
+            orcas_core::CodexThreadAssignmentStatus::Active,
+        ));
+
+    let harness = AppHarness::new(snapshot).await.unwrap();
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("actions: s propose steer  i propose interrupt"))
+    );
+}
+
+#[tokio::test]
+async fn assigned_active_thread_without_open_decision_shows_propose_steer_action() {
+    let mut snapshot = sample_snapshot();
+    snapshot.threads[0].status = "active".to_string();
+    snapshot.threads[0].loaded_status = ipc::ThreadLoadedStatus::Active;
+    snapshot.threads[0].active_turn_id = Some("turn-1".to_string());
+    snapshot.threads[0].turn_in_flight = true;
+    snapshot.active_thread = Some(sample_thread_view("thread-1", "hello", "turn output"));
+    if let Some(active_thread) = snapshot.active_thread.as_mut() {
+        active_thread.summary.status = "active".to_string();
+        active_thread.summary.loaded_status = ipc::ThreadLoadedStatus::Active;
+        active_thread.summary.active_turn_id = Some("turn-1".to_string());
+        active_thread.summary.turn_in_flight = true;
+        active_thread.turns[0].status = "in_progress".to_string();
+    }
+    snapshot
+        .collaboration
+        .codex_thread_assignments
+        .push(sample_codex_assignment_summary(
+            "thread-1",
+            orcas_core::CodexThreadAssignmentStatus::Active,
+        ));
+
+    let harness = AppHarness::new(snapshot).await.unwrap();
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("actions: s propose steer  i propose interrupt"))
+    );
+}
+
+#[tokio::test]
+async fn propose_steer_dispatches_backend_command_only_when_valid() {
+    let mut snapshot = sample_snapshot();
+    snapshot.threads[0].status = "active".to_string();
+    snapshot.threads[0].loaded_status = ipc::ThreadLoadedStatus::Active;
+    snapshot.threads[0].active_turn_id = Some("turn-1".to_string());
+    snapshot.threads[0].turn_in_flight = true;
+    snapshot.active_thread = Some(sample_thread_view("thread-1", "hello", "turn output"));
+    if let Some(active_thread) = snapshot.active_thread.as_mut() {
+        active_thread.summary.status = "active".to_string();
+        active_thread.summary.loaded_status = ipc::ThreadLoadedStatus::Active;
+        active_thread.summary.active_turn_id = Some("turn-1".to_string());
+        active_thread.summary.turn_in_flight = true;
+        active_thread.turns[0].status = "in_progress".to_string();
+    }
+    snapshot
+        .collaboration
+        .codex_thread_assignments
+        .push(sample_codex_assignment_summary(
+            "thread-1",
+            orcas_core::CodexThreadAssignmentStatus::Active,
+        ));
+    let mut harness = AppHarness::new(snapshot).await.unwrap();
+
+    harness
+        .dispatch(UserAction::ProposeSteerForSelectedThread)
+        .await;
+
+    let commands = harness.recorded_commands().await;
+    assert!(commands.iter().any(|command| {
+        matches!(
+            command,
+            BackendCommand::ProposeSteerSupervisorDecision { assignment_id }
+                if assignment_id == "cta-1"
+        )
+    }));
+
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("steer active turn"))
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("pending steer approval"))
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("proposed Continue the active turn"))
+    );
+}
+
+#[tokio::test]
+async fn steer_decisions_render_distinctly_from_interrupt_and_next_turn() {
+    let mut snapshot = sample_snapshot();
+    snapshot
+        .collaboration
+        .codex_thread_assignments
+        .push(sample_codex_assignment_summary(
+            "thread-1",
+            orcas_core::CodexThreadAssignmentStatus::Active,
+        ));
+    snapshot.collaboration.supervisor_turn_decisions.push(
+        sample_supervisor_turn_decision_summary_with_kind(
+            "thread-1",
+            orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman,
+            orcas_core::SupervisorTurnDecisionKind::SteerActiveTurn,
+            orcas_core::SupervisorTurnProposalKind::OperatorSteer,
+        ),
+    );
+
+    let harness = AppHarness::new(snapshot).await.unwrap();
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("decision std-1 [pending steer approval]"))
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("kind=steer active turn  proposal=operator steer"))
+    );
+}
+
+#[tokio::test]
+async fn propose_interrupt_dispatches_backend_command_only_when_valid() {
+    let mut snapshot = sample_snapshot();
+    snapshot.threads[0].status = "active".to_string();
+    snapshot.threads[0].loaded_status = ipc::ThreadLoadedStatus::Active;
+    snapshot.threads[0].active_turn_id = Some("turn-1".to_string());
+    snapshot.threads[0].turn_in_flight = true;
+    snapshot.active_thread = Some(sample_thread_view("thread-1", "hello", "turn output"));
+    if let Some(active_thread) = snapshot.active_thread.as_mut() {
+        active_thread.summary.status = "active".to_string();
+        active_thread.summary.loaded_status = ipc::ThreadLoadedStatus::Active;
+        active_thread.summary.active_turn_id = Some("turn-1".to_string());
+        active_thread.summary.turn_in_flight = true;
+        active_thread.turns[0].status = "in_progress".to_string();
+    }
+    snapshot
+        .collaboration
+        .codex_thread_assignments
+        .push(sample_codex_assignment_summary(
+            "thread-1",
+            orcas_core::CodexThreadAssignmentStatus::Active,
+        ));
+    let mut harness = AppHarness::new(snapshot).await.unwrap();
+
+    harness
+        .dispatch(UserAction::ProposeInterruptForSelectedThread)
+        .await;
+
+    let commands = harness.recorded_commands().await;
+    assert!(commands.iter().any(|command| {
+        matches!(
+            command,
+            BackendCommand::ProposeInterruptSupervisorDecision { assignment_id }
+                if assignment_id == "cta-1"
+        )
+    }));
+
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("interrupt active turn"))
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("pending interrupt approval"))
+    );
+}
+
+#[tokio::test]
+async fn interrupt_action_is_hidden_for_idle_or_conflicting_thread() {
+    let mut snapshot = sample_snapshot();
+    snapshot
+        .collaboration
+        .codex_thread_assignments
+        .push(sample_codex_assignment_summary(
+            "thread-1",
+            orcas_core::CodexThreadAssignmentStatus::Active,
+        ));
+    let harness = AppHarness::new(snapshot.clone()).await.unwrap();
+    let idle_detail = harness.thread_detail_vm();
+    assert!(
+        !idle_detail
+            .lines
+            .iter()
+            .any(|line| line.contains("actions: s propose steer  i propose interrupt"))
+    );
+
+    snapshot.threads[0].status = "active".to_string();
+    snapshot.threads[0].loaded_status = ipc::ThreadLoadedStatus::Active;
+    snapshot.threads[0].active_turn_id = Some("turn-1".to_string());
+    snapshot.threads[0].turn_in_flight = true;
+    snapshot.active_thread = Some(sample_thread_view("thread-1", "hello", "turn output"));
+    if let Some(active_thread) = snapshot.active_thread.as_mut() {
+        active_thread.summary.status = "active".to_string();
+        active_thread.summary.loaded_status = ipc::ThreadLoadedStatus::Active;
+        active_thread.summary.active_turn_id = Some("turn-1".to_string());
+        active_thread.summary.turn_in_flight = true;
+        active_thread.turns[0].status = "in_progress".to_string();
+    }
+    snapshot.collaboration.supervisor_turn_decisions.push(
+        sample_supervisor_turn_decision_summary_with_kind(
+            "thread-1",
+            orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman,
+            orcas_core::SupervisorTurnDecisionKind::NextTurn,
+            orcas_core::SupervisorTurnProposalKind::Bootstrap,
+        ),
+    );
+    let harness = AppHarness::new(snapshot).await.unwrap();
+    let conflicting_detail = harness.thread_detail_vm();
+    assert!(
+        !conflicting_detail
+            .lines
+            .iter()
+            .any(|line| line.contains("actions: s propose steer  i propose interrupt"))
     );
 }
 

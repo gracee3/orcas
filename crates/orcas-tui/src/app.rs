@@ -136,6 +136,8 @@ pub enum UserAction {
     PromptAppend(char),
     PromptBackspace,
     SubmitPrompt,
+    ProposeSteerForSelectedThread,
+    ProposeInterruptForSelectedThread,
     ApproveSelectedSupervisorDecision,
     RejectSelectedSupervisorDecision,
 }
@@ -287,6 +289,8 @@ pub enum Effect {
     LoadTurnState { thread_id: String, turn_id: String },
     LoadWorkUnitDetail { work_unit_id: String },
     SubmitPrompt { thread_id: String, text: String },
+    ProposeSteerDecision { assignment_id: String },
+    ProposeInterruptDecision { assignment_id: String },
     ApproveSupervisorDecision { decision_id: String },
     RejectSupervisorDecision { decision_id: String },
     LoadModels,
@@ -426,6 +430,40 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
                     .to_string(),
             });
             Vec::new()
+        }
+        UserAction::ProposeSteerForSelectedThread => {
+            let Some(assignment_id) = selected_thread_steer_assignment_id(state) else {
+                state.banner = Some(StatusBanner {
+                    level: BannerLevel::Warning,
+                    message: "Selected thread cannot propose a steer right now.".to_string(),
+                });
+                return Vec::new();
+            };
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Info,
+                message: format!(
+                    "Creating steer proposal for assignment {}...",
+                    assignment_id
+                ),
+            });
+            vec![Effect::ProposeSteerDecision { assignment_id }]
+        }
+        UserAction::ProposeInterruptForSelectedThread => {
+            let Some(assignment_id) = selected_thread_interrupt_assignment_id(state) else {
+                state.banner = Some(StatusBanner {
+                    level: BannerLevel::Warning,
+                    message: "Selected thread cannot propose an interrupt right now.".to_string(),
+                });
+                return Vec::new();
+            };
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Info,
+                message: format!(
+                    "Creating interrupt proposal for assignment {}...",
+                    assignment_id
+                ),
+            });
+            vec![Effect::ProposeInterruptDecision { assignment_id }]
         }
         UserAction::ApproveSelectedSupervisorDecision => {
             let Some(decision_id) = selected_thread_pending_supervisor_decision(state)
@@ -1378,6 +1416,45 @@ fn selected_thread_pending_supervisor_decision(
                 .cmp(&right.created_at)
                 .then_with(|| left.decision_id.cmp(&right.decision_id))
         })
+}
+
+fn selected_thread_interrupt_assignment_id(state: &AppState) -> Option<String> {
+    let thread_id = state.selected_thread_id.as_deref()?;
+    let assignment = state
+        .collaboration
+        .codex_thread_assignments
+        .iter()
+        .find(|assignment| {
+            assignment.codex_thread_id == thread_id
+                && assignment.status == orcas_core::CodexThreadAssignmentStatus::Active
+        })?;
+    let active_turn_id = state
+        .thread_details
+        .get(thread_id)
+        .and_then(|thread| thread.summary.active_turn_id.clone())
+        .or_else(|| {
+            state
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .and_then(|thread| thread.active_turn_id.clone())
+        });
+    if active_turn_id.is_none() {
+        return None;
+    }
+    if state
+        .collaboration
+        .supervisor_turn_decisions
+        .iter()
+        .any(|decision| decision.assignment_id == assignment.assignment_id && decision.open)
+    {
+        return None;
+    }
+    Some(assignment.assignment_id.clone())
+}
+
+fn selected_thread_steer_assignment_id(state: &AppState) -> Option<String> {
+    selected_thread_interrupt_assignment_id(state)
 }
 
 fn upsert_report_summary(reports: &mut Vec<ipc::ReportSummary>, summary: ipc::ReportSummary) {

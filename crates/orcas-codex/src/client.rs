@@ -169,6 +169,13 @@ impl CodexClient {
         self.request(methods::TURN_START, &params).await
     }
 
+    pub async fn turn_steer(
+        &self,
+        params: types::TurnSteerParams,
+    ) -> OrcasResult<types::TurnSteerResponse> {
+        self.request(methods::TURN_STEER, &params).await
+    }
+
     pub async fn turn_interrupt(
         &self,
         params: types::TurnInterruptParams,

@@ -39,6 +39,7 @@ pub mod methods {
     pub const TURN_GET: &str = "turn/get";
     pub const TURN_ATTACH: &str = "turn/attach";
     pub const TURN_START: &str = "turn/start";
+    pub const TURN_STEER: &str = "turn/steer";
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
     pub const WORKSTREAM_CREATE: &str = "workstream/create";
     pub const WORKSTREAM_LIST: &str = "workstream/list";
@@ -57,6 +58,8 @@ pub mod methods {
     pub const CODEX_ASSIGNMENT_RELEASE: &str = "codex_assignment/release";
     pub const SUPERVISOR_DECISION_LIST: &str = "supervisor_decision/list";
     pub const SUPERVISOR_DECISION_GET: &str = "supervisor_decision/get";
+    pub const SUPERVISOR_DECISION_PROPOSE_STEER: &str = "supervisor_decision/propose_steer";
+    pub const SUPERVISOR_DECISION_PROPOSE_INTERRUPT: &str = "supervisor_decision/propose_interrupt";
     pub const SUPERVISOR_DECISION_APPROVE_AND_SEND: &str = "supervisor_decision/approve_and_send";
     pub const SUPERVISOR_DECISION_REJECT: &str = "supervisor_decision/reject";
     pub const REPORT_GET: &str = "report/get";
@@ -841,6 +844,19 @@ pub struct TurnStartResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnSteerRequest {
+    pub thread_id: String,
+    pub expected_turn_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnSteerResponse {
+    pub turn_id: String,
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnInterruptRequest {
     pub thread_id: String,
     pub turn_id: String,
@@ -1050,6 +1066,34 @@ pub struct SupervisorDecisionGetRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorDecisionGetResponse {
+    pub decision: SupervisorTurnDecision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionProposeSteerRequest {
+    pub assignment_id: String,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    #[serde(default)]
+    pub proposed_text: Option<String>,
+    #[serde(default)]
+    pub rationale_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionProposeSteerResponse {
+    pub decision: SupervisorTurnDecision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionProposeInterruptRequest {
+    pub assignment_id: String,
+    pub requested_by: Option<String>,
+    pub rationale_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionProposeInterruptResponse {
     pub decision: SupervisorTurnDecision,
 }
 
