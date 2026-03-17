@@ -124,6 +124,8 @@ pub struct SupervisorConfig {
     pub model: String,
     pub reasoning_effort: String,
     pub max_output_tokens: u32,
+    #[serde(default)]
+    pub proposals: SupervisorProposalConfig,
 }
 
 impl Default for SupervisorConfig {
@@ -134,6 +136,13 @@ impl Default for SupervisorConfig {
             model: "gpt-5.4".to_string(),
             reasoning_effort: "high".to_string(),
             max_output_tokens: 2_000,
+            proposals: SupervisorProposalConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SupervisorProposalConfig {
+    #[serde(default)]
+    pub auto_create_on_report_recorded: bool,
 }

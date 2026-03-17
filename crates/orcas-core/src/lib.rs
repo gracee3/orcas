@@ -15,7 +15,10 @@ pub use collaboration::{
     WorkerSession, WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus,
     Workstream, WorkstreamStatus,
 };
-pub use config::{AppConfig, CodexConnectionMode, CodexDaemonConfig, ReconnectPolicy};
+pub use config::{
+    AppConfig, CodexConnectionMode, CodexDaemonConfig, ReconnectPolicy, SupervisorConfig,
+    SupervisorProposalConfig,
+};
 pub use error::{OrcasError, OrcasResult};
 pub use events::{ConnectionState, EventEnvelope, OrcasEvent};
 pub use ipc::*;

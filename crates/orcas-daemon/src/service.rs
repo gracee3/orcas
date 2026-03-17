@@ -31,9 +31,9 @@ use orcas_core::{
     OrcasEvent, OrcasResult, OrcasSessionStore, Report, ReportConfidence, ReportDisposition,
     ReportParseResult, SupervisorContextPack, SupervisorProposal, SupervisorProposalFailure,
     SupervisorProposalFailureStage, SupervisorProposalRecord, SupervisorProposalStatus,
-    SupervisorReasonerUsage, ThreadMetadata, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
-    WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, Workstream,
-    WorkstreamStatus,
+    SupervisorProposalTriggerKind, SupervisorReasonerUsage, ThreadMetadata, WorkUnit,
+    WorkUnitStatus, Worker, WorkerSession, WorkerSessionAttachability, WorkerSessionRuntimeStatus,
+    WorkerStatus, Workstream, WorkstreamStatus,
 };
 
 use crate::process::{
@@ -104,6 +104,39 @@ struct ParsedWorkerReport {
 struct PreparedAssignment {
     assignment: Assignment,
     created_new: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProposalGenerationRequest {
+    work_unit_id: String,
+    source_report_id: Option<String>,
+    requested_by: String,
+    note: Option<String>,
+    trigger_kind: SupervisorProposalTriggerKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProposalDuplicatePolicy {
+    Manual { supersede_open: bool },
+    Auto,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedProposalGeneration {
+    collaboration: CollaborationState,
+    source_report_id: String,
+}
+
+#[derive(Debug, Clone)]
+enum PreparedProposalGenerationOutcome {
+    Ready(PreparedProposalGeneration),
+    Suppressed { reason: String },
+}
+
+#[derive(Debug, Clone)]
+enum ProposalGenerationOutcome {
+    Created(SupervisorProposalRecord),
+    Suppressed { reason: String },
 }
 
 #[derive(Debug, Clone, Eq)]
@@ -1291,6 +1324,7 @@ impl OrcasDaemonService {
             self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
                 .await;
         }
+        self.maybe_auto_create_proposal_for_report(&report).await;
 
         let (assignment, worker, worker_session) = {
             let state = self.state.read().await;
@@ -1664,95 +1698,222 @@ impl OrcasDaemonService {
         Ok(ipc::ReportListForWorkunitResponse { reports })
     }
 
-    async fn proposal_create(
+    fn auto_proposal_requested_by() -> String {
+        "orcasd_auto_report_recorded".to_string()
+    }
+
+    fn auto_proposal_note(report_id: &str) -> String {
+        format!(
+            "Automatically synthesize the next bounded proposal for authoritative report `{report_id}`."
+        )
+    }
+
+    fn same_source_proposals<'a>(
+        collaboration: &'a CollaborationState,
+        work_unit_id: &str,
+        source_report_id: &str,
+    ) -> impl Iterator<Item = &'a SupervisorProposalRecord> {
+        collaboration
+            .supervisor_proposals
+            .values()
+            .filter(move |proposal| {
+                proposal.primary_work_unit_id == work_unit_id
+                    && proposal.source_report_id == source_report_id
+            })
+    }
+
+    fn same_source_open_proposal_ids(
+        collaboration: &CollaborationState,
+        work_unit_id: &str,
+        source_report_id: &str,
+    ) -> Vec<String> {
+        Self::same_source_proposals(collaboration, work_unit_id, source_report_id)
+            .filter(|proposal| proposal.status == SupervisorProposalStatus::Open)
+            .map(|proposal| proposal.id.clone())
+            .collect()
+    }
+
+    async fn persist_and_emit_stale_proposals(
         &self,
-        params: ipc::ProposalCreateRequest,
-    ) -> OrcasResult<ipc::ProposalCreateResponse> {
-        let requested_by = params
-            .requested_by
-            .clone()
-            .unwrap_or_else(|| "supervisor_cli".to_string());
+        stale_proposals: Vec<SupervisorProposalRecord>,
+    ) -> OrcasResult<()> {
+        if stale_proposals.is_empty() {
+            return Ok(());
+        }
+        self.persist_collaboration_state().await?;
+        for proposal in &stale_proposals {
+            self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn prepare_proposal_generation(
+        &self,
+        work_unit_id: &str,
+        source_report_id: Option<&str>,
+        suppress_ineligible: bool,
+    ) -> OrcasResult<PreparedProposalGenerationOutcome> {
         let stale_proposals = {
             let mut state = self.state.write().await;
-            Self::refresh_stale_proposals_for_work_unit(
-                &mut state.collaboration,
-                &params.work_unit_id,
-            )
+            Self::refresh_stale_proposals_for_work_unit(&mut state.collaboration, work_unit_id)
         };
-        if !stale_proposals.is_empty() {
-            self.persist_collaboration_state().await?;
-            for proposal in &stale_proposals {
-                self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
-                    .await;
-            }
-        }
+        self.persist_and_emit_stale_proposals(stale_proposals)
+            .await?;
 
-        let (source_report_id, supersede_candidate_ids) = {
-            let state = self.state.read().await;
-            let work_unit = state
-                .collaboration
-                .work_units
-                .get(&params.work_unit_id)
-                .cloned()
-                .ok_or_else(|| {
-                    OrcasError::Protocol(format!("unknown work unit `{}`", params.work_unit_id))
-                })?;
-            if work_unit.status != WorkUnitStatus::AwaitingDecision {
-                return Err(OrcasError::Protocol(format!(
-                    "work unit `{}` is not awaiting_decision",
-                    work_unit.id
-                )));
+        let state = self.state.read().await;
+        let work_unit = state
+            .collaboration
+            .work_units
+            .get(work_unit_id)
+            .cloned()
+            .ok_or_else(|| OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`")))?;
+        if work_unit.status != WorkUnitStatus::AwaitingDecision {
+            if suppress_ineligible {
+                return Ok(PreparedProposalGenerationOutcome::Suppressed {
+                    reason: format!("work unit `{}` is not awaiting_decision", work_unit.id),
+                });
             }
-            if Self::work_unit_has_live_attachable_turn(&state, &work_unit.id) {
-                return Err(OrcasError::Protocol(
-                    "supervisor proposal generation is blocked while the work unit still has a live attachable turn"
+            return Err(OrcasError::Protocol(format!(
+                "work unit `{}` is not awaiting_decision",
+                work_unit.id
+            )));
+        }
+        if Self::work_unit_has_live_attachable_turn(&state, &work_unit.id) {
+            if suppress_ineligible {
+                return Ok(PreparedProposalGenerationOutcome::Suppressed {
+                    reason: "supervisor proposal generation is blocked while the work unit still has a live attachable turn"
                         .to_string(),
-                ));
+                });
             }
-            let source_report_id = params
-                .source_report_id
-                .clone()
-                .or(work_unit.latest_report_id.clone())
-                .ok_or_else(|| {
+            return Err(OrcasError::Protocol(
+                "supervisor proposal generation is blocked while the work unit still has a live attachable turn"
+                    .to_string(),
+            ));
+        }
+        let resolved_source_report_id = source_report_id
+            .map(ToOwned::to_owned)
+            .or(work_unit.latest_report_id.clone())
+            .ok_or_else(|| {
+                if suppress_ineligible {
+                    OrcasError::Protocol(format!(
+                        "auto proposal generation found no latest report for work unit `{}`",
+                        work_unit.id
+                    ))
+                } else {
                     OrcasError::Protocol(format!(
                         "work unit `{}` has no latest report",
                         work_unit.id
                     ))
-                })?;
-            if work_unit.latest_report_id.as_deref() != Some(source_report_id.as_str()) {
-                return Err(OrcasError::Protocol(
-                    "proposal generation requires the latest report for the work unit".to_string(),
-                ));
+                }
+            })?;
+        if work_unit.latest_report_id.as_deref() != Some(resolved_source_report_id.as_str()) {
+            if suppress_ineligible {
+                return Ok(PreparedProposalGenerationOutcome::Suppressed {
+                    reason: "proposal generation requires the latest report for the work unit"
+                        .to_string(),
+                });
             }
+            return Err(OrcasError::Protocol(
+                "proposal generation requires the latest report for the work unit".to_string(),
+            ));
+        }
+        let source_report = state
+            .collaboration
+            .reports
+            .get(&resolved_source_report_id)
+            .cloned()
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!(
+                    "unknown source report `{resolved_source_report_id}`"
+                ))
+            })?;
+        if work_unit.current_assignment_id.as_deref() != Some(source_report.assignment_id.as_str())
+        {
+            if suppress_ineligible {
+                return Ok(PreparedProposalGenerationOutcome::Suppressed {
+                    reason: "proposal generation requires the source report assignment to remain the current assignment"
+                        .to_string(),
+                });
+            }
+            return Err(OrcasError::Protocol(
+                "proposal generation requires the source report assignment to remain the current assignment"
+                    .to_string(),
+            ));
+        }
 
-            let open_same_source = state
-                .collaboration
-                .supervisor_proposals
-                .values()
-                .filter(|proposal| {
-                    proposal.primary_work_unit_id == work_unit.id
-                        && proposal.source_report_id == source_report_id
-                        && proposal.status == SupervisorProposalStatus::Open
-                })
-                .map(|proposal| proposal.id.clone())
-                .collect::<Vec<_>>();
-            if !open_same_source.is_empty() && !params.supersede_open {
-                return Err(OrcasError::Protocol(format!(
-                    "an open proposal already exists for work unit `{}` and source report `{}`",
-                    work_unit.id, source_report_id
-                )));
+        Ok(PreparedProposalGenerationOutcome::Ready(
+            PreparedProposalGeneration {
+                collaboration: state.collaboration.clone(),
+                source_report_id: resolved_source_report_id,
+            },
+        ))
+    }
+
+    async fn generate_proposal(
+        &self,
+        request: ProposalGenerationRequest,
+        duplicate_policy: ProposalDuplicatePolicy,
+    ) -> OrcasResult<ProposalGenerationOutcome> {
+        let prepared = self
+            .prepare_proposal_generation(
+                &request.work_unit_id,
+                request.source_report_id.as_deref(),
+                matches!(duplicate_policy, ProposalDuplicatePolicy::Auto),
+            )
+            .await?;
+        let prepared = match prepared {
+            PreparedProposalGenerationOutcome::Ready(prepared) => prepared,
+            PreparedProposalGenerationOutcome::Suppressed { reason } => {
+                return Ok(ProposalGenerationOutcome::Suppressed { reason });
             }
-            (source_report_id, open_same_source)
         };
 
-        let collaboration = self.state.read().await.collaboration.clone();
+        match duplicate_policy {
+            ProposalDuplicatePolicy::Manual {
+                supersede_open: false,
+            } => {
+                let open_same_source = Self::same_source_open_proposal_ids(
+                    &prepared.collaboration,
+                    &request.work_unit_id,
+                    &prepared.source_report_id,
+                );
+                if !open_same_source.is_empty() {
+                    return Err(OrcasError::Protocol(format!(
+                        "an open proposal already exists for work unit `{}` and source report `{}`",
+                        request.work_unit_id, prepared.source_report_id
+                    )));
+                }
+            }
+            ProposalDuplicatePolicy::Manual {
+                supersede_open: true,
+            } => {}
+            ProposalDuplicatePolicy::Auto => {
+                if Self::same_source_proposals(
+                    &prepared.collaboration,
+                    &request.work_unit_id,
+                    &prepared.source_report_id,
+                )
+                .next()
+                .is_some()
+                {
+                    return Ok(ProposalGenerationOutcome::Suppressed {
+                        reason: format!(
+                            "proposal generation already exists for work unit `{}` and source report `{}`",
+                            request.work_unit_id, prepared.source_report_id
+                        ),
+                    });
+                }
+            }
+        }
+
         let context_pack = build_context_pack(
-            &collaboration,
-            &params.work_unit_id,
-            Some(source_report_id.as_str()),
-            requested_by,
-            params.note.clone(),
-            orcas_core::SupervisorProposalTriggerKind::HumanRequested,
+            &prepared.collaboration,
+            &request.work_unit_id,
+            Some(prepared.source_report_id.as_str()),
+            request.requested_by,
+            request.note.clone(),
+            request.trigger_kind,
         )?;
         let proposal_id = Self::new_object_id("proposal");
         let result = match self.supervisor_reasoner.propose(context_pack.clone()).await {
@@ -1782,7 +1943,9 @@ impl OrcasDaemonService {
                 return Err(Self::proposal_generation_failure_error(&record));
             }
         };
-        if let Err(error) = validate_proposal(&result.proposal, &context_pack, &collaboration) {
+        if let Err(error) =
+            validate_proposal(&result.proposal, &context_pack, &prepared.collaboration)
+        {
             let record = self
                 .persist_failed_proposal_record(
                     proposal_id.clone(),
@@ -1843,23 +2006,63 @@ impl OrcasDaemonService {
                 ));
             }
             if proposal.status == SupervisorProposalStatus::Open {
-                for proposal_id in &supersede_candidate_ids {
-                    if let Some(other) = state
-                        .collaboration
-                        .supervisor_proposals
-                        .get_mut(proposal_id)
-                        && other.status == SupervisorProposalStatus::Open
-                        && other.primary_work_unit_id == proposal.primary_work_unit_id
-                        && other.source_report_id == proposal.source_report_id
-                    {
-                        other.status = SupervisorProposalStatus::Superseded;
-                        if other.review_note.is_none() {
-                            other.review_note = Some(
-                                "Superseded by an operator-requested re-synthesis for the same report."
-                                    .to_string(),
-                            );
+                match duplicate_policy {
+                    ProposalDuplicatePolicy::Manual {
+                        supersede_open: false,
+                    } => {
+                        let open_same_source = Self::same_source_open_proposal_ids(
+                            &state.collaboration,
+                            &proposal.primary_work_unit_id,
+                            &proposal.source_report_id,
+                        );
+                        if !open_same_source.is_empty() {
+                            return Err(OrcasError::Protocol(format!(
+                                "an open proposal already exists for work unit `{}` and source report `{}`",
+                                proposal.primary_work_unit_id, proposal.source_report_id
+                            )));
                         }
-                        superseded_proposals.push(other.clone());
+                    }
+                    ProposalDuplicatePolicy::Manual {
+                        supersede_open: true,
+                    } => {
+                        for proposal_id in Self::same_source_open_proposal_ids(
+                            &state.collaboration,
+                            &proposal.primary_work_unit_id,
+                            &proposal.source_report_id,
+                        ) {
+                            if let Some(other) = state
+                                .collaboration
+                                .supervisor_proposals
+                                .get_mut(&proposal_id)
+                                && other.status == SupervisorProposalStatus::Open
+                            {
+                                other.status = SupervisorProposalStatus::Superseded;
+                                if other.review_note.is_none() {
+                                    other.review_note = Some(
+                                        "Superseded by an operator-requested re-synthesis for the same report."
+                                            .to_string(),
+                                    );
+                                }
+                                superseded_proposals.push(other.clone());
+                            }
+                        }
+                    }
+                    ProposalDuplicatePolicy::Auto => {
+                        if Self::same_source_proposals(
+                            &state.collaboration,
+                            &proposal.primary_work_unit_id,
+                            &proposal.source_report_id,
+                        )
+                        .next()
+                        .is_some()
+                        {
+                            return Ok(ProposalGenerationOutcome::Suppressed {
+                                reason: format!(
+                                    "proposal generation raced with an existing proposal for work unit `{}` and source report `{}`",
+                                    proposal.primary_work_unit_id, proposal.source_report_id
+                                ),
+                            });
+                        }
                     }
                 }
             }
@@ -1885,7 +2088,88 @@ impl OrcasDaemonService {
         )
         .await;
 
-        Ok(ipc::ProposalCreateResponse { proposal })
+        Ok(ProposalGenerationOutcome::Created(proposal))
+    }
+
+    async fn maybe_auto_create_proposal_for_report(&self, report: &Report) {
+        if !self
+            .config
+            .supervisor
+            .proposals
+            .auto_create_on_report_recorded
+        {
+            return;
+        }
+
+        let result = self
+            .generate_proposal(
+                ProposalGenerationRequest {
+                    work_unit_id: report.work_unit_id.clone(),
+                    source_report_id: Some(report.id.clone()),
+                    requested_by: Self::auto_proposal_requested_by(),
+                    note: Some(Self::auto_proposal_note(&report.id)),
+                    trigger_kind: SupervisorProposalTriggerKind::ReportRecorded,
+                },
+                ProposalDuplicatePolicy::Auto,
+            )
+            .await;
+
+        match result {
+            Ok(ProposalGenerationOutcome::Created(_)) => {}
+            Ok(ProposalGenerationOutcome::Suppressed { reason }) => {
+                info!(
+                    work_unit_id = %report.work_unit_id,
+                    report_id = %report.id,
+                    %reason,
+                    "auto supervisor proposal suppressed"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    work_unit_id = %report.work_unit_id,
+                    report_id = %report.id,
+                    %error,
+                    "auto supervisor proposal generation failed"
+                );
+                self.emit(ipc::DaemonEvent::Warning {
+                    message: format!(
+                        "auto supervisor proposal generation for report `{}` failed: {error}",
+                        report.id
+                    ),
+                })
+                .await;
+            }
+        }
+    }
+
+    async fn proposal_create(
+        &self,
+        params: ipc::ProposalCreateRequest,
+    ) -> OrcasResult<ipc::ProposalCreateResponse> {
+        let requested_by = params
+            .requested_by
+            .clone()
+            .unwrap_or_else(|| "supervisor_cli".to_string());
+        match self
+            .generate_proposal(
+                ProposalGenerationRequest {
+                    work_unit_id: params.work_unit_id,
+                    source_report_id: params.source_report_id,
+                    requested_by,
+                    note: params.note,
+                    trigger_kind: SupervisorProposalTriggerKind::HumanRequested,
+                },
+                ProposalDuplicatePolicy::Manual {
+                    supersede_open: params.supersede_open,
+                },
+            )
+            .await?
+        {
+            ProposalGenerationOutcome::Created(proposal) => {
+                Ok(ipc::ProposalCreateResponse { proposal })
+            }
+            ProposalGenerationOutcome::Suppressed { reason } => Err(OrcasError::Protocol(reason)),
+        }
     }
 
     async fn proposal_get(
@@ -4650,6 +4934,7 @@ mod tests {
     struct StaticSupervisorReasoner {
         outcome: Mutex<Option<StaticSupervisorReasonerOutcome>>,
         last_pack: Mutex<Option<SupervisorContextPack>>,
+        propose_calls: AtomicUsize,
     }
 
     impl StaticSupervisorReasoner {
@@ -4688,6 +4973,10 @@ mod tests {
         async fn last_pack(&self) -> Option<SupervisorContextPack> {
             self.last_pack.lock().await.clone()
         }
+
+        fn propose_call_count(&self) -> usize {
+            self.propose_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     #[async_trait]
@@ -4696,6 +4985,8 @@ mod tests {
             &self,
             pack: SupervisorContextPack,
         ) -> Result<SupervisorReasonerResult, SupervisorReasonerFailure> {
+            self.propose_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.last_pack.lock().await = Some(pack);
             match self.outcome.lock().await.clone() {
                 Some(StaticSupervisorReasonerOutcome::Success(result)) => Ok(result),
@@ -4787,6 +5078,12 @@ mod tests {
         }
     }
 
+    fn auto_proposal_config(enabled: bool) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.supervisor.proposals.auto_create_on_report_recorded = enabled;
+        config
+    }
+
     fn sample_thread(id: &str, scope: &str, updated_at: i64) -> ipc::ThreadView {
         ipc::ThreadView {
             summary: ipc::ThreadSummary {
@@ -4815,8 +5112,15 @@ mod tests {
     async fn test_service_with_reasoner(
         reasoner: Arc<dyn SupervisorReasoner>,
     ) -> Arc<OrcasDaemonService> {
+        test_service_with_reasoner_and_config(reasoner, AppConfig::default()).await
+    }
+
+    async fn test_service_with_reasoner_and_config(
+        reasoner: Arc<dyn SupervisorReasoner>,
+        config: AppConfig,
+    ) -> Arc<OrcasDaemonService> {
         let base = std::env::temp_dir().join(format!("orcas-collab-test-{}", Uuid::new_v4()));
-        test_service_at_with_reasoner(base, reasoner).await
+        test_service_at_with_reasoner_and_config(base, reasoner, config).await
     }
 
     async fn test_service_at(base: PathBuf) -> Arc<OrcasDaemonService> {
@@ -4826,6 +5130,15 @@ mod tests {
     async fn test_service_at_with_reasoner(
         base: PathBuf,
         supervisor_reasoner: Arc<dyn SupervisorReasoner>,
+    ) -> Arc<OrcasDaemonService> {
+        test_service_at_with_reasoner_and_config(base, supervisor_reasoner, AppConfig::default())
+            .await
+    }
+
+    async fn test_service_at_with_reasoner_and_config(
+        base: PathBuf,
+        supervisor_reasoner: Arc<dyn SupervisorReasoner>,
+        config: AppConfig,
     ) -> Arc<OrcasDaemonService> {
         let paths = AppPaths {
             config_dir: base.join("config"),
@@ -4839,7 +5152,6 @@ mod tests {
             daemon_log_file: base.join("logs/orcasd.log"),
         };
         paths.ensure().await.expect("paths");
-        let config = AppConfig::default();
         let store = Arc::new(JsonSessionStore::new(paths.clone(), config.clone()));
         let codex_daemon =
             LocalCodexDaemonManager::new(config.codex.clone(), &paths, config.defaults.cwd.clone());
@@ -5989,6 +6301,445 @@ mod tests {
                 .to_string()
                 .contains("is not open and cannot be rejected")
         );
+    }
+
+    #[tokio::test]
+    async fn auto_proposal_disabled_does_not_generate_on_report_recorded() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Continue,
+                "wu-disabled",
+                "report-disabled",
+                "assignment-disabled",
+                "worker-disabled",
+            ))
+            .await;
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(false))
+                .await;
+        let (_workstream, work_unit, _assignment, report) =
+            seed_awaiting_decision_fixture(&service, "auto-disabled").await;
+
+        service.maybe_auto_create_proposal_for_report(&report).await;
+
+        let proposals = service
+            .proposal_list_for_workunit(ipc::ProposalListForWorkunitRequest {
+                work_unit_id: work_unit.id.clone(),
+            })
+            .await
+            .expect("proposal list");
+        assert!(proposals.proposals.is_empty());
+        assert_eq!(reasoner.propose_call_count(), 0);
+        assert!(reasoner.last_pack().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_proposal_enabled_generates_for_eligible_report_and_emits_created_event() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(true))
+                .await;
+        let mut events = service.event_tx.subscribe();
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "auto-enabled").await;
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Continue,
+                &work_unit.id,
+                &report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+
+        service.maybe_auto_create_proposal_for_report(&report).await;
+
+        let stored = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        assert_eq!(stored.status, SupervisorProposalStatus::Open);
+        assert_eq!(
+            stored.trigger.kind,
+            SupervisorProposalTriggerKind::ReportRecorded
+        );
+        let state = service.state.read().await;
+        assert!(state.collaboration.decisions.is_empty());
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].current_assignment_id,
+            Some(assignment.id.clone())
+        );
+        drop(state);
+        assert_eq!(reasoner.propose_call_count(), 1);
+
+        let event =
+            wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::Created).await;
+        assert_eq!(event.primary_work_unit_id, work_unit.id);
+
+        let snapshot = service.snapshot().await.expect("snapshot");
+        let summary = snapshot
+            .collaboration
+            .work_units
+            .iter()
+            .find(|summary| summary.id == work_unit.id)
+            .and_then(|summary| summary.proposal.as_ref())
+            .expect("proposal summary");
+        assert!(summary.has_open_proposal);
+        assert_eq!(
+            summary.latest_proposed_decision_type,
+            Some(DecisionType::Continue)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_auto_trigger_does_not_create_duplicate_open_proposals() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(true))
+                .await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "auto-repeat").await;
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Continue,
+                &work_unit.id,
+                &report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+
+        service.maybe_auto_create_proposal_for_report(&report).await;
+        service.maybe_auto_create_proposal_for_report(&report).await;
+
+        let proposals = service
+            .proposal_list_for_workunit(ipc::ProposalListForWorkunitRequest {
+                work_unit_id: work_unit.id.clone(),
+            })
+            .await
+            .expect("proposal list");
+        assert_eq!(proposals.proposals.len(), 1);
+        assert_eq!(
+            proposals.proposals[0].status,
+            SupervisorProposalStatus::Open
+        );
+        assert_eq!(reasoner.propose_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn existing_manual_open_proposal_suppresses_auto_generation_for_same_report() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(true))
+                .await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "auto-existing-open").await;
+        let _manual =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
+        assert_eq!(reasoner.propose_call_count(), 1);
+
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Redirect,
+                &work_unit.id,
+                &report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+        service.maybe_auto_create_proposal_for_report(&report).await;
+
+        let proposals = service
+            .proposal_list_for_workunit(ipc::ProposalListForWorkunitRequest {
+                work_unit_id: work_unit.id.clone(),
+            })
+            .await
+            .expect("proposal list");
+        assert_eq!(proposals.proposals.len(), 1);
+        assert_eq!(reasoner.propose_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_same_report_proposal_suppresses_auto_generation() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(true))
+                .await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "auto-rejected").await;
+        let proposal =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
+        let _ = service
+            .proposal_reject(ipc::ProposalRejectRequest {
+                proposal_id: proposal.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("reject".to_string()),
+            })
+            .await
+            .expect("reject");
+        assert_eq!(reasoner.propose_call_count(), 1);
+
+        service.maybe_auto_create_proposal_for_report(&report).await;
+
+        let proposals = service
+            .proposal_list_for_workunit(ipc::ProposalListForWorkunitRequest {
+                work_unit_id: work_unit.id.clone(),
+            })
+            .await
+            .expect("proposal list");
+        assert_eq!(proposals.proposals.len(), 1);
+        assert_eq!(
+            proposals.proposals[0].status,
+            SupervisorProposalStatus::Rejected
+        );
+        assert_eq!(reasoner.propose_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn auto_generation_failed_record_suppresses_repeated_same_report_trigger() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(true))
+                .await;
+        let (_workstream, work_unit, _assignment, report) =
+            seed_awaiting_decision_fixture(&service, "auto-failed-repeat").await;
+        reasoner
+            .set_failure(
+                SupervisorProposalFailureStage::Backend,
+                "timeout contacting provider",
+                Some("provider timeout".to_string()),
+            )
+            .await;
+
+        service.maybe_auto_create_proposal_for_report(&report).await;
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Continue,
+                &work_unit.id,
+                &report.id,
+                &report.assignment_id,
+                &report.worker_id,
+            ))
+            .await;
+        service.maybe_auto_create_proposal_for_report(&report).await;
+
+        let proposals = service
+            .proposal_list_for_workunit(ipc::ProposalListForWorkunitRequest {
+                work_unit_id: work_unit.id.clone(),
+            })
+            .await
+            .expect("proposal list");
+        assert_eq!(proposals.proposals.len(), 1);
+        assert_eq!(
+            proposals.proposals[0].status,
+            SupervisorProposalStatus::GenerationFailed
+        );
+        assert_eq!(reasoner.propose_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn auto_proposal_stales_old_report_and_generates_for_new_current_report() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(true))
+                .await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "auto-stale-old").await;
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Continue,
+                &work_unit.id,
+                &report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+        service.maybe_auto_create_proposal_for_report(&report).await;
+        let first = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+
+        let newer_report = {
+            let now = Utc::now();
+            let mut state = service.state.write().await;
+            let newer_report = Report {
+                id: format!("report-{}", Uuid::new_v4().simple()),
+                work_unit_id: work_unit.id.clone(),
+                assignment_id: assignment.id.clone(),
+                worker_id: assignment.worker_id.clone(),
+                disposition: ReportDisposition::Partial,
+                summary: "A newer authoritative report replaced the earlier decision point."
+                    .to_string(),
+                findings: vec!["The current bounded gap narrowed further.".to_string()],
+                blockers: Vec::new(),
+                questions: vec!["Should the final step redirect?".to_string()],
+                recommended_next_actions: vec!["Synthesize a fresh proposal.".to_string()],
+                confidence: ReportConfidence::High,
+                raw_output: "raw newer output".to_string(),
+                parse_result: ReportParseResult::Parsed,
+                needs_supervisor_review: false,
+                created_at: now,
+            };
+            state
+                .collaboration
+                .reports
+                .insert(newer_report.id.clone(), newer_report.clone());
+            let work_unit_entry = state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .expect("work unit");
+            work_unit_entry.latest_report_id = Some(newer_report.id.clone());
+            work_unit_entry.updated_at = now;
+            newer_report
+        };
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist newer report");
+
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Redirect,
+                &work_unit.id,
+                &newer_report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+        service
+            .maybe_auto_create_proposal_for_report(&newer_report)
+            .await;
+
+        let proposals = service
+            .proposal_list_for_workunit(ipc::ProposalListForWorkunitRequest {
+                work_unit_id: work_unit.id.clone(),
+            })
+            .await
+            .expect("proposal list");
+        assert_eq!(proposals.proposals.len(), 2);
+        let first_record = service
+            .proposal_get(ipc::ProposalGetRequest {
+                proposal_id: first.id.clone(),
+            })
+            .await
+            .expect("first proposal");
+        assert_eq!(
+            first_record.proposal.status,
+            SupervisorProposalStatus::Stale
+        );
+        assert_eq!(proposals.proposals[0].source_report_id, newer_report.id);
+        assert_eq!(
+            proposals.proposals[0].status,
+            SupervisorProposalStatus::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_proposal_failure_persists_generation_failed_without_authoritative_changes() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(true))
+                .await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "auto-failure").await;
+        reasoner
+            .set_failure(
+                SupervisorProposalFailureStage::Backend,
+                "timeout contacting provider",
+                Some("provider timeout".to_string()),
+            )
+            .await;
+
+        service.maybe_auto_create_proposal_for_report(&report).await;
+
+        let stored = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        assert_eq!(stored.status, SupervisorProposalStatus::GenerationFailed);
+        assert_eq!(
+            stored.trigger.kind,
+            SupervisorProposalTriggerKind::ReportRecorded
+        );
+        let state = service.state.read().await;
+        assert!(state.collaboration.decisions.is_empty());
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].current_assignment_id,
+            Some(assignment.id.clone())
+        );
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].status,
+            WorkUnitStatus::AwaitingDecision
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_still_works_after_auto_generated_proposal_exists() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(true))
+                .await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "auto-approve").await;
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Continue,
+                &work_unit.id,
+                &report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+
+        service.maybe_auto_create_proposal_for_report(&report).await;
+        let proposal = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        let response =
+            approve_proposal(&service, &proposal.id, SupervisorProposalEdits::default()).await;
+
+        assert_eq!(response.proposal.status, SupervisorProposalStatus::Approved);
+        assert_eq!(
+            response.proposal.trigger.kind,
+            SupervisorProposalTriggerKind::ReportRecorded
+        );
+        assert_eq!(response.decision.decision_type, DecisionType::Continue);
+        assert!(response.next_assignment.is_some());
+    }
+
+    #[tokio::test]
+    async fn approved_same_report_does_not_regenerate_auto_proposal() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(true))
+                .await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "auto-approved-suppressed").await;
+        reasoner
+            .set_proposal(sample_proposal_for_decision(
+                DecisionType::Continue,
+                &work_unit.id,
+                &report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+
+        service.maybe_auto_create_proposal_for_report(&report).await;
+        let proposal = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        let _ = approve_proposal(&service, &proposal.id, SupervisorProposalEdits::default()).await;
+        assert_eq!(reasoner.propose_call_count(), 1);
+
+        service.maybe_auto_create_proposal_for_report(&report).await;
+
+        let proposals = service
+            .proposal_list_for_workunit(ipc::ProposalListForWorkunitRequest {
+                work_unit_id: work_unit.id.clone(),
+            })
+            .await
+            .expect("proposal list");
+        assert_eq!(proposals.proposals.len(), 1);
+        assert_eq!(
+            proposals.proposals[0].status,
+            SupervisorProposalStatus::Approved
+        );
+        assert_eq!(reasoner.propose_call_count(), 1);
     }
 
     #[tokio::test]
