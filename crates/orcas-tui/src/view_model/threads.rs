@@ -11,6 +11,7 @@ pub struct ThreadRowViewModel {
     pub status: String,
     pub turn_badge: Option<String>,
     pub assignment_badge: Option<String>,
+    pub decision_badge: Option<String>,
     pub preview: String,
     pub selected: bool,
 }
@@ -43,6 +44,7 @@ pub fn thread_list(state: &AppState) -> ThreadListViewModel {
                 status: thread_status_label(state, thread),
                 turn_badge: thread_turn_badge(state, &thread.id),
                 assignment_badge: thread_assignment_badge(state, &thread.id),
+                decision_badge: thread_decision_badge(state, &thread.id),
                 preview: abbreviate(&thread.preview.replace('\n', " "), 40),
                 selected: state.selected_thread_id.as_deref() == Some(thread.id.as_str()),
             })
@@ -100,6 +102,20 @@ pub fn thread_summary(state: &AppState) -> PanelViewModel {
         ));
     } else {
         lines.push("assignment: unassigned".to_string());
+    }
+    if let Some(decision) = thread_decision_for_display(state, thread_id) {
+        lines.push(format!(
+            "decision: {} [{}]",
+            decision.decision_id,
+            supervisor_decision_status_label(decision.status)
+        ));
+        lines.push(format!(
+            "review: {}  proposal: {}",
+            supervisor_decision_kind_label(decision.kind),
+            supervisor_proposal_kind_label(decision.proposal_kind)
+        ));
+    } else {
+        lines.push("decision: none".to_string());
     }
 
     if let Some(turn_state) = latest_turn_state_for_thread(state, thread_id) {
@@ -203,6 +219,59 @@ pub fn thread_detail(state: &AppState) -> ThreadDetailViewModel {
         lines.push(String::new());
     }
 
+    if let Some(decision) = thread_decision_for_display(state, thread_id) {
+        lines.push(format!(
+            "decision {} [{}]",
+            decision.decision_id,
+            supervisor_decision_status_label(decision.status)
+        ));
+        lines.push(format!(
+            "  kind={}  proposal={}  basis={}",
+            supervisor_decision_kind_label(decision.kind),
+            supervisor_proposal_kind_label(decision.proposal_kind),
+            decision.basis_turn_id.as_deref().unwrap_or("-"),
+        ));
+        lines.push(format!(
+            "  rationale {}",
+            abbreviate(&compact_line(&decision.rationale_summary), 84)
+        ));
+        if let Some(text) = decision.proposed_text.as_ref() {
+            lines.push(format!(
+                "  proposed {}",
+                abbreviate(&compact_line(text), 84)
+            ));
+        }
+        lines.push(format!(
+            "  created {}  approved {}  rejected {}  sent {}",
+            timestamp_label(decision.created_at),
+            decision
+                .approved_at
+                .map(timestamp_label)
+                .unwrap_or_else(|| "-".to_string()),
+            decision
+                .rejected_at
+                .map(timestamp_label)
+                .unwrap_or_else(|| "-".to_string()),
+            decision
+                .sent_at
+                .map(timestamp_label)
+                .unwrap_or_else(|| "-".to_string()),
+        ));
+        if let Some(turn_id) = decision.sent_turn_id.as_ref() {
+            lines.push(format!("  sent turn {turn_id}"));
+        }
+        if let Some(notes) = decision.notes.as_ref() {
+            lines.push(format!("  notes {}", abbreviate(&compact_line(notes), 84)));
+        }
+        if decision.status == orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman {
+            lines.push("  actions: a approve/send  d reject".to_string());
+        }
+        lines.push(String::new());
+    } else {
+        lines.push("Decision: none".to_string());
+        lines.push(String::new());
+    }
+
     if thread.turns.is_empty() {
         lines.push("No turns loaded.".to_string());
     } else {
@@ -283,6 +352,11 @@ fn thread_assignment_badge(state: &AppState, thread_id: &str) -> Option<String> 
     Some(codex_assignment_status_label(assignment.status).to_string())
 }
 
+fn thread_decision_badge(state: &AppState, thread_id: &str) -> Option<String> {
+    let decision = thread_decision_for_display(state, thread_id)?;
+    Some(supervisor_decision_status_label(decision.status).to_string())
+}
+
 fn loaded_status_label(status: ipc::ThreadLoadedStatus) -> &'static str {
     match status {
         ipc::ThreadLoadedStatus::NotLoaded => "not loaded",
@@ -328,6 +402,35 @@ fn codex_bootstrap_state_label(state: CodexThreadBootstrapState) -> &'static str
     }
 }
 
+fn supervisor_decision_kind_label(kind: orcas_core::SupervisorTurnDecisionKind) -> &'static str {
+    match kind {
+        orcas_core::SupervisorTurnDecisionKind::NextTurn => "next turn",
+        orcas_core::SupervisorTurnDecisionKind::NoAction => "no action",
+    }
+}
+
+fn supervisor_proposal_kind_label(kind: orcas_core::SupervisorTurnProposalKind) -> &'static str {
+    match kind {
+        orcas_core::SupervisorTurnProposalKind::Bootstrap => "bootstrap",
+        orcas_core::SupervisorTurnProposalKind::ContinueAfterTurn => "continue after turn",
+        orcas_core::SupervisorTurnProposalKind::ManualRefresh => "manual refresh",
+    }
+}
+
+fn supervisor_decision_status_label(
+    status: orcas_core::SupervisorTurnDecisionStatus,
+) -> &'static str {
+    match status {
+        orcas_core::SupervisorTurnDecisionStatus::Draft => "draft",
+        orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman => "pending human approval",
+        orcas_core::SupervisorTurnDecisionStatus::Approved => "approved",
+        orcas_core::SupervisorTurnDecisionStatus::Rejected => "rejected",
+        orcas_core::SupervisorTurnDecisionStatus::Sent => "sent",
+        orcas_core::SupervisorTurnDecisionStatus::Superseded => "superseded",
+        orcas_core::SupervisorTurnDecisionStatus::Stale => "stale proposal",
+    }
+}
+
 fn current_thread_assignment<'a>(
     state: &'a AppState,
     thread_id: &str,
@@ -365,6 +468,22 @@ fn thread_assignment_for_display<'a>(
 ) -> Option<&'a ipc::CodexThreadAssignmentSummary> {
     current_thread_assignment(state, thread_id)
         .or_else(|| latest_thread_assignment(state, thread_id))
+}
+
+fn thread_decision_for_display<'a>(
+    state: &'a AppState,
+    thread_id: &str,
+) -> Option<&'a ipc::SupervisorTurnDecisionSummary> {
+    state
+        .collaboration
+        .supervisor_turn_decisions
+        .iter()
+        .filter(|decision| decision.codex_thread_id == thread_id)
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.decision_id.cmp(&right.decision_id))
+        })
 }
 
 fn latest_turn_state_for_thread<'a>(

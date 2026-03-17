@@ -6,7 +6,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep};
 
-use crate::app::{Action, AppState, Effect, UiEvent, reduce};
+use crate::app::{Action, AppState, Effect, UiEvent, UserAction, reduce};
 use crate::backend::{BackendCommand, BackendCommandResult, TuiBackend};
 use orcas_core::logging::runtime_cycle_enabled;
 use tracing::debug;
@@ -663,6 +663,70 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                         }
                     }
                 }
+            }
+            Effect::ApproveSupervisorDecision { decision_id } => {
+                let effect = Effect::ApproveSupervisorDecision {
+                    decision_id: decision_id.clone(),
+                };
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::ApproveSupervisorDecision { decision_id },
+                    |response| match response {
+                        BackendCommandResult::SupervisorDecision(_) => {
+                            vec![Action::User(UserAction::Refresh)]
+                        }
+                        other => {
+                            vec![Action::Event(UiEvent::Error(format!(
+                                "unexpected supervisor approve response: {other:?}"
+                            )))]
+                        }
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "supervisor approve failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!(
+                                "supervisor approve failed: {error}"
+                            )))
+                        }
+                    },
+                )
+                .await
+            }
+            Effect::RejectSupervisorDecision { decision_id } => {
+                let effect = Effect::RejectSupervisorDecision {
+                    decision_id: decision_id.clone(),
+                };
+                Self::run_backend_effect(
+                    backend,
+                    effect,
+                    BackendCommand::RejectSupervisorDecision { decision_id },
+                    |response| match response {
+                        BackendCommandResult::SupervisorDecision(_) => {
+                            vec![Action::User(UserAction::Refresh)]
+                        }
+                        other => {
+                            vec![Action::Event(UiEvent::Error(format!(
+                                "unexpected supervisor reject response: {other:?}"
+                            )))]
+                        }
+                    },
+                    |error| {
+                        if Self::is_disconnect_error(&error) {
+                            Action::Event(UiEvent::ConnectionLost(format!(
+                                "supervisor reject failed: {error}"
+                            )))
+                        } else {
+                            Action::Event(UiEvent::Error(format!(
+                                "supervisor reject failed: {error}"
+                            )))
+                        }
+                    },
+                )
+                .await
             }
         }
     }

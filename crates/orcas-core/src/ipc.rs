@@ -5,8 +5,9 @@ use serde_json::Value;
 use crate::collaboration::{
     Assignment, AssignmentStatus, CodexThreadAssignment, CodexThreadAssignmentStatus,
     CodexThreadBootstrapState, CodexThreadSendPolicy, Decision, DecisionType, Report,
-    ReportConfidence, ReportDisposition, ReportParseResult, WorkUnit, WorkUnitStatus, Worker,
-    WorkerSession, Workstream, WorkstreamStatus,
+    ReportConfidence, ReportDisposition, ReportParseResult, SupervisorTurnDecision,
+    SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus, SupervisorTurnProposalKind, WorkUnit,
+    WorkUnitStatus, Worker, WorkerSession, Workstream, WorkstreamStatus,
 };
 use crate::communication::AssignmentCommunicationRecord;
 use crate::events::ConnectionState;
@@ -54,6 +55,10 @@ pub mod methods {
     pub const CODEX_ASSIGNMENT_PAUSE: &str = "codex_assignment/pause";
     pub const CODEX_ASSIGNMENT_RESUME: &str = "codex_assignment/resume";
     pub const CODEX_ASSIGNMENT_RELEASE: &str = "codex_assignment/release";
+    pub const SUPERVISOR_DECISION_LIST: &str = "supervisor_decision/list";
+    pub const SUPERVISOR_DECISION_GET: &str = "supervisor_decision/get";
+    pub const SUPERVISOR_DECISION_APPROVE_AND_SEND: &str = "supervisor_decision/approve_and_send";
+    pub const SUPERVISOR_DECISION_REJECT: &str = "supervisor_decision/reject";
     pub const REPORT_GET: &str = "report/get";
     pub const REPORT_LIST_FOR_WORKUNIT: &str = "report/list_for_workunit";
     pub const DECISION_APPLY: &str = "decision/apply";
@@ -167,6 +172,8 @@ pub struct CollaborationSnapshot {
     pub assignments: Vec<AssignmentSummary>,
     #[serde(default)]
     pub codex_thread_assignments: Vec<CodexThreadAssignmentSummary>,
+    #[serde(default)]
+    pub supervisor_turn_decisions: Vec<SupervisorTurnDecisionSummary>,
     pub reports: Vec<ReportSummary>,
     pub decisions: Vec<DecisionSummary>,
 }
@@ -252,6 +259,10 @@ pub enum DaemonEvent {
         action: CodexAssignmentLifecycleAction,
         assignment: CodexThreadAssignmentSummary,
     },
+    SupervisorDecisionLifecycle {
+        action: SupervisorDecisionLifecycleAction,
+        decision: SupervisorTurnDecisionSummary,
+    },
     ReportRecorded {
         report: ReportSummary,
     },
@@ -296,6 +307,17 @@ pub enum CodexAssignmentLifecycleAction {
     Resumed,
     Released,
     Updated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorDecisionLifecycleAction {
+    Created,
+    Approved,
+    Sent,
+    Rejected,
+    Superseded,
+    Stale,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,6 +400,27 @@ pub struct CodexThreadAssignmentSummary {
     pub latest_decision_id: Option<String>,
     pub notes: Option<String>,
     pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorTurnDecisionSummary {
+    pub decision_id: String,
+    pub assignment_id: String,
+    pub codex_thread_id: String,
+    pub basis_turn_id: Option<String>,
+    pub kind: SupervisorTurnDecisionKind,
+    pub proposal_kind: SupervisorTurnProposalKind,
+    pub proposed_text: Option<String>,
+    pub rationale_summary: String,
+    pub status: SupervisorTurnDecisionStatus,
+    pub created_at: DateTime<Utc>,
+    pub approved_at: Option<DateTime<Utc>>,
+    pub rejected_at: Option<DateTime<Utc>>,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub superseded_by: Option<String>,
+    pub sent_turn_id: Option<String>,
+    pub notes: Option<String>,
+    pub open: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -983,6 +1026,55 @@ pub struct CodexAssignmentReleaseRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexAssignmentReleaseResponse {
     pub assignment: CodexThreadAssignment,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SupervisorDecisionListRequest {
+    #[serde(default)]
+    pub assignment_id: Option<String>,
+    #[serde(default)]
+    pub codex_thread_id: Option<String>,
+    #[serde(default)]
+    pub include_closed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionListResponse {
+    pub decisions: Vec<SupervisorTurnDecisionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionGetRequest {
+    pub decision_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionGetResponse {
+    pub decision: SupervisorTurnDecision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionApproveAndSendRequest {
+    pub decision_id: String,
+    pub reviewed_by: Option<String>,
+    pub review_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionApproveAndSendResponse {
+    pub decision: SupervisorTurnDecision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionRejectRequest {
+    pub decision_id: String,
+    pub reviewed_by: Option<String>,
+    pub review_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorDecisionRejectResponse {
+    pub decision: SupervisorTurnDecision,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

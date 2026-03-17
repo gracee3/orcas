@@ -200,6 +200,38 @@ impl OrcasIpcClient {
         Ok(())
     }
 
+    pub async fn supervisor_decision_list(
+        &self,
+        params: &ipc::SupervisorDecisionListRequest,
+    ) -> OrcasResult<ipc::SupervisorDecisionListResponse> {
+        self.request(ipc::methods::SUPERVISOR_DECISION_LIST, params)
+            .await
+    }
+
+    pub async fn supervisor_decision_get(
+        &self,
+        params: &ipc::SupervisorDecisionGetRequest,
+    ) -> OrcasResult<ipc::SupervisorDecisionGetResponse> {
+        self.request(ipc::methods::SUPERVISOR_DECISION_GET, params)
+            .await
+    }
+
+    pub async fn supervisor_decision_approve_and_send(
+        &self,
+        params: &ipc::SupervisorDecisionApproveAndSendRequest,
+    ) -> OrcasResult<ipc::SupervisorDecisionApproveAndSendResponse> {
+        self.request(ipc::methods::SUPERVISOR_DECISION_APPROVE_AND_SEND, params)
+            .await
+    }
+
+    pub async fn supervisor_decision_reject(
+        &self,
+        params: &ipc::SupervisorDecisionRejectRequest,
+    ) -> OrcasResult<ipc::SupervisorDecisionRejectResponse> {
+        self.request(ipc::methods::SUPERVISOR_DECISION_REJECT, params)
+            .await
+    }
+
     pub async fn workstream_create(
         &self,
         params: &ipc::WorkstreamCreateRequest,

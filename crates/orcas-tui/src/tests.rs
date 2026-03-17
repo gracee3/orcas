@@ -97,6 +97,36 @@ fn sample_codex_assignment_summary(
     }
 }
 
+fn sample_supervisor_turn_decision_summary(
+    thread_id: &str,
+    status: orcas_core::SupervisorTurnDecisionStatus,
+) -> ipc::SupervisorTurnDecisionSummary {
+    ipc::SupervisorTurnDecisionSummary {
+        decision_id: "std-1".to_string(),
+        assignment_id: "cta-1".to_string(),
+        codex_thread_id: thread_id.to_string(),
+        basis_turn_id: Some("turn-1".to_string()),
+        kind: orcas_core::SupervisorTurnDecisionKind::NextTurn,
+        proposal_kind: orcas_core::SupervisorTurnProposalKind::Bootstrap,
+        proposed_text: Some("Please summarize status and take the next bounded step.".to_string()),
+        rationale_summary: "Thread is idle under an active assignment and needs bootstrap review."
+            .to_string(),
+        status,
+        created_at: Utc::now(),
+        approved_at: None,
+        rejected_at: None,
+        sent_at: None,
+        superseded_by: None,
+        sent_turn_id: None,
+        notes: Some("human approval required".to_string()),
+        open: matches!(
+            status,
+            orcas_core::SupervisorTurnDecisionStatus::Draft
+                | orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman
+        ),
+    }
+}
+
 fn sample_turn_state(
     thread_id: &str,
     turn_id: &str,
@@ -446,6 +476,7 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
             },
         ],
         codex_thread_assignments: Vec::new(),
+        supervisor_turn_decisions: Vec::new(),
         reports: vec![
             ipc::ReportSummary {
                 id: "report-2".to_string(),
@@ -851,6 +882,122 @@ async fn thread_list_and_detail_show_codex_assignment_state() {
         detail.lines.iter().any(|line| {
             line.contains("workstream=ws-1  work_unit=wu-1  supervisor=supervisor-a")
         })
+    );
+}
+
+#[tokio::test]
+async fn thread_list_and_detail_show_supervisor_decision_state() {
+    let mut snapshot = sample_snapshot();
+    snapshot
+        .collaboration
+        .codex_thread_assignments
+        .push(sample_codex_assignment_summary(
+            "thread-1",
+            orcas_core::CodexThreadAssignmentStatus::Active,
+        ));
+    snapshot
+        .collaboration
+        .supervisor_turn_decisions
+        .push(sample_supervisor_turn_decision_summary(
+            "thread-1",
+            orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman,
+        ));
+
+    let harness = AppHarness::new(snapshot).await.unwrap();
+    let list = harness.thread_list_vm();
+    assert_eq!(
+        list.rows[0].decision_badge.as_deref(),
+        Some("pending human approval")
+    );
+
+    let summary = harness.thread_summary_vm();
+    assert!(
+        summary
+            .lines
+            .iter()
+            .any(|line| line.contains("decision: std-1 [pending human approval]"))
+    );
+
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("decision std-1 [pending human approval]"))
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("actions: a approve/send  d reject"))
+    );
+}
+
+#[tokio::test]
+async fn approve_selected_supervisor_decision_refreshes_thread_state() {
+    let mut snapshot = sample_snapshot();
+    snapshot
+        .collaboration
+        .supervisor_turn_decisions
+        .push(sample_supervisor_turn_decision_summary(
+            "thread-1",
+            orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman,
+        ));
+    let mut harness = AppHarness::new(snapshot).await.unwrap();
+
+    harness
+        .dispatch(UserAction::ApproveSelectedSupervisorDecision)
+        .await;
+
+    let commands = harness.recorded_commands().await;
+    assert!(commands.iter().any(|command| {
+        matches!(
+            command,
+            BackendCommand::ApproveSupervisorDecision { decision_id }
+                if decision_id == "std-1"
+        )
+    }));
+
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("decision std-1 [sent]"))
+    );
+}
+
+#[tokio::test]
+async fn reject_selected_supervisor_decision_refreshes_thread_state() {
+    let mut snapshot = sample_snapshot();
+    snapshot
+        .collaboration
+        .supervisor_turn_decisions
+        .push(sample_supervisor_turn_decision_summary(
+            "thread-1",
+            orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman,
+        ));
+    let mut harness = AppHarness::new(snapshot).await.unwrap();
+
+    harness
+        .dispatch(UserAction::RejectSelectedSupervisorDecision)
+        .await;
+
+    let commands = harness.recorded_commands().await;
+    assert!(commands.iter().any(|command| {
+        matches!(
+            command,
+            BackendCommand::RejectSupervisorDecision { decision_id }
+                if decision_id == "std-1"
+        )
+    }));
+
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("decision std-1 [rejected]"))
     );
 }
 

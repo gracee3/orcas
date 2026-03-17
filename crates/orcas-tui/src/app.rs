@@ -136,6 +136,8 @@ pub enum UserAction {
     PromptAppend(char),
     PromptBackspace,
     SubmitPrompt,
+    ApproveSelectedSupervisorDecision,
+    RejectSelectedSupervisorDecision,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +184,10 @@ pub enum UiEvent {
         action: ipc::CodexAssignmentLifecycleAction,
         assignment: ipc::CodexThreadAssignmentSummary,
     },
+    SupervisorDecisionLifecycle {
+        action: ipc::SupervisorDecisionLifecycleAction,
+        decision: ipc::SupervisorTurnDecisionSummary,
+    },
     ReportRecorded(ipc::ReportSummary),
     DecisionApplied(ipc::DecisionSummary),
     ProposalLifecycle {
@@ -227,6 +233,9 @@ impl UiEvent {
             }
             ipc::DaemonEvent::CodexAssignmentLifecycle { action, assignment } => {
                 Self::CodexAssignmentLifecycle { action, assignment }
+            }
+            ipc::DaemonEvent::SupervisorDecisionLifecycle { action, decision } => {
+                Self::SupervisorDecisionLifecycle { action, decision }
             }
             ipc::DaemonEvent::ReportRecorded { report } => Self::ReportRecorded(report),
             ipc::DaemonEvent::DecisionApplied { decision } => Self::DecisionApplied(decision),
@@ -278,6 +287,8 @@ pub enum Effect {
     LoadTurnState { thread_id: String, turn_id: String },
     LoadWorkUnitDetail { work_unit_id: String },
     SubmitPrompt { thread_id: String, text: String },
+    ApproveSupervisorDecision { decision_id: String },
+    RejectSupervisorDecision { decision_id: String },
     LoadModels,
     StartDaemon,
     RestartDaemon,
@@ -415,6 +426,41 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
                     .to_string(),
             });
             Vec::new()
+        }
+        UserAction::ApproveSelectedSupervisorDecision => {
+            let Some(decision_id) = selected_thread_pending_supervisor_decision(state)
+                .map(|decision| decision.decision_id.clone())
+            else {
+                state.banner = Some(StatusBanner {
+                    level: BannerLevel::Warning,
+                    message: "Selected thread has no pending supervisor proposal.".to_string(),
+                });
+                return Vec::new();
+            };
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Info,
+                message: format!(
+                    "Approving and sending supervisor proposal {}...",
+                    decision_id
+                ),
+            });
+            vec![Effect::ApproveSupervisorDecision { decision_id }]
+        }
+        UserAction::RejectSelectedSupervisorDecision => {
+            let Some(decision_id) = selected_thread_pending_supervisor_decision(state)
+                .map(|decision| decision.decision_id.clone())
+            else {
+                state.banner = Some(StatusBanner {
+                    level: BannerLevel::Warning,
+                    message: "Selected thread has no pending supervisor proposal.".to_string(),
+                });
+                return Vec::new();
+            };
+            state.banner = Some(StatusBanner {
+                level: BannerLevel::Info,
+                message: format!("Rejecting supervisor proposal {}...", decision_id),
+            });
+            vec![Effect::RejectSupervisorDecision { decision_id }]
         }
     }
 }
@@ -705,6 +751,12 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             upsert_codex_assignment_summary(
                 &mut state.collaboration.codex_thread_assignments,
                 assignment,
+            );
+        }
+        UiEvent::SupervisorDecisionLifecycle { decision, .. } => {
+            upsert_supervisor_turn_decision_summary(
+                &mut state.collaboration.supervisor_turn_decisions,
+                decision,
             );
         }
         UiEvent::ReportRecorded(report) => {
@@ -1289,6 +1341,45 @@ fn upsert_codex_assignment_summary(
     });
 }
 
+fn upsert_supervisor_turn_decision_summary(
+    decisions: &mut Vec<ipc::SupervisorTurnDecisionSummary>,
+    summary: ipc::SupervisorTurnDecisionSummary,
+) {
+    if let Some(existing) = decisions
+        .iter_mut()
+        .find(|decision| decision.decision_id == summary.decision_id)
+    {
+        *existing = summary;
+    } else {
+        decisions.push(summary);
+    }
+    decisions.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left.decision_id.cmp(&right.decision_id))
+    });
+}
+
+fn selected_thread_pending_supervisor_decision(
+    state: &AppState,
+) -> Option<&ipc::SupervisorTurnDecisionSummary> {
+    let thread_id = state.selected_thread_id.as_deref()?;
+    state
+        .collaboration
+        .supervisor_turn_decisions
+        .iter()
+        .filter(|decision| {
+            decision.codex_thread_id == thread_id
+                && decision.status == orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman
+        })
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.decision_id.cmp(&right.decision_id))
+        })
+}
+
 fn upsert_report_summary(reports: &mut Vec<ipc::ReportSummary>, summary: ipc::ReportSummary) {
     if let Some(existing) = reports.iter_mut().find(|report| report.id == summary.id) {
         *existing = summary;
@@ -1457,6 +1548,16 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
             Some(assignment.codex_thread_id.clone()),
             assignment.latest_basis_turn_id.clone(),
         ),
+        UiEvent::SupervisorDecisionLifecycle { action, decision } => (
+            "supervisor_decision",
+            format!(
+                "decision {} {}",
+                decision.decision_id,
+                supervisor_decision_action_label(*action)
+            ),
+            Some(decision.codex_thread_id.clone()),
+            decision.basis_turn_id.clone(),
+        ),
         UiEvent::ReportRecorded(report) => (
             "report",
             format!("report {} {:?}", report.id, report.parse_result),
@@ -1544,6 +1645,19 @@ fn codex_assignment_action_label(action: ipc::CodexAssignmentLifecycleAction) ->
         ipc::CodexAssignmentLifecycleAction::Resumed => "resumed",
         ipc::CodexAssignmentLifecycleAction::Released => "released",
         ipc::CodexAssignmentLifecycleAction::Updated => "updated",
+    }
+}
+
+fn supervisor_decision_action_label(
+    action: ipc::SupervisorDecisionLifecycleAction,
+) -> &'static str {
+    match action {
+        ipc::SupervisorDecisionLifecycleAction::Created => "created",
+        ipc::SupervisorDecisionLifecycleAction::Approved => "approved",
+        ipc::SupervisorDecisionLifecycleAction::Sent => "sent",
+        ipc::SupervisorDecisionLifecycleAction::Rejected => "rejected",
+        ipc::SupervisorDecisionLifecycleAction::Superseded => "superseded",
+        ipc::SupervisorDecisionLifecycleAction::Stale => "stale",
     }
 }
 

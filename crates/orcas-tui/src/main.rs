@@ -100,6 +100,7 @@ async fn handle_key(runtime: &mut AppRuntime<OrcasDaemonBackend>, code: KeyCode)
 
 fn action_for_key(current_view: TopLevelView, code: KeyCode) -> Option<UserAction> {
     let in_supervisor_view = current_view == TopLevelView::Supervisor;
+    let in_threads_view = current_view == TopLevelView::Threads;
     match code {
         KeyCode::Char('r') => Some(UserAction::Refresh),
         KeyCode::Char('?') => Some(UserAction::ToggleHelp),
@@ -111,6 +112,10 @@ fn action_for_key(current_view: TopLevelView, code: KeyCode) -> Option<UserActio
         KeyCode::Char('s') if in_supervisor_view => Some(UserAction::StartDaemon),
         KeyCode::Char('x') if in_supervisor_view => Some(UserAction::StopDaemon),
         KeyCode::Char('R') if in_supervisor_view => Some(UserAction::RestartDaemon),
+        KeyCode::Char('a') if in_threads_view => {
+            Some(UserAction::ApproveSelectedSupervisorDecision)
+        }
+        KeyCode::Char('d') if in_threads_view => Some(UserAction::RejectSelectedSupervisorDecision),
         KeyCode::Down => Some(UserAction::SelectNextInView),
         KeyCode::Up => Some(UserAction::SelectPreviousInView),
         KeyCode::Left => Some(UserAction::ShowView(current_view.previous())),
@@ -177,6 +182,18 @@ mod tests {
         assert_eq!(
             action_for_key(TopLevelView::Collaboration, KeyCode::Char('l')),
             None
+        );
+    }
+
+    #[test]
+    fn threads_view_maps_supervisor_review_actions() {
+        assert_eq!(
+            action_for_key(TopLevelView::Threads, KeyCode::Char('a')),
+            Some(UserAction::ApproveSelectedSupervisorDecision)
+        );
+        assert_eq!(
+            action_for_key(TopLevelView::Threads, KeyCode::Char('d')),
+            Some(UserAction::RejectSelectedSupervisorDecision)
         );
     }
 }

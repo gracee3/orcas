@@ -28,6 +28,8 @@ pub struct CollaborationState {
     pub supervisor_proposals: BTreeMap<String, SupervisorProposalRecord>,
     #[serde(default)]
     pub codex_thread_assignments: BTreeMap<String, CodexThreadAssignment>,
+    #[serde(default)]
+    pub supervisor_turn_decisions: BTreeMap<String, SupervisorTurnDecision>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -79,6 +81,67 @@ pub struct CodexThreadAssignment {
     pub latest_basis_turn_id: Option<String>,
     #[serde(default)]
     pub latest_decision_id: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorTurnDecisionKind {
+    #[default]
+    NextTurn,
+    NoAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorTurnProposalKind {
+    #[default]
+    Bootstrap,
+    ContinueAfterTurn,
+    ManualRefresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorTurnDecisionStatus {
+    Draft,
+    #[default]
+    ProposedToHuman,
+    Approved,
+    Rejected,
+    Sent,
+    Superseded,
+    Stale,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorTurnDecision {
+    pub decision_id: String,
+    pub assignment_id: String,
+    pub codex_thread_id: String,
+    #[serde(default)]
+    pub basis_turn_id: Option<String>,
+    #[serde(default)]
+    pub kind: SupervisorTurnDecisionKind,
+    #[serde(default)]
+    pub proposal_kind: SupervisorTurnProposalKind,
+    #[serde(default)]
+    pub proposed_text: Option<String>,
+    pub rationale_summary: String,
+    #[serde(default)]
+    pub status: SupervisorTurnDecisionStatus,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub approved_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub rejected_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub sent_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub sent_turn_id: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
 }

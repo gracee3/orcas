@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, mpsc};
 
-use orcas_core::{AppPaths, Assignment, Decision, Report, WorkUnit, ipc};
+use orcas_core::{AppPaths, Assignment, Decision, Report, SupervisorTurnDecision, WorkUnit, ipc};
 use orcas_daemon::{
     OrcasDaemonLaunch, OrcasDaemonProcessManager, OrcasIpcClient, OrcasRuntimeOverrides,
 };
@@ -21,6 +21,8 @@ pub enum BackendCommand {
     StartDaemon,
     StopDaemon,
     SubmitPrompt { thread_id: String, text: String },
+    ApproveSupervisorDecision { decision_id: String },
+    RejectSupervisorDecision { decision_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +37,7 @@ pub enum BackendCommandResult {
     DaemonStarted { connected: bool },
     DaemonStopped { stopping: bool },
     PromptStarted { thread_id: String, turn_id: String },
+    SupervisorDecision(SupervisorTurnDecision),
 }
 
 #[async_trait]
@@ -201,6 +204,32 @@ impl OrcasDaemonBackend {
                     thread_id,
                     turn_id: response.turn_id,
                 })
+            }
+            BackendCommand::ApproveSupervisorDecision { decision_id } => {
+                Ok(BackendCommandResult::SupervisorDecision(
+                    client
+                        .supervisor_decision_approve_and_send(
+                            &ipc::SupervisorDecisionApproveAndSendRequest {
+                                decision_id,
+                                reviewed_by: Some("tui_operator".to_string()),
+                                review_note: None,
+                            },
+                        )
+                        .await?
+                        .decision,
+                ))
+            }
+            BackendCommand::RejectSupervisorDecision { decision_id } => {
+                Ok(BackendCommandResult::SupervisorDecision(
+                    client
+                        .supervisor_decision_reject(&ipc::SupervisorDecisionRejectRequest {
+                            decision_id,
+                            reviewed_by: Some("tui_operator".to_string()),
+                            review_note: None,
+                        })
+                        .await?
+                        .decision,
+                ))
             }
         }
     }
@@ -518,6 +547,73 @@ impl TuiBackend for FakeBackend {
                 );
                 guard.active_turns.push(turn);
                 Ok(BackendCommandResult::PromptStarted { thread_id, turn_id })
+            }
+            BackendCommand::ApproveSupervisorDecision { decision_id } => {
+                let next_turn_id = format!("turn-{}", guard.next_submit_id);
+                let decision = guard
+                    .snapshot
+                    .collaboration
+                    .supervisor_turn_decisions
+                    .iter_mut()
+                    .find(|decision| decision.decision_id == decision_id)
+                    .ok_or_else(|| anyhow!("unknown supervisor decision `{decision_id}`"))?;
+                decision.status = orcas_core::SupervisorTurnDecisionStatus::Sent;
+                decision.open = false;
+                decision.approved_at = Some(chrono::Utc::now());
+                decision.sent_at = Some(chrono::Utc::now());
+                decision.sent_turn_id = Some(next_turn_id);
+                Ok(BackendCommandResult::SupervisorDecision(
+                    SupervisorTurnDecision {
+                        decision_id: decision.decision_id.clone(),
+                        assignment_id: decision.assignment_id.clone(),
+                        codex_thread_id: decision.codex_thread_id.clone(),
+                        basis_turn_id: decision.basis_turn_id.clone(),
+                        kind: decision.kind,
+                        proposal_kind: decision.proposal_kind,
+                        proposed_text: decision.proposed_text.clone(),
+                        rationale_summary: decision.rationale_summary.clone(),
+                        status: decision.status,
+                        created_at: decision.created_at,
+                        approved_at: decision.approved_at,
+                        rejected_at: decision.rejected_at,
+                        sent_at: decision.sent_at,
+                        superseded_by: decision.superseded_by.clone(),
+                        sent_turn_id: decision.sent_turn_id.clone(),
+                        notes: decision.notes.clone(),
+                    },
+                ))
+            }
+            BackendCommand::RejectSupervisorDecision { decision_id } => {
+                let decision = guard
+                    .snapshot
+                    .collaboration
+                    .supervisor_turn_decisions
+                    .iter_mut()
+                    .find(|decision| decision.decision_id == decision_id)
+                    .ok_or_else(|| anyhow!("unknown supervisor decision `{decision_id}`"))?;
+                decision.status = orcas_core::SupervisorTurnDecisionStatus::Rejected;
+                decision.open = false;
+                decision.rejected_at = Some(chrono::Utc::now());
+                Ok(BackendCommandResult::SupervisorDecision(
+                    SupervisorTurnDecision {
+                        decision_id: decision.decision_id.clone(),
+                        assignment_id: decision.assignment_id.clone(),
+                        codex_thread_id: decision.codex_thread_id.clone(),
+                        basis_turn_id: decision.basis_turn_id.clone(),
+                        kind: decision.kind,
+                        proposal_kind: decision.proposal_kind,
+                        proposed_text: decision.proposed_text.clone(),
+                        rationale_summary: decision.rationale_summary.clone(),
+                        status: decision.status,
+                        created_at: decision.created_at,
+                        approved_at: decision.approved_at,
+                        rejected_at: decision.rejected_at,
+                        sent_at: decision.sent_at,
+                        superseded_by: decision.superseded_by.clone(),
+                        sent_turn_id: decision.sent_turn_id.clone(),
+                        notes: decision.notes.clone(),
+                    },
+                ))
             }
         }
     }

@@ -1,7 +1,7 @@
 # Codex Thread Supervision v1
 
 This slice adds Orcas-side mirror and monitoring support for Codex app-server threads.
-It now also includes Orcas-native assignment metadata for binding a Codex thread to Orcas workflow objects.
+It now also includes Orcas-native assignment metadata for binding a Codex thread to Orcas workflow objects, plus Orcas-native next-turn supervisor decisions with explicit human review.
 
 ## Canonical Boundaries
 
@@ -18,7 +18,9 @@ Orcas remains canonical for:
 - persisted mirror state used by Orcas clients
 - monitor attachment intent and attachment status shown to operators
 - thread-to-workflow assignment metadata
-- any future supervisor decision and approval workflow
+- supervisor proposal state for Codex threads
+- human approval workflow for Codex next-turn sends
+- stale-basis validation before Orcas sends into a Codex thread
 
 This slice does not store Orcas workflow metadata inside Codex thread history.
 
@@ -30,12 +32,19 @@ This slice does not store Orcas workflow metadata inside Codex thread history.
 - detach a thread in Orcas so the operator surface reports `history only`
 - assign a Codex thread to an Orcas workstream, work unit, and supervisor
 - pause, resume, and release Orcas-native Codex-thread assignments
+- auto-generate a single human-reviewable next-turn proposal for an active assigned idle thread
+- approve and send that proposal through documented `turn/start`
+- reject a proposal without sending
+- mark a proposal stale when the assignment or Codex thread basis changes before send
 - persist thread mirror state and turn state across Orcas restart
 - persist Codex-thread assignment state across Orcas restart
+- persist Codex-thread supervisor-decision state across Orcas restart
 - show in the TUI:
   - loaded status
   - live attach status
   - assignment badge / assignment panel
+  - pending human approval / stale / sent / rejected decision state
+  - latest next-turn proposal text and rationale
   - persisted turn history
   - aggregated item text
   - turn lifecycle snapshots
@@ -88,19 +97,70 @@ Current assignment lifecycle operations:
 - `resume`
 - `release`
 
+## Supervisor Decision Semantics
+
+Supervisor next-turn decisions are Orcas-native objects.
+
+- They are bound to an active `CodexThreadAssignment`.
+- They are persisted in Orcas collaboration state, not in Codex thread history.
+- Orcas generates them only when the assigned thread is idle.
+- Orcas does not silently send them. Human approval is required in this slice.
+- Orcas keeps at most one open pending decision per assignment.
+
+Current decision lifecycle operations:
+
+- `list`
+- `get`
+- `approve_and_send`
+- `reject`
+
+Decision status meanings:
+
+- `proposed_to_human`: pending human approval
+- `approved`: reserved internal transition during the send path
+- `sent`: Orcas successfully called documented `turn/start`
+- `rejected`: human rejected the proposal
+- `stale`: basis changed before Orcas could send
+- `superseded`: defined in the model, but not yet a primary path in this slice
+
+## Basis / Stale Validation
+
+For Codex-thread next-turn proposals, Orcas uses a conservative basis:
+
+- proposals are generated only when the thread is idle
+- the basis is the latest known `last_seen_turn_id` at generation time
+- `approve_and_send` re-checks that:
+  - the assignment is still active
+  - the thread is still idle
+  - the latest known basis still matches the decision basis
+  - the decision is still pending human review
+
+If any of those checks fail, Orcas does not send. The decision is marked stale and remains Orcas-native audit state.
+
+## Bootstrap Proposal Semantics
+
+Assignments persist a `bootstrap_state`.
+
+- new active assignments begin with bootstrap pending
+- when the assigned thread is idle and no open decision exists, Orcas proposes a bootstrap next turn first
+- when that bootstrap proposal is generated, assignment bootstrap state becomes `proposed`
+- if bootstrap is approved and sent, bootstrap state becomes `sent`
+- if bootstrap is rejected, bootstrap state becomes `not_needed`
+- if bootstrap becomes stale before send, bootstrap state returns to `pending`
+
+Bootstrap text is deterministic and template-based in this slice. Orcas does not yet rely on a separate autonomous reasoning subsystem for Codex-thread next-turn proposals.
+
 ## Non-goals In This Slice
 
 - PTY attach or PTY replay
-- exact replay of already-missed transient deltas
+- exact replay of transient deltas Orcas missed before attach
 - whole-thread kill semantics
 - process-tree kill semantics
-- supervisor decision generation
-- approve/reject/send workflow
-- automatic bootstrap proposal generation
-- steer/interrupt proposal workflow
+- steer proposal/send workflow
+- interrupt proposal/send workflow
 - automatic supervisor writing into Codex threads
 - mutation of app-server’s persisted thread log format
-- full assignment / approval / next-turn supervision workflow
+- autonomous sending without human approval
 
 ## IPC Surface Added
 
@@ -119,3 +179,10 @@ Assignment IPC added:
 - `codex_assignment/pause`
 - `codex_assignment/resume`
 - `codex_assignment/release`
+
+Supervisor decision IPC added:
+
+- `supervisor_decision/list`
+- `supervisor_decision/get`
+- `supervisor_decision/approve_and_send`
+- `supervisor_decision/reject`
