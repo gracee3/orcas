@@ -8,6 +8,7 @@ use tokio::time::{Instant, sleep};
 
 use crate::app::{Action, AppState, Effect, UiEvent, reduce};
 use crate::backend::{BackendCommand, BackendCommandResult, TuiBackend};
+use orcas_core::logging::runtime_cycle_enabled;
 use tracing::debug;
 
 const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -103,11 +104,13 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
     }
 
     pub async fn process_all(&mut self) {
-        debug!(
-            pending = self.pending_effects.len(),
-            running = self.running_effects.len(),
-            "processing runtime cycle"
-        );
+        if runtime_cycle_enabled() {
+            debug!(
+                pending = self.pending_effects.len(),
+                running = self.running_effects.len(),
+                "processing runtime cycle"
+            );
+        }
         self.enqueue_due_reconnect();
         self.drain_effect_completions();
         self.drain_backend_events();

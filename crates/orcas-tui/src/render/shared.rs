@@ -33,7 +33,7 @@ fn panel_line(raw_line: String) -> Line<'static> {
         spans.push(Span::styled(value.to_string(), value_style()));
         Line::from(spans)
     } else {
-        Line::styled(raw_line, muted_style())
+        Line::styled(raw_line, metadata_style())
     }
 }
 
@@ -64,21 +64,25 @@ pub(super) fn focus_border_style(focused: bool) -> Style {
 pub(super) fn panel_title_style(focused: bool) -> Style {
     if focused {
         Style::default()
-            .fg(Color::White)
+            .fg(Color::LightCyan)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
     }
 }
 
 pub(super) fn heading_style() -> Style {
     Style::default()
-        .fg(Color::White)
+        .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn status_label_style() -> Style {
-    Style::default().fg(Color::Gray)
+    Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM)
 }
 
 pub(super) fn selection_marker(selected: bool, _list_focused: bool) -> &'static str {
@@ -96,7 +100,7 @@ pub(super) fn row_style(selected: bool, list_has_focus: bool) -> Style {
 pub(super) fn selected_row_style(list_has_focus: bool) -> Style {
     if list_has_focus {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(Color::LightCyan)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
@@ -105,7 +109,7 @@ pub(super) fn selected_row_style(list_has_focus: bool) -> Style {
 
 pub(super) fn unselected_row_style(list_has_focus: bool) -> Style {
     if list_has_focus {
-        Style::default().fg(Color::White)
+        Style::default().fg(Color::Gray)
     } else {
         Style::default()
             .fg(Color::DarkGray)
@@ -136,16 +140,16 @@ pub(super) fn muted_style() -> Style {
 }
 
 pub(super) fn label_style() -> Style {
-    Style::default().fg(Color::Gray)
+    Style::default().fg(Color::DarkGray)
 }
 
 pub(super) fn value_style() -> Style {
-    Style::default().fg(Color::White)
+    Style::default().fg(Color::Gray)
 }
 
 pub(super) fn emphasis_style() -> Style {
     Style::default()
-        .fg(Color::Green)
+        .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD)
 }
 

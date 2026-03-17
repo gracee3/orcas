@@ -133,11 +133,11 @@ fn render_models(state: &AppState, compact: bool) -> Paragraph<'static> {
     if is_inflight {
         lines.push(Line::styled(
             "model update deferred during daemon transition",
-            emphasis_style(),
+            metadata_style(),
         ));
     }
     if state.models_loading {
-        lines.push(Line::styled("loading models...", emphasis_style()));
+        lines.push(Line::styled("loading models...", metadata_style()));
     }
 
     if state.daemon_lifecycle == DaemonLifecycleState::Stopped {
@@ -178,7 +178,7 @@ fn render_models(state: &AppState, compact: bool) -> Paragraph<'static> {
         if state.daemon_models.len() > model_limit {
             lines.push(Line::styled(
                 format!("+ {} more models", state.daemon_models.len() - model_limit),
-                emphasis_style(),
+                metadata_style(),
             ));
         }
     }

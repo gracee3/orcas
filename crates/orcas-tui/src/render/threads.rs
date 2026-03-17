@@ -7,8 +7,8 @@ use crate::app::{AppState, TopLevelView};
 use crate::view_model;
 
 use super::shared::{
-    emphasis_style, focus_block_style, metadata_style, render_panel_with_focus, row_style,
-    selection_marker, selection_marker_style, status_text_style,
+    focus_block_style, metadata_style, render_panel_with_focus, row_style, selection_marker,
+    selection_marker_style, status_text_style,
 };
 
 pub(super) fn render_view(frame: &mut Frame<'_>, state: &AppState, area: Rect) {
@@ -112,7 +112,7 @@ fn render_thread_list(
 
 fn render_thread_detail(detail: view_model::ThreadDetailViewModel) -> Paragraph<'static> {
     Paragraph::new(Text::from(
-        std::iter::once(Line::styled(format!("{} ", detail.title), emphasis_style()))
+        std::iter::once(Line::styled(format!("{} ", detail.title), metadata_style()))
             .chain(
                 detail
                     .lines

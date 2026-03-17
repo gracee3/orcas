@@ -79,14 +79,9 @@ pub(super) fn render_shell_status(state: &AppState, compact: bool) -> Paragraph<
     }
 
     if let Some(detail) = connection.upstream_detail {
-        let upstream_style = if compact {
-            metadata_style()
-        } else {
-            daemon_phase_to_status_style(&connection.upstream_status)
-        };
         lines.push(Line::styled(
             format!("upstream detail: {detail}"),
-            upstream_style,
+            metadata_style(),
         ));
     } else if let Some(banner) = view_model::status_banner(state) {
         let color = status_style(banner.level);
@@ -98,7 +93,7 @@ pub(super) fn render_shell_status(state: &AppState, compact: bool) -> Paragraph<
             ));
         }
     } else {
-        lines.push(Line::from(selection_summary(state)));
+        lines.push(Line::styled(selection_summary(state), metadata_style()));
         if let Some(error) = state.daemon_lifecycle_error.as_deref() {
             lines.push(Line::styled(format!("daemon: {error}"), metadata_style()));
         }
@@ -111,25 +106,41 @@ pub(super) fn render_footer(state: &AppState, compact: bool) -> Paragraph<'stati
     let mut lines = Vec::new();
     if state.show_help {
         if compact {
-            lines.push(Line::from("views: 1/2/3/4  tab next  ? help  q quit"));
-            lines.push(Line::from(help_navigation_line_compact(state.current_view)));
+            let mut help_line = String::from("views: 1/2/3/4  left/right cycle");
+            if state.current_view == TopLevelView::Collaboration {
+                help_line.push_str("  tab focus");
+            }
+            help_line.push_str("  ? help  q quit");
+            lines.push(Line::styled(help_line, metadata_style()));
+            lines.push(Line::styled(
+                help_navigation_line_compact(state.current_view),
+                metadata_style(),
+            ));
             if let Some(error) = state.daemon_lifecycle_error.as_deref() {
                 lines.push(Line::styled(format!("daemon: {error}"), metadata_style()));
             }
         } else {
-            lines.push(Line::from(
-                "views: 1 overview  2 threads  3 collaboration  4 supervisor  tab next view",
+            lines.push(Line::styled(
+                "views: 1 overview  2 threads  3 collaboration  4 supervisor  left/right cycle",
+                metadata_style(),
             ));
-            lines.push(Line::from(help_navigation_line(state.current_view)));
+            lines.push(Line::styled(
+                help_navigation_line(state.current_view),
+                metadata_style(),
+            ));
         }
     } else {
         let mut spans = vec![
             Span::styled("keys: ", label_style()),
             Span::styled("1/2/3/4", key_hint_style()),
             Span::styled(" views  ", metadata_style()),
-            Span::styled("tab", key_hint_style()),
-            Span::styled(" next  ", metadata_style()),
+            Span::styled("left/right", key_hint_style()),
+            Span::styled(" cycle  ", metadata_style()),
         ];
+        if state.current_view == TopLevelView::Collaboration {
+            spans.push(Span::styled("tab", key_hint_style()));
+            spans.push(Span::styled(" focus  ", metadata_style()));
+        }
         spans.extend(key_bindings_hint(state.current_view));
         spans.push(Span::styled(" ", metadata_style()));
         spans.push(Span::styled("? help", key_hint_style()));
@@ -184,23 +195,25 @@ fn selection_summary(state: &AppState) -> String {
 
 fn help_navigation_line(view: TopLevelView) -> &'static str {
     match view {
-        TopLevelView::Overview => "nav: overview is read-heavy  r refresh  ? help  q quit",
-        TopLevelView::Threads => "nav: j/k thread selection  r refresh  ? help  q quit",
+        TopLevelView::Overview => "nav: left/right views  r refresh  ? help  q quit",
+        TopLevelView::Threads => {
+            "nav: left/right views  up/down thread selection  r refresh  ? help  q quit"
+        }
         TopLevelView::Collaboration => {
-            "nav: j/k move selected list  h/l switch workstreams/work_units  r refresh  ? help  q quit"
+            "nav: left/right views  tab switch workstreams/work_units  up/down move selection  r refresh  ? help  q quit"
         }
         TopLevelView::Supervisor => {
-            "nav: m reload models  s start daemon  x request daemon stop  R restart daemon  r refresh  ? help  q quit"
+            "nav: left/right views  m reload models  s start daemon  x request daemon stop  R restart daemon  r refresh  ? help  q quit"
         }
     }
 }
 
 fn help_navigation_line_compact(view: TopLevelView) -> &'static str {
     match view {
-        TopLevelView::Overview => "nav: r refresh",
-        TopLevelView::Threads => "nav: j/k move  r refresh",
-        TopLevelView::Collaboration => "nav: h/l focus  j/k move  r refresh",
-        TopLevelView::Supervisor => "nav: m/s/x/R  r",
+        TopLevelView::Overview => "nav: left/right  r",
+        TopLevelView::Threads => "nav: left/right  up/down  r",
+        TopLevelView::Collaboration => "nav: left/right  tab focus  up/down  r",
+        TopLevelView::Supervisor => "nav: left/right  m/s/x/R  r",
     }
 }
 
@@ -208,15 +221,15 @@ fn key_bindings_hint(view: TopLevelView) -> Vec<Span<'static>> {
     match view {
         TopLevelView::Overview => action_hint("r", "refresh"),
         TopLevelView::Threads => {
-            let mut spans = action_hint("j/k", "threads");
+            let mut spans = action_hint("up/down", "thread selection");
             spans.push(Span::styled("  ", metadata_style()));
             spans.extend(action_hint("r", "refresh"));
             spans
         }
         TopLevelView::Collaboration => {
-            let mut spans = action_hint("h/l", "focus list");
+            let mut spans = action_hint("tab", "switch workstreams/work_units");
             spans.push(Span::styled("  ", metadata_style()));
-            spans.extend(action_hint("j/k", "selection"));
+            spans.extend(action_hint("up/down", "selection"));
             spans
         }
         TopLevelView::Supervisor => {

@@ -80,17 +80,29 @@ async fn run_app(
 }
 
 async fn handle_key(runtime: &mut AppRuntime<OrcasDaemonBackend>, code: KeyCode) -> bool {
-    let in_supervisor_view = runtime.state().current_view == TopLevelView::Supervisor;
     debug!(
         key = ?code,
         current_view = ?runtime.state().current_view,
         "received key in tui"
     );
-    let action = match code {
-        KeyCode::Char('q') => return true,
+    if code == KeyCode::Char('q') {
+        return true;
+    }
+
+    let action = action_for_key(runtime.state().current_view, code);
+
+    if let Some(action) = action {
+        info!(?action, "dispatching tui action");
+        runtime.dispatch(Action::User(action));
+    }
+    false
+}
+
+fn action_for_key(current_view: TopLevelView, code: KeyCode) -> Option<UserAction> {
+    let in_supervisor_view = current_view == TopLevelView::Supervisor;
+    match code {
         KeyCode::Char('r') => Some(UserAction::Refresh),
         KeyCode::Char('?') => Some(UserAction::ToggleHelp),
-        KeyCode::Tab => Some(UserAction::CycleView),
         KeyCode::Char('1') => Some(UserAction::ShowView(TopLevelView::Overview)),
         KeyCode::Char('2') => Some(UserAction::ShowView(TopLevelView::Threads)),
         KeyCode::Char('3') => Some(UserAction::ShowView(TopLevelView::Collaboration)),
@@ -99,16 +111,72 @@ async fn handle_key(runtime: &mut AppRuntime<OrcasDaemonBackend>, code: KeyCode)
         KeyCode::Char('s') if in_supervisor_view => Some(UserAction::StartDaemon),
         KeyCode::Char('x') if in_supervisor_view => Some(UserAction::StopDaemon),
         KeyCode::Char('R') if in_supervisor_view => Some(UserAction::RestartDaemon),
-        KeyCode::Char('j') | KeyCode::Down => Some(UserAction::SelectNextInView),
-        KeyCode::Char('k') | KeyCode::Up => Some(UserAction::SelectPreviousInView),
-        KeyCode::Char('h') | KeyCode::Left => Some(UserAction::CycleCollaborationFocus),
-        KeyCode::Char('l') | KeyCode::Right => Some(UserAction::CycleCollaborationFocus),
+        KeyCode::Down => Some(UserAction::SelectNextInView),
+        KeyCode::Up => Some(UserAction::SelectPreviousInView),
+        KeyCode::Left => Some(UserAction::ShowView(current_view.previous())),
+        KeyCode::Right => Some(UserAction::ShowView(current_view.next())),
+        KeyCode::Tab if current_view == TopLevelView::Collaboration => {
+            Some(UserAction::CycleCollaborationFocus)
+        }
         _ => None,
-    };
-
-    if let Some(action) = action {
-        info!(?action, "dispatching tui action");
-        runtime.dispatch(Action::User(action));
     }
-    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyCode;
+
+    #[test]
+    fn left_and_right_cycle_top_level_views() {
+        assert_eq!(
+            action_for_key(TopLevelView::Overview, KeyCode::Right),
+            Some(UserAction::ShowView(TopLevelView::Threads))
+        );
+        assert_eq!(
+            action_for_key(TopLevelView::Threads, KeyCode::Right),
+            Some(UserAction::ShowView(TopLevelView::Collaboration))
+        );
+        assert_eq!(
+            action_for_key(TopLevelView::Collaboration, KeyCode::Left),
+            Some(UserAction::ShowView(TopLevelView::Threads))
+        );
+        assert_eq!(
+            action_for_key(TopLevelView::Overview, KeyCode::Left),
+            Some(UserAction::ShowView(TopLevelView::Supervisor))
+        );
+    }
+
+    #[test]
+    fn arrow_keys_drive_selection_and_tab_switches_collaboration_focus() {
+        assert_eq!(
+            action_for_key(TopLevelView::Threads, KeyCode::Down),
+            Some(UserAction::SelectNextInView)
+        );
+        assert_eq!(
+            action_for_key(TopLevelView::Threads, KeyCode::Up),
+            Some(UserAction::SelectPreviousInView)
+        );
+        assert_eq!(
+            action_for_key(TopLevelView::Collaboration, KeyCode::Tab),
+            Some(UserAction::CycleCollaborationFocus)
+        );
+        assert_eq!(action_for_key(TopLevelView::Supervisor, KeyCode::Tab), None);
+    }
+
+    #[test]
+    fn legacy_j_k_h_l_keys_are_not_mapped_anymore() {
+        assert_eq!(
+            action_for_key(TopLevelView::Threads, KeyCode::Char('j')),
+            None
+        );
+        assert_eq!(
+            action_for_key(TopLevelView::Collaboration, KeyCode::Char('h')),
+            None
+        );
+        assert_eq!(
+            action_for_key(TopLevelView::Collaboration, KeyCode::Char('l')),
+            None
+        );
+    }
 }

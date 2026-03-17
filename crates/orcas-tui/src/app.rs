@@ -22,6 +22,15 @@ impl TopLevelView {
             Self::Supervisor => Self::Overview,
         }
     }
+
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Overview => Self::Supervisor,
+            Self::Threads => Self::Overview,
+            Self::Collaboration => Self::Threads,
+            Self::Supervisor => Self::Collaboration,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

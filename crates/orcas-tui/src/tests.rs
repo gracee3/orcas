@@ -1765,7 +1765,7 @@ async fn supervisor_redundant_lifecycle_keys_are_ignored_while_inflight() {
 }
 
 #[tokio::test]
-async fn supervisor_footer_shows_supervisor_actions_once_each() {
+async fn supervisor_footer_shows_global_and_supervisor_actions_once_each() {
     let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
     harness
         .dispatch(UserAction::ShowView(TopLevelView::Supervisor))
@@ -1777,10 +1777,32 @@ async fn supervisor_footer_shows_supervisor_actions_once_each() {
         .find(|line| line.contains("keys:"))
         .map(str::to_string)
         .unwrap_or_default();
+    assert!(keys_line.contains("left/right"));
+    assert!(!keys_line.contains("tab focus"));
     assert_eq!(keys_line.matches("x stop daemon").count(), 1);
     assert!(keys_line.contains("s start daemon"));
     assert!(keys_line.contains("R restart daemon"));
     assert!(keys_line.contains("m refresh models"));
+}
+
+#[tokio::test]
+async fn collaboration_footer_shows_tab_for_focus_and_arrows_for_selection() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness
+        .dispatch(UserAction::ShowView(TopLevelView::Collaboration))
+        .await;
+
+    let keys_line = harness
+        .render_text(160, 42)
+        .lines()
+        .find(|line| line.contains("keys:"))
+        .map(str::to_string)
+        .unwrap_or_default();
+    assert!(keys_line.contains("left/right"));
+    assert!(keys_line.contains("tab focus"));
+    assert!(keys_line.contains("up/down"));
+    assert!(!keys_line.contains("j/k"));
+    assert!(!keys_line.contains("h/l"));
 }
 
 #[tokio::test]
@@ -1802,7 +1824,7 @@ async fn reconnect_keeps_selected_top_level_view_and_collaboration_focus() {
 }
 
 #[tokio::test]
-async fn j_and_k_only_move_the_focused_list_selection() {
+async fn arrow_keys_only_move_the_focused_list_selection() {
     let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
 
     let initial_thread = harness.selected_thread_id().map(str::to_string);
