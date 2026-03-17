@@ -82,6 +82,10 @@ enum SupervisorCommand {
         #[command(subcommand)]
         command: DecisionsCommand,
     },
+    Proposals {
+        #[command(subcommand)]
+        command: ProposalsCommand,
+    },
     Prompt(PromptArgs),
     Quickstart(QuickstartArgs),
 }
@@ -142,6 +146,15 @@ enum ReportsCommand {
 #[derive(Debug, Subcommand)]
 enum DecisionsCommand {
     Apply(DecisionApplyArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProposalsCommand {
+    Create(ProposalCreateArgs),
+    Get(ProposalRefArgs),
+    ListForWorkunit(WorkunitRefArgs),
+    Approve(ProposalApproveArgs),
+    Reject(ProposalRejectArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -244,6 +257,64 @@ struct AssignmentRefArgs {
 struct ReportRefArgs {
     #[arg(long)]
     report: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProposalRefArgs {
+    #[arg(long)]
+    proposal: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProposalCreateArgs {
+    #[arg(long)]
+    workunit: String,
+    #[arg(long)]
+    report: Option<String>,
+    #[arg(long)]
+    note: Option<String>,
+    #[arg(long)]
+    requested_by: Option<String>,
+    #[arg(long, default_value_t = false)]
+    supersede_open: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProposalApproveArgs {
+    #[arg(long)]
+    proposal: String,
+    #[arg(long)]
+    review_note: Option<String>,
+    #[arg(long)]
+    reviewed_by: Option<String>,
+    #[arg(long = "type", value_enum)]
+    decision_type: Option<DecisionTypeArg>,
+    #[arg(long)]
+    rationale: Option<String>,
+    #[arg(long)]
+    worker: Option<String>,
+    #[arg(long)]
+    worker_kind: Option<String>,
+    #[arg(long)]
+    objective: Option<String>,
+    #[arg(long = "instruction")]
+    instructions: Vec<String>,
+    #[arg(long = "acceptance")]
+    acceptance_criteria: Vec<String>,
+    #[arg(long = "stop-condition")]
+    stop_conditions: Vec<String>,
+    #[arg(long = "expected-report-field")]
+    expected_report_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProposalRejectArgs {
+    #[arg(long)]
+    proposal: String,
+    #[arg(long)]
+    review_note: Option<String>,
+    #[arg(long)]
+    reviewed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -398,6 +469,52 @@ async fn main() -> Result<()> {
                             args.worker,
                             args.worker_kind,
                         )
+                        .await?;
+                }
+            },
+            SupervisorCommand::Proposals { command } => match command {
+                ProposalsCommand::Create(args) => {
+                    service
+                        .proposal_create(
+                            &args.workunit,
+                            args.report,
+                            args.note,
+                            args.requested_by,
+                            args.supersede_open,
+                        )
+                        .await?;
+                }
+                ProposalsCommand::Get(args) => service.proposal_get(&args.proposal).await?,
+                ProposalsCommand::ListForWorkunit(args) => {
+                    service.proposal_list_for_workunit(&args.workunit).await?;
+                }
+                ProposalsCommand::Approve(args) => {
+                    service
+                        .proposal_approve(
+                            &args.proposal,
+                            args.reviewed_by,
+                            args.review_note,
+                            args.decision_type.map(|decision_type| match decision_type {
+                                DecisionTypeArg::Accept => DecisionType::Accept,
+                                DecisionTypeArg::Continue => DecisionType::Continue,
+                                DecisionTypeArg::Redirect => DecisionType::Redirect,
+                                DecisionTypeArg::MarkComplete => DecisionType::MarkComplete,
+                                DecisionTypeArg::EscalateToHuman => DecisionType::EscalateToHuman,
+                            }),
+                            args.rationale,
+                            args.worker,
+                            args.worker_kind,
+                            args.objective,
+                            args.instructions,
+                            args.acceptance_criteria,
+                            args.stop_conditions,
+                            args.expected_report_fields,
+                        )
+                        .await?;
+                }
+                ProposalsCommand::Reject(args) => {
+                    service
+                        .proposal_reject(&args.proposal, args.reviewed_by, args.review_note)
                         .await?;
                 }
             },

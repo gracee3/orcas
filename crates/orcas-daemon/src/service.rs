@@ -29,14 +29,19 @@ use orcas_core::{
     AppConfig, AppPaths, Assignment, AssignmentStatus, CodexConnectionMode, CollaborationState,
     ConnectionState, Decision, DecisionType, EventEnvelope, JsonSessionStore, OrcasError,
     OrcasEvent, OrcasResult, OrcasSessionStore, Report, ReportConfidence, ReportDisposition,
-    ReportParseResult, ThreadMetadata, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
-    WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, Workstream,
-    WorkstreamStatus,
+    ReportParseResult, SupervisorProposalRecord, SupervisorProposalStatus, ThreadMetadata,
+    WorkUnit, WorkUnitStatus, Worker, WorkerSession, WorkerSessionAttachability,
+    WorkerSessionRuntimeStatus, WorkerStatus, Workstream, WorkstreamStatus,
 };
 
 use crate::process::{
     ENV_CODEX_BIN, ENV_CODEX_LISTEN_URL, ENV_CONNECTION_MODE, ENV_DEFAULT_CWD, ENV_DEFAULT_MODEL,
     OrcasDaemonProcessManager, OrcasRuntimeOverrides, apply_runtime_overrides,
+};
+use crate::supervisor::{
+    ResponsesApiReasoner, SupervisorReasoner, apply_edits, build_context_pack,
+    compile_assignment_instructions, proposal_freshness_error, state_anchor_freshness_error,
+    validate_proposal,
 };
 
 const RECENT_EVENT_LIMIT: usize = 200;
@@ -140,6 +145,7 @@ pub struct OrcasDaemonService {
     event_tx: broadcast::Sender<ipc::DaemonEventEnvelope>,
     client_count: AtomicUsize,
     shutdown: Notify,
+    supervisor_reasoner: Arc<dyn SupervisorReasoner>,
 }
 
 impl OrcasDaemonService {
@@ -163,6 +169,7 @@ impl OrcasDaemonService {
 
         let service = Arc::new(Self {
             paths,
+            supervisor_reasoner: Arc::new(ResponsesApiReasoner::new(config.clone())),
             config,
             runtime,
             store,
@@ -485,6 +492,30 @@ impl OrcasDaemonService {
                 let params: ipc::DecisionApplyRequest =
                     Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.decision_apply(params).await?)?
+            }
+            ipc::methods::PROPOSAL_CREATE => {
+                let params: ipc::ProposalCreateRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.proposal_create(params).await?)?
+            }
+            ipc::methods::PROPOSAL_GET => {
+                let params: ipc::ProposalGetRequest = Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.proposal_get(params).await?)?
+            }
+            ipc::methods::PROPOSAL_LIST_FOR_WORKUNIT => {
+                let params: ipc::ProposalListForWorkunitRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.proposal_list_for_workunit(params).await?)?
+            }
+            ipc::methods::PROPOSAL_APPROVE => {
+                let params: ipc::ProposalApproveRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.proposal_approve(params).await?)?
+            }
+            ipc::methods::PROPOSAL_REJECT => {
+                let params: ipc::ProposalRejectRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.proposal_reject(params).await?)?
             }
             ipc::methods::EVENTS_SUBSCRIBE => {
                 let params: ipc::EventsSubscribeRequest =
@@ -1592,6 +1623,391 @@ impl OrcasDaemonService {
         Ok(ipc::ReportListForWorkunitResponse { reports })
     }
 
+    async fn proposal_create(
+        &self,
+        params: ipc::ProposalCreateRequest,
+    ) -> OrcasResult<ipc::ProposalCreateResponse> {
+        let requested_by = params
+            .requested_by
+            .clone()
+            .unwrap_or_else(|| "supervisor_cli".to_string());
+        let (source_report_id, mutated_existing) = {
+            let mut state = self.state.write().await;
+            let stale_changed = Self::refresh_stale_proposals_for_work_unit(
+                &mut state.collaboration,
+                &params.work_unit_id,
+            );
+            let work_unit = state
+                .collaboration
+                .work_units
+                .get(&params.work_unit_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown work unit `{}`", params.work_unit_id))
+                })?;
+            if work_unit.status != WorkUnitStatus::AwaitingDecision {
+                return Err(OrcasError::Protocol(format!(
+                    "work unit `{}` is not awaiting_decision",
+                    work_unit.id
+                )));
+            }
+            if Self::work_unit_has_live_attachable_turn(&state, &work_unit.id) {
+                return Err(OrcasError::Protocol(
+                    "supervisor proposal generation is blocked while the work unit still has a live attachable turn"
+                        .to_string(),
+                ));
+            }
+            let source_report_id = params
+                .source_report_id
+                .clone()
+                .or(work_unit.latest_report_id.clone())
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "work unit `{}` has no latest report",
+                        work_unit.id
+                    ))
+                })?;
+            if work_unit.latest_report_id.as_deref() != Some(source_report_id.as_str()) {
+                return Err(OrcasError::Protocol(
+                    "proposal generation requires the latest report for the work unit".to_string(),
+                ));
+            }
+
+            let mut open_same_source = state
+                .collaboration
+                .supervisor_proposals
+                .values_mut()
+                .filter(|proposal| {
+                    proposal.primary_work_unit_id == work_unit.id
+                        && proposal.source_report_id == source_report_id
+                        && proposal.status == SupervisorProposalStatus::Open
+                })
+                .collect::<Vec<_>>();
+            if !open_same_source.is_empty() && !params.supersede_open {
+                return Err(OrcasError::Protocol(format!(
+                    "an open proposal already exists for work unit `{}` and source report `{}`",
+                    work_unit.id, source_report_id
+                )));
+            }
+            if params.supersede_open {
+                for proposal in &mut open_same_source {
+                    proposal.status = SupervisorProposalStatus::Superseded;
+                    if proposal.review_note.is_none() {
+                        proposal.review_note = Some(
+                            "Superseded by an operator-requested re-synthesis for the same report."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            (source_report_id, stale_changed || params.supersede_open)
+        };
+        if mutated_existing {
+            self.persist_collaboration_state().await?;
+        }
+
+        let collaboration = self.state.read().await.collaboration.clone();
+        let context_pack = build_context_pack(
+            &collaboration,
+            &params.work_unit_id,
+            Some(source_report_id.as_str()),
+            requested_by,
+            params.note.clone(),
+            orcas_core::SupervisorProposalTriggerKind::HumanRequested,
+        )?;
+        let result = self
+            .supervisor_reasoner
+            .propose(context_pack.clone())
+            .await?;
+        validate_proposal(&result.proposal, &context_pack, &collaboration)?;
+
+        let mut proposal = SupervisorProposalRecord {
+            id: Self::new_object_id("proposal"),
+            workstream_id: context_pack.workstream.id.clone(),
+            primary_work_unit_id: context_pack.primary_work_unit.id.clone(),
+            source_report_id: context_pack.source_report.id.clone(),
+            trigger: context_pack.trigger.clone(),
+            status: SupervisorProposalStatus::Open,
+            created_at: Utc::now(),
+            reasoner_backend: result.backend_kind,
+            reasoner_model: result.model,
+            reasoner_response_id: result.response_id,
+            reasoner_usage: result.usage,
+            context_pack,
+            proposal: result.proposal,
+            approved_proposal: None,
+            validated_at: Utc::now(),
+            reviewed_at: None,
+            reviewed_by: None,
+            review_note: None,
+            approved_decision_id: None,
+            approved_assignment_id: None,
+        };
+
+        {
+            let mut state = self.state.write().await;
+            if let Some(reason) = state_anchor_freshness_error(
+                &proposal.context_pack.state_anchor,
+                &state.collaboration,
+            ) {
+                proposal.status = SupervisorProposalStatus::Stale;
+                proposal.review_note = Some(format!(
+                    "Proposal became stale before persistence: {reason}"
+                ));
+            }
+            state
+                .collaboration
+                .supervisor_proposals
+                .insert(proposal.id.clone(), proposal.clone());
+        }
+        self.persist_collaboration_state().await?;
+
+        Ok(ipc::ProposalCreateResponse { proposal })
+    }
+
+    async fn proposal_get(
+        &self,
+        params: ipc::ProposalGetRequest,
+    ) -> OrcasResult<ipc::ProposalGetResponse> {
+        let (proposal, changed) = {
+            let mut state = self.state.write().await;
+            let work_unit_id = state
+                .collaboration
+                .supervisor_proposals
+                .get(&params.proposal_id)
+                .map(|proposal| proposal.primary_work_unit_id.clone())
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
+                })?;
+            let changed = Self::refresh_stale_proposals_for_work_unit(
+                &mut state.collaboration,
+                &work_unit_id,
+            );
+            let proposal = state
+                .collaboration
+                .supervisor_proposals
+                .get(&params.proposal_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
+                })?;
+            (proposal, changed)
+        };
+        if changed {
+            self.persist_collaboration_state().await?;
+        }
+        Ok(ipc::ProposalGetResponse { proposal })
+    }
+
+    async fn proposal_list_for_workunit(
+        &self,
+        params: ipc::ProposalListForWorkunitRequest,
+    ) -> OrcasResult<ipc::ProposalListForWorkunitResponse> {
+        let (proposals, changed) = {
+            let mut state = self.state.write().await;
+            let changed = Self::refresh_stale_proposals_for_work_unit(
+                &mut state.collaboration,
+                &params.work_unit_id,
+            );
+            let mut proposals = state
+                .collaboration
+                .supervisor_proposals
+                .values()
+                .filter(|proposal| proposal.primary_work_unit_id == params.work_unit_id)
+                .map(Self::proposal_summary)
+                .collect::<Vec<_>>();
+            proposals.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            (proposals, changed)
+        };
+        if changed {
+            self.persist_collaboration_state().await?;
+        }
+        Ok(ipc::ProposalListForWorkunitResponse { proposals })
+    }
+
+    async fn proposal_approve(
+        &self,
+        params: ipc::ProposalApproveRequest,
+    ) -> OrcasResult<ipc::ProposalApproveResponse> {
+        let reviewed_by = params
+            .reviewed_by
+            .clone()
+            .unwrap_or_else(|| "supervisor_cli".to_string());
+
+        let (proposal, collaboration, changed) = {
+            let mut state = self.state.write().await;
+            let work_unit_id = state
+                .collaboration
+                .supervisor_proposals
+                .get(&params.proposal_id)
+                .map(|proposal| proposal.primary_work_unit_id.clone())
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
+                })?;
+            let changed = Self::refresh_stale_proposals_for_work_unit(
+                &mut state.collaboration,
+                &work_unit_id,
+            );
+            let proposal = state
+                .collaboration
+                .supervisor_proposals
+                .get(&params.proposal_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
+                })?;
+            let collaboration = state.collaboration.clone();
+            (proposal, collaboration, changed)
+        };
+        if changed {
+            self.persist_collaboration_state().await?;
+        }
+
+        if proposal.status != SupervisorProposalStatus::Open {
+            return Err(OrcasError::Protocol(format!(
+                "proposal `{}` is not open and cannot be approved",
+                proposal.id
+            )));
+        }
+
+        let approved_proposal = apply_edits(&proposal.proposal, &params.edits);
+        validate_proposal(&approved_proposal, &proposal.context_pack, &collaboration)?;
+
+        let (instructions, worker_id, worker_kind) =
+            if approved_proposal.proposed_decision.requires_assignment {
+                let draft = approved_proposal
+                    .draft_next_assignment
+                    .as_ref()
+                    .ok_or_else(|| {
+                        OrcasError::Protocol(
+                            "approved proposal requires a draft assignment but none was present"
+                                .to_string(),
+                        )
+                    })?;
+                (
+                    Some(compile_assignment_instructions(
+                        draft,
+                        &proposal.source_report_id,
+                    )),
+                    draft.preferred_worker_id.clone(),
+                    draft.worker_kind.clone(),
+                )
+            } else {
+                (None, None, None)
+            };
+
+        let decision_response = self
+            .decision_apply(ipc::DecisionApplyRequest {
+                work_unit_id: proposal.primary_work_unit_id.clone(),
+                report_id: Some(proposal.source_report_id.clone()),
+                decision_type: approved_proposal.proposed_decision.decision_type,
+                rationale: approved_proposal.proposed_decision.rationale.clone(),
+                instructions,
+                worker_id,
+                worker_kind,
+            })
+            .await?;
+
+        let updated_proposal = {
+            let mut state = self.state.write().await;
+            for other in state.collaboration.supervisor_proposals.values_mut() {
+                if other.primary_work_unit_id != proposal.primary_work_unit_id
+                    || other.id == proposal.id
+                    || other.status != SupervisorProposalStatus::Open
+                {
+                    continue;
+                }
+                other.status = if other.source_report_id == proposal.source_report_id {
+                    SupervisorProposalStatus::Superseded
+                } else {
+                    SupervisorProposalStatus::Stale
+                };
+                if other.review_note.is_none() {
+                    other.review_note = Some(format!(
+                        "Proposal `{}` was approved for this work unit.",
+                        proposal.id
+                    ));
+                }
+            }
+
+            let proposal_record = state
+                .collaboration
+                .supervisor_proposals
+                .get_mut(&proposal.id)
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown proposal `{}`", proposal.id))
+                })?;
+            proposal_record.status = SupervisorProposalStatus::Approved;
+            proposal_record.approved_proposal = Some(approved_proposal);
+            proposal_record.reviewed_at = Some(Utc::now());
+            proposal_record.reviewed_by = Some(reviewed_by);
+            proposal_record.review_note = params.review_note.clone();
+            proposal_record.approved_decision_id = Some(decision_response.decision.id.clone());
+            proposal_record.approved_assignment_id = decision_response
+                .next_assignment
+                .as_ref()
+                .map(|assignment| assignment.id.clone());
+            proposal_record.clone()
+        };
+        self.persist_collaboration_state().await?;
+
+        Ok(ipc::ProposalApproveResponse {
+            proposal: updated_proposal,
+            decision: decision_response.decision,
+            next_assignment: decision_response.next_assignment,
+        })
+    }
+
+    async fn proposal_reject(
+        &self,
+        params: ipc::ProposalRejectRequest,
+    ) -> OrcasResult<ipc::ProposalRejectResponse> {
+        let reviewed_by = params
+            .reviewed_by
+            .clone()
+            .unwrap_or_else(|| "supervisor_cli".to_string());
+        let (proposal, _changed) = {
+            let mut state = self.state.write().await;
+            let work_unit_id = state
+                .collaboration
+                .supervisor_proposals
+                .get(&params.proposal_id)
+                .map(|proposal| proposal.primary_work_unit_id.clone())
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
+                })?;
+            let changed = Self::refresh_stale_proposals_for_work_unit(
+                &mut state.collaboration,
+                &work_unit_id,
+            );
+            let proposal_record = state
+                .collaboration
+                .supervisor_proposals
+                .get_mut(&params.proposal_id)
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
+                })?;
+            if proposal_record.status != SupervisorProposalStatus::Open {
+                return Err(OrcasError::Protocol(format!(
+                    "proposal `{}` is not open and cannot be rejected",
+                    proposal_record.id
+                )));
+            }
+            proposal_record.status = SupervisorProposalStatus::Rejected;
+            proposal_record.reviewed_at = Some(Utc::now());
+            proposal_record.reviewed_by = Some(reviewed_by);
+            proposal_record.review_note = params.review_note.clone();
+            (proposal_record.clone(), changed)
+        };
+        self.persist_collaboration_state().await?;
+        Ok(ipc::ProposalRejectResponse { proposal })
+    }
+
     async fn decision_apply(
         &self,
         params: ipc::DecisionApplyRequest,
@@ -2273,6 +2689,81 @@ impl OrcasDaemonService {
             rationale: decision.rationale.clone(),
             created_at: decision.created_at,
         }
+    }
+
+    fn proposal_summary(proposal: &SupervisorProposalRecord) -> ipc::ProposalSummary {
+        ipc::ProposalSummary {
+            id: proposal.id.clone(),
+            primary_work_unit_id: proposal.primary_work_unit_id.clone(),
+            source_report_id: proposal.source_report_id.clone(),
+            status: proposal.status,
+            proposed_decision_type: proposal.proposal.proposed_decision.decision_type,
+            created_at: proposal.created_at,
+            reasoner_model: proposal.reasoner_model.clone(),
+        }
+    }
+
+    fn refresh_stale_proposals_for_work_unit(
+        collaboration: &mut CollaborationState,
+        work_unit_id: &str,
+    ) -> bool {
+        let mut changed = false;
+        let candidate_ids = collaboration
+            .supervisor_proposals
+            .values()
+            .filter(|proposal| {
+                proposal.primary_work_unit_id == work_unit_id
+                    && proposal.status == SupervisorProposalStatus::Open
+            })
+            .map(|proposal| proposal.id.clone())
+            .collect::<Vec<_>>();
+        for proposal_id in candidate_ids {
+            let reason = collaboration
+                .supervisor_proposals
+                .get(&proposal_id)
+                .and_then(|proposal| proposal_freshness_error(proposal, collaboration));
+            if let Some(reason) = reason {
+                if let Some(proposal) = collaboration.supervisor_proposals.get_mut(&proposal_id) {
+                    proposal.status = SupervisorProposalStatus::Stale;
+                    if proposal.review_note.is_none() {
+                        proposal.review_note = Some(format!("Proposal became stale: {reason}"));
+                    }
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    fn work_unit_has_live_attachable_turn(state: &DaemonState, work_unit_id: &str) -> bool {
+        let Some(work_unit) = state.collaboration.work_units.get(work_unit_id) else {
+            return false;
+        };
+        let Some(assignment_id) = work_unit.current_assignment_id.as_ref() else {
+            return false;
+        };
+        let Some(assignment) = state.collaboration.assignments.get(assignment_id) else {
+            return false;
+        };
+        let Some(worker_session) = state
+            .collaboration
+            .worker_sessions
+            .get(&assignment.worker_session_id)
+        else {
+            return false;
+        };
+        let Some(thread_id) = worker_session.thread_id.as_ref() else {
+            return false;
+        };
+        let Some(turn_id) = worker_session.active_turn_id.as_ref() else {
+            return false;
+        };
+        state
+            .turns
+            .get(&TurnKey::new(thread_id, turn_id))
+            .is_some_and(|turn| {
+                turn.attachable && matches!(turn.lifecycle, ipc::TurnLifecycleState::Active)
+            })
     }
 
     fn select_worker_session_for_assignment(
@@ -3750,20 +4241,62 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
+    use async_trait::async_trait;
     use chrono::Utc;
     use tokio::sync::{Mutex, Notify, RwLock, broadcast};
     use uuid::Uuid;
 
     use super::OrcasDaemonService;
     use super::{DaemonState, TurnKey};
+    use crate::supervisor::{
+        SupervisorReasoner, SupervisorReasonerResult, sample_continue_proposal,
+    };
     use orcas_codex::{
         CodexClient, LocalCodexDaemonManager, RejectingApprovalRouter, WebSocketTransport,
     };
     use orcas_core::{
         AppConfig, AppPaths, Assignment, AssignmentStatus, DecisionType, JsonSessionStore,
-        OrcasSessionStore, Report, ReportConfidence, ReportDisposition, ReportParseResult,
-        WorkUnitStatus, WorkerSessionRuntimeStatus, WorkerStatus, WorkstreamStatus, ipc,
+        OrcasError, OrcasResult, OrcasSessionStore, Report, ReportConfidence, ReportDisposition,
+        ReportParseResult, SupervisorContextPack, SupervisorProposal, SupervisorProposalStatus,
+        SupervisorProposalTriggerKind, WorkUnit, WorkUnitStatus, WorkerSessionRuntimeStatus,
+        WorkerStatus, Workstream, WorkstreamStatus, ipc,
     };
+
+    #[derive(Default)]
+    struct StaticSupervisorReasoner {
+        proposal: Mutex<Option<SupervisorProposal>>,
+        last_pack: Mutex<Option<SupervisorContextPack>>,
+    }
+
+    impl StaticSupervisorReasoner {
+        async fn set_proposal(&self, proposal: SupervisorProposal) {
+            *self.proposal.lock().await = Some(proposal);
+        }
+
+        async fn last_pack(&self) -> Option<SupervisorContextPack> {
+            self.last_pack.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl SupervisorReasoner for StaticSupervisorReasoner {
+        async fn propose(
+            &self,
+            pack: SupervisorContextPack,
+        ) -> OrcasResult<SupervisorReasonerResult> {
+            *self.last_pack.lock().await = Some(pack);
+            let proposal = self.proposal.lock().await.clone().ok_or_else(|| {
+                OrcasError::Protocol("missing test supervisor proposal".to_string())
+            })?;
+            Ok(SupervisorReasonerResult {
+                proposal,
+                backend_kind: "test".to_string(),
+                model: "test-supervisor".to_string(),
+                response_id: Some("resp-test".to_string()),
+                usage: None,
+            })
+        }
+    }
 
     fn sample_thread(id: &str, scope: &str, updated_at: i64) -> ipc::ThreadView {
         ipc::ThreadView {
@@ -3790,7 +4323,21 @@ mod tests {
         test_service_at(base).await
     }
 
+    async fn test_service_with_reasoner(
+        reasoner: Arc<dyn SupervisorReasoner>,
+    ) -> Arc<OrcasDaemonService> {
+        let base = std::env::temp_dir().join(format!("orcas-collab-test-{}", Uuid::new_v4()));
+        test_service_at_with_reasoner(base, reasoner).await
+    }
+
     async fn test_service_at(base: PathBuf) -> Arc<OrcasDaemonService> {
+        test_service_at_with_reasoner(base, Arc::new(StaticSupervisorReasoner::default())).await
+    }
+
+    async fn test_service_at_with_reasoner(
+        base: PathBuf,
+        supervisor_reasoner: Arc<dyn SupervisorReasoner>,
+    ) -> Arc<OrcasDaemonService> {
         let paths = AppPaths {
             config_dir: base.join("config"),
             config_file: base.join("config/config.toml"),
@@ -3835,9 +4382,339 @@ mod tests {
             event_tx,
             client_count: AtomicUsize::new(0),
             shutdown: Notify::new(),
+            supervisor_reasoner,
         });
         service.initialize_state().await.expect("initialize state");
         service
+    }
+
+    async fn seed_awaiting_decision_fixture(
+        service: &Arc<OrcasDaemonService>,
+        label: &str,
+    ) -> (Workstream, WorkUnit, Assignment, Report) {
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: format!("Proposal {label}"),
+                objective: "Exercise supervisor proposal flow".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: format!("Work unit {label}"),
+                task_statement: "Inspect the report and propose one bounded next step.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let assignment = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: format!("worker-{label}"),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Review the current result and report back.".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment")
+            .assignment;
+
+        let report = {
+            let now = Utc::now();
+            let mut state = service.state.write().await;
+            state
+                .collaboration
+                .assignments
+                .get_mut(&assignment.id)
+                .expect("assignment")
+                .status = AssignmentStatus::AwaitingDecision;
+            let work_unit_entry = state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .expect("work unit");
+            work_unit_entry.status = WorkUnitStatus::AwaitingDecision;
+            work_unit_entry.updated_at = now;
+
+            let report = Report {
+                id: format!("report-{}", Uuid::new_v4().simple()),
+                work_unit_id: work_unit.id.clone(),
+                assignment_id: assignment.id.clone(),
+                worker_id: assignment.worker_id.clone(),
+                disposition: ReportDisposition::Completed,
+                summary: "The first pass was useful but left one bounded follow-up question."
+                    .to_string(),
+                findings: vec!["Reconnect handling was partially verified.".to_string()],
+                blockers: Vec::new(),
+                questions: vec!["Does the interrupted path surface honest status?".to_string()],
+                recommended_next_actions: vec![
+                    "Run one more narrow verification step.".to_string(),
+                ],
+                confidence: ReportConfidence::Medium,
+                raw_output: "raw worker output".to_string(),
+                parse_result: ReportParseResult::Parsed,
+                needs_supervisor_review: false,
+                created_at: now,
+            };
+            state
+                .collaboration
+                .reports
+                .insert(report.id.clone(), report.clone());
+            let work_unit_entry = state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .expect("work unit");
+            work_unit_entry.latest_report_id = Some(report.id.clone());
+            work_unit_entry.updated_at = now;
+            report
+        };
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist fixture");
+
+        (workstream, work_unit, assignment, report)
+    }
+
+    #[tokio::test]
+    async fn proposal_create_persists_open_record_with_context_pack() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "create").await;
+        reasoner
+            .set_proposal(sample_continue_proposal(
+                &work_unit.id,
+                &report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+
+        let response = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: Some("Synthesize the next bounded step.".to_string()),
+                supersede_open: false,
+            })
+            .await
+            .expect("proposal create");
+
+        assert_eq!(response.proposal.status, SupervisorProposalStatus::Open);
+        assert_eq!(
+            response.proposal.proposal.proposed_decision.decision_type,
+            DecisionType::Continue
+        );
+        assert_eq!(
+            response.proposal.context_pack.primary_work_unit.id,
+            work_unit.id
+        );
+        assert_eq!(response.proposal.context_pack.source_report.id, report.id);
+        assert_eq!(
+            response.proposal.trigger.kind,
+            SupervisorProposalTriggerKind::HumanRequested
+        );
+        assert_eq!(response.proposal.trigger.requested_by, "tester".to_string());
+
+        let pack = reasoner.last_pack().await.expect("captured context pack");
+        assert_eq!(
+            pack.trigger.kind,
+            SupervisorProposalTriggerKind::HumanRequested
+        );
+        assert_eq!(pack.trigger.source_report_id, report.id);
+        assert!(
+            pack.decision_policy
+                .allowed_decisions
+                .contains(&DecisionType::Continue)
+        );
+
+        let state = service.state.read().await;
+        let stored = state
+            .collaboration
+            .supervisor_proposals
+            .get(&response.proposal.id)
+            .expect("stored proposal");
+        assert_eq!(stored.status, SupervisorProposalStatus::Open);
+        assert_eq!(stored.reasoner_backend, "test");
+    }
+
+    #[tokio::test]
+    async fn proposal_approve_continue_creates_decision_and_next_assignment() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "approve").await;
+        reasoner
+            .set_proposal(sample_continue_proposal(
+                &work_unit.id,
+                &report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+
+        let proposal = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect("proposal create")
+            .proposal;
+
+        let response = service
+            .proposal_approve(ipc::ProposalApproveRequest {
+                proposal_id: proposal.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("Approved as proposed.".to_string()),
+                edits: Default::default(),
+            })
+            .await
+            .expect("proposal approve");
+
+        let next_assignment = response.next_assignment.expect("next assignment");
+        assert_eq!(response.decision.decision_type, DecisionType::Continue);
+        assert_eq!(response.proposal.status, SupervisorProposalStatus::Approved);
+        assert_eq!(
+            response.proposal.approved_decision_id.as_deref(),
+            Some(response.decision.id.as_str())
+        );
+        assert_eq!(
+            response.proposal.approved_assignment_id.as_deref(),
+            Some(next_assignment.id.as_str())
+        );
+        assert_eq!(next_assignment.status, AssignmentStatus::Created);
+        assert_eq!(
+            next_assignment.attempt_number,
+            assignment.attempt_number + 1
+        );
+        assert!(
+            next_assignment
+                .instructions
+                .contains("Objective: Resolve the remaining open question.")
+        );
+
+        let state = service.state.read().await;
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].status,
+            WorkUnitStatus::Ready
+        );
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id]
+                .current_assignment_id
+                .as_deref(),
+            Some(next_assignment.id.as_str())
+        );
+        assert_eq!(
+            state.collaboration.assignments[&assignment.id].status,
+            AssignmentStatus::Closed
+        );
+        assert_eq!(
+            state.collaboration.assignments[&next_assignment.id].worker_id,
+            assignment.worker_id
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_becomes_stale_after_newer_report_and_cannot_be_approved() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "stale").await;
+        reasoner
+            .set_proposal(sample_continue_proposal(
+                &work_unit.id,
+                &report.id,
+                &assignment.id,
+                &assignment.worker_id,
+            ))
+            .await;
+
+        let proposal = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect("proposal create")
+            .proposal;
+
+        {
+            let newer_time = Utc::now();
+            let mut state = service.state.write().await;
+            let newer_report = Report {
+                id: format!("report-{}", Uuid::new_v4().simple()),
+                work_unit_id: work_unit.id.clone(),
+                assignment_id: assignment.id.clone(),
+                worker_id: assignment.worker_id.clone(),
+                disposition: ReportDisposition::Completed,
+                summary: "A newer report superseded the earlier decision point.".to_string(),
+                findings: vec!["The second pass changed the state anchor.".to_string()],
+                blockers: Vec::new(),
+                questions: Vec::new(),
+                recommended_next_actions: vec!["Regenerate the proposal.".to_string()],
+                confidence: ReportConfidence::High,
+                raw_output: "newer raw worker output".to_string(),
+                parse_result: ReportParseResult::Parsed,
+                needs_supervisor_review: false,
+                created_at: newer_time,
+            };
+            state
+                .collaboration
+                .reports
+                .insert(newer_report.id.clone(), newer_report.clone());
+            let work_unit_entry = state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .expect("work unit");
+            work_unit_entry.latest_report_id = Some(newer_report.id);
+            work_unit_entry.updated_at = newer_time;
+        }
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist newer report");
+
+        let get_response = service
+            .proposal_get(ipc::ProposalGetRequest {
+                proposal_id: proposal.id.clone(),
+            })
+            .await
+            .expect("proposal get");
+        assert_eq!(
+            get_response.proposal.status,
+            SupervisorProposalStatus::Stale
+        );
+
+        let error = service
+            .proposal_approve(ipc::ProposalApproveRequest {
+                proposal_id: proposal.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: None,
+                edits: Default::default(),
+            })
+            .await
+            .expect_err("stale proposal should not approve");
+        assert!(
+            error
+                .to_string()
+                .contains("is not open and cannot be approved")
+        );
     }
 
     #[test]

@@ -246,6 +246,42 @@ impl OrcasIpcClient {
         self.request(ipc::methods::DECISION_APPLY, params).await
     }
 
+    pub async fn proposal_create(
+        &self,
+        params: &ipc::ProposalCreateRequest,
+    ) -> OrcasResult<ipc::ProposalCreateResponse> {
+        self.request(ipc::methods::PROPOSAL_CREATE, params).await
+    }
+
+    pub async fn proposal_get(
+        &self,
+        params: &ipc::ProposalGetRequest,
+    ) -> OrcasResult<ipc::ProposalGetResponse> {
+        self.request(ipc::methods::PROPOSAL_GET, params).await
+    }
+
+    pub async fn proposal_list_for_workunit(
+        &self,
+        params: &ipc::ProposalListForWorkunitRequest,
+    ) -> OrcasResult<ipc::ProposalListForWorkunitResponse> {
+        self.request(ipc::methods::PROPOSAL_LIST_FOR_WORKUNIT, params)
+            .await
+    }
+
+    pub async fn proposal_approve(
+        &self,
+        params: &ipc::ProposalApproveRequest,
+    ) -> OrcasResult<ipc::ProposalApproveResponse> {
+        self.request(ipc::methods::PROPOSAL_APPROVE, params).await
+    }
+
+    pub async fn proposal_reject(
+        &self,
+        params: &ipc::ProposalRejectRequest,
+    ) -> OrcasResult<ipc::ProposalRejectResponse> {
+        self.request(ipc::methods::PROPOSAL_REJECT, params).await
+    }
+
     pub async fn subscribe_events(
         &self,
         include_snapshot: bool,

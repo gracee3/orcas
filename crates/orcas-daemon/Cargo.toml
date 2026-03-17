@@ -11,9 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
 orcas-codex = { path = "../orcas-codex" }
 orcas-core = { path = "../orcas-core" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

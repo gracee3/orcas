@@ -8,6 +8,9 @@ use crate::paths::AppPaths;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub codex: CodexDaemonConfig,
+    #[serde(default)]
+    pub supervisor: SupervisorConfig,
+    #[serde(default)]
     pub defaults: DefaultsConfig,
 }
 
@@ -15,6 +18,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             codex: CodexDaemonConfig::default(),
+            supervisor: SupervisorConfig::default(),
             defaults: DefaultsConfig::default(),
         }
     }
@@ -109,6 +113,27 @@ impl Default for DefaultsConfig {
         Self {
             cwd: None,
             model: Some("gpt-5".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorConfig {
+    pub base_url: String,
+    pub api_key_env: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub max_output_tokens: u32,
+}
+
+impl Default for SupervisorConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            model: "gpt-5.4".to_string(),
+            reasoning_effort: "high".to_string(),
+            max_output_tokens: 2_000,
         }
     }
 }

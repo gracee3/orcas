@@ -7,6 +7,9 @@ use crate::collaboration::{
     Workstream, WorkstreamStatus,
 };
 use crate::events::ConnectionState;
+use crate::supervisor::{
+    SupervisorProposalEdits, SupervisorProposalRecord, SupervisorProposalStatus,
+};
 
 pub mod methods {
     pub const DAEMON_STATUS: &str = "daemon/status";
@@ -39,6 +42,11 @@ pub mod methods {
     pub const REPORT_GET: &str = "report/get";
     pub const REPORT_LIST_FOR_WORKUNIT: &str = "report/list_for_workunit";
     pub const DECISION_APPLY: &str = "decision/apply";
+    pub const PROPOSAL_CREATE: &str = "proposal/create";
+    pub const PROPOSAL_GET: &str = "proposal/get";
+    pub const PROPOSAL_LIST_FOR_WORKUNIT: &str = "proposal/list_for_workunit";
+    pub const PROPOSAL_APPROVE: &str = "proposal/approve";
+    pub const PROPOSAL_REJECT: &str = "proposal/reject";
     pub const EVENTS_SUBSCRIBE: &str = "events/subscribe";
     pub const EVENTS_NOTIFICATION: &str = "events/notification";
 }
@@ -311,6 +319,17 @@ pub struct DecisionSummary {
     #[serde(default)]
     pub rationale: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalSummary {
+    pub id: String,
+    pub primary_work_unit_id: String,
+    pub source_report_id: String,
+    pub status: SupervisorProposalStatus,
+    pub proposed_decision_type: DecisionType,
+    pub created_at: DateTime<Utc>,
+    pub reasoner_model: String,
 }
 
 #[cfg(test)]
@@ -718,4 +737,67 @@ pub struct DecisionApplyResponse {
     pub decision: Decision,
     pub work_unit: WorkUnit,
     pub next_assignment: Option<Assignment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalCreateRequest {
+    pub work_unit_id: String,
+    pub source_report_id: Option<String>,
+    pub requested_by: Option<String>,
+    pub note: Option<String>,
+    #[serde(default)]
+    pub supersede_open: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalCreateResponse {
+    pub proposal: SupervisorProposalRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalGetRequest {
+    pub proposal_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalGetResponse {
+    pub proposal: SupervisorProposalRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalListForWorkunitRequest {
+    pub work_unit_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalListForWorkunitResponse {
+    pub proposals: Vec<ProposalSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalApproveRequest {
+    pub proposal_id: String,
+    pub reviewed_by: Option<String>,
+    pub review_note: Option<String>,
+    #[serde(default)]
+    pub edits: SupervisorProposalEdits,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalApproveResponse {
+    pub proposal: SupervisorProposalRecord,
+    pub decision: Decision,
+    pub next_assignment: Option<Assignment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalRejectRequest {
+    pub proposal_id: String,
+    pub reviewed_by: Option<String>,
+    pub review_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalRejectResponse {
+    pub proposal: SupervisorProposalRecord,
 }

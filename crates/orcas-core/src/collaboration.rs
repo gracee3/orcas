@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::supervisor::SupervisorProposalRecord;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CollaborationState {
     #[serde(default)]
@@ -19,6 +21,8 @@ pub struct CollaborationState {
     pub reports: BTreeMap<String, Report>,
     #[serde(default)]
     pub decisions: BTreeMap<String, Decision>,
+    #[serde(default)]
+    pub supervisor_proposals: BTreeMap<String, SupervisorProposalRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

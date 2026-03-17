@@ -7,6 +7,7 @@ pub mod jsonrpc;
 pub mod paths;
 pub mod session;
 pub mod store;
+pub mod supervisor;
 
 pub use collaboration::{
     Assignment, AssignmentStatus, CollaborationState, Decision, DecisionType, Report,
@@ -25,3 +26,4 @@ pub use jsonrpc::{
 pub use paths::AppPaths;
 pub use session::{ThreadDescriptor, ThreadMetadata, ThreadRegistry, TurnDescriptor};
 pub use store::{JsonSessionStore, OrcasSessionStore, StoredState};
+pub use supervisor::*;

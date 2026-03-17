@@ -1,5 +1,15 @@
 # Orcas Collaboration v1 Overview
 
+## Related Docs
+
+- [Scope And Non-Goals](./v1-scope.md)
+- [Object Model](./object-model.md)
+- [Reporting And Decisions](./reporting-and-decisions.md)
+- [Lifecycles](./lifecycles.md)
+- [Runtime Mapping](./runtime-mapping.md)
+- [Supervisor Proposal v1](./supervisor-proposal-v1.md)
+- [Next Implementation Cut](./next-implementation-cut.md)
+
 ## What Orcas Is At This Layer
 
 Orcas v1 is a supervisor-centered collaboration protocol built on top of the existing Orcas runtime.
@@ -129,7 +139,7 @@ A worker stops when any of the following happens:
 
 ### What types of supervisor decisions exist in v1?
 
-V1 decisions are:
+The full collaboration v1 decision universe is:
 
 - `accept`
 - `continue`
@@ -141,6 +151,16 @@ V1 decisions are:
 - `interrupt`
 - `abandon`
 - `mark_complete`
+
+The first model-backed supervisor proposal loop is intentionally narrower. It only proposes:
+
+- `accept`
+- `continue`
+- `redirect`
+- `mark_complete`
+- `escalate_to_human`
+
+That narrower slice is defined in [Supervisor Proposal v1](./supervisor-proposal-v1.md). The broader v1 decision universe still exists at the protocol level, but it is not all part of the first proposal-generation implementation cut.
 
 ### How should dependencies be represented in v1?
 

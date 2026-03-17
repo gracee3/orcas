@@ -6,8 +6,8 @@ use anyhow::{Error, Result};
 use tokio::time::sleep;
 
 use orcas_core::{
-    AppConfig, AppPaths, DecisionType, ThreadReadRequest, ThreadResumeRequest, ThreadStartRequest,
-    ipc,
+    AppConfig, AppPaths, DecisionType, SupervisorProposalEdits, SupervisorProposalRecord,
+    ThreadReadRequest, ThreadResumeRequest, ThreadStartRequest, ipc,
 };
 use orcas_daemon::{
     OrcasDaemonLaunch, OrcasDaemonProcessManager, OrcasIpcClient, OrcasRuntimeOverrides,
@@ -556,6 +556,133 @@ impl SupervisorService {
         Ok(())
     }
 
+    pub async fn proposal_create(
+        &self,
+        work_unit_id: &str,
+        source_report_id: Option<String>,
+        note: Option<String>,
+        requested_by: Option<String>,
+        supersede_open: bool,
+    ) -> Result<()> {
+        let client = self.ready_client().await?;
+        let response = client
+            .proposal_create(&ipc::ProposalCreateRequest {
+                work_unit_id: work_unit_id.to_string(),
+                source_report_id,
+                requested_by,
+                note,
+                supersede_open,
+            })
+            .await?;
+        Self::print_proposal_record(&response.proposal);
+        Ok(())
+    }
+
+    pub async fn proposal_get(&self, proposal_id: &str) -> Result<()> {
+        let client = self.ready_client().await?;
+        let response = client
+            .proposal_get(&ipc::ProposalGetRequest {
+                proposal_id: proposal_id.to_string(),
+            })
+            .await?;
+        Self::print_proposal_record(&response.proposal);
+        Ok(())
+    }
+
+    pub async fn proposal_list_for_workunit(&self, work_unit_id: &str) -> Result<()> {
+        let client = self.ready_client().await?;
+        let response = client
+            .proposal_list_for_workunit(&ipc::ProposalListForWorkunitRequest {
+                work_unit_id: work_unit_id.to_string(),
+            })
+            .await?;
+        if response.proposals.is_empty() {
+            println!("no proposals for work unit: {work_unit_id}");
+            return Ok(());
+        }
+
+        for proposal in response.proposals {
+            println!(
+                "{}\t{:?}\t{:?}\t{}\t{}\t{}",
+                proposal.id,
+                proposal.status,
+                proposal.proposed_decision_type,
+                proposal.created_at,
+                proposal.reasoner_model,
+                proposal.source_report_id
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn proposal_approve(
+        &self,
+        proposal_id: &str,
+        reviewed_by: Option<String>,
+        review_note: Option<String>,
+        decision_type: Option<DecisionType>,
+        decision_rationale: Option<String>,
+        preferred_worker_id: Option<String>,
+        worker_kind: Option<String>,
+        objective: Option<String>,
+        instructions: Vec<String>,
+        acceptance_criteria: Vec<String>,
+        stop_conditions: Vec<String>,
+        expected_report_fields: Vec<String>,
+    ) -> Result<()> {
+        let client = self.ready_client().await?;
+        let response = client
+            .proposal_approve(&ipc::ProposalApproveRequest {
+                proposal_id: proposal_id.to_string(),
+                reviewed_by,
+                review_note,
+                edits: SupervisorProposalEdits {
+                    decision_type,
+                    decision_rationale,
+                    preferred_worker_id,
+                    worker_kind,
+                    objective,
+                    instructions,
+                    acceptance_criteria,
+                    stop_conditions,
+                    expected_report_fields,
+                },
+            })
+            .await?;
+
+        Self::print_proposal_record(&response.proposal);
+        println!("decision_id: {}", response.decision.id);
+        println!("decision_type: {:?}", response.decision.decision_type);
+        println!("decision_rationale: {}", response.decision.rationale);
+        if let Some(next_assignment) = response.next_assignment.as_ref() {
+            println!("next_assignment_id: {}", next_assignment.id);
+            println!("next_assignment_status: {:?}", next_assignment.status);
+            println!("next_assignment_worker: {}", next_assignment.worker_id);
+        } else {
+            println!("next_assignment_id:");
+        }
+        Ok(())
+    }
+
+    pub async fn proposal_reject(
+        &self,
+        proposal_id: &str,
+        reviewed_by: Option<String>,
+        review_note: Option<String>,
+    ) -> Result<()> {
+        let client = self.ready_client().await?;
+        let response = client
+            .proposal_reject(&ipc::ProposalRejectRequest {
+                proposal_id: proposal_id.to_string(),
+                reviewed_by,
+                review_note,
+            })
+            .await?;
+        Self::print_proposal_record(&response.proposal);
+        Ok(())
+    }
+
     pub async fn thread_start(
         &self,
         cwd: Option<PathBuf>,
@@ -757,5 +884,149 @@ impl SupervisorService {
         }
 
         Err(last_error.unwrap_or_else(|| Error::msg("connect to Orcas daemon")))
+    }
+
+    fn print_proposal_record(proposal: &SupervisorProposalRecord) {
+        println!("proposal_id: {}", proposal.id);
+        println!("workstream_id: {}", proposal.workstream_id);
+        println!("work_unit_id: {}", proposal.primary_work_unit_id);
+        println!("source_report_id: {}", proposal.source_report_id);
+        println!("status: {:?}", proposal.status);
+        println!("created_at: {}", proposal.created_at);
+        println!("trigger_kind: {:?}", proposal.trigger.kind);
+        println!("trigger_requested_by: {}", proposal.trigger.requested_by);
+        println!("reasoner_backend: {}", proposal.reasoner_backend);
+        println!("reasoner_model: {}", proposal.reasoner_model);
+        if let Some(response_id) = proposal.reasoner_response_id.as_ref() {
+            println!("reasoner_response_id: {response_id}");
+        }
+        println!(
+            "proposal_schema_version: {}",
+            proposal.proposal.schema_version
+        );
+        println!("summary_headline: {}", proposal.proposal.summary.headline);
+        println!("summary_situation: {}", proposal.proposal.summary.situation);
+        println!(
+            "summary_recommended_action: {}",
+            proposal.proposal.summary.recommended_action
+        );
+        println!(
+            "proposed_decision_type: {:?}",
+            proposal.proposal.proposed_decision.decision_type
+        );
+        println!(
+            "proposed_decision_rationale: {}",
+            proposal.proposal.proposed_decision.rationale
+        );
+        println!(
+            "expected_work_unit_status: {}",
+            proposal
+                .proposal
+                .proposed_decision
+                .expected_work_unit_status
+        );
+        println!(
+            "requires_assignment: {}",
+            proposal.proposal.proposed_decision.requires_assignment
+        );
+        println!("confidence: {:?}", proposal.proposal.confidence);
+        if !proposal.proposal.summary.key_evidence.is_empty() {
+            println!(
+                "key_evidence: {}",
+                proposal.proposal.summary.key_evidence.join(" | ")
+            );
+        }
+        if !proposal.proposal.summary.risks.is_empty() {
+            println!("risks: {}", proposal.proposal.summary.risks.join(" | "));
+        }
+        if !proposal.proposal.summary.review_focus.is_empty() {
+            println!(
+                "review_focus: {}",
+                proposal.proposal.summary.review_focus.join(" | ")
+            );
+        }
+        if !proposal.proposal.warnings.is_empty() {
+            println!("warnings: {}", proposal.proposal.warnings.join(" | "));
+        }
+        if !proposal.proposal.open_questions.is_empty() {
+            println!(
+                "open_questions: {}",
+                proposal.proposal.open_questions.join(" | ")
+            );
+        }
+        if let Some(draft) = proposal.proposal.draft_next_assignment.as_ref() {
+            Self::print_draft_assignment(draft);
+        }
+        if let Some(reviewed_at) = proposal.reviewed_at.as_ref() {
+            println!("reviewed_at: {reviewed_at}");
+        }
+        if let Some(reviewed_by) = proposal.reviewed_by.as_ref() {
+            println!("reviewed_by: {reviewed_by}");
+        }
+        if let Some(review_note) = proposal.review_note.as_ref() {
+            println!("review_note: {review_note}");
+        }
+        if let Some(decision_id) = proposal.approved_decision_id.as_ref() {
+            println!("approved_decision_id: {decision_id}");
+        }
+        if let Some(assignment_id) = proposal.approved_assignment_id.as_ref() {
+            println!("approved_assignment_id: {assignment_id}");
+        }
+    }
+
+    fn print_draft_assignment(draft: &orcas_core::DraftAssignment) {
+        println!(
+            "draft_assignment_target_work_unit_id: {}",
+            draft.target_work_unit_id
+        );
+        println!(
+            "draft_assignment_predecessor_assignment_id: {}",
+            draft.predecessor_assignment_id
+        );
+        println!(
+            "draft_assignment_derived_from_decision_type: {:?}",
+            draft.derived_from_decision_type
+        );
+        if let Some(worker_id) = draft.preferred_worker_id.as_ref() {
+            println!("draft_assignment_preferred_worker_id: {worker_id}");
+        }
+        if let Some(worker_kind) = draft.worker_kind.as_ref() {
+            println!("draft_assignment_worker_kind: {worker_kind}");
+        }
+        println!("draft_assignment_objective: {}", draft.objective);
+        if !draft.instructions.is_empty() {
+            println!(
+                "draft_assignment_instructions: {}",
+                draft.instructions.join(" | ")
+            );
+        }
+        if !draft.acceptance_criteria.is_empty() {
+            println!(
+                "draft_assignment_acceptance_criteria: {}",
+                draft.acceptance_criteria.join(" | ")
+            );
+        }
+        if !draft.stop_conditions.is_empty() {
+            println!(
+                "draft_assignment_stop_conditions: {}",
+                draft.stop_conditions.join(" | ")
+            );
+        }
+        if !draft.required_context_refs.is_empty() {
+            println!(
+                "draft_assignment_required_context_refs: {}",
+                draft.required_context_refs.join(",")
+            );
+        }
+        if !draft.expected_report_fields.is_empty() {
+            println!(
+                "draft_assignment_expected_report_fields: {}",
+                draft.expected_report_fields.join(",")
+            );
+        }
+        println!(
+            "draft_assignment_boundedness_note: {}",
+            draft.boundedness_note
+        );
     }
 }
