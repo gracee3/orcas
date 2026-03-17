@@ -1294,8 +1294,8 @@ impl OrcasDaemonService {
             .raw_output_for_turn(&thread_id, &turn.turn_id)
             .await
             .unwrap_or_default();
-        let (report, assignment_after_report, work_unit_after_report, stale_proposals) = self
-            .record_assignment_turn_outcome(
+        let (report, _assignment_after_report, _work_unit_after_report) = self
+            .ingest_assignment_turn_outcome(
                 &assignment_id,
                 &worker_id,
                 &worker_session_id,
@@ -1303,28 +1303,6 @@ impl OrcasDaemonService {
                 raw_output,
             )
             .await?;
-        self.persist_collaboration_state().await?;
-        self.emit_report_recorded(&report).await;
-        let assignment_event_action = match assignment_after_report.status {
-            AssignmentStatus::Interrupted => ipc::AssignmentLifecycleAction::Interrupted,
-            AssignmentStatus::Failed | AssignmentStatus::Lost => {
-                ipc::AssignmentLifecycleAction::Failed
-            }
-            AssignmentStatus::AwaitingDecision => ipc::AssignmentLifecycleAction::Reported,
-            _ => ipc::AssignmentLifecycleAction::Reported,
-        };
-        self.emit_assignment_lifecycle(assignment_event_action, &assignment_after_report)
-            .await;
-        self.emit_work_unit_lifecycle(
-            ipc::CollaborationLifecycleAction::Updated,
-            &work_unit_after_report,
-        )
-        .await;
-        for proposal in &stale_proposals {
-            self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
-                .await;
-        }
-        self.maybe_auto_create_proposal_for_report(&report).await;
 
         let (assignment, worker, worker_session) = {
             let state = self.state.read().await;
@@ -1610,6 +1588,48 @@ impl OrcasDaemonService {
             work_unit_after_report,
             stale_proposals,
         ))
+    }
+
+    async fn ingest_assignment_turn_outcome(
+        &self,
+        assignment_id: &str,
+        worker_id: &str,
+        worker_session_id: &str,
+        turn_state: ipc::TurnStateView,
+        raw_output: String,
+    ) -> OrcasResult<(Report, Assignment, WorkUnit)> {
+        let (report, assignment_after_report, work_unit_after_report, stale_proposals) = self
+            .record_assignment_turn_outcome(
+                assignment_id,
+                worker_id,
+                worker_session_id,
+                turn_state,
+                raw_output,
+            )
+            .await?;
+        self.persist_collaboration_state().await?;
+        self.emit_report_recorded(&report).await;
+        let assignment_event_action = match assignment_after_report.status {
+            AssignmentStatus::Interrupted => ipc::AssignmentLifecycleAction::Interrupted,
+            AssignmentStatus::Failed | AssignmentStatus::Lost => {
+                ipc::AssignmentLifecycleAction::Failed
+            }
+            AssignmentStatus::AwaitingDecision => ipc::AssignmentLifecycleAction::Reported,
+            _ => ipc::AssignmentLifecycleAction::Reported,
+        };
+        self.emit_assignment_lifecycle(assignment_event_action, &assignment_after_report)
+            .await;
+        self.emit_work_unit_lifecycle(
+            ipc::CollaborationLifecycleAction::Updated,
+            &work_unit_after_report,
+        )
+        .await;
+        for proposal in &stale_proposals {
+            self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                .await;
+        }
+        self.maybe_auto_create_proposal_for_report(&report).await;
+        Ok((report, assignment_after_report, work_unit_after_report))
     }
 
     async fn assignment_get(
@@ -5003,6 +5023,48 @@ mod tests {
         }
     }
 
+    struct PackDrivenSupervisorReasoner {
+        decision_type: DecisionType,
+        last_pack: Mutex<Option<SupervisorContextPack>>,
+        propose_calls: AtomicUsize,
+    }
+
+    impl PackDrivenSupervisorReasoner {
+        fn new(decision_type: DecisionType) -> Self {
+            Self {
+                decision_type,
+                last_pack: Mutex::new(None),
+                propose_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn propose_call_count(&self) -> usize {
+            self.propose_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl SupervisorReasoner for PackDrivenSupervisorReasoner {
+        async fn propose(
+            &self,
+            pack: SupervisorContextPack,
+        ) -> Result<SupervisorReasonerResult, SupervisorReasonerFailure> {
+            self.propose_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.last_pack.lock().await = Some(pack.clone());
+            let proposal = sample_proposal_for_pack(self.decision_type, &pack);
+            let output_text = serde_json::to_string(&proposal).expect("serialize proposal");
+            Ok(SupervisorReasonerResult {
+                proposal,
+                backend_kind: "test".to_string(),
+                model: "test-pack-driven".to_string(),
+                response_id: Some("resp-pack-driven".to_string()),
+                usage: None,
+                output_text: Some(output_text),
+            })
+        }
+    }
+
     fn sample_proposal_for_decision(
         decision_type: DecisionType,
         work_unit_id: &str,
@@ -5076,6 +5138,19 @@ mod tests {
             warnings: Vec::new(),
             open_questions: Vec::new(),
         }
+    }
+
+    fn sample_proposal_for_pack(
+        decision_type: DecisionType,
+        pack: &SupervisorContextPack,
+    ) -> SupervisorProposal {
+        sample_proposal_for_decision(
+            decision_type,
+            &pack.primary_work_unit.id,
+            &pack.source_report.id,
+            &pack.current_assignment.id,
+            &pack.current_assignment.worker_id,
+        )
     }
 
     fn auto_proposal_config(enabled: bool) -> AppConfig {
@@ -5291,6 +5366,110 @@ mod tests {
         (workstream, work_unit, assignment, report)
     }
 
+    async fn seed_running_assignment_fixture(
+        service: &Arc<OrcasDaemonService>,
+        label: &str,
+    ) -> (Workstream, WorkUnit, Assignment, ipc::TurnStateView, String) {
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: format!("Running {label}"),
+                objective: "Exercise real report ingestion".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: format!("Work unit {label}"),
+                task_statement: "Execute one bounded step and stop with a structured report."
+                    .to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let assignment = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: format!("worker-{label}"),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Run the bounded step and emit a report.".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("assignment")
+            .assignment;
+
+        {
+            let now = Utc::now();
+            let mut state = service.state.write().await;
+            state
+                .collaboration
+                .assignments
+                .get_mut(&assignment.id)
+                .expect("assignment")
+                .status = AssignmentStatus::Running;
+            let worker = state
+                .collaboration
+                .workers
+                .get_mut(&assignment.worker_id)
+                .expect("worker");
+            worker.status = WorkerStatus::Busy;
+            worker.current_assignment_id = Some(assignment.id.clone());
+            let worker_session = state
+                .collaboration
+                .worker_sessions
+                .get_mut(&assignment.worker_session_id)
+                .expect("worker session");
+            worker_session.active_turn_id = Some(format!("turn-{label}"));
+            worker_session.runtime_status = WorkerSessionRuntimeStatus::Running;
+            worker_session.attachability = WorkerSessionAttachability::Attachable;
+            worker_session.updated_at = now;
+            let work_unit_entry = state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .expect("work unit");
+            work_unit_entry.status = WorkUnitStatus::Running;
+            work_unit_entry.updated_at = now;
+        }
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist running fixture");
+
+        let turn_state = ipc::TurnStateView {
+            thread_id: format!("thread-{label}"),
+            turn_id: format!("turn-{label}"),
+            lifecycle: ipc::TurnLifecycleState::Completed,
+            status: "completed".to_string(),
+            attachable: false,
+            live_stream: false,
+            terminal: true,
+            recent_output: Some("structured worker report".to_string()),
+            recent_event: Some("turn completed".to_string()),
+            updated_at: Utc::now(),
+            error_message: None,
+        };
+        let raw_output = r#"ORCAS_REPORT_BEGIN
+{
+  "disposition": "completed",
+  "summary": "finished the bounded task",
+  "findings": ["root cause isolated"],
+  "blockers": [],
+  "questions": [],
+  "recommended_next_actions": ["apply supervisor decision"],
+  "confidence": "high"
+}
+ORCAS_REPORT_END"#
+            .to_string();
+
+        (workstream, work_unit, assignment, turn_state, raw_output)
+    }
+
     async fn create_proposal_for_decision(
         service: &Arc<OrcasDaemonService>,
         reasoner: &Arc<StaticSupervisorReasoner>,
@@ -5393,6 +5572,20 @@ mod tests {
                 if action == expected {
                     return proposal;
                 }
+            }
+        }
+    }
+
+    async fn wait_for_report_recorded(
+        events: &mut broadcast::Receiver<ipc::DaemonEventEnvelope>,
+    ) -> ipc::ReportSummary {
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event");
+            if let ipc::DaemonEvent::ReportRecorded { report } = event.event {
+                return report;
             }
         }
     }
@@ -6301,6 +6494,137 @@ mod tests {
                 .to_string()
                 .contains("is not open and cannot be rejected")
         );
+    }
+
+    #[tokio::test]
+    async fn real_report_ingestion_path_respects_auto_proposal_config_when_disabled() {
+        let reasoner = Arc::new(PackDrivenSupervisorReasoner::new(DecisionType::Continue));
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(false))
+                .await;
+        let (_workstream, work_unit, assignment, turn_state, raw_output) =
+            seed_running_assignment_fixture(&service, "real-ingest-disabled").await;
+
+        let (report, assignment_after_report, work_unit_after_report) = service
+            .ingest_assignment_turn_outcome(
+                &assignment.id,
+                &assignment.worker_id,
+                &assignment.worker_session_id,
+                turn_state,
+                raw_output,
+            )
+            .await
+            .expect("ingest report");
+
+        assert_eq!(report.work_unit_id, work_unit.id);
+        assert_eq!(
+            assignment_after_report.status,
+            AssignmentStatus::AwaitingDecision
+        );
+        assert_eq!(
+            work_unit_after_report.status,
+            WorkUnitStatus::AwaitingDecision
+        );
+        assert_eq!(reasoner.propose_call_count(), 0);
+
+        let proposals = service
+            .proposal_list_for_workunit(ipc::ProposalListForWorkunitRequest {
+                work_unit_id: work_unit.id.clone(),
+            })
+            .await
+            .expect("proposal list");
+        assert!(proposals.proposals.is_empty());
+
+        let state = service.state.read().await;
+        assert!(state.collaboration.decisions.is_empty());
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].latest_report_id,
+            Some(report.id.clone())
+        );
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].current_assignment_id,
+            Some(assignment.id.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn real_report_ingestion_path_creates_auto_proposal_and_suppresses_redundant_trigger() {
+        let reasoner = Arc::new(PackDrivenSupervisorReasoner::new(DecisionType::Continue));
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(true))
+                .await;
+        let mut events = service.event_tx.subscribe();
+        let (_workstream, work_unit, assignment, turn_state, raw_output) =
+            seed_running_assignment_fixture(&service, "real-ingest-enabled").await;
+
+        let (report, assignment_after_report, work_unit_after_report) = service
+            .ingest_assignment_turn_outcome(
+                &assignment.id,
+                &assignment.worker_id,
+                &assignment.worker_session_id,
+                turn_state,
+                raw_output,
+            )
+            .await
+            .expect("ingest report");
+
+        let recorded_report = wait_for_report_recorded(&mut events).await;
+        assert_eq!(recorded_report.id, report.id);
+        let proposal_event =
+            wait_for_proposal_action(&mut events, ipc::ProposalLifecycleAction::Created).await;
+
+        assert_eq!(
+            assignment_after_report.status,
+            AssignmentStatus::AwaitingDecision
+        );
+        assert_eq!(
+            work_unit_after_report.status,
+            WorkUnitStatus::AwaitingDecision
+        );
+        assert_eq!(reasoner.propose_call_count(), 1);
+        assert_eq!(proposal_event.source_report_id, report.id);
+
+        let stored = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        assert_eq!(stored.status, SupervisorProposalStatus::Open);
+        assert_eq!(stored.source_report_id, report.id);
+        assert_eq!(
+            stored.trigger.kind,
+            SupervisorProposalTriggerKind::ReportRecorded
+        );
+
+        let snapshot = service.snapshot().await.expect("snapshot");
+        let summary = snapshot
+            .collaboration
+            .work_units
+            .iter()
+            .find(|summary| summary.id == work_unit.id)
+            .and_then(|summary| summary.proposal.as_ref())
+            .expect("proposal summary");
+        assert!(summary.has_open_proposal);
+        assert_eq!(
+            summary.latest_proposed_decision_type,
+            Some(DecisionType::Continue)
+        );
+
+        let state = service.state.read().await;
+        assert!(state.collaboration.decisions.is_empty());
+        assert_eq!(state.collaboration.assignments.len(), 1);
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].current_assignment_id,
+            Some(assignment.id.clone())
+        );
+        drop(state);
+
+        service.maybe_auto_create_proposal_for_report(&report).await;
+
+        let proposals = service
+            .proposal_list_for_workunit(ipc::ProposalListForWorkunitRequest {
+                work_unit_id: work_unit.id.clone(),
+            })
+            .await
+            .expect("proposal list");
+        assert_eq!(proposals.proposals.len(), 1);
+        assert_eq!(reasoner.propose_call_count(), 1);
     }
 
     #[tokio::test]
