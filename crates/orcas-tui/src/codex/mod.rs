@@ -20,6 +20,7 @@ pub mod terminal;
 pub use ring_buffer::PtyRingBuffer;
 pub use session::{
     CodexResumeDescriptor, CodexResumeDescriptorError, CodexSession, CodexSessionId,
-    CodexSessionManager, CodexSessionState, DEFAULT_PTY_RING_BUFFER_CAPACITY,
+    CodexSessionManager, CodexSessionState, CodexThreadSessionSummary,
+    DEFAULT_PTY_RING_BUFFER_CAPACITY,
 };
 pub use terminal::{OrcasTerminal, SuspendedOrcasTerminal, suspend_terminal};

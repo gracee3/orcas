@@ -5,6 +5,7 @@ use crate::app::{
     UiEvent, UserAction,
 };
 use crate::backend::BackendCommand;
+use crate::codex::{CodexSessionId, CodexSessionState, CodexThreadSessionSummary};
 use crate::test_harness::AppHarness;
 use orcas_core::{
     Assignment, AssignmentStatus, ConnectionState, Decision, DecisionPolicy, DecisionType,
@@ -942,6 +943,49 @@ async fn thread_list_and_detail_show_codex_assignment_state() {
         detail.lines.iter().any(|line| {
             line.contains("workstream=ws-1  work_unit=wu-1  supervisor=supervisor-a")
         })
+    );
+}
+
+#[tokio::test]
+async fn detached_codex_session_surfaces_in_thread_views() {
+    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    harness
+        .inject_ui_event(UiEvent::CodexSessionsChanged {
+            sessions: std::iter::once((
+                "thread-1".to_string(),
+                CodexThreadSessionSummary {
+                    session_id: CodexSessionId::from(1_u64),
+                    thread_id: "thread-1".to_string(),
+                    state: CodexSessionState::Detached { pid: 4242 },
+                },
+            ))
+            .collect(),
+        })
+        .await;
+
+    let list = harness.thread_list_vm();
+    assert_eq!(list.rows[0].session_badge.as_deref(), Some("detached"));
+
+    let summary = harness.thread_summary_vm();
+    assert!(
+        summary
+            .lines
+            .iter()
+            .any(|line| line.contains("codex session: detached"))
+    );
+
+    let detail = harness.thread_detail_vm();
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("Codex Session: detached"))
+    );
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("actions: c reattach Codex session"))
     );
 }
 

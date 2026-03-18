@@ -1,4 +1,5 @@
 use crate::app::AppState;
+use crate::codex::CodexSessionState;
 use orcas_core::{
     CodexThreadAssignmentStatus, CodexThreadBootstrapState, CodexThreadSendPolicy, ipc,
 };
@@ -12,6 +13,7 @@ pub struct ThreadRowViewModel {
     pub turn_badge: Option<String>,
     pub assignment_badge: Option<String>,
     pub decision_badge: Option<String>,
+    pub session_badge: Option<String>,
     pub preview: String,
     pub selected: bool,
 }
@@ -45,6 +47,7 @@ pub fn thread_list(state: &AppState) -> ThreadListViewModel {
                 turn_badge: thread_turn_badge(state, &thread.id),
                 assignment_badge: thread_assignment_badge(state, &thread.id),
                 decision_badge: thread_decision_badge(state, &thread.id),
+                session_badge: thread_session_badge(state, &thread.id),
                 preview: abbreviate(&thread.preview.replace('\n', " "), 40),
                 selected: state.selected_thread_id.as_deref() == Some(thread.id.as_str()),
             })
@@ -84,6 +87,14 @@ pub fn thread_summary(state: &AppState) -> PanelViewModel {
     }
     if let Some(turn_id) = summary.last_seen_turn_id.as_ref() {
         lines.push(format!("last seen turn: {turn_id}"));
+    }
+    if let Some(session) = local_codex_session(state, thread_id) {
+        lines.push(format!(
+            "codex session: {}",
+            codex_session_state_label(&session.state)
+        ));
+    } else {
+        lines.push("codex session: none".to_string());
     }
     if let Some(assignment) = thread_assignment_for_display(state, thread_id) {
         lines.push(format!(
@@ -334,6 +345,36 @@ pub fn thread_detail(state: &AppState) -> ThreadDetailViewModel {
         lines.push(String::new());
     }
 
+    if let Some(session) = local_codex_session(state, thread_id) {
+        lines.push(format!(
+            "Codex Session: {}",
+            codex_session_state_label(&session.state)
+        ));
+        if let Some(pid) = session.state.pid() {
+            lines.push(format!("  pid {pid}"));
+        }
+        match &session.state {
+            CodexSessionState::Detached { .. } => {
+                lines.push("  actions: c reattach Codex session".to_string());
+                lines.push("  attached detach chord: ctrl+] d".to_string());
+            }
+            CodexSessionState::Attached { .. } => {
+                lines.push("  attached detach chord: ctrl+] d".to_string());
+            }
+            CodexSessionState::Exited { .. } | CodexSessionState::Failed { .. } => {
+                lines.push("  actions: c start a new Codex session".to_string());
+            }
+            CodexSessionState::Launching => {
+                lines.push("  session is launching".to_string());
+            }
+        }
+        lines.push(String::new());
+    } else {
+        lines.push("Codex Session: none".to_string());
+        lines.push("  actions: c start Codex session".to_string());
+        lines.push(String::new());
+    }
+
     let history = thread_decision_history(state, thread_id);
     if !history.is_empty() {
         lines.push("Decision History:".to_string());
@@ -457,6 +498,28 @@ fn thread_assignment_badge(state: &AppState, thread_id: &str) -> Option<String> 
 fn thread_decision_badge(state: &AppState, thread_id: &str) -> Option<String> {
     let decision = thread_decision_for_display(state, thread_id)?;
     Some(supervisor_decision_status_label(decision).to_string())
+}
+
+fn thread_session_badge(state: &AppState, thread_id: &str) -> Option<String> {
+    let session = local_codex_session(state, thread_id)?;
+    Some(codex_session_state_label(&session.state).to_string())
+}
+
+fn local_codex_session<'state>(
+    state: &'state AppState,
+    thread_id: &str,
+) -> Option<&'state crate::codex::CodexThreadSessionSummary> {
+    state.codex_sessions.get(thread_id)
+}
+
+fn codex_session_state_label(state: &CodexSessionState) -> &'static str {
+    match state {
+        CodexSessionState::Launching => "launching",
+        CodexSessionState::Attached { .. } => "attached",
+        CodexSessionState::Detached { .. } => "detached",
+        CodexSessionState::Exited { .. } => "exited",
+        CodexSessionState::Failed { .. } => "failed",
+    }
 }
 
 fn loaded_status_label(status: ipc::ThreadLoadedStatus) -> &'static str {

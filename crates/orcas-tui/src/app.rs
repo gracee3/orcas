@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
+use crate::codex::CodexThreadSessionSummary;
 use orcas_core::{ConnectionState, ipc};
 
 const MAX_LOG_ENTRIES: usize = 64;
@@ -83,6 +84,7 @@ pub struct AppState {
     pub models_loading: bool,
     pub thread_details: HashMap<String, ipc::ThreadView>,
     pub turn_states: HashMap<String, ipc::TurnStateView>,
+    pub codex_sessions: HashMap<String, CodexThreadSessionSummary>,
     pub current_view: TopLevelView,
     pub selected_thread_id: Option<String>,
     pub selected_workstream_id: Option<String>,
@@ -240,6 +242,9 @@ pub enum UiEvent {
         turn_id: String,
         item_id: String,
         delta: String,
+    },
+    CodexSessionsChanged {
+        sessions: HashMap<String, CodexThreadSessionSummary>,
     },
     Ignored,
     Warning(String),
@@ -1135,6 +1140,9 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
                 item.text.get_or_insert_with(String::new).push_str(&delta);
             }
         }
+        UiEvent::CodexSessionsChanged { sessions } => {
+            state.codex_sessions = sessions;
+        }
         UiEvent::Ignored => {}
         UiEvent::Warning(message) => {
             state.banner = Some(StatusBanner {
@@ -1966,6 +1974,7 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
         UiEvent::SnapshotLoaded(_) => return None,
         UiEvent::WorkUnitDetailLoaded(_) => return None,
         UiEvent::Ignored => return None,
+        UiEvent::CodexSessionsChanged { .. } => return None,
         UiEvent::ReconnectScheduled { attempt, .. } => (
             "reconnect",
             format!("scheduled reconnect attempt {attempt}"),

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -16,7 +16,8 @@ use nix::fcntl::{FcntlArg, OFlag, fcntl};
 #[cfg(unix)]
 use nix::unistd::read as nix_read;
 use portable_pty::{
-    Child, CommandBuilder, ExitStatus as PtyExitStatus, MasterPty, PtySize, native_pty_system,
+    Child, ChildKiller, CommandBuilder, ExitStatus as PtyExitStatus, MasterPty, PtySize,
+    native_pty_system,
 };
 use tracing::info;
 
@@ -27,6 +28,9 @@ use super::terminal::{OrcasTerminal, enter_pass_through_mode, suspend_terminal};
 
 const RELAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const INPUT_IDLE_SLEEP: Duration = Duration::from_millis(10);
+const DETACH_PREFIX: u8 = 0x1d;
+const DETACH_SUFFIX: u8 = b'd';
+const DETACH_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(750);
 
 pub const DEFAULT_PTY_RING_BUFFER_CAPACITY: usize = 64 * 1024;
 
@@ -40,10 +44,23 @@ impl CodexSessionId {
     }
 }
 
+impl From<u64> for CodexSessionId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 impl fmt::Display for CodexSessionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.0)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexThreadSessionSummary {
+    pub session_id: CodexSessionId,
+    pub thread_id: String,
+    pub state: CodexSessionState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,9 +141,7 @@ pub enum CodexResumeDescriptorError {
 impl fmt::Display for CodexResumeDescriptorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DaemonUnavailable => {
-                write!(formatter, "daemon status is not loaded yet")
-            }
+            Self::DaemonUnavailable => write!(formatter, "daemon status is not loaded yet"),
             Self::NoThreadSelected => write!(formatter, "no thread is selected"),
             Self::UnknownThread(thread_id) => {
                 write!(formatter, "selected thread `{thread_id}` is not loaded")
@@ -147,6 +162,24 @@ pub enum CodexSessionState {
     Detached { pid: u32 },
     Exited { result: CodexExit },
     Failed { error: String },
+}
+
+impl CodexSessionState {
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self,
+            Self::Launching | Self::Attached { .. } | Self::Detached { .. }
+        )
+    }
+
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Attached { pid } | Self::Detached { pid } => Some(*pid),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,13 +237,13 @@ impl CodexSession {
 
     pub fn mark_attached(&mut self, pid: u32) -> Result<(), SessionTransitionError> {
         match self.state {
-            CodexSessionState::Launching => {
+            CodexSessionState::Launching | CodexSessionState::Detached { .. } => {
                 self.state = CodexSessionState::Attached { pid };
                 self.last_activity_at = Some(Instant::now());
                 Ok(())
             }
             _ => Err(SessionTransitionError(
-                "session can only attach from launching",
+                "session can only attach from launching or detached",
             )),
         }
     }
@@ -266,6 +299,10 @@ impl CodexSession {
     #[must_use]
     pub fn terminal_message(&self) -> Option<String> {
         match &self.state {
+            CodexSessionState::Detached { .. } => Some(format!(
+                "Detached Codex session for thread {}. Press c to reattach.",
+                self.thread_id
+            )),
             CodexSessionState::Exited { result } if !result.success => Some(match result.code {
                 Some(code) => format!(
                     "Codex resume for thread {} exited with status {}.",
@@ -296,10 +333,31 @@ impl fmt::Display for SessionTransitionError {
 
 impl std::error::Error for SessionTransitionError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputRelayControl {
+    DetachRequested,
+}
+
+enum BackgroundEvent {
+    Output {
+        session_id: CodexSessionId,
+        bytes: Vec<u8>,
+    },
+    Exited {
+        session_id: CodexSessionId,
+        result: CodexExit,
+    },
+    Failed {
+        session_id: CodexSessionId,
+        error: String,
+    },
+}
+
 struct CodexSessionHost {
+    pid: u32,
     master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
 pub struct CodexSessionManager {
@@ -307,16 +365,21 @@ pub struct CodexSessionManager {
     ring_capacity: usize,
     sessions: BTreeMap<CodexSessionId, CodexSession>,
     hosts: BTreeMap<CodexSessionId, CodexSessionHost>,
+    event_tx: mpsc::Sender<BackgroundEvent>,
+    event_rx: mpsc::Receiver<BackgroundEvent>,
 }
 
 impl CodexSessionManager {
     #[must_use]
     pub fn new(ring_capacity: usize) -> Self {
+        let (event_tx, event_rx) = mpsc::channel();
         Self {
             next_session_id: 1,
             ring_capacity,
             sessions: BTreeMap::new(),
             hosts: BTreeMap::new(),
+            event_tx,
+            event_rx,
         }
     }
 
@@ -325,36 +388,96 @@ impl CodexSessionManager {
         self.sessions.get(&session_id)
     }
 
-    pub fn resume_attached(
+    #[must_use]
+    pub fn session_for_thread(&self, thread_id: &str) -> Option<&CodexSession> {
+        self.live_session_id_for_thread(thread_id)
+            .and_then(|session_id| self.sessions.get(&session_id))
+            .or_else(|| {
+                self.sessions
+                    .values()
+                    .rev()
+                    .find(|session| session.thread_id == thread_id)
+            })
+    }
+
+    pub fn thread_session_summaries(&self) -> HashMap<String, CodexThreadSessionSummary> {
+        let mut summaries = HashMap::new();
+        for session in self.sessions.values() {
+            summaries.insert(
+                session.thread_id.clone(),
+                CodexThreadSessionSummary {
+                    session_id: session.id,
+                    thread_id: session.thread_id.clone(),
+                    state: session.state.clone(),
+                },
+            );
+        }
+        summaries
+    }
+
+    pub fn drain_background_events(&mut self) -> Result<bool> {
+        let mut changed = false;
+        while let Ok(event) = self.event_rx.try_recv() {
+            changed |= self.handle_background_event(event, None)?;
+        }
+        Ok(changed)
+    }
+
+    pub fn attach_or_resume(
         &mut self,
         terminal: &mut OrcasTerminal,
         descriptor: CodexResumeDescriptor,
     ) -> Result<CodexSessionId> {
-        let session_id = self.insert_session(descriptor);
+        self.drain_background_events()?;
+        let session_id = match self.live_session_id_for_thread(&descriptor.thread_id) {
+            Some(existing_id) => existing_id,
+            None => {
+                let new_id = self.insert_session(descriptor);
+                self.spawn_pty_host(new_id)?;
+                new_id
+            }
+        };
+
         let suspended = suspend_terminal(terminal)?;
         let run_result = self.run_suspended_attached_session(session_id);
-        let cleanup_result = self.cleanup_attached_host(session_id);
         let restore_result = suspended.resume();
+        let drain_result = self.drain_background_events();
+        let cleanup_result = self.cleanup_terminal_sessions();
 
-        match (run_result, cleanup_result, restore_result) {
-            (Ok(()), Ok(()), Ok(())) => Ok(session_id),
-            (Err(error), _, Ok(())) => Err(error),
-            (Ok(()), Err(error), Ok(())) => Err(error),
-            (Ok(()), Ok(()), Err(error)) => Err(error),
-            (Err(error), _, Err(restore_error)) | (Ok(()), Err(error), Err(restore_error)) => {
+        match (run_result, restore_result, drain_result, cleanup_result) {
+            (Ok(()), Ok(()), Ok(_), Ok(())) => Ok(session_id),
+            (Err(error), Ok(()), _, _) => Err(error),
+            (Ok(()), Err(error), _, _) => Err(error),
+            (Ok(()), Ok(()), Err(error), _) => Err(error),
+            (Ok(()), Ok(()), Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(restore_error), _, _) => {
                 Err(error.context(format!("terminal restore also failed: {restore_error}")))
             }
         }
     }
 
     fn run_suspended_attached_session(&mut self, session_id: CodexSessionId) -> Result<()> {
+        let pid = self
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.state.pid())
+            .or_else(|| self.hosts.get(&session_id).map(|host| host.pid))
+            .ok_or_else(|| anyhow!("missing live session {}", session_id))?;
+        if !self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| matches!(session.state, CodexSessionState::Attached { .. }))
+        {
+            self.session_mut(session_id)?
+                .mark_attached(pid)
+                .map_err(|error| anyhow!(error))?;
+        }
+
         let relay_mode = enter_pass_through_mode()?;
-        let session_result = self
-            .spawn_pty_host(session_id)
-            .and_then(|_| self.run_attached_relay(session_id));
+        let relay_result = self.run_attached_relay(session_id);
         drop(relay_mode);
 
-        if let Err(error) = session_result {
+        if let Err(error) = relay_result {
             self.mark_session_failed(session_id, error.to_string());
             self.terminate_host(session_id);
             return Err(error);
@@ -388,6 +511,12 @@ impl CodexSessionManager {
                 descriptor.thread_id
             )
         })?;
+        let reader = pair.master.try_clone_reader().with_context(|| {
+            format!(
+                "failed to clone PTY reader for thread {}",
+                descriptor.thread_id
+            )
+        })?;
         let command = descriptor.pty_command_builder();
 
         info!(
@@ -396,7 +525,7 @@ impl CodexSessionManager {
             command = %descriptor.display_command,
             rows = pty_size.rows,
             cols = pty_size.cols,
-            "launching Codex resume in PTY-backed attached mode"
+            "launching Codex resume in PTY-backed mode"
         );
 
         let child = pair.slave.spawn_command(command).with_context(|| {
@@ -406,28 +535,25 @@ impl CodexSessionManager {
             )
         })?;
         let pid = child.process_id().unwrap_or_default();
+        let killer = child.clone_killer();
         self.session_mut(session_id)?
             .mark_attached(pid)
             .map_err(|error| anyhow!(error))?;
         self.hosts.insert(
             session_id,
             CodexSessionHost {
+                pid,
                 master: pair.master,
-                child,
                 writer: Arc::new(Mutex::new(writer)),
+                killer,
             },
         );
+        spawn_output_drain_thread(session_id, reader, self.event_tx.clone())?;
+        spawn_wait_thread(session_id, child, self.event_tx.clone())?;
         Ok(())
     }
 
     fn run_attached_relay(&mut self, session_id: CodexSessionId) -> Result<()> {
-        let reader = self
-            .hosts
-            .get(&session_id)
-            .ok_or_else(|| anyhow!("missing PTY host for session {}", session_id))?
-            .master
-            .try_clone_reader()
-            .with_context(|| format!("failed to clone PTY reader for session {}", session_id))?;
         let writer = Arc::clone(
             &self
                 .hosts
@@ -435,56 +561,99 @@ impl CodexSessionManager {
                 .ok_or_else(|| anyhow!("missing PTY host for session {}", session_id))?
                 .writer,
         );
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let (output_tx, output_rx) = mpsc::channel();
-        let input_thread = spawn_input_relay_thread(Arc::clone(&stop), writer)?;
-        let output_thread = spawn_output_relay_thread(Arc::clone(&stop), reader, output_tx)?;
-
-        let mut output_rx = Some(output_rx);
+        let (stop, input_thread, control_rx) = spawn_input_relay_thread(writer)?;
         let mut stdout = io::stdout().lock();
         let mut last_size = current_pty_size();
 
         loop {
-            if let Some(rx) = output_rx.as_ref() {
-                match rx.recv_timeout(RELAY_POLL_INTERVAL) {
-                    Ok(bytes) => {
-                        stdout
-                            .write_all(&bytes)
-                            .context("failed to write PTY output to stdout")?;
-                        stdout.flush().context("failed to flush PTY output")?;
-                        self.session_mut(session_id)?.record_pty_output(&bytes);
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => output_rx = None,
-                }
-            } else {
-                thread::sleep(RELAY_POLL_INTERVAL);
-            }
-
-            self.propagate_resize_if_needed(session_id, &mut last_size)?;
-
-            let exit_status = self
-                .hosts
-                .get_mut(&session_id)
-                .ok_or_else(|| anyhow!("missing PTY host for session {}", session_id))?
-                .child
-                .try_wait()
-                .with_context(|| format!("failed to poll Codex session {}", session_id))?;
-
-            if let Some(status) = exit_status {
+            self.drain_background_events_for_attached(session_id, &mut stdout)?;
+            if matches!(
+                control_rx.try_recv(),
+                Ok(InputRelayControl::DetachRequested)
+            ) {
                 self.session_mut(session_id)?
-                    .mark_exited(CodexExit::from(status))
+                    .mark_detached()
                     .map_err(|error| anyhow!(error))?;
                 break;
             }
+            if !self
+                .sessions
+                .get(&session_id)
+                .is_some_and(|session| matches!(session.state, CodexSessionState::Attached { .. }))
+            {
+                break;
+            }
+
+            self.propagate_resize_if_needed(session_id, &mut last_size)?;
+            self.wait_for_background_event(RELAY_POLL_INTERVAL, Some((session_id, &mut stdout)))?;
         }
 
         stop.store(true, Ordering::Relaxed);
         stdout.flush().context("failed to flush final PTY output")?;
         join_relay_thread(input_thread, "stdin relay")?;
-        join_relay_thread(output_thread, "PTY output relay")?;
         Ok(())
+    }
+
+    fn drain_background_events_for_attached(
+        &mut self,
+        attached_session_id: CodexSessionId,
+        stdout: &mut dyn Write,
+    ) -> Result<bool> {
+        let mut changed = false;
+        while let Ok(event) = self.event_rx.try_recv() {
+            changed |= self.handle_background_event(event, Some((attached_session_id, stdout)))?;
+        }
+        Ok(changed)
+    }
+
+    fn wait_for_background_event(
+        &mut self,
+        timeout: Duration,
+        attached: Option<(CodexSessionId, &mut dyn Write)>,
+    ) -> Result<bool> {
+        match self.event_rx.recv_timeout(timeout) {
+            Ok(event) => self.handle_background_event(event, attached),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(false),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(false),
+        }
+    }
+
+    fn handle_background_event(
+        &mut self,
+        event: BackgroundEvent,
+        attached: Option<(CodexSessionId, &mut dyn Write)>,
+    ) -> Result<bool> {
+        match event {
+            BackgroundEvent::Output { session_id, bytes } => {
+                let Some(session) = self.sessions.get_mut(&session_id) else {
+                    return Ok(false);
+                };
+                session.record_pty_output(&bytes);
+                if let Some((attached_session_id, stdout)) = attached
+                    && attached_session_id == session_id
+                    && matches!(session.state, CodexSessionState::Attached { .. })
+                {
+                    stdout
+                        .write_all(&bytes)
+                        .context("failed to write PTY output to stdout")?;
+                    stdout.flush().context("failed to flush PTY output")?;
+                }
+                Ok(true)
+            }
+            BackgroundEvent::Exited { session_id, result } => {
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    let _ = session.mark_exited(result);
+                }
+                self.hosts.remove(&session_id);
+                Ok(true)
+            }
+            BackgroundEvent::Failed { session_id, error } => {
+                self.mark_session_failed(session_id, error);
+                self.terminate_host(session_id);
+                self.hosts.remove(&session_id);
+                Ok(true)
+            }
+        }
     }
 
     fn propagate_resize_if_needed(
@@ -506,27 +675,26 @@ impl CodexSessionManager {
         Ok(())
     }
 
-    fn terminate_host(&mut self, session_id: CodexSessionId) {
-        if let Some(host) = self.hosts.get_mut(&session_id) {
-            let _ = host.child.kill();
-        }
+    fn live_session_id_for_thread(&self, thread_id: &str) -> Option<CodexSessionId> {
+        self.sessions
+            .iter()
+            .rev()
+            .find(|(_, session)| session.thread_id == thread_id && session.state.is_live())
+            .map(|(session_id, _)| *session_id)
     }
 
-    fn cleanup_attached_host(&mut self, session_id: CodexSessionId) -> Result<()> {
-        match self.sessions.get(&session_id).map(|session| &session.state) {
-            Some(CodexSessionState::Attached { .. }) | Some(CodexSessionState::Detached { .. }) => {
-                Ok(())
-            }
-            Some(CodexSessionState::Exited { .. })
-            | Some(CodexSessionState::Failed { .. })
-            | None => {
-                self.hosts.remove(&session_id);
-                Ok(())
-            }
-            Some(CodexSessionState::Launching) => {
-                self.hosts.remove(&session_id);
-                Ok(())
-            }
+    fn cleanup_terminal_sessions(&mut self) -> Result<()> {
+        self.hosts.retain(|session_id, _| {
+            self.sessions
+                .get(session_id)
+                .is_some_and(|session| session.state.is_live())
+        });
+        Ok(())
+    }
+
+    fn terminate_host(&mut self, session_id: CodexSessionId) {
+        if let Some(host) = self.hosts.get_mut(&session_id) {
+            let _ = host.killer.kill();
         }
     }
 
@@ -598,11 +766,80 @@ fn current_pty_size() -> PtySize {
     }
 }
 
-fn spawn_input_relay_thread(
-    stop: Arc<AtomicBool>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
-) -> Result<thread::JoinHandle<Result<()>>> {
+fn spawn_output_drain_thread(
+    session_id: CodexSessionId,
+    mut reader: Box<dyn Read + Send>,
+    event_tx: mpsc::Sender<BackgroundEvent>,
+) -> Result<()> {
     thread::Builder::new()
+        .name(format!("orcas-codex-drain-{}", session_id.as_u64()))
+        .spawn(move || {
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if event_tx
+                            .send(BackgroundEvent::Output {
+                                session_id,
+                                bytes: buffer[..read].to_vec(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) if is_normal_pty_eof(&error) => break,
+                    Err(error) => {
+                        let _ = event_tx.send(BackgroundEvent::Failed {
+                            session_id,
+                            error: format!("failed to read PTY output: {error}"),
+                        });
+                        break;
+                    }
+                }
+            }
+        })
+        .context("failed to spawn PTY output drain thread")?;
+    Ok(())
+}
+
+fn spawn_wait_thread(
+    session_id: CodexSessionId,
+    mut child: Box<dyn Child + Send + Sync>,
+    event_tx: mpsc::Sender<BackgroundEvent>,
+) -> Result<()> {
+    thread::Builder::new()
+        .name(format!("orcas-codex-wait-{}", session_id.as_u64()))
+        .spawn(move || match child.wait() {
+            Ok(status) => {
+                let _ = event_tx.send(BackgroundEvent::Exited {
+                    session_id,
+                    result: CodexExit::from(status),
+                });
+            }
+            Err(error) => {
+                let _ = event_tx.send(BackgroundEvent::Failed {
+                    session_id,
+                    error: format!("failed to wait for Codex session: {error}"),
+                });
+            }
+        })
+        .context("failed to spawn Codex wait thread")?;
+    Ok(())
+}
+
+fn spawn_input_relay_thread(
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+) -> Result<(
+    Arc<AtomicBool>,
+    thread::JoinHandle<Result<()>>,
+    mpsc::Receiver<InputRelayControl>,
+)> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (control_tx, control_rx) = mpsc::channel();
+    let stop_for_thread = Arc::clone(&stop);
+    let handle = thread::Builder::new()
         .name("orcas-codex-stdin".to_string())
         .spawn(move || {
             #[cfg(unix)]
@@ -610,21 +847,43 @@ fn spawn_input_relay_thread(
 
             let stdin = io::stdin();
             let mut buffer = [0_u8; 1024];
+            let mut pending_detach_prefix: Option<Instant> = None;
 
             loop {
-                if stop.load(Ordering::Relaxed) {
+                if stop_for_thread.load(Ordering::Relaxed) {
                     break;
+                }
+
+                if pending_detach_prefix
+                    .is_some_and(|started_at| started_at.elapsed() >= DETACH_SEQUENCE_TIMEOUT)
+                {
+                    forward_input_bytes(&writer, &[DETACH_PREFIX])?;
+                    pending_detach_prefix = None;
                 }
 
                 match read_stdin_chunk(&stdin, &mut buffer) {
                     Ok(0) => break,
                     Ok(read) => {
-                        let mut writer = writer
-                            .lock()
-                            .map_err(|_| anyhow!("PTY writer lock was poisoned"))?;
-                        writer
-                            .write_all(&buffer[..read])
-                            .context("failed to write stdin bytes into PTY")?;
+                        for byte in &buffer[..read] {
+                            if pending_detach_prefix.is_some() {
+                                if *byte == DETACH_SUFFIX
+                                    || *byte == DETACH_SUFFIX.to_ascii_uppercase()
+                                {
+                                    let _ = control_tx.send(InputRelayControl::DetachRequested);
+                                    pending_detach_prefix = None;
+                                    continue;
+                                }
+
+                                forward_input_bytes(&writer, &[DETACH_PREFIX])?;
+                                pending_detach_prefix = None;
+                            }
+
+                            if *byte == DETACH_PREFIX {
+                                pending_detach_prefix = Some(Instant::now());
+                            } else {
+                                forward_input_bytes(&writer, &[*byte])?;
+                            }
+                        }
                     }
                     Err(error) if is_would_block(&error) => {
                         thread::sleep(INPUT_IDLE_SLEEP);
@@ -633,43 +892,23 @@ fn spawn_input_relay_thread(
                 }
             }
 
-            Ok(())
-        })
-        .context("failed to spawn stdin relay thread")
-}
-
-fn spawn_output_relay_thread(
-    stop: Arc<AtomicBool>,
-    mut reader: Box<dyn Read + Send>,
-    output_tx: mpsc::Sender<Vec<u8>>,
-) -> Result<thread::JoinHandle<Result<()>>> {
-    thread::Builder::new()
-        .name("orcas-codex-stdout".to_string())
-        .spawn(move || {
-            let mut buffer = [0_u8; 8192];
-
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(read) => {
-                        if output_tx.send(buffer[..read].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) if is_normal_pty_eof(&error) => break,
-                    Err(error) => {
-                        return Err(error).context("failed to read PTY output");
-                    }
-                }
+            if pending_detach_prefix.is_some() && !stop_for_thread.load(Ordering::Relaxed) {
+                forward_input_bytes(&writer, &[DETACH_PREFIX])?;
             }
 
             Ok(())
         })
-        .context("failed to spawn PTY output relay thread")
+        .context("failed to spawn stdin relay thread")?;
+    Ok((stop, handle, control_rx))
+}
+
+fn forward_input_bytes(writer: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8]) -> Result<()> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| anyhow!("PTY writer lock was poisoned"))?;
+    writer
+        .write_all(bytes)
+        .context("failed to write stdin bytes into PTY")
 }
 
 fn join_relay_thread(handle: thread::JoinHandle<Result<()>>, label: &str) -> Result<()> {
@@ -754,8 +993,8 @@ impl Drop for NonblockingStdinGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexExit, CodexResumeDescriptor, CodexSession, CodexSessionId, CodexSessionState,
-        DEFAULT_PTY_RING_BUFFER_CAPACITY,
+        CodexExit, CodexResumeDescriptor, CodexSession, CodexSessionId, CodexSessionManager,
+        CodexSessionState, DEFAULT_PTY_RING_BUFFER_CAPACITY,
     };
     use crate::app::AppState;
     use chrono::Utc;
@@ -764,8 +1003,8 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn session_transitions_cover_launch_attach_detach_exit() {
-        let descriptor = sample_descriptor();
+    fn session_transitions_cover_launch_attach_detach_reattach_exit() {
+        let descriptor = sample_descriptor("thread-1");
         let mut session = CodexSession::new(CodexSessionId(1), descriptor, 16);
         assert_eq!(session.state, CodexSessionState::Launching);
 
@@ -774,6 +1013,9 @@ mod tests {
 
         session.mark_detached().expect("detach");
         assert_eq!(session.state, CodexSessionState::Detached { pid: 4242 });
+
+        session.mark_attached(4242).expect("reattach");
+        assert_eq!(session.state, CodexSessionState::Attached { pid: 4242 });
 
         session
             .mark_exited(CodexExit {
@@ -793,23 +1035,39 @@ mod tests {
     }
 
     #[test]
-    fn session_cannot_detach_after_exit() {
-        let descriptor = sample_descriptor();
+    fn detached_session_can_exit() {
+        let descriptor = sample_descriptor("thread-1");
         let mut session = CodexSession::new(CodexSessionId(2), descriptor, 16);
         session.mark_attached(7).expect("attach");
+        session.mark_detached().expect("detach");
         session
             .mark_exited(CodexExit {
                 success: false,
                 code: Some(1),
             })
             .expect("exit");
-        assert!(session.mark_detached().is_err());
+        assert!(matches!(session.state, CodexSessionState::Exited { .. }));
+    }
+
+    #[test]
+    fn detached_session_can_fail() {
+        let descriptor = sample_descriptor("thread-1");
+        let mut session = CodexSession::new(CodexSessionId(3), descriptor, 16);
+        session.mark_attached(7).expect("attach");
+        session.mark_detached().expect("detach");
+        session.mark_failed("boom").expect("failed");
+        assert_eq!(
+            session.state,
+            CodexSessionState::Failed {
+                error: "boom".to_string(),
+            }
+        );
     }
 
     #[test]
     fn recording_output_updates_bounded_buffer() {
-        let descriptor = sample_descriptor();
-        let mut session = CodexSession::new(CodexSessionId(3), descriptor, 4);
+        let descriptor = sample_descriptor("thread-1");
+        let mut session = CodexSession::new(CodexSessionId(4), descriptor, 4);
         session.record_pty_output(b"abc");
         session.record_pty_output(b"def");
         assert_eq!(session.pty_output.snapshot(), b"cdef");
@@ -881,14 +1139,42 @@ mod tests {
         assert_eq!(exit.code, Some(17));
     }
 
-    fn sample_descriptor() -> CodexResumeDescriptor {
+    #[test]
+    fn only_one_live_session_is_tracked_per_thread() {
+        let mut manager = CodexSessionManager::default();
+        let first_id = manager.insert_session(sample_descriptor("thread-1"));
+        manager
+            .sessions
+            .get_mut(&first_id)
+            .expect("session")
+            .mark_attached(11)
+            .expect("attach");
+
+        let second_id = manager.insert_session(sample_descriptor("thread-1"));
+        manager
+            .sessions
+            .get_mut(&second_id)
+            .expect("session")
+            .mark_exited(CodexExit {
+                success: true,
+                code: Some(0),
+            })
+            .expect("exit");
+
+        assert_eq!(
+            manager.live_session_id_for_thread("thread-1"),
+            Some(first_id)
+        );
+    }
+
+    fn sample_descriptor(thread_id: &str) -> CodexResumeDescriptor {
         CodexResumeDescriptor {
-            thread_id: "thread-1".to_string(),
+            thread_id: thread_id.to_string(),
             program: PathBuf::from("/usr/local/bin/codex"),
-            args: vec!["resume".to_string(), "thread-1".to_string()],
+            args: vec!["resume".to_string(), thread_id.to_string()],
             cwd: Some(PathBuf::from("/worktree")),
             env_overrides: Default::default(),
-            display_command: "codex resume thread-1".to_string(),
+            display_command: format!("codex resume {thread_id}"),
         }
     }
 

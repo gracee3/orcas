@@ -64,6 +64,7 @@ async fn run_app(
     codex_sessions: &mut CodexSessionManager,
 ) -> Result<()> {
     loop {
+        sync_codex_sessions(runtime, codex_sessions)?;
         runtime.process_all().await;
         terminal.draw(|frame| render::render(frame, runtime.state()))?;
 
@@ -88,6 +89,7 @@ async fn handle_key(
     codex_sessions: &mut CodexSessionManager,
     key: KeyEvent,
 ) -> Result<bool> {
+    sync_codex_sessions(runtime, codex_sessions)?;
     debug!(
         key = ?key,
         current_view = ?runtime.state().current_view,
@@ -104,9 +106,10 @@ async fn handle_key(
             match CodexResumeDescriptor::for_selected_thread(runtime.state()) {
                 Ok(descriptor) => {
                     match tokio::task::block_in_place(|| {
-                        codex_sessions.resume_attached(terminal, descriptor)
+                        codex_sessions.attach_or_resume(terminal, descriptor)
                     }) {
                         Ok(session_id) => {
+                            sync_codex_sessions(runtime, codex_sessions)?;
                             if let Some(message) = codex_sessions
                                 .session(session_id)
                                 .and_then(orcas_tui::codex::CodexSession::terminal_message)
@@ -135,6 +138,20 @@ async fn handle_key(
         }
     }
     Ok(false)
+}
+
+fn sync_codex_sessions(
+    runtime: &mut AppRuntime<OrcasDaemonBackend>,
+    codex_sessions: &mut CodexSessionManager,
+) -> Result<()> {
+    codex_sessions.drain_background_events()?;
+    let sessions = codex_sessions.thread_session_summaries();
+    if runtime.state().codex_sessions != sessions {
+        runtime.dispatch(Action::Event(
+            orcas_tui::app::UiEvent::CodexSessionsChanged { sessions },
+        ));
+    }
+    Ok(())
 }
 
 fn action_for_key(state: &orcas_tui::app::AppState, key: KeyEvent) -> Option<UserAction> {
