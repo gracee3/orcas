@@ -1,0 +1,43 @@
+.TH ORCAS-TUI 1 "2026-03-17" "Orcas 0.1.0" "User Commands"
+.SH NAME
+orcas-tui \- terminal UI for Orcas supervision
+.SH SYNOPSIS
+.B orcas-tui
+.SH DESCRIPTION
+The
+.B orcas-tui
+binary is the interactive terminal interface for Orcas. It connects to the
+local Orcas daemon over the Unix socket, renders the current supervision
+state, and issues control actions through the daemon rather than talking to
+Codex directly.
+
+The TUI is intended for local use on a Linux workstation or terminal session.
+It shares the same configuration, runtime state, and log locations as the rest
+of the Orcas suite.
+.SH FILES
+.TP
+.I ~/.config/orcas/config.toml
+User configuration file.
+
+.TP
+.I ~/.local/share/orcas/state.json
+Persistent workflow state.
+
+.TP
+.I ~/.local/share/orcas/logs/orcas-tui.log
+TUI log file.
+
+.TP
+.I ${XDG_RUNTIME_DIR}/orcas/orcasd.sock
+Local IPC socket used to reach the daemon.
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Controls tracing verbosity for the TUI.
+.SH SEE ALSO
+.BR orcas (1),
+.BR orcasd (1)
+.SH AUTHOR
+Orcas contributors.
+.SH LICENSE
+Licensed under the Apache License, Version 2.0.

@@ -1,0 +1,61 @@
+.TH ORCASD 1 "2026-03-17" "Orcas 0.1.0" "User Commands"
+.SH NAME
+orcasd \- Orcas daemon for local Codex supervision
+.SH SYNOPSIS
+.B orcasd
+.SH DESCRIPTION
+The
+.B orcasd
+binary is the long-lived Orcas daemon. It owns the local control plane,
+maintains workflow state, serves the Unix domain socket used by clients, and
+coordinates the upstream Codex worker connection.
+
+The daemon is normally managed by
+.BR systemd (1)
+through
+.I orcas-daemon.service
+and is designed to run as a local service rather than a public network daemon.
+
+Orcas records workstreams, work units, assignments, reports, decisions,
+proposals, thread state, and turn state in Orcas-native storage. The CLI and
+TUI connect to the daemon for inspection and control.
+.SH FILES
+.TP
+.I ~/.config/orcas/config.toml
+User configuration file.
+
+.TP
+.I ~/.local/share/orcas/state.json
+Persistent workflow state.
+
+.TP
+.I ~/.local/share/orcas/logs/orcasd.log
+Daemon log file.
+
+.TP
+.I ~/.local/share/orcas/logs/orcas.log
+Aggregate Orcas log file when enabled.
+
+.TP
+.I ${XDG_RUNTIME_DIR}/orcas/orcasd.sock
+Local IPC socket used by supervisor clients.
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Controls tracing verbosity for the daemon.
+
+.TP
+.B ORCAS_CODEX_BIN
+Overrides the path to the local Codex binary.
+
+.TP
+.B ORCAS_CODEX_LISTEN_URL
+Overrides the upstream Codex listen URL.
+.SH SEE ALSO
+.BR orcas (1),
+.BR orcas-tui (1),
+.BR systemd (1)
+.SH AUTHOR
+Orcas contributors.
+.SH LICENSE
+Licensed under the Apache License, Version 2.0.

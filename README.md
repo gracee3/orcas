@@ -23,7 +23,7 @@ What Orcas offers is not more automation for its own sake. It offers calmer auto
 
 A common pattern is to open a new workstream for an objective, create one or more threads beneath it, and let those threads map cleanly to separate worktrees or separate repositories. From there, the supervisor can inspect the live state from the CLI or move into the TUI when the work becomes more visual and parallel. That is where Orcas feels especially strong: several active threads, several possible next actions, and a local view that stays coherent as the system moves.
 
-The TUI is not only a dashboard. It is part of the control surface. It makes room for collaboration, turn review, next-turn approval, multiline steer authoring, interruption, and state inspection in a form that stays fast and readable even when the work is spread across multiple threads. Steer revisions remain visible in thread-local history instead of disappearing behind the latest pending decision. The CLI remains close at hand for scripted flows, quick checks, and direct operator actions.
+The TUI is not only a dashboard. It is part of the control surface. It makes room for collaboration, turn review, next-turn approval, deliberate no-action recording, manual refresh of idle-thread proposals, multiline steer authoring, interruption, and state inspection in a form that stays fast and readable even when the work is spread across multiple threads. Steer revisions remain visible in thread-local history instead of disappearing behind the latest pending decision. The CLI remains close at hand for scripted flows, quick checks, and direct operator actions, including authored steer creation, replacement, review, approve/send, reject, record-no-action, manual-refresh, and a cross-thread Codex decision queue/history surface for supervised threads.
 
 ## Quick start
 
@@ -33,7 +33,7 @@ On Linux, the easiest install path is a `.deb` package. If you are working from 
 sudo dpkg -i ./orcas_0.1.0_amd64.deb
 sudo systemctl enable --now orcas-daemon.service
 orcas supervisor doctor
-````
+```
 
 Or, from a tarball release:
 
@@ -90,7 +90,7 @@ meta:    ${XDG_RUNTIME_DIR:-~/.local/share/orcas/runtime}/orcas/orcasd.json
 
 ## Read more
 
-For a fuller technical picture, see [Architecture](docs/architecture.md), [Installation](docs/install.md), [Configuration](docs/configuration.md), and [Operations](docs/operations.md).
+For a fuller technical picture, see [Architecture](docs/architecture.md), [Collaboration](docs/collaboration.md), [Installation](docs/install.md), [Configuration](docs/configuration.md), and [Operations](docs/operations.md).
 
 ## License
 

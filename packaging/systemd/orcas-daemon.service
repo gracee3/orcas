@@ -1,0 +1,19 @@
+[Unit]
+Description=Orcas daemon
+Documentation=man:orcasd(1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/orcasd
+WorkingDirectory=/var/lib/orcas
+StateDirectory=orcas
+Environment=HOME=/var/lib/orcas
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
