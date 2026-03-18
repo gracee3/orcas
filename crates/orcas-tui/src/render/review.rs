@@ -14,7 +14,7 @@ use super::shared::{
 
 pub(super) fn render_surface(frame: &mut Frame<'_>, state: &AppState) {
     let header_height = if frame.area().height < 34 { 5 } else { 6 };
-    let footer_height = if frame.area().height < 34 { 8 } else { 10 };
+    let footer_height = if frame.area().height < 34 { 7 } else { 8 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -24,39 +24,39 @@ pub(super) fn render_surface(frame: &mut Frame<'_>, state: &AppState) {
         ])
         .split(frame.area());
 
-    let main = view_model::main_view(state);
-    let header = main.header.clone();
-    let footer = main.footer_prompt.clone();
-    render_header(frame, header, layout[0]);
-    render_body(frame, main, layout[1]);
-    frame.render_widget(render_footer(footer), layout[2]);
+    let review = view_model::review_view(state);
+    render_header(frame, review.header.clone(), layout[0]);
+    render_body(frame, review.queue, review.detail_panel, layout[1]);
+    frame.render_widget(render_footer(review.footer), layout[2]);
 }
 
-fn render_header(frame: &mut Frame<'_>, header: view_model::MainHeaderViewModel, area: Rect) {
+fn render_header(frame: &mut Frame<'_>, header: view_model::ReviewHeaderViewModel, area: Rect) {
     let sections = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(44),
+            Constraint::Percentage(42),
             Constraint::Length(20),
-            Constraint::Percentage(34),
+            Constraint::Percentage(38),
         ])
         .split(area);
     frame.render_widget(render_status_segments(header.status_segments), sections[0]);
     frame.render_widget(render_program_tabs(header.program_tabs), sections[1]);
-    frame.render_widget(render_toast(header.toast_lines), sections[2]);
+    frame.render_widget(render_summary(header.summary_lines), sections[2]);
 }
 
-fn render_body(frame: &mut Frame<'_>, main: view_model::MainViewModel, area: Rect) {
+fn render_body(
+    frame: &mut Frame<'_>,
+    queue: view_model::ReviewQueueViewModel,
+    detail_panel: view_model::PanelViewModel,
+    area: Rect,
+) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(area);
+    frame.render_widget(render_queue(queue, columns[0]), columns[0]);
     frame.render_widget(
-        render_hierarchy(main.hierarchy_list, columns[0]),
-        columns[0],
-    );
-    frame.render_widget(
-        render_panel_with_focus(main.detail_panel, false, false),
+        render_panel_with_focus(detail_panel, false, false),
         columns[1],
     );
 }
@@ -64,7 +64,6 @@ fn render_body(frame: &mut Frame<'_>, main: view_model::MainViewModel, area: Rec
 fn render_status_segments(
     segments: Vec<view_model::MainStatusSegmentViewModel>,
 ) -> Paragraph<'static> {
-    let mut lines = Vec::new();
     let mut spans = Vec::new();
     for (index, segment) in segments.into_iter().enumerate() {
         if index > 0 {
@@ -76,8 +75,7 @@ fn render_status_segments(
             status_text_style(&segment.value),
         ));
     }
-    lines.push(Line::from(spans));
-    Paragraph::new(Text::from(lines))
+    Paragraph::new(Text::from(vec![Line::from(spans)]))
         .block(
             Block::default()
                 .title(Line::styled("Status", panel_title_style(true)))
@@ -94,8 +92,6 @@ fn render_program_tabs(tabs: Vec<view_model::ProgramTabViewModel>) -> Paragraph<
             let mut spans = vec![Span::styled(
                 if tab.selected {
                     format!("[{}]", tab.label)
-                } else if tab.placeholder {
-                    format!("{}*", tab.label)
                 } else {
                     tab.label
                 },
@@ -119,7 +115,7 @@ fn render_program_tabs(tabs: Vec<view_model::ProgramTabViewModel>) -> Paragraph<
         .wrap(Wrap { trim: true })
 }
 
-fn render_toast(lines: Vec<String>) -> Paragraph<'static> {
+fn render_summary(lines: Vec<String>) -> Paragraph<'static> {
     Paragraph::new(Text::from(
         lines
             .into_iter()
@@ -128,50 +124,44 @@ fn render_toast(lines: Vec<String>) -> Paragraph<'static> {
     ))
     .block(
         Block::default()
-            .title(Line::styled("Updates", panel_title_style(true)))
+            .title(Line::styled("Review Summary", panel_title_style(true)))
             .borders(Borders::ALL)
             .border_style(focus_block_style(true)),
     )
     .wrap(Wrap { trim: true })
 }
 
-fn render_hierarchy(
-    list: view_model::MainHierarchyListViewModel,
-    area: Rect,
-) -> Paragraph<'static> {
+fn render_queue(queue: view_model::ReviewQueueViewModel, area: Rect) -> Paragraph<'static> {
     let visible_rows = area.height.saturating_sub(2) as usize;
-    let total_rows = list.rows.len();
-    let offset = list
+    let total_rows = queue.rows.len();
+    let offset = queue
         .scroll_offset
         .min(total_rows.saturating_sub(visible_rows));
-    let row_lines = if list.rows.is_empty() {
-        vec![Line::styled("No workstreams loaded.", metadata_style())]
+
+    let lines = if queue.rows.is_empty() {
+        vec![Line::styled(
+            "No review items are queued.",
+            metadata_style(),
+        )]
     } else {
-        list.rows
+        queue
+            .rows
             .into_iter()
             .skip(offset)
             .take(visible_rows.max(1))
             .map(|row| {
-                let marker = selection_marker(row.selected, true);
-                let indicator = if row.collapsible {
-                    if row.expanded { "▾" } else { "▸" }
-                } else {
-                    "•"
-                };
-                let indent = "  ".repeat(row.depth as usize);
                 let mut spans = vec![
                     Span::styled(
-                        marker.to_string(),
+                        selection_marker(row.selected, true),
                         selection_marker_style(row.selected, true),
                     ),
                     Span::styled(" ", metadata_style()),
-                    Span::styled(indent, metadata_style()),
-                    Span::styled(indicator.to_string(), metadata_style()),
+                    Span::styled(review_kind_label(row.kind), metadata_style()),
                     Span::styled(" ", metadata_style()),
                     Span::styled(row.label, row_style(row.selected, true)),
                 ];
                 for badge in row.badges {
-                    if badge.is_empty() {
+                    if badge == "-" || badge.is_empty() {
                         continue;
                     }
                     spans.push(Span::styled(" ", metadata_style()));
@@ -189,13 +179,14 @@ fn render_hierarchy(
             .collect::<Vec<_>>()
     };
 
-    Paragraph::new(Text::from(row_lines))
+    Paragraph::new(Text::from(lines))
         .block(
             Block::default()
                 .title(Line::styled(
                     format!(
-                        "Hierarchy {}",
-                        list.selected_index
+                        "Review Queue {}",
+                        queue
+                            .selected_index
                             .map(|index| format!("({}/{})", index + 1, total_rows.max(1)))
                             .unwrap_or_else(|| "(0/0)".to_string())
                     ),
@@ -207,21 +198,12 @@ fn render_hierarchy(
         .wrap(Wrap { trim: true })
 }
 
-fn render_footer(footer: view_model::MainFooterPromptViewModel) -> Paragraph<'static> {
-    let mut lines = vec![Line::styled("composer", label_style())];
-    lines.extend(
-        footer
-            .prompt_lines
-            .into_iter()
-            .map(|line| Line::styled(format!("  {line}"), value_style())),
-    );
-    lines.push(Line::styled(String::new(), metadata_style()));
-    lines.extend(
-        footer
-            .context_lines
-            .into_iter()
-            .map(|line| Line::styled(line, metadata_style())),
-    );
+fn render_footer(footer: view_model::ReviewFooterViewModel) -> Paragraph<'static> {
+    let mut lines = footer
+        .lines
+        .into_iter()
+        .map(|line| Line::styled(line, value_style()))
+        .collect::<Vec<_>>();
     lines.push(Line::styled(String::new(), metadata_style()));
     lines.push(Line::from(vec![
         Span::styled("keys: ", label_style()),
@@ -235,4 +217,13 @@ fn render_footer(footer: view_model::MainFooterPromptViewModel) -> Paragraph<'st
                 .border_style(focus_block_style(true)),
         )
         .wrap(Wrap { trim: true })
+}
+
+fn review_kind_label(kind: view_model::ReviewRowKind) -> &'static str {
+    match kind {
+        view_model::ReviewRowKind::Proposal => "proposal",
+        view_model::ReviewRowKind::Decision => "decision",
+        view_model::ReviewRowKind::Failure => "failure",
+        view_model::ReviewRowKind::ReviewRequired => "review",
+    }
 }

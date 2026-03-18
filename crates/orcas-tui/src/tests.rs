@@ -2,7 +2,7 @@ use chrono::Utc;
 
 use crate::app::{
     BannerLevel, CollaborationFocus, DaemonConnectionPhase, DaemonLifecycleState,
-    MainHierarchySelection, ProgramView, TopLevelView, UiEvent, UserAction,
+    MainHierarchySelection, ProgramView, ReviewSelection, TopLevelView, UiEvent, UserAction,
 };
 use crate::backend::BackendCommand;
 use crate::codex::{
@@ -649,6 +649,19 @@ fn sample_main_surface_snapshot() -> ipc::StateSnapshot {
             )
         },
     ];
+    snapshot
+}
+
+fn sample_review_snapshot() -> ipc::StateSnapshot {
+    let mut snapshot = sample_main_surface_snapshot();
+    snapshot.collaboration.supervisor_turn_decisions.push(
+        sample_supervisor_turn_decision_summary_with_kind(
+            "thread-1",
+            orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman,
+            orcas_core::SupervisorTurnDecisionKind::NextTurn,
+            orcas_core::SupervisorTurnProposalKind::Bootstrap,
+        ),
+    );
     snapshot
 }
 
@@ -3728,6 +3741,159 @@ async fn snapshot_refresh_keeps_main_selection_stable() {
     );
     let rendered = harness.render_text(160, 42);
     assert!(rendered.contains("Hierarchy"), "{rendered}");
+}
+
+#[tokio::test]
+async fn review_surface_renders_queue_detail_and_header_counts() {
+    let mut harness = AppHarness::new(sample_review_snapshot()).await.unwrap();
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-1"))
+        .await;
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-2"))
+        .await;
+    harness
+        .dispatch(UserAction::ShowProgramView(ProgramView::Review))
+        .await;
+    harness.dispatch(UserAction::Refresh).await;
+
+    let rendered = harness.render_text(160, 42);
+    assert!(rendered.contains("Review Queue"), "{rendered}");
+    assert!(rendered.contains("Review Summary"), "{rendered}");
+    assert!(rendered.contains("Review Actions"), "{rendered}");
+    assert!(rendered.contains("pending_decisions=1"), "{rendered}");
+    assert!(rendered.contains("open_proposals=1"), "{rendered}");
+    assert!(rendered.contains("failures=1"), "{rendered}");
+}
+
+#[tokio::test]
+async fn review_queue_contains_decision_proposal_failure_and_review_rows() {
+    let mut harness = AppHarness::new(sample_review_snapshot()).await.unwrap();
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-1"))
+        .await;
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-2"))
+        .await;
+    harness
+        .dispatch(UserAction::ShowProgramView(ProgramView::Review))
+        .await;
+    harness.dispatch(UserAction::Refresh).await;
+
+    let review = harness.review_queue_vm();
+    assert!(
+        review
+            .rows
+            .iter()
+            .any(|row| row.kind == view_model::ReviewRowKind::Decision)
+    );
+    assert!(
+        review
+            .rows
+            .iter()
+            .any(|row| row.kind == view_model::ReviewRowKind::Proposal)
+    );
+    assert!(
+        review
+            .rows
+            .iter()
+            .any(|row| row.kind == view_model::ReviewRowKind::Failure)
+    );
+    assert!(
+        review
+            .rows
+            .iter()
+            .any(|row| row.kind == view_model::ReviewRowKind::ReviewRequired)
+    );
+}
+
+#[tokio::test]
+async fn review_selection_updates_detail_and_queue_selection() {
+    let mut harness = AppHarness::new(sample_review_snapshot()).await.unwrap();
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-1"))
+        .await;
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-2"))
+        .await;
+    harness
+        .dispatch(UserAction::ShowProgramView(ProgramView::Review))
+        .await;
+    harness.dispatch(UserAction::Refresh).await;
+
+    let initial = harness.review_vm();
+    assert!(initial.detail_panel.title.contains("Decision"));
+    assert_eq!(
+        harness.state().review_view.selected,
+        Some(ReviewSelection::Decision {
+            decision_id: "std-1".to_string(),
+        })
+    );
+
+    harness.dispatch(UserAction::SelectNextInView).await;
+    let proposal = harness.review_vm();
+    assert!(proposal.detail_panel.title.contains("Proposal"));
+
+    harness.dispatch(UserAction::SelectNextInView).await;
+    let failure = harness.review_vm();
+    assert!(failure.detail_panel.title.contains("Failure"));
+
+    harness.dispatch(UserAction::SelectNextInView).await;
+    let review_required = harness.review_vm();
+    assert!(review_required.detail_panel.title.contains("Review"));
+}
+
+#[tokio::test]
+async fn tab_switching_between_main_and_review_is_stable() {
+    let mut harness = AppHarness::new(sample_review_snapshot()).await.unwrap();
+    harness
+        .dispatch(UserAction::ShowProgramView(ProgramView::Review))
+        .await;
+    assert_eq!(harness.state().main_view.program_view, ProgramView::Review);
+    let review = harness.render_text(160, 42);
+    assert!(review.contains("Review Queue"), "{review}");
+
+    harness.dispatch(UserAction::CycleProgramView).await;
+    assert_eq!(harness.state().main_view.program_view, ProgramView::Main);
+    let main = harness.render_text(160, 42);
+    assert!(main.contains("Hierarchy"), "{main}");
+    assert!(!main.contains("Review Queue"), "{main}");
+}
+
+#[tokio::test]
+async fn review_selection_survives_snapshot_refresh() {
+    let mut harness = AppHarness::new(sample_review_snapshot()).await.unwrap();
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-1"))
+        .await;
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-2"))
+        .await;
+    harness
+        .dispatch(UserAction::ShowProgramView(ProgramView::Review))
+        .await;
+    harness.dispatch(UserAction::Refresh).await;
+    harness.dispatch(UserAction::SelectNextInView).await;
+    assert_eq!(
+        harness.state().review_view.selected,
+        Some(ReviewSelection::Proposal {
+            work_unit_id: "wu-1".to_string(),
+            proposal_id: "proposal-1".to_string(),
+        })
+    );
+
+    harness.replace_snapshot(sample_review_snapshot()).await;
+    harness.dispatch(UserAction::Refresh).await;
+
+    assert_eq!(
+        harness.state().review_view.selected,
+        Some(ReviewSelection::Proposal {
+            work_unit_id: "wu-1".to_string(),
+            proposal_id: "proposal-1".to_string(),
+        })
+    );
+    let rendered = harness.render_text(160, 42);
+    assert!(rendered.contains("Review Queue"), "{rendered}");
 }
 
 #[tokio::test]

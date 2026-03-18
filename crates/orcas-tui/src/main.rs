@@ -13,7 +13,7 @@ use crossterm::terminal::{
 use tracing::{debug, info};
 
 use orcas_core::{AppPaths, init_file_logger};
-use orcas_tui::app::{Action, TopLevelView, UserAction};
+use orcas_tui::app::{Action, ProgramView, TopLevelView, UserAction};
 use orcas_tui::backend::OrcasDaemonBackend;
 use orcas_tui::codex::{
     CodexResumeDescriptor, CodexSessionManager, DEFAULT_PTY_RING_BUFFER_CAPACITY, OrcasTerminal,
@@ -175,9 +175,11 @@ fn action_for_key(state: &orcas_tui::app::AppState, key: KeyEvent) -> Option<Use
     }
 
     let current_view = state.current_view;
-    let in_main_view = current_view == TopLevelView::Overview;
+    let in_main_view =
+        current_view == TopLevelView::Overview && state.main_view.program_view == ProgramView::Main;
     let in_supervisor_view = current_view == TopLevelView::Supervisor;
     let in_threads_view = current_view == TopLevelView::Threads;
+    let in_overview_program = current_view == TopLevelView::Overview;
     match key.code {
         KeyCode::Char('r') => Some(UserAction::Refresh),
         KeyCode::Char('?') => Some(UserAction::ToggleHelp),
@@ -207,9 +209,10 @@ fn action_for_key(state: &orcas_tui::app::AppState, key: KeyEvent) -> Option<Use
         KeyCode::Up => Some(UserAction::SelectPreviousInView),
         KeyCode::Left if in_main_view => Some(UserAction::CollapseSelectedInView),
         KeyCode::Right if in_main_view => Some(UserAction::ExpandSelectedInView),
+        KeyCode::Left | KeyCode::Right if in_overview_program => None,
         KeyCode::Left => Some(UserAction::ShowView(current_view.previous())),
         KeyCode::Right => Some(UserAction::ShowView(current_view.next())),
-        KeyCode::Tab if in_main_view => Some(UserAction::CycleProgramView),
+        KeyCode::Tab if in_overview_program => Some(UserAction::CycleProgramView),
         KeyCode::Tab if current_view == TopLevelView::Collaboration => {
             Some(UserAction::CycleCollaborationFocus)
         }
@@ -247,16 +250,39 @@ mod tests {
     #[test]
     fn arrow_keys_drive_selection_and_tab_switches_view_specific_focus() {
         assert_eq!(
-            action_for_key(&state_for_view(TopLevelView::Overview), key(KeyCode::Left)),
+            action_for_key(
+                &state_for_overview_program(ProgramView::Main),
+                key(KeyCode::Left)
+            ),
             Some(UserAction::CollapseSelectedInView)
         );
         assert_eq!(
-            action_for_key(&state_for_view(TopLevelView::Overview), key(KeyCode::Right)),
+            action_for_key(
+                &state_for_overview_program(ProgramView::Main),
+                key(KeyCode::Right)
+            ),
             Some(UserAction::ExpandSelectedInView)
         );
         assert_eq!(
-            action_for_key(&state_for_view(TopLevelView::Overview), key(KeyCode::Tab)),
+            action_for_key(
+                &state_for_overview_program(ProgramView::Main),
+                key(KeyCode::Tab)
+            ),
             Some(UserAction::CycleProgramView)
+        );
+        assert_eq!(
+            action_for_key(
+                &state_for_overview_program(ProgramView::Review),
+                key(KeyCode::Left)
+            ),
+            None
+        );
+        assert_eq!(
+            action_for_key(
+                &state_for_overview_program(ProgramView::Review),
+                key(KeyCode::Right)
+            ),
+            None
         );
         assert_eq!(
             action_for_key(&state_for_view(TopLevelView::Threads), key(KeyCode::Down)),
@@ -410,6 +436,12 @@ mod tests {
             current_view: view,
             ..Default::default()
         }
+    }
+
+    fn state_for_overview_program(program_view: ProgramView) -> orcas_tui::app::AppState {
+        let mut state = state_for_view(TopLevelView::Overview);
+        state.main_view.program_view = program_view;
+        state
     }
 
     fn key(code: KeyCode) -> KeyEvent {

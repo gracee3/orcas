@@ -1,6 +1,7 @@
 mod collaboration;
 mod main;
 mod overview;
+mod review;
 mod shared;
 mod shell;
 mod supervisor;
@@ -9,11 +10,14 @@ mod threads;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 
-use crate::app::{AppState, TopLevelView};
+use crate::app::{AppState, ProgramView, TopLevelView};
 
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     if state.current_view == TopLevelView::Overview {
-        main::render_surface(frame, state);
+        match state.main_view.program_view {
+            ProgramView::Main => main::render_surface(frame, state),
+            ProgramView::Review => review::render_surface(frame, state),
+        }
         return;
     }
 

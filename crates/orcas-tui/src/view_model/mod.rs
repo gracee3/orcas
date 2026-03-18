@@ -1,6 +1,7 @@
 pub mod collaboration;
 pub mod main;
 pub mod overview;
+pub mod review;
 pub mod shared;
 pub mod threads;
 
@@ -18,6 +19,10 @@ pub use main::{
     main_hierarchy_list, main_view,
 };
 pub use overview::{OverviewViewModel, overview_view};
+pub use review::{
+    ReviewFooterViewModel, ReviewHeaderViewModel, ReviewQueueRowViewModel, ReviewQueueViewModel,
+    ReviewRowKind, ReviewViewModel, review_queue, review_view,
+};
 pub use shared::{
     ConnectionStatusViewModel, EventLogViewModel, PanelViewModel, StatusBannerViewModel,
     collaboration_focus_label, connection_status, event_log, status_banner,

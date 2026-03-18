@@ -5,6 +5,7 @@ use orcas_core::{ConnectionState, ipc};
 
 const MAX_LOG_ENTRIES: usize = 64;
 const MAIN_HIERARCHY_SCROLL_WINDOW: usize = 12;
+const REVIEW_QUEUE_SCROLL_WINDOW: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TopLevelView {
@@ -83,6 +84,25 @@ pub enum MainHierarchySelection {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewSelection {
+    Proposal {
+        work_unit_id: String,
+        proposal_id: String,
+    },
+    Decision {
+        decision_id: String,
+    },
+    Failure {
+        work_unit_id: String,
+        proposal_id: String,
+    },
+    ReviewRequired {
+        work_unit_id: String,
+        report_id: String,
+    },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MainViewState {
     pub program_view: ProgramView,
@@ -91,6 +111,12 @@ pub struct MainViewState {
     pub expanded_work_units: BTreeSet<String>,
     pub scroll_offset: usize,
     pub initialized: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewViewState {
+    pub selected: Option<ReviewSelection>,
+    pub scroll_offset: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -130,6 +156,7 @@ pub struct AppState {
     pub codex_sessions: HashMap<String, CodexThreadSessions>,
     pub current_view: TopLevelView,
     pub main_view: MainViewState,
+    pub review_view: ReviewViewState,
     pub selected_thread_id: Option<String>,
     pub selected_workstream_id: Option<String>,
     pub selected_work_unit_id: Option<String>,
@@ -523,12 +550,16 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
         UserAction::CycleProgramView => {
             if state.current_view == TopLevelView::Overview {
                 state.main_view.program_view = state.main_view.program_view.next();
+                reconcile_main_view(state);
+                return activate_program_view(state);
             }
             Vec::new()
         }
         UserAction::ShowProgramView(view) => {
             if state.current_view == TopLevelView::Overview {
                 state.main_view.program_view = view;
+                reconcile_main_view(state);
+                return activate_program_view(state);
             }
             Vec::new()
         }
@@ -1277,7 +1308,10 @@ fn select_thread(state: &mut AppState, thread_id: String) -> Vec<Effect> {
 
 fn select_relative_in_view(state: &mut AppState, delta: isize) -> Vec<Effect> {
     match state.current_view {
-        TopLevelView::Overview => select_relative_main_hierarchy(state, delta),
+        TopLevelView::Overview => match state.main_view.program_view {
+            ProgramView::Main => select_relative_main_hierarchy(state, delta),
+            ProgramView::Review => select_relative_review_queue(state, delta),
+        },
         TopLevelView::Threads => select_relative_thread(state, delta),
         TopLevelView::Collaboration => match state.collaboration_focus {
             CollaborationFocus::Workstreams => select_relative_workstream(state, delta),
@@ -1289,15 +1323,38 @@ fn select_relative_in_view(state: &mut AppState, delta: isize) -> Vec<Effect> {
 
 fn expand_selected_in_view(state: &mut AppState) -> Vec<Effect> {
     match state.current_view {
-        TopLevelView::Overview => expand_selected_main_hierarchy(state),
+        TopLevelView::Overview => match state.main_view.program_view {
+            ProgramView::Main => expand_selected_main_hierarchy(state),
+            ProgramView::Review => Vec::new(),
+        },
         _ => Vec::new(),
     }
 }
 
 fn collapse_selected_in_view(state: &mut AppState) -> Vec<Effect> {
     match state.current_view {
-        TopLevelView::Overview => collapse_selected_main_hierarchy(state),
+        TopLevelView::Overview => match state.main_view.program_view {
+            ProgramView::Main => collapse_selected_main_hierarchy(state),
+            ProgramView::Review => Vec::new(),
+        },
         _ => Vec::new(),
+    }
+}
+
+fn activate_program_view(state: &mut AppState) -> Vec<Effect> {
+    match state.main_view.program_view {
+        ProgramView::Main => state
+            .main_view
+            .selected
+            .clone()
+            .map(|selection| apply_main_selection(state, selection, false, true))
+            .unwrap_or_default(),
+        ProgramView::Review => state
+            .review_view
+            .selected
+            .clone()
+            .map(|selection| apply_review_selection(state, selection, true))
+            .unwrap_or_default(),
     }
 }
 
@@ -1342,6 +1399,7 @@ fn reconcile_main_view(state: &mut AppState) {
     if visible_rows.is_empty() {
         state.main_view.selected = None;
         state.main_view.scroll_offset = 0;
+        reconcile_review_view(state);
         return;
     }
 
@@ -1353,6 +1411,124 @@ fn reconcile_main_view(state: &mut AppState) {
         .or_else(|| preferred_main_selection(state))
         .unwrap_or_else(|| visible_rows[0].clone());
     restore_main_selection(state, selection);
+    reconcile_review_view(state);
+}
+
+fn reconcile_review_view(state: &mut AppState) {
+    let visible_rows = review_queue_selections(state);
+    if visible_rows.is_empty() {
+        state.review_view.selected = None;
+        state.review_view.scroll_offset = 0;
+        return;
+    }
+
+    let selection = state
+        .review_view
+        .selected
+        .clone()
+        .filter(|selected| visible_rows.contains(selected))
+        .unwrap_or_else(|| visible_rows[0].clone());
+    restore_review_selection(state, selection);
+}
+
+pub(crate) fn review_queue_selections(state: &AppState) -> Vec<ReviewSelection> {
+    let mut queue = state
+        .collaboration
+        .supervisor_turn_decisions
+        .iter()
+        .filter(|decision| {
+            decision.status == orcas_core::SupervisorTurnDecisionStatus::ProposedToHuman
+                || decision.open
+        })
+        .map(|decision| {
+            (
+                0u8,
+                decision.created_at,
+                ReviewSelection::Decision {
+                    decision_id: decision.decision_id.clone(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    queue.extend(
+        state
+            .collaboration
+            .work_units
+            .iter()
+            .filter_map(|work_unit| {
+                let proposal = work_unit.proposal.as_ref()?;
+                match proposal.latest_status {
+                    orcas_core::SupervisorProposalStatus::Open => Some((
+                        1u8,
+                        proposal.latest_created_at,
+                        ReviewSelection::Proposal {
+                            work_unit_id: work_unit.id.clone(),
+                            proposal_id: proposal.latest_proposal_id.clone(),
+                        },
+                    )),
+                    orcas_core::SupervisorProposalStatus::GenerationFailed => Some((
+                        2u8,
+                        proposal.latest_created_at,
+                        ReviewSelection::Failure {
+                            work_unit_id: work_unit.id.clone(),
+                            proposal_id: proposal.latest_proposal_id.clone(),
+                        },
+                    )),
+                    _ => None,
+                }
+            }),
+    );
+
+    queue.extend(
+        state
+            .collaboration
+            .reports
+            .iter()
+            .filter(|report| report.needs_supervisor_review)
+            .map(|report| {
+                (
+                    3u8,
+                    report.created_at,
+                    ReviewSelection::ReviewRequired {
+                        work_unit_id: report.work_unit_id.clone(),
+                        report_id: report.id.clone(),
+                    },
+                )
+            }),
+    );
+
+    queue.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| {
+                review_selection_sort_key(&left.2).cmp(&review_selection_sort_key(&right.2))
+            })
+    });
+
+    queue
+        .into_iter()
+        .map(|(_, _, selection)| selection)
+        .collect()
+}
+
+fn review_selection_sort_key(selection: &ReviewSelection) -> String {
+    match selection {
+        ReviewSelection::Proposal {
+            work_unit_id,
+            proposal_id,
+        } => format!("proposal/{work_unit_id}/{proposal_id}"),
+        ReviewSelection::Decision { decision_id } => format!("decision/{decision_id}"),
+        ReviewSelection::Failure {
+            work_unit_id,
+            proposal_id,
+        } => format!("failure/{work_unit_id}/{proposal_id}"),
+        ReviewSelection::ReviewRequired {
+            work_unit_id,
+            report_id,
+        } => format!("review/{work_unit_id}/{report_id}"),
+    }
 }
 
 fn preferred_main_selection(state: &AppState) -> Option<MainHierarchySelection> {
@@ -1501,6 +1677,28 @@ fn select_relative_main_hierarchy(state: &mut AppState, delta: isize) -> Vec<Eff
     set_main_selection(state, visible_rows[next_index].clone())
 }
 
+fn select_relative_review_queue(state: &mut AppState, delta: isize) -> Vec<Effect> {
+    let visible_rows = review_queue_selections(state);
+    if visible_rows.is_empty() {
+        state.review_view.selected = None;
+        state.review_view.scroll_offset = 0;
+        return Vec::new();
+    }
+
+    let current_index = state
+        .review_view
+        .selected
+        .as_ref()
+        .and_then(|selected| visible_rows.iter().position(|row| row == selected))
+        .unwrap_or(0);
+    let next_index = if delta.is_negative() {
+        current_index.saturating_sub(delta.unsigned_abs())
+    } else {
+        (current_index + delta as usize).min(visible_rows.len().saturating_sub(1))
+    };
+    set_review_selection(state, visible_rows[next_index].clone())
+}
+
 fn expand_selected_main_hierarchy(state: &mut AppState) -> Vec<Effect> {
     let Some(selected) = state.main_view.selected.clone() else {
         return Vec::new();
@@ -1591,6 +1789,14 @@ fn restore_main_selection(state: &mut AppState, selection: MainHierarchySelectio
     let _ = apply_main_selection(state, selection, false, false);
 }
 
+fn set_review_selection(state: &mut AppState, selection: ReviewSelection) -> Vec<Effect> {
+    apply_review_selection(state, selection, true)
+}
+
+fn restore_review_selection(state: &mut AppState, selection: ReviewSelection) {
+    let _ = apply_review_selection(state, selection, false);
+}
+
 fn apply_main_selection(
     state: &mut AppState,
     selection: MainHierarchySelection,
@@ -1619,6 +1825,33 @@ fn apply_main_selection(
         MainHierarchySelection::Workstream { .. } => {
             load_selected_work_unit_detail_if_needed(state)
         }
+    }
+}
+
+fn apply_review_selection(
+    state: &mut AppState,
+    selection: ReviewSelection,
+    load_effects: bool,
+) -> Vec<Effect> {
+    state.review_view.selected = Some(selection.clone());
+    let visible_rows = review_queue_selections(state);
+    if let Some(selected_index) = visible_rows.iter().position(|row| row == &selection) {
+        adjust_review_scroll(state, selected_index, visible_rows.len());
+    } else {
+        state.review_view.scroll_offset = 0;
+    }
+
+    if !load_effects {
+        return Vec::new();
+    }
+
+    match selection {
+        ReviewSelection::Proposal { work_unit_id, .. }
+        | ReviewSelection::Failure { work_unit_id, .. }
+        | ReviewSelection::ReviewRequired { work_unit_id, .. } => {
+            load_work_unit_detail_if_needed_for(state, &work_unit_id)
+        }
+        ReviewSelection::Decision { .. } => Vec::new(),
     }
 }
 
@@ -1705,6 +1938,19 @@ fn adjust_main_scroll(state: &mut AppState, selected_index: usize, row_count: us
     }
     let max_offset = row_count.saturating_sub(MAIN_HIERARCHY_SCROLL_WINDOW);
     state.main_view.scroll_offset = state.main_view.scroll_offset.min(max_offset);
+}
+
+fn adjust_review_scroll(state: &mut AppState, selected_index: usize, row_count: usize) {
+    if selected_index < state.review_view.scroll_offset {
+        state.review_view.scroll_offset = selected_index;
+    } else {
+        let visible_end = state.review_view.scroll_offset + REVIEW_QUEUE_SCROLL_WINDOW;
+        if selected_index >= visible_end {
+            state.review_view.scroll_offset = selected_index + 1 - REVIEW_QUEUE_SCROLL_WINDOW;
+        }
+    }
+    let max_offset = row_count.saturating_sub(REVIEW_QUEUE_SCROLL_WINDOW);
+    state.review_view.scroll_offset = state.review_view.scroll_offset.min(max_offset);
 }
 
 fn reconcile_thread_selection(state: &mut AppState, preferred_thread_id: Option<&str>) {
@@ -1853,11 +2099,7 @@ fn load_selected_work_unit_detail_if_needed(state: &AppState) -> Vec<Effect> {
     let Some(work_unit_id) = state.selected_work_unit_id.clone() else {
         return Vec::new();
     };
-    if state.work_unit_details.contains_key(&work_unit_id) {
-        Vec::new()
-    } else {
-        vec![Effect::LoadWorkUnitDetail { work_unit_id }]
-    }
+    load_work_unit_detail_if_needed_for(state, &work_unit_id)
 }
 
 fn load_selected_work_unit_detail(state: &AppState) -> Vec<Effect> {
@@ -1867,6 +2109,16 @@ fn load_selected_work_unit_detail(state: &AppState) -> Vec<Effect> {
         .map(|work_unit_id| Effect::LoadWorkUnitDetail { work_unit_id })
         .into_iter()
         .collect()
+}
+
+fn load_work_unit_detail_if_needed_for(state: &AppState, work_unit_id: &str) -> Vec<Effect> {
+    if state.work_unit_details.contains_key(work_unit_id) {
+        Vec::new()
+    } else {
+        vec![Effect::LoadWorkUnitDetail {
+            work_unit_id: work_unit_id.to_string(),
+        }]
+    }
 }
 
 fn ensure_thread_detail(state: &mut AppState, thread_id: &str) {

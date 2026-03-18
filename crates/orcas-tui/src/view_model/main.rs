@@ -153,7 +153,7 @@ fn main_header(state: &AppState) -> MainHeaderViewModel {
                 program_view: ProgramView::Review,
                 label: "Review".to_string(),
                 selected: state.main_view.program_view == ProgramView::Review,
-                placeholder: true,
+                placeholder: false,
             },
         ],
         toast_lines,
@@ -278,34 +278,25 @@ fn hierarchy_rows(state: &AppState) -> Vec<MainHierarchyRowViewModel> {
 }
 
 fn main_detail_panel(state: &AppState) -> PanelViewModel {
-    match state.main_view.program_view {
-        ProgramView::Main => match state.main_view.selected.as_ref() {
-            Some(MainHierarchySelection::Workstream { .. }) => {
-                let detail = workstream_detail(state);
-                PanelViewModel {
-                    title: detail.title,
-                    lines: detail.lines,
-                }
+    match state.main_view.selected.as_ref() {
+        Some(MainHierarchySelection::Workstream { .. }) => {
+            let detail = workstream_detail(state);
+            PanelViewModel {
+                title: detail.title,
+                lines: detail.lines,
             }
-            Some(MainHierarchySelection::WorkUnit { .. }) => {
-                let detail = collaboration_detail(state);
-                PanelViewModel {
-                    title: detail.title,
-                    lines: detail.lines,
-                }
+        }
+        Some(MainHierarchySelection::WorkUnit { .. }) => {
+            let detail = collaboration_detail(state);
+            PanelViewModel {
+                title: detail.title,
+                lines: detail.lines,
             }
-            Some(MainHierarchySelection::Thread { .. }) => thread_summary(state),
-            None => PanelViewModel {
-                title: "Selection Detail".to_string(),
-                lines: vec!["No hierarchy row selected.".to_string()],
-            },
-        },
-        ProgramView::Review => PanelViewModel {
-            title: "Review".to_string(),
-            lines: vec![
-                "Review and decision workflows move into a separate program surface in a later pass."
-                    .to_string(),
-            ],
+        }
+        Some(MainHierarchySelection::Thread { .. }) => thread_summary(state),
+        None => PanelViewModel {
+            title: "Selection Detail".to_string(),
+            lines: vec!["No hierarchy row selected.".to_string()],
         },
     }
 }

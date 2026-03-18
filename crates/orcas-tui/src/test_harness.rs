@@ -133,6 +133,14 @@ impl AppHarness {
         view_model::main_hierarchy_list(self.runtime.state())
     }
 
+    pub fn review_vm(&self) -> view_model::ReviewViewModel {
+        view_model::review_view(self.runtime.state())
+    }
+
+    pub fn review_queue_vm(&self) -> view_model::ReviewQueueViewModel {
+        view_model::review_queue(self.runtime.state())
+    }
+
     pub fn connection_vm(&self) -> view_model::ConnectionStatusViewModel {
         view_model::connection_status(self.runtime.state())
     }
