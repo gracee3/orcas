@@ -9,11 +9,11 @@ use tokio::process::Command;
 use tokio::time::{Instant, sleep, timeout};
 
 use orcas_core::AppPaths;
-use orcas_daemon::OrcasIpcClient;
+use orcasd::OrcasIpcClient;
 
 fn temp_root(test_name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "orcas-daemon-it-{test_name}-{}-{}",
+        "orcasd-it-{test_name}-{}-{}",
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     ))

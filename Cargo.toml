@@ -2,8 +2,8 @@
 members = [
     "crates/orcas-core",
     "crates/orcas-codex",
-    "crates/orcas-daemon",
-    "crates/orcas-supervisor",
+    "crates/orcasd",
+    "crates/orcas",
     "crates/orcas-tui",
 ]
 resolver = "2"

@@ -30,7 +30,7 @@ Use SQLite as the local durable store. Treat the SQLite event log as the canonic
   - command and event enums
   - projection/query DTOs
   - store traits that do not assume SQLite outside the trait boundary
-- `orcas-daemon`
+- `orcasd`
   - SQLite-backed store implementation
   - command handlers
   - projector
@@ -729,7 +729,7 @@ The intended later evolution is straightforward:
 - add store traits for command append, event append, projection update, and query
 - add `state_db_file` path alongside the current JSON state path
 
-### Pass 2: SQLite Store In `orcas-daemon`
+### Pass 2: SQLite Store In `orcasd`
 
 - introduce a minimal SQLite dependency, preferably `rusqlite`
 - add migrations

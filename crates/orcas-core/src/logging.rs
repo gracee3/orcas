@@ -100,7 +100,7 @@ pub fn component_label(component: &str) -> Cow<'static, str> {
     match component {
         "orcas-tui" | "tui" => Cow::Borrowed("tui"),
         "orcasd" | "orcas-daemon" | "daemon" => Cow::Borrowed("daemon"),
-        "orcas-supervisor" | "supervisor" => Cow::Borrowed("supervisor"),
+        "orcas" | "orcas-supervisor" | "supervisor" => Cow::Borrowed("supervisor"),
         "app-server" | "codex-app-server" => Cow::Borrowed("app-server"),
         other if other.contains("tui") => Cow::Borrowed("tui"),
         other if other.contains("daemon") => Cow::Borrowed("daemon"),
@@ -195,6 +195,8 @@ mod tests {
     fn component_labels_are_normalized() {
         assert_eq!(component_label("orcas-tui").as_ref(), "tui");
         assert_eq!(component_label("orcasd").as_ref(), "daemon");
+        assert_eq!(component_label("orcas-daemon").as_ref(), "daemon");
+        assert_eq!(component_label("orcas").as_ref(), "supervisor");
         assert_eq!(component_label("orcas-supervisor").as_ref(), "supervisor");
         assert_eq!(component_label("app-server").as_ref(), "app-server");
         assert_eq!(component_label("codex-app-server").as_ref(), "app-server");

@@ -9970,7 +9970,7 @@ mod tests {
   "mode_payload": {
     "kind": "implement",
     "semantic_changes": ["root cause isolated"],
-    "tests_run": ["cargo test -p orcas-daemon"],
+    "tests_run": ["cargo test -p orcasd"],
     "rough_edges": []
   }
 }
@@ -13577,8 +13577,7 @@ ORCAS_REPORT_END"#
 
     #[tokio::test]
     async fn recorded_no_action_and_suppression_persist_across_restart() {
-        let base =
-            std::env::temp_dir().join(format!("orcas-supervisor-no-action-{}", Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("orcas-no-action-{}", Uuid::new_v4()));
         let service = test_service_at(base.clone()).await;
         let mut thread = sample_thread("thread-idle", "live_observed", 200);
         thread.summary.last_seen_turn_id = Some("turn-1".to_string());
@@ -15722,8 +15721,7 @@ ORCAS_REPORT_END"#
 
     #[tokio::test]
     async fn supervisor_decisions_persist_across_restart() {
-        let base =
-            std::env::temp_dir().join(format!("orcas-supervisor-decision-{}", Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("orcas-decision-{}", Uuid::new_v4()));
         let service = test_service_at(base.clone()).await;
         let thread = sample_thread("thread-idle", "live_observed", 200);
         let (workstream, work_unit) =
@@ -15865,8 +15863,7 @@ ORCAS_REPORT_END"#
 
     #[tokio::test]
     async fn interrupt_decisions_persist_across_restart() {
-        let base =
-            std::env::temp_dir().join(format!("orcas-supervisor-interrupt-{}", Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("orcas-interrupt-{}", Uuid::new_v4()));
         let service = test_service_at(base.clone()).await;
         let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
         let (workstream, work_unit) =
@@ -15908,7 +15905,7 @@ ORCAS_REPORT_END"#
 
     #[tokio::test]
     async fn steer_decisions_persist_across_restart() {
-        let base = std::env::temp_dir().join(format!("orcas-supervisor-steer-{}", Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("orcas-steer-{}", Uuid::new_v4()));
         let service = test_service_at(base.clone()).await;
         let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
         let (workstream, work_unit) =
@@ -15955,8 +15952,7 @@ ORCAS_REPORT_END"#
 
     #[tokio::test]
     async fn replaced_steer_revision_chain_persists_across_restart() {
-        let base =
-            std::env::temp_dir().join(format!("orcas-supervisor-steer-chain-{}", Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("orcas-steer-chain-{}", Uuid::new_v4()));
         let service = test_service_at(base.clone()).await;
         let thread = sample_active_thread("thread-active", "live_observed", 200, "turn-live");
         let (workstream, work_unit) =

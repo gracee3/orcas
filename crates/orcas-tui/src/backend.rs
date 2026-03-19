@@ -9,9 +9,7 @@ use tokio::sync::{Mutex, mpsc};
 use orcas_core::{
     AppPaths, Assignment, Decision, Report, SupervisorTurnDecision, WorkUnit, authority, ipc,
 };
-use orcas_daemon::{
-    OrcasDaemonLaunch, OrcasDaemonProcessManager, OrcasIpcClient, OrcasRuntimeOverrides,
-};
+use orcasd::{OrcasDaemonLaunch, OrcasDaemonProcessManager, OrcasIpcClient, OrcasRuntimeOverrides};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendCommand {

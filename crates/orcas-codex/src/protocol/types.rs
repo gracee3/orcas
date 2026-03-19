@@ -94,7 +94,7 @@ impl Default for ThreadStartParams {
             approvals_reviewer: None,
             sandbox: None,
             config: None,
-            service_name: Some("orcas-supervisor".to_string()),
+            service_name: Some("orcas".to_string()),
             base_instructions: None,
             developer_instructions: None,
             ephemeral: Some(false),

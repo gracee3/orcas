@@ -555,11 +555,8 @@ struct QuickstartArgs {
 async fn main() -> Result<()> {
     let paths = AppPaths::discover()?;
     paths.ensure().await?;
-    init_file_logger(
-        "orcas-supervisor",
-        &paths.logs_dir.join("orcas-supervisor.log"),
-    )?;
-    info!("starting orcas supervisor process");
+    init_file_logger("orcas", &paths.logs_dir.join("orcas.log"))?;
+    info!("starting orcas process");
 
     let cli = Cli::parse();
     let overrides = RuntimeOverrides {

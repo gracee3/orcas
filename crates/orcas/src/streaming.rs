@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 use tokio::time::sleep;
 
 use orcas_core::{AppConfig, AppPaths, TurnStartRequest, ipc};
-use orcas_daemon::{
+use orcasd::{
     EventSubscription, OrcasDaemonLaunch, OrcasDaemonProcessManager, OrcasIpcClient,
     OrcasRuntimeOverrides,
 };

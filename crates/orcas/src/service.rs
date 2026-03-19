@@ -11,7 +11,7 @@ use orcas_core::{
     SupervisorProposalRecord, SupervisorTurnDecision, SupervisorTurnDecisionKind,
     SupervisorTurnDecisionStatus, ThreadReadRequest, ThreadResumeRequest, ThreadStartRequest, ipc,
 };
-use orcas_daemon::{
+use orcasd::{
     OrcasDaemonLaunch, OrcasDaemonProcessManager, OrcasIpcClient, OrcasRuntimeOverrides,
     apply_runtime_overrides,
 };
@@ -21,7 +21,7 @@ use crate::streaming::{
     StreamingCommandRunner,
 };
 
-pub use orcas_daemon::OrcasRuntimeOverrides as RuntimeOverrides;
+pub use orcasd::OrcasRuntimeOverrides as RuntimeOverrides;
 
 const SUPERVISOR_CLI_OPERATOR: &str = "supervisor_cli_operator";
 

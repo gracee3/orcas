@@ -4,7 +4,7 @@ use anyhow::Result;
 use orcas_core::{AppPaths, init_file_logger};
 use tracing::info;
 
-use orcas_daemon::OrcasDaemonService;
+use orcasd::OrcasDaemonService;
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -54,7 +54,7 @@ orcas-tui
 
 Orcas is written in Rust and designed to be fast and portable. The runtime is built on [Tokio](https://tokio.rs/), which keeps the daemon responsive under concurrent work, and the terminal interface is built with [Ratatui](https://ratatui.rs/), which keeps the interactive surface fast, lightweight, and comfortable to live in. The daemon talks to local clients over a Unix domain socket, keeps snapshots and event streams close to the machine, and avoids turning the control plane into a heavyweight web service when it does not need to be one.
 
-Inside the workspace, the responsibilities are separated cleanly. `orcas-core` holds shared types, errors, paths, and IPC structures. `orcas-codex` handles the Codex connection and typed `app-server` surface. `orcas-daemon` builds `orcasd`, the long-lived daemon. `orcas-supervisor` builds the `orcas` CLI. `orcas-tui` provides the interactive terminal client.
+Inside the workspace, the responsibilities are separated cleanly. `orcas-core` holds shared types, errors, paths, and IPC structures. `orcas-codex` handles the Codex connection and typed `app-server` surface. `orcasd` builds `orcasd`, the long-lived daemon. `orcas` builds the `orcas` CLI. `orcas-tui` provides the interactive terminal client.
 
 ## Building from source
 

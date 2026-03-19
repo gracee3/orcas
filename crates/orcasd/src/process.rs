@@ -408,7 +408,7 @@ impl OrcasDaemonProcessManager {
             .arg("build")
             .arg("-q")
             .arg("-p")
-            .arg("orcas-daemon")
+            .arg("orcasd")
             .arg("--bin")
             .arg("orcasd")
             .current_dir(&repo_root)

@@ -1119,6 +1119,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "orcas"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "orcas-core",
+ "orcasd",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "orcas-codex"
 version = "0.1.0"
 dependencies = [
@@ -1151,7 +1166,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "orcas-daemon"
+name = "orcas-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "crossterm",
+ "nix 0.31.2",
+ "orcas-core",
+ "orcasd",
+ "portable-pty",
+ "ratatui",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "orcasd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1166,38 +1198,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "orcas-supervisor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "clap",
- "orcas-core",
- "orcas-daemon",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "orcas-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "crossterm",
- "nix 0.31.2",
- "orcas-core",
- "orcas-daemon",
- "portable-pty",
- "ratatui",
- "tokio",
- "tracing",
 ]
 
 [[package]]
