@@ -2,8 +2,9 @@ mod service;
 mod streaming;
 
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use orcas_core::{AppPaths, DecisionType, init_file_logger};
 use tracing::info;
@@ -41,6 +42,7 @@ enum TopCommand {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    Tui,
     Supervisor {
         #[command(subcommand)]
         command: SupervisorCommand,
@@ -567,269 +569,324 @@ async fn main() -> Result<()> {
         connect_only: cli.global.connect_only,
         force_spawn: cli.global.force_spawn,
     };
-    let service = SupervisorService::load(&overrides).await?;
-
     match cli.command {
-        TopCommand::Daemon { command } => match command {
-            DaemonCommand::Start => service.daemon_start(overrides.force_spawn).await?,
-            DaemonCommand::Status => service.daemon_status().await?,
-            DaemonCommand::Restart => service.daemon_restart().await?,
-            DaemonCommand::Stop => service.daemon_stop().await?,
-        },
-        TopCommand::Supervisor { command } => match command {
-            SupervisorCommand::Doctor => service.doctor().await?,
-            SupervisorCommand::Models { command } => match command {
-                ModelsCommand::List => service.models_list().await?,
-            },
-            SupervisorCommand::Threads { command } => match command {
-                ThreadsCommand::List => service.threads_list().await?,
-                ThreadsCommand::Read(args) => service.thread_read(&args.thread).await?,
-                ThreadsCommand::Start(args) => {
-                    service
-                        .thread_start(args.cwd, args.model, args.ephemeral)
-                        .await?;
-                }
-                ThreadsCommand::Resume(args) => {
-                    service
-                        .thread_resume(&args.thread, args.cwd, args.model)
-                        .await?;
-                }
-            },
-            SupervisorCommand::Turns { command } => match command {
-                TurnsCommand::ListActive => service.turns_list_active().await?,
-                TurnsCommand::Get(args) => service.turn_get(&args.thread, &args.turn).await?,
-            },
-            SupervisorCommand::Workstreams { command } => match command {
-                WorkstreamsCommand::Create(args) => {
-                    service
-                        .workstream_create(args.title, args.objective, args.priority)
-                        .await?;
-                }
-                WorkstreamsCommand::List => service.workstream_list().await?,
-                WorkstreamsCommand::Get(args) => service.workstream_get(&args.workstream).await?,
-            },
-            SupervisorCommand::Workunits { command } => match command {
-                WorkunitsCommand::Create(args) => {
-                    service
-                        .workunit_create(&args.workstream, args.title, args.task, args.dependencies)
-                        .await?;
-                }
-                WorkunitsCommand::List(args) => {
-                    service.workunit_list(args.workstream.as_deref()).await?;
-                }
-                WorkunitsCommand::Get(args) => service.workunit_get(&args.workunit).await?,
-            },
-            SupervisorCommand::Assignments { command } => match command {
-                AssignmentsCommand::Start(args) => {
-                    service
-                        .assignment_start(
-                            &args.workunit,
-                            &args.worker,
-                            args.instructions,
-                            args.worker_kind,
-                            args.cwd,
-                            args.model,
-                        )
-                        .await?;
-                }
-                AssignmentsCommand::Get(args) => service.assignment_get(&args.assignment).await?,
-                AssignmentsCommand::Communication(args) => {
-                    service
-                        .assignment_communication_get(&args.assignment)
-                        .await?
-                }
-            },
-            SupervisorCommand::Reports { command } => match command {
-                ReportsCommand::Get(args) => service.report_get(&args.report).await?,
-                ReportsCommand::ListForWorkunit(args) => {
-                    service.report_list_for_workunit(&args.workunit).await?;
-                }
-            },
-            SupervisorCommand::Decisions { command } => match command {
-                DecisionsCommand::Apply(args) => {
-                    service
-                        .decision_apply(
-                            &args.workunit,
-                            args.report,
-                            match args.decision_type {
-                                DecisionTypeArg::Accept => DecisionType::Accept,
-                                DecisionTypeArg::Continue => DecisionType::Continue,
-                                DecisionTypeArg::Redirect => DecisionType::Redirect,
-                                DecisionTypeArg::MarkComplete => DecisionType::MarkComplete,
-                                DecisionTypeArg::EscalateToHuman => DecisionType::EscalateToHuman,
-                            },
-                            args.rationale,
-                            args.instructions,
-                            args.worker,
-                            args.worker_kind,
-                        )
-                        .await?;
-                }
-            },
-            SupervisorCommand::Proposals { command } => match command {
-                ProposalsCommand::Create(args) => {
-                    service
-                        .proposal_create(
-                            &args.workunit,
-                            args.report,
-                            args.note,
-                            args.requested_by,
-                            args.supersede_open,
-                        )
-                        .await?;
-                }
-                ProposalsCommand::Get(args) => service.proposal_get(&args.proposal).await?,
-                ProposalsCommand::ListForWorkunit(args) => {
-                    service.proposal_list_for_workunit(&args.workunit).await?;
-                }
-                ProposalsCommand::Approve(args) => {
-                    service
-                        .proposal_approve(
-                            &args.proposal,
-                            args.reviewed_by,
-                            args.review_note,
-                            args.decision_type.map(|decision_type| match decision_type {
-                                DecisionTypeArg::Accept => DecisionType::Accept,
-                                DecisionTypeArg::Continue => DecisionType::Continue,
-                                DecisionTypeArg::Redirect => DecisionType::Redirect,
-                                DecisionTypeArg::MarkComplete => DecisionType::MarkComplete,
-                                DecisionTypeArg::EscalateToHuman => DecisionType::EscalateToHuman,
-                            }),
-                            args.rationale,
-                            args.worker,
-                            args.worker_kind,
-                            args.objective,
-                            args.instructions,
-                            args.acceptance_criteria,
-                            args.stop_conditions,
-                            args.expected_report_fields,
-                        )
-                        .await?;
-                }
-                ProposalsCommand::Reject(args) => {
-                    service
-                        .proposal_reject(&args.proposal, args.reviewed_by, args.review_note)
-                        .await?;
-                }
-            },
-            SupervisorCommand::Codex { command } => match command {
-                CodexCommand::Decisions { command } => match command {
-                    CodexDecisionsCommand::List(args) => {
+        TopCommand::Tui => launch_tui()?,
+        TopCommand::Daemon { command } => {
+            let service = SupervisorService::load(&overrides).await?;
+            match command {
+                DaemonCommand::Start => service.daemon_start(overrides.force_spawn).await?,
+                DaemonCommand::Status => service.daemon_status().await?,
+                DaemonCommand::Restart => service.daemon_restart().await?,
+                DaemonCommand::Stop => service.daemon_stop().await?,
+            }
+        }
+        TopCommand::Supervisor { command } => {
+            let service = SupervisorService::load(&overrides).await?;
+            match command {
+                SupervisorCommand::Doctor => service.doctor().await?,
+                SupervisorCommand::Models { command } => match command {
+                    ModelsCommand::List => service.models_list().await?,
+                },
+                SupervisorCommand::Threads { command } => match command {
+                    ThreadsCommand::List => service.threads_list().await?,
+                    ThreadsCommand::Read(args) => service.thread_read(&args.thread).await?,
+                    ThreadsCommand::Start(args) => {
                         service
-                            .codex_decision_list(
-                                args.filters.thread.as_deref(),
-                                args.filters.assignment.as_deref(),
-                                args.filters.workstream.as_deref(),
-                                args.filters.workunit.as_deref(),
-                                args.filters.supervisor.as_deref(),
-                                args.filters.status.map(Into::into),
-                                args.filters.kind.map(Into::into),
-                                args.include_closed,
-                                args.filters.include_superseded,
-                                false,
-                                args.filters.limit,
+                            .thread_start(args.cwd, args.model, args.ephemeral)
+                            .await?;
+                    }
+                    ThreadsCommand::Resume(args) => {
+                        service
+                            .thread_resume(&args.thread, args.cwd, args.model)
+                            .await?;
+                    }
+                },
+                SupervisorCommand::Turns { command } => match command {
+                    TurnsCommand::ListActive => service.turns_list_active().await?,
+                    TurnsCommand::Get(args) => service.turn_get(&args.thread, &args.turn).await?,
+                },
+                SupervisorCommand::Workstreams { command } => match command {
+                    WorkstreamsCommand::Create(args) => {
+                        service
+                            .workstream_create(args.title, args.objective, args.priority)
+                            .await?;
+                    }
+                    WorkstreamsCommand::List => service.workstream_list().await?,
+                    WorkstreamsCommand::Get(args) => {
+                        service.workstream_get(&args.workstream).await?
+                    }
+                },
+                SupervisorCommand::Workunits { command } => match command {
+                    WorkunitsCommand::Create(args) => {
+                        service
+                            .workunit_create(
+                                &args.workstream,
+                                args.title,
+                                args.task,
+                                args.dependencies,
                             )
                             .await?;
                     }
-                    CodexDecisionsCommand::Queue(args) => {
+                    WorkunitsCommand::List(args) => {
+                        service.workunit_list(args.workstream.as_deref()).await?;
+                    }
+                    WorkunitsCommand::Get(args) => service.workunit_get(&args.workunit).await?,
+                },
+                SupervisorCommand::Assignments { command } => match command {
+                    AssignmentsCommand::Start(args) => {
                         service
-                            .codex_decision_list(
-                                args.filters.thread.as_deref(),
-                                args.filters.assignment.as_deref(),
-                                args.filters.workstream.as_deref(),
-                                args.filters.workunit.as_deref(),
-                                args.filters.supervisor.as_deref(),
-                                args.filters.status.map(Into::into),
-                                args.filters.kind.map(Into::into),
-                                false,
-                                args.filters.include_superseded,
-                                true,
-                                args.filters.limit,
+                            .assignment_start(
+                                &args.workunit,
+                                &args.worker,
+                                args.instructions,
+                                args.worker_kind,
+                                args.cwd,
+                                args.model,
                             )
                             .await?;
                     }
-                    CodexDecisionsCommand::History(args) => {
-                        service
-                            .codex_decision_history(
-                                args.thread.as_deref(),
-                                args.assignment.as_deref(),
-                                args.include_superseded,
-                                args.limit,
-                            )
-                            .await?;
+                    AssignmentsCommand::Get(args) => {
+                        service.assignment_get(&args.assignment).await?
                     }
-                    CodexDecisionsCommand::Get(args) => {
-                        service.codex_decision_get(&args.decision).await?;
-                    }
-                    CodexDecisionsCommand::ProposeSteer(args) => {
+                    AssignmentsCommand::Communication(args) => {
                         service
-                            .codex_decision_propose_steer(
-                                &args.thread,
-                                &args.text,
-                                args.requested_by,
-                                args.rationale_note,
-                            )
-                            .await?;
+                            .assignment_communication_get(&args.assignment)
+                            .await?
                     }
-                    CodexDecisionsCommand::ReplacePendingSteer(args) => {
-                        service
-                            .codex_decision_replace_pending_steer(
-                                &args.decision,
-                                &args.text,
-                                args.requested_by,
-                                args.rationale_note,
-                            )
-                            .await?;
+                },
+                SupervisorCommand::Reports { command } => match command {
+                    ReportsCommand::Get(args) => service.report_get(&args.report).await?,
+                    ReportsCommand::ListForWorkunit(args) => {
+                        service.report_list_for_workunit(&args.workunit).await?;
                     }
-                    CodexDecisionsCommand::RecordNoAction(args) => {
+                },
+                SupervisorCommand::Decisions { command } => match command {
+                    DecisionsCommand::Apply(args) => {
                         service
-                            .codex_decision_record_no_action(
-                                &args.decision,
-                                args.reviewed_by,
-                                args.review_note,
-                            )
-                            .await?;
-                    }
-                    CodexDecisionsCommand::ManualRefresh(args) => {
-                        service
-                            .codex_decision_manual_refresh(
-                                args.thread.as_deref(),
-                                args.assignment.as_deref(),
-                                args.requested_by,
-                                args.rationale_note,
-                            )
-                            .await?;
-                    }
-                    CodexDecisionsCommand::Approve(args) => {
-                        service
-                            .codex_decision_approve_and_send(
-                                &args.decision,
-                                args.reviewed_by,
-                                args.review_note,
-                            )
-                            .await?;
-                    }
-                    CodexDecisionsCommand::Reject(args) => {
-                        service
-                            .codex_decision_reject(
-                                &args.decision,
-                                args.reviewed_by,
-                                args.review_note,
+                            .decision_apply(
+                                &args.workunit,
+                                args.report,
+                                match args.decision_type {
+                                    DecisionTypeArg::Accept => DecisionType::Accept,
+                                    DecisionTypeArg::Continue => DecisionType::Continue,
+                                    DecisionTypeArg::Redirect => DecisionType::Redirect,
+                                    DecisionTypeArg::MarkComplete => DecisionType::MarkComplete,
+                                    DecisionTypeArg::EscalateToHuman => {
+                                        DecisionType::EscalateToHuman
+                                    }
+                                },
+                                args.rationale,
+                                args.instructions,
+                                args.worker,
+                                args.worker_kind,
                             )
                             .await?;
                     }
                 },
-            },
-            SupervisorCommand::Prompt(args) => {
-                let _ = service.prompt(&args.thread, &args.text).await?;
+                SupervisorCommand::Proposals { command } => match command {
+                    ProposalsCommand::Create(args) => {
+                        service
+                            .proposal_create(
+                                &args.workunit,
+                                args.report,
+                                args.note,
+                                args.requested_by,
+                                args.supersede_open,
+                            )
+                            .await?;
+                    }
+                    ProposalsCommand::Get(args) => service.proposal_get(&args.proposal).await?,
+                    ProposalsCommand::ListForWorkunit(args) => {
+                        service.proposal_list_for_workunit(&args.workunit).await?;
+                    }
+                    ProposalsCommand::Approve(args) => {
+                        service
+                            .proposal_approve(
+                                &args.proposal,
+                                args.reviewed_by,
+                                args.review_note,
+                                args.decision_type.map(|decision_type| match decision_type {
+                                    DecisionTypeArg::Accept => DecisionType::Accept,
+                                    DecisionTypeArg::Continue => DecisionType::Continue,
+                                    DecisionTypeArg::Redirect => DecisionType::Redirect,
+                                    DecisionTypeArg::MarkComplete => DecisionType::MarkComplete,
+                                    DecisionTypeArg::EscalateToHuman => {
+                                        DecisionType::EscalateToHuman
+                                    }
+                                }),
+                                args.rationale,
+                                args.worker,
+                                args.worker_kind,
+                                args.objective,
+                                args.instructions,
+                                args.acceptance_criteria,
+                                args.stop_conditions,
+                                args.expected_report_fields,
+                            )
+                            .await?;
+                    }
+                    ProposalsCommand::Reject(args) => {
+                        service
+                            .proposal_reject(&args.proposal, args.reviewed_by, args.review_note)
+                            .await?;
+                    }
+                },
+                SupervisorCommand::Codex { command } => match command {
+                    CodexCommand::Decisions { command } => match command {
+                        CodexDecisionsCommand::List(args) => {
+                            service
+                                .codex_decision_list(
+                                    args.filters.thread.as_deref(),
+                                    args.filters.assignment.as_deref(),
+                                    args.filters.workstream.as_deref(),
+                                    args.filters.workunit.as_deref(),
+                                    args.filters.supervisor.as_deref(),
+                                    args.filters.status.map(Into::into),
+                                    args.filters.kind.map(Into::into),
+                                    args.include_closed,
+                                    args.filters.include_superseded,
+                                    false,
+                                    args.filters.limit,
+                                )
+                                .await?;
+                        }
+                        CodexDecisionsCommand::Queue(args) => {
+                            service
+                                .codex_decision_list(
+                                    args.filters.thread.as_deref(),
+                                    args.filters.assignment.as_deref(),
+                                    args.filters.workstream.as_deref(),
+                                    args.filters.workunit.as_deref(),
+                                    args.filters.supervisor.as_deref(),
+                                    args.filters.status.map(Into::into),
+                                    args.filters.kind.map(Into::into),
+                                    false,
+                                    args.filters.include_superseded,
+                                    true,
+                                    args.filters.limit,
+                                )
+                                .await?;
+                        }
+                        CodexDecisionsCommand::History(args) => {
+                            service
+                                .codex_decision_history(
+                                    args.thread.as_deref(),
+                                    args.assignment.as_deref(),
+                                    args.include_superseded,
+                                    args.limit,
+                                )
+                                .await?;
+                        }
+                        CodexDecisionsCommand::Get(args) => {
+                            service.codex_decision_get(&args.decision).await?;
+                        }
+                        CodexDecisionsCommand::ProposeSteer(args) => {
+                            service
+                                .codex_decision_propose_steer(
+                                    &args.thread,
+                                    &args.text,
+                                    args.requested_by,
+                                    args.rationale_note,
+                                )
+                                .await?;
+                        }
+                        CodexDecisionsCommand::ReplacePendingSteer(args) => {
+                            service
+                                .codex_decision_replace_pending_steer(
+                                    &args.decision,
+                                    &args.text,
+                                    args.requested_by,
+                                    args.rationale_note,
+                                )
+                                .await?;
+                        }
+                        CodexDecisionsCommand::RecordNoAction(args) => {
+                            service
+                                .codex_decision_record_no_action(
+                                    &args.decision,
+                                    args.reviewed_by,
+                                    args.review_note,
+                                )
+                                .await?;
+                        }
+                        CodexDecisionsCommand::ManualRefresh(args) => {
+                            service
+                                .codex_decision_manual_refresh(
+                                    args.thread.as_deref(),
+                                    args.assignment.as_deref(),
+                                    args.requested_by,
+                                    args.rationale_note,
+                                )
+                                .await?;
+                        }
+                        CodexDecisionsCommand::Approve(args) => {
+                            service
+                                .codex_decision_approve_and_send(
+                                    &args.decision,
+                                    args.reviewed_by,
+                                    args.review_note,
+                                )
+                                .await?;
+                        }
+                        CodexDecisionsCommand::Reject(args) => {
+                            service
+                                .codex_decision_reject(
+                                    &args.decision,
+                                    args.reviewed_by,
+                                    args.review_note,
+                                )
+                                .await?;
+                        }
+                    },
+                },
+                SupervisorCommand::Prompt(args) => {
+                    let _ = service.prompt(&args.thread, &args.text).await?;
+                }
+                SupervisorCommand::Quickstart(args) => {
+                    service.quickstart(args.cwd, args.model, &args.text).await?;
+                }
             }
-            SupervisorCommand::Quickstart(args) => {
-                service.quickstart(args.cwd, args.model, &args.text).await?;
-            }
-        },
+        }
     }
 
     Ok(())
+}
+
+fn launch_tui() -> Result<()> {
+    let binary = resolve_tui_binary();
+    let status = Command::new(&binary)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("failed to launch `{}`", binary.display()))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("`{}` exited with status {status}", binary.display())
+    }
+}
+
+fn resolve_tui_binary() -> PathBuf {
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            let candidate = parent.join(tui_binary_name());
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    PathBuf::from(tui_binary_name())
+}
+
+fn tui_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "orcas-tui.exe"
+    } else {
+        "orcas-tui"
+    }
 }
 
 #[cfg(test)]
@@ -845,6 +902,16 @@ mod tests {
             TopCommand::Daemon {
                 command: DaemonCommand::Status,
             } => {}
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_top_level_tui_command() {
+        let cli = Cli::parse_from(["orcas", "tui"]);
+
+        match cli.command {
+            TopCommand::Tui => {}
             other => panic!("unexpected command parse: {other:?}"),
         }
     }
