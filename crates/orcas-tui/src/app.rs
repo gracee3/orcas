@@ -1,3 +1,13 @@
+//! Reducer-driven TUI state and state transitions.
+//!
+//! This module owns the TUI's in-memory state tree and the rules for how it is
+//! updated. Different slices of `AppState` have different authority levels:
+//! collaboration snapshot state comes from `state/get`, authority hierarchy and
+//! detail caches come from authority RPCs, footer/editor state is transient UI
+//! state, and PTY/session references are TUI-local. Reconnect and delete
+//! boundaries are handled as invalidation plus reload, not replay-driven
+//! convergence.
+
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::codex::CodexThreadSessions;
@@ -104,13 +114,21 @@ pub enum ReviewSelection {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Main hierarchy view state.
+///
+/// `selected` is the visible row, while `pending_selection` preserves user
+/// intent across refreshes until the hierarchy is rebuilt and the row is known
+/// to exist again.
 pub struct MainViewState {
     pub program_view: ProgramView,
+    /// Current visible hierarchy row in the main view.
     pub selected: Option<MainHierarchySelection>,
+    /// Selection intent preserved across invalidation boundaries.
     pub pending_selection: Option<MainHierarchySelection>,
     pub expanded_workstreams: BTreeSet<String>,
     pub expanded_work_units: BTreeSet<String>,
     pub scroll_offset: usize,
+    /// Tracks whether the view has already performed its first auto-expansion.
     pub initialized: bool,
 }
 
@@ -200,15 +218,29 @@ impl Default for MainFooterState {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Cached authority hierarchy plus detail responses and transient footer state.
+///
+/// The hierarchy is refreshed separately from the collaboration snapshot, and
+/// the detail caches are invalidated on reconnect/delete boundaries rather than
+/// being treated as part of the snapshot.
 pub struct AuthorityMainState {
+    /// Canonical planning hierarchy read from the authority surface.
     pub hierarchy: authority::HierarchySnapshot,
+    /// Cached authority workstream detail responses keyed by id.
     pub workstream_details: HashMap<String, ipc::AuthorityWorkstreamGetResponse>,
+    /// Cached authority work-unit detail responses keyed by id.
     pub work_unit_details: HashMap<String, ipc::AuthorityWorkunitGetResponse>,
+    /// Cached authority tracked-thread detail responses keyed by id.
     pub tracked_thread_details: HashMap<String, ipc::AuthorityTrackedThreadGetResponse>,
+    /// Transient editor/delete state for authority-facing mutations.
     pub footer: MainFooterState,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Review-queue selection and artifact detail/export state.
+///
+/// This state is driven by collaboration/runtime data and the retained
+/// supervisor artifact surfaces, not by the canonical authority hierarchy.
 pub struct ReviewViewState {
     pub selected: Option<ReviewSelection>,
     pub scroll_offset: usize,
@@ -284,13 +316,26 @@ pub enum DaemonLifecycleState {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Full TUI state tree.
+///
+/// `AppState` intentionally mixes several ownership classes: collaboration
+/// snapshot data, authority caches, transient UI/editor state, and TUI-local
+/// PTY/session state references. That split matters when deciding what to
+/// preserve versus invalidate on reconnect or delete.
 pub struct AppState {
+    /// Latest daemon status response from `state/get`.
     pub daemon: Option<ipc::DaemonStatusResponse>,
+    /// Connection phase for the current daemon socket.
     pub daemon_phase: DaemonConnectionPhase,
+    /// Lifecycle state for the daemon process as observed by the TUI.
     pub daemon_lifecycle: DaemonLifecycleState,
     pub daemon_lifecycle_error: Option<String>,
+    /// How many reconnect attempts have been scheduled since the last good snapshot.
     pub reconnect_attempt: u32,
+    /// Collaboration/runtime snapshot from `state/get`.
     pub session: ipc::SessionState,
+    /// Collaboration snapshot data from `state/get`. This is not the canonical
+    /// planning hierarchy read surface.
     pub collaboration: ipc::CollaborationSnapshot,
     pub proposal_artifact_summary_work_units: HashMap<String, Vec<String>>,
     pub loaded_proposal_artifact_summary_work_units: BTreeSet<String>,
@@ -302,25 +347,43 @@ pub struct AppState {
     pub loading_proposal_artifact_details: BTreeSet<String>,
     pub proposal_artifact_summary_errors: HashMap<String, String>,
     pub proposal_artifact_detail_errors: HashMap<String, String>,
+    /// Canonical planning hierarchy and detail cache state.
     pub authority_main: AuthorityMainState,
+    /// TUI-visible thread summaries and details from the daemon runtime view.
     pub threads: Vec<ipc::ThreadSummary>,
+    /// Cached daemon model list for the supervisor view.
     pub daemon_models: Vec<ipc::ModelSummary>,
     pub models_loading: bool,
+    /// Cached daemon thread detail views for the currently loaded threads.
     pub thread_details: HashMap<String, ipc::ThreadView>,
+    /// Cached turn state by thread/turn id.
     pub turn_states: HashMap<String, ipc::TurnStateView>,
+    /// TUI-local PTY-backed Codex session history. These sessions are owned by
+    /// the TUI process, not the daemon or the authority model.
     pub codex_sessions: HashMap<String, CodexThreadSessions>,
+    /// Current top-level screen.
     pub current_view: TopLevelView,
+    /// Main hierarchy substate, including selection intent and cached expansion.
     pub main_view: MainViewState,
+    /// Review queue substate.
     pub review_view: ReviewViewState,
+    /// Currently selected daemon thread id, if any.
     pub selected_thread_id: Option<String>,
+    /// Selected collaboration workstream id for sidebar/context navigation.
     pub selected_workstream_id: Option<String>,
+    /// Selected collaboration work-unit id for sidebar/context navigation.
     pub selected_work_unit_id: Option<String>,
+    /// Retained runtime-detail work-unit responses from `workunit/get`.
     pub work_unit_details: HashMap<String, ipc::WorkunitGetResponse>,
     pub collaboration_focus: CollaborationFocus,
     pub recent_events: VecDeque<ipc::EventSummary>,
+    /// Whether a prompt/turn interaction is currently active in the TUI.
     pub prompt_in_flight: bool,
+    /// Transient draft state for steer/review composition.
     pub steer_compose: Option<SteerComposeState>,
+    /// Status banner shown in the TUI chrome.
     pub banner: Option<StatusBanner>,
+    /// Help overlay toggle.
     pub show_help: bool,
 }
 
@@ -1526,6 +1589,9 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             });
         }
         UiEvent::ConnectionLost(message) => {
+            // Disconnect invalidates authority caches immediately. Keep only the
+            // user's selection intent so the next snapshot can restore the same
+            // row if it still exists.
             state.models_loading = false;
             state.daemon_phase = DaemonConnectionPhase::Reconnecting;
             state.prompt_in_flight = false;
@@ -1578,6 +1644,9 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             state.banner = None;
         }
         UiEvent::AuthorityHierarchyLoaded(hierarchy) => {
+            // The hierarchy refresh updates the selectable tree, but detail
+            // panes are still loaded independently so stale edit forms do not
+            // survive a reconnect or delete.
             state.authority_main.hierarchy = hierarchy;
             if state.main_view.expanded_workstreams.is_empty()
                 && state.main_view.expanded_work_units.is_empty()
@@ -1608,6 +1677,8 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             effects.extend(load_selected_main_detail_if_needed(state));
         }
         UiEvent::AuthorityWorkstreamDetailLoaded(detail) => {
+            // Authority detail caches are separate from the hierarchy snapshot;
+            // load them explicitly so edit forms always read a current record.
             state
                 .authority_main
                 .workstream_details
@@ -1615,6 +1686,8 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             reconcile_main_view(state);
         }
         UiEvent::AuthorityWorkUnitDetailLoaded(detail) => {
+            // Authority detail caches are separate from the hierarchy snapshot;
+            // load them explicitly so edit forms always read a current record.
             state
                 .authority_main
                 .work_unit_details
@@ -1622,6 +1695,8 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             reconcile_main_view(state);
         }
         UiEvent::AuthorityTrackedThreadDetailLoaded(detail) => {
+            // Authority detail caches are separate from the hierarchy snapshot;
+            // load them explicitly so edit forms always read a current record.
             state
                 .authority_main
                 .tracked_thread_details
@@ -1657,6 +1732,9 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::AuthorityWorkstreamCreated(workstream)
         | UiEvent::AuthorityWorkstreamEdited(workstream) => {
+            // Keep the user's intent, clear the stale edit footer, and reload
+            // the hierarchy/detail caches instead of trying to mutate them in
+            // place from an event payload.
             state.authority_main.footer = MainFooterState::Inspect;
             state.main_view.pending_selection = Some(MainHierarchySelection::Workstream {
                 workstream_id: workstream.id.to_string(),
@@ -1675,6 +1753,8 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             });
         }
         UiEvent::AuthorityWorkstreamDeleted(workstream) => {
+            // Delete boundaries must close the old detail pane and preserve a
+            // valid fallback selection instead of keeping a deleted row alive.
             let fallback = selected_main_delete_fallback(state);
             state.authority_main.footer = MainFooterState::Inspect;
             state
@@ -1690,6 +1770,9 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::AuthorityWorkUnitCreated(work_unit)
         | UiEvent::AuthorityWorkUnitEdited(work_unit) => {
+            // Keep the user's intent, clear the stale edit footer, and reload
+            // the hierarchy/detail caches instead of trying to mutate them in
+            // place from an event payload.
             state.authority_main.footer = MainFooterState::Inspect;
             state.main_view.pending_selection = Some(MainHierarchySelection::WorkUnit {
                 workstream_id: work_unit.workstream_id.to_string(),
@@ -1709,6 +1792,8 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             });
         }
         UiEvent::AuthorityWorkUnitDeleted(work_unit) => {
+            // Delete boundaries must close the old detail pane and preserve a
+            // valid fallback selection instead of keeping a deleted row alive.
             let fallback = selected_main_delete_fallback(state);
             state.authority_main.footer = MainFooterState::Inspect;
             state
@@ -1724,6 +1809,9 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::AuthorityTrackedThreadCreated(tracked_thread)
         | UiEvent::AuthorityTrackedThreadEdited(tracked_thread) => {
+            // Keep the user's intent, clear the stale edit footer, and reload
+            // the hierarchy/detail caches instead of trying to mutate them in
+            // place from an event payload.
             let parent_workstream_id =
                 workstream_id_for_work_unit(state, tracked_thread.work_unit_id.as_str())
                     .unwrap_or_default();
@@ -1747,6 +1835,8 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             });
         }
         UiEvent::AuthorityTrackedThreadDeleted(tracked_thread) => {
+            // Delete boundaries must close the old detail pane and preserve a
+            // valid fallback selection instead of keeping a deleted row alive.
             let fallback = selected_main_delete_fallback(state);
             state.authority_main.footer = MainFooterState::Inspect;
             state
@@ -2363,6 +2453,9 @@ fn activate_program_view(state: &mut AppState) -> Vec<Effect> {
 }
 
 fn reconcile_main_view(state: &mut AppState) {
+    // Reconcile selection against the current authority hierarchy. `pending`
+    // selection preserves intent across invalidation boundaries, but it only
+    // becomes the active selection once the row is visible again.
     state
         .main_view
         .expanded_workstreams
@@ -4229,6 +4322,8 @@ fn daemon_is_connected(state: &AppState) -> bool {
 
 fn invalidate_authority_view_state(state: &mut AppState, preserve_selection: bool) {
     if preserve_selection && state.main_view.pending_selection.is_none() {
+        // Preserve intent, not stale data. The cached hierarchy/detail panes are
+        // always cleared so a reconnect/delete boundary can rebuild them fresh.
         state.main_view.pending_selection = state.main_view.selected.clone();
     }
     state.authority_main.hierarchy = authority::HierarchySnapshot::default();

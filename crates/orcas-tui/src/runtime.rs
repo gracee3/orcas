@@ -1,3 +1,10 @@
+//! TUI runtime loop and recovery scheduler.
+//!
+//! This module drives effect execution, IPC interaction, and reconnect
+//! scheduling for the TUI. Recovery is snapshot-first and event subscriptions
+//! are socket-bound, so this layer rebuilds runtime state around reconnect
+//! boundaries instead of trying to replay missed daemon history.
+
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,11 +22,17 @@ const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(250);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
+/// Internal timer for a deferred reconnect attempt.
 struct ReconnectSchedule {
     due_at: Instant,
 }
 
 #[derive(Debug)]
+/// Bookkeeping for a finished effect.
+///
+/// Some completions intentionally schedule follow-up effects or connection
+/// invalidation because recovery is staged: snapshot first, then event
+/// subscription, then incremental updates.
 struct EffectCompletion {
     effect: Effect,
     actions: Vec<Action>,
@@ -59,6 +72,11 @@ impl EffectCompletion {
     }
 }
 
+/// Runtime controller for the TUI reducer.
+///
+/// The runtime owns effect execution, event subscription, and reconnect timing.
+/// It does not own durable domain state; it rebuilds state by feeding snapshots
+/// and incremental events back through the reducer.
 pub struct AppRuntime<B: TuiBackend> {
     backend: Arc<B>,
     state: AppState,
@@ -183,6 +201,8 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
             self.schedule_reconnect();
         }
         if completion.request_event_subscription && self.event_rx.is_none() {
+            // Subscription is recreated only after a fresh snapshot has been
+            // applied; the old socket stream is not treated as replayable state.
             self.enqueue_effect(Effect::SubscribeEvents);
         }
 
@@ -243,6 +263,8 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
             return;
         }
         self.reconnect = None;
+        // Reconnect always re-enters through a snapshot reload rather than
+        // assuming missed daemon events can be replayed.
         if !self
             .pending_effects
             .iter()
@@ -274,6 +296,9 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
         match effect {
             effect @ Effect::RefreshSnapshot => match backend.get_snapshot().await {
                 Ok(snapshot) => {
+                    // The snapshot re-establishes the current state first. Once
+                    // it is applied, the runtime requests a new event
+                    // subscription on the same socket lifecycle.
                     let mut completion = EffectCompletion::success(
                         effect,
                         vec![Action::Event(UiEvent::SnapshotLoaded(snapshot))],
@@ -289,6 +314,9 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
             },
             effect @ Effect::SubscribeEvents => match backend.subscribe_events().await {
                 Ok(events) => {
+                    // This subscription is tied to the current daemon socket.
+                    // If it fails, the runtime invalidates the stream and lets
+                    // reconnect rebuild it from a fresh snapshot.
                     let mut completion = EffectCompletion::success(effect, Vec::new());
                     completion.set_event_rx = Some(events);
                     completion
@@ -305,6 +333,8 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                 }
             },
             effect @ Effect::ScheduleReconnect => {
+                // Scheduling reconnect is a state-machine transition, not a
+                // replay request; the old event stream is intentionally dropped.
                 let mut completion = EffectCompletion::success(effect, Vec::new());
                 completion.clear_event_rx = true;
                 completion.schedule_reconnect = true;

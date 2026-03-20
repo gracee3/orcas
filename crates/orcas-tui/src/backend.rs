@@ -1,3 +1,11 @@
+//! Backend command surface used by the TUI.
+//!
+//! The commands here are not a flat bag of interchangeable RPCs. Some target
+//! canonical authority planning reads/writes, some target collaboration/runtime
+//! surfaces, and one retained path exists only for runtime-detail reads. The
+//! distinction matters for both the production backend and the fake backend
+//! used in tests.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,6 +22,11 @@ use orcas_core::{
 };
 use orcasd::{OrcasDaemonLaunch, OrcasDaemonProcessManager, OrcasIpcClient, OrcasRuntimeOverrides};
 
+/// Commands issued by the TUI backend.
+///
+/// Most commands fall into canonical authority planning, collaboration/runtime
+/// reads, or operator actions. `GetWorkUnit` is the retained runtime-detail
+/// exception and should not accumulate new planning behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendCommand {
     GetAuthorityHierarchy {
@@ -116,6 +129,11 @@ pub enum BackendCommand {
     },
 }
 
+/// Results returned by the TUI backend.
+///
+/// The result family mirrors the command classification: authority planning,
+/// collaboration/runtime, retained runtime-detail, and operator lifecycle
+/// actions.
 #[derive(Debug, Clone)]
 pub enum BackendCommandResult {
     AuthorityHierarchy(authority::HierarchySnapshot),
@@ -144,6 +162,11 @@ pub enum BackendCommandResult {
 }
 
 #[async_trait]
+/// TUI backend abstraction.
+///
+/// Production uses the daemon-backed implementation, while tests can provide a
+/// fake backend. Both must preserve the same command classification even when
+/// the transport is mocked.
 pub trait TuiBackend: Send + Sync {
     async fn get_snapshot(&self) -> Result<ipc::StateSnapshot>;
     async fn subscribe_events(&self) -> Result<mpsc::Receiver<ipc::DaemonEventEnvelope>>;
@@ -675,6 +698,7 @@ impl OrcasDaemonBackend {
             )),
             // Retained runtime-detail exception: this collaboration read carries execution
             // detail that is outside the canonical authority planning hierarchy.
+            // New planning features should not target this path.
             BackendCommand::GetWorkUnit { work_unit_id } => Ok(BackendCommandResult::WorkUnit(
                 client
                     .workunit_get(&ipc::WorkunitGetRequest { work_unit_id })
