@@ -249,13 +249,48 @@ impl TuiBackend for OrcasDaemonBackend {
     }
 
     async fn execute(&self, command: BackendCommand) -> Result<BackendCommandResult> {
+        let started_at = Instant::now();
+        let review_meta = review_command_target(&command)
+            .map(|(action, target_id, target_field)| (action, target_id.to_string(), target_field));
+        if let Some((action, target_id, target_field)) = review_meta.as_ref() {
+            log_review_action_start(action, target_field, target_id);
+        }
         let launch = match command {
             BackendCommand::StartDaemon => OrcasDaemonLaunch::IfNeeded,
             _ => OrcasDaemonLaunch::Never,
         };
-        let client = self.ensure_client(launch).await?;
+        let client = match self.ensure_client(launch).await {
+            Ok(client) => client,
+            Err(error) => {
+                if let Some((action, target_id, target_field)) = review_meta.as_ref() {
+                    log_review_action_failure(
+                        action,
+                        target_field,
+                        target_id,
+                        started_at.elapsed().as_millis() as u64,
+                        &error,
+                    );
+                }
+                return Err(error);
+            }
+        };
         match Self::execute_with_client(&client, command.clone()).await {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                if let (
+                    Some((action, target_id, target_field)),
+                    BackendCommandResult::SupervisorDecision(decision),
+                ) = (review_meta.as_ref(), &result)
+                {
+                    log_review_action_success(
+                        action,
+                        target_field,
+                        target_id,
+                        decision,
+                        started_at.elapsed().as_millis() as u64,
+                    );
+                }
+                Ok(result)
+            }
             Err(error) => {
                 let retry_launch = if Self::should_restart_for_error(&command, &error) {
                     warn!(
@@ -278,11 +313,49 @@ impl TuiBackend for OrcasDaemonBackend {
                     launch
                 };
                 self.invalidate_client().await;
-                let client = self.connect_client(retry_launch).await?;
+                let client = match self.connect_client(retry_launch).await {
+                    Ok(client) => client,
+                    Err(error) => {
+                        if let Some((action, target_id, target_field)) = review_meta.as_ref() {
+                            log_review_action_failure(
+                                action,
+                                target_field,
+                                target_id,
+                                started_at.elapsed().as_millis() as u64,
+                                &error,
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
                 let retried = Self::execute_with_client(&client, command).await;
                 match &retried {
-                    Ok(_) => info!("TUI backend reconnect succeeded"),
-                    Err(error) => warn!(error = %error, "TUI backend reconnect retry failed"),
+                    Ok(result) => {
+                        info!("TUI backend reconnect succeeded");
+                        if let Some((action, target_id, target_field)) = review_meta.as_ref() {
+                            if let BackendCommandResult::SupervisorDecision(decision) = result {
+                                log_review_action_success(
+                                    action,
+                                    target_field,
+                                    target_id,
+                                    decision,
+                                    started_at.elapsed().as_millis() as u64,
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "TUI backend reconnect retry failed");
+                        if let Some((action, target_id, target_field)) = review_meta.as_ref() {
+                            log_review_action_failure(
+                                action,
+                                target_field,
+                                target_id,
+                                started_at.elapsed().as_millis() as u64,
+                                error,
+                            );
+                        }
+                    }
                 }
                 retried
             }
@@ -653,6 +726,102 @@ impl OrcasDaemonBackend {
                 ))
             }
         }
+    }
+}
+
+fn review_command_target(command: &BackendCommand) -> Option<(&'static str, &str, &'static str)> {
+    match command {
+        BackendCommand::RecordNoActionSupervisorDecision { decision_id } => {
+            Some(("record_no_action", decision_id.as_str(), "decision_id"))
+        }
+        BackendCommand::ManualRefreshSupervisorDecision { assignment_id } => {
+            Some(("manual_refresh", assignment_id.as_str(), "assignment_id"))
+        }
+        BackendCommand::ApproveSupervisorDecision { decision_id } => {
+            Some(("approve_and_send", decision_id.as_str(), "decision_id"))
+        }
+        BackendCommand::RejectSupervisorDecision { decision_id } => {
+            Some(("reject_decision", decision_id.as_str(), "decision_id"))
+        }
+        _ => None,
+    }
+}
+
+fn log_review_action_start(action: &str, target_field: &str, target_id: &str) {
+    match target_field {
+        "decision_id" => info!(
+            surface = "tui",
+            action,
+            decision_id = target_id,
+            "starting review action"
+        ),
+        "assignment_id" => info!(
+            surface = "tui",
+            action,
+            assignment_id = target_id,
+            "starting review action"
+        ),
+        _ => {}
+    }
+}
+
+fn log_review_action_failure(
+    action: &str,
+    target_field: &str,
+    target_id: &str,
+    duration_ms: u64,
+    error: &anyhow::Error,
+) {
+    match target_field {
+        "decision_id" => warn!(
+            surface = "tui",
+            action,
+            decision_id = target_id,
+            result = "failed",
+            duration_ms,
+            error = %error,
+            "review action failed"
+        ),
+        "assignment_id" => warn!(
+            surface = "tui",
+            action,
+            assignment_id = target_id,
+            result = "failed",
+            duration_ms,
+            error = %error,
+            "review action failed"
+        ),
+        _ => {}
+    }
+}
+
+fn log_review_action_success(
+    action: &str,
+    target_field: &str,
+    target_id: &str,
+    decision: &SupervisorTurnDecision,
+    duration_ms: u64,
+) {
+    match target_field {
+        "decision_id" => info!(
+            surface = "tui",
+            action,
+            decision_id = target_id,
+            assignment_id = %decision.assignment_id,
+            result = "completed",
+            duration_ms,
+            "review action completed"
+        ),
+        "assignment_id" => info!(
+            surface = "tui",
+            action,
+            assignment_id = target_id,
+            decision_id = %decision.decision_id,
+            result = "completed",
+            duration_ms,
+            "review action completed"
+        ),
+        _ => {}
     }
 }
 

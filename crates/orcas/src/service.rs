@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Error, Result, anyhow, bail};
 use async_trait::async_trait;
 use tokio::time::sleep;
+use tracing::{info, warn};
 
 use orcas_core::{
     AppConfig, AppPaths, CodexThreadAssignmentStatus, DecisionType, SupervisorProposalEdits,
@@ -781,8 +783,30 @@ impl SupervisorService {
         stop_conditions: Vec<String>,
         expected_report_fields: Vec<String>,
     ) -> Result<()> {
-        let client = self.daemon_state_client().await?;
-        let response = client
+        let started_at = Instant::now();
+        info!(
+            surface = "cli",
+            action = "approve_proposal",
+            proposal_id,
+            "starting review action"
+        );
+        let client = match self.daemon_state_client().await {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(
+                    surface = "cli",
+                    action = "approve_proposal",
+                    proposal_id,
+                    result = "failed",
+                    reason = "backend_client_unavailable",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "review action failed"
+                );
+                return Err(error);
+            }
+        };
+        let result = client
             .proposal_approve(&ipc::ProposalApproveRequest {
                 proposal_id: proposal_id.to_string(),
                 reviewed_by,
@@ -799,7 +823,22 @@ impl SupervisorService {
                     expected_report_fields,
                 },
             })
-            .await?;
+            .await;
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(
+                    surface = "cli",
+                    action = "approve_proposal",
+                    proposal_id,
+                    result = "failed",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "review action failed"
+                );
+                return Err(error.into());
+            }
+        };
 
         Self::print_proposal_record(&response.proposal);
         println!("decision_id: {}", response.decision.id);
@@ -812,6 +851,20 @@ impl SupervisorService {
         } else {
             println!("next_assignment_id:");
         }
+        info!(
+            surface = "cli",
+            action = "approve_proposal",
+            proposal_id,
+            result = "approved",
+            decision_id = %response.decision.id,
+            next_assignment_id = response
+                .next_assignment
+                .as_ref()
+                .map(|assignment| assignment.id.as_str())
+                .unwrap_or("none"),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "review action completed"
+        );
         Ok(())
     }
 
@@ -821,15 +874,60 @@ impl SupervisorService {
         reviewed_by: Option<String>,
         review_note: Option<String>,
     ) -> Result<()> {
-        let client = self.daemon_state_client().await?;
-        let response = client
+        let started_at = Instant::now();
+        info!(
+            surface = "cli",
+            action = "reject_proposal",
+            proposal_id,
+            "starting review action"
+        );
+        let client = match self.daemon_state_client().await {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(
+                    surface = "cli",
+                    action = "reject_proposal",
+                    proposal_id,
+                    result = "failed",
+                    reason = "backend_client_unavailable",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "review action failed"
+                );
+                return Err(error);
+            }
+        };
+        let result = client
             .proposal_reject(&ipc::ProposalRejectRequest {
                 proposal_id: proposal_id.to_string(),
                 reviewed_by,
                 review_note,
             })
-            .await?;
+            .await;
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(
+                    surface = "cli",
+                    action = "reject_proposal",
+                    proposal_id,
+                    result = "failed",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "review action failed"
+                );
+                return Err(error.into());
+            }
+        };
         Self::print_proposal_record(&response.proposal);
+        info!(
+            surface = "cli",
+            action = "reject_proposal",
+            proposal_id,
+            result = "rejected",
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "review action completed"
+        );
         Ok(())
     }
 
@@ -1013,15 +1111,61 @@ impl SupervisorService {
         reviewed_by: Option<String>,
         review_note: Option<String>,
     ) -> Result<()> {
-        let client = self.ready_client().await?;
-        let decision = Self::codex_decision_record_no_action_with_backend(
+        let started_at = Instant::now();
+        info!(
+            surface = "cli",
+            action = "record_no_action",
+            decision_id,
+            "starting review action"
+        );
+        let client = match self.ready_client().await {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(
+                    surface = "cli",
+                    action = "record_no_action",
+                    decision_id,
+                    result = "failed",
+                    reason = "backend_client_unavailable",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "review action failed"
+                );
+                return Err(error);
+            }
+        };
+        let result = Self::codex_decision_record_no_action_with_backend(
             client.as_ref(),
             decision_id,
             reviewed_by,
             review_note,
         )
-        .await?;
+        .await;
+        let decision = match result {
+            Ok(decision) => decision,
+            Err(error) => {
+                warn!(
+                    surface = "cli",
+                    action = "record_no_action",
+                    decision_id,
+                    result = "failed",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "review action failed"
+                );
+                return Err(error);
+            }
+        };
         Self::print_supervisor_turn_decision(&decision, None, &[]);
+        info!(
+            surface = "cli",
+            action = "record_no_action",
+            decision_id = %decision.decision_id,
+            assignment_id = %decision.assignment_id,
+            result = "completed",
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "review action completed"
+        );
         Ok(())
     }
 
@@ -1032,16 +1176,65 @@ impl SupervisorService {
         requested_by: Option<String>,
         rationale_note: Option<String>,
     ) -> Result<()> {
-        let client = self.ready_client().await?;
-        let decision = Self::codex_decision_manual_refresh_with_backend(
+        let started_at = Instant::now();
+        info!(
+            surface = "cli",
+            action = "manual_refresh",
+            assignment_id = assignment_id.unwrap_or("-"),
+            thread_id = thread_id.unwrap_or("-"),
+            "starting review action"
+        );
+        let client = match self.ready_client().await {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(
+                    surface = "cli",
+                    action = "manual_refresh",
+                    assignment_id = assignment_id.unwrap_or("-"),
+                    thread_id = thread_id.unwrap_or("-"),
+                    result = "failed",
+                    reason = "backend_client_unavailable",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "review action failed"
+                );
+                return Err(error);
+            }
+        };
+        let result = Self::codex_decision_manual_refresh_with_backend(
             client.as_ref(),
             thread_id,
             assignment_id,
             requested_by,
             rationale_note,
         )
-        .await?;
+        .await;
+        let decision = match result {
+            Ok(decision) => decision,
+            Err(error) => {
+                warn!(
+                    surface = "cli",
+                    action = "manual_refresh",
+                    assignment_id = assignment_id.unwrap_or("-"),
+                    thread_id = thread_id.unwrap_or("-"),
+                    result = "failed",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "review action failed"
+                );
+                return Err(error);
+            }
+        };
         Self::print_supervisor_turn_decision(&decision, None, &[]);
+        info!(
+            surface = "cli",
+            action = "manual_refresh",
+            decision_id = %decision.decision_id,
+            assignment_id = %decision.assignment_id,
+            result = "completed",
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "review action completed"
+        );
         Ok(())
     }
 
@@ -1051,15 +1244,61 @@ impl SupervisorService {
         reviewed_by: Option<String>,
         review_note: Option<String>,
     ) -> Result<()> {
-        let client = self.ready_client().await?;
-        let decision = Self::codex_decision_approve_and_send_with_backend(
+        let started_at = Instant::now();
+        info!(
+            surface = "cli",
+            action = "approve_and_send",
+            decision_id,
+            "starting review action"
+        );
+        let client = match self.ready_client().await {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(
+                    surface = "cli",
+                    action = "approve_and_send",
+                    decision_id,
+                    result = "failed",
+                    reason = "backend_client_unavailable",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "review action failed"
+                );
+                return Err(error);
+            }
+        };
+        let result = Self::codex_decision_approve_and_send_with_backend(
             client.as_ref(),
             decision_id,
             reviewed_by,
             review_note,
         )
-        .await?;
+        .await;
+        let decision = match result {
+            Ok(decision) => decision,
+            Err(error) => {
+                warn!(
+                    surface = "cli",
+                    action = "approve_and_send",
+                    decision_id,
+                    result = "failed",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "review action failed"
+                );
+                return Err(error);
+            }
+        };
         Self::print_supervisor_turn_decision(&decision, None, &[]);
+        info!(
+            surface = "cli",
+            action = "approve_and_send",
+            decision_id = %decision.decision_id,
+            assignment_id = %decision.assignment_id,
+            result = "completed",
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "review action completed"
+        );
         Ok(())
     }
 
@@ -1069,15 +1308,61 @@ impl SupervisorService {
         reviewed_by: Option<String>,
         review_note: Option<String>,
     ) -> Result<()> {
-        let client = self.ready_client().await?;
-        let decision = Self::codex_decision_reject_with_backend(
+        let started_at = Instant::now();
+        info!(
+            surface = "cli",
+            action = "reject_decision",
+            decision_id,
+            "starting review action"
+        );
+        let client = match self.ready_client().await {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(
+                    surface = "cli",
+                    action = "reject_decision",
+                    decision_id,
+                    result = "failed",
+                    reason = "backend_client_unavailable",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "review action failed"
+                );
+                return Err(error);
+            }
+        };
+        let result = Self::codex_decision_reject_with_backend(
             client.as_ref(),
             decision_id,
             reviewed_by,
             review_note,
         )
-        .await?;
+        .await;
+        let decision = match result {
+            Ok(decision) => decision,
+            Err(error) => {
+                warn!(
+                    surface = "cli",
+                    action = "reject_decision",
+                    decision_id,
+                    result = "failed",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "review action failed"
+                );
+                return Err(error);
+            }
+        };
         Self::print_supervisor_turn_decision(&decision, None, &[]);
+        info!(
+            surface = "cli",
+            action = "reject_decision",
+            decision_id = %decision.decision_id,
+            assignment_id = %decision.assignment_id,
+            result = "completed",
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "review action completed"
+        );
         Ok(())
     }
 
