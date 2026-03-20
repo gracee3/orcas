@@ -476,6 +476,7 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
                 objective: "Harden collaboration snapshot semantics.".to_string(),
                 status: WorkstreamStatus::Active,
                 priority: "high".to_string(),
+                source_kind: ipc::PlanningSummarySourceKind::Collaboration,
                 updated_at: Utc::now(),
             },
             ipc::WorkstreamSummary {
@@ -484,6 +485,7 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
                 objective: "Hold future scope.".to_string(),
                 status: WorkstreamStatus::Blocked,
                 priority: "low".to_string(),
+                source_kind: ipc::PlanningSummarySourceKind::Collaboration,
                 updated_at: Utc::now(),
             },
         ],
@@ -504,6 +506,7 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
                         Some(DecisionType::Continue),
                     )
                 }),
+                source_kind: ipc::PlanningSummarySourceKind::Collaboration,
                 updated_at: Utc::now(),
             },
             ipc::WorkUnitSummary {
@@ -518,6 +521,7 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
                     latest_failure_stage: Some(SupervisorProposalFailureStage::Backend),
                     ..sample_proposal_summary(SupervisorProposalStatus::GenerationFailed, None)
                 }),
+                source_kind: ipc::PlanningSummarySourceKind::Collaboration,
                 updated_at: Utc::now(),
             },
             ipc::WorkUnitSummary {
@@ -529,6 +533,7 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
                 current_assignment_id: None,
                 latest_report_id: None,
                 proposal: None,
+                source_kind: ipc::PlanningSummarySourceKind::Collaboration,
                 updated_at: Utc::now(),
             },
         ],
@@ -2081,6 +2086,7 @@ async fn reconnect_recovers_with_snapshot_then_resubscribe() {
         objective: "Reload collaboration snapshot.".to_string(),
         status: WorkstreamStatus::Active,
         priority: "high".to_string(),
+        source_kind: ipc::PlanningSummarySourceKind::Collaboration,
         updated_at: Utc::now(),
     }];
     recovered.collaboration.work_units = vec![ipc::WorkUnitSummary {
@@ -2092,6 +2098,7 @@ async fn reconnect_recovers_with_snapshot_then_resubscribe() {
         current_assignment_id: None,
         latest_report_id: None,
         proposal: None,
+        source_kind: ipc::PlanningSummarySourceKind::Collaboration,
         updated_at: Utc::now(),
     }];
     recovered.collaboration.assignments = Vec::new();
@@ -2336,6 +2343,7 @@ async fn collaboration_events_refresh_summaries_incrementally() {
                     objective: "Add new read-only surface.".to_string(),
                     status: WorkstreamStatus::Active,
                     priority: "medium".to_string(),
+                    source_kind: ipc::PlanningSummarySourceKind::Collaboration,
                     updated_at: Utc::now(),
                 },
             },
@@ -2355,6 +2363,7 @@ async fn collaboration_events_refresh_summaries_incrementally() {
                     current_assignment_id: Some("assignment-4".to_string()),
                     latest_report_id: Some("report-4".to_string()),
                     proposal: None,
+                    source_kind: ipc::PlanningSummarySourceKind::Collaboration,
                     updated_at: Utc::now(),
                 },
             },
@@ -2555,6 +2564,7 @@ async fn collaboration_history_shows_failed_interrupted_and_lost_states_explicit
         current_assignment_id: Some("assignment-i".to_string()),
         latest_report_id: Some("report-i".to_string()),
         proposal: None,
+        source_kind: ipc::PlanningSummarySourceKind::Collaboration,
         updated_at: Utc::now(),
     }];
     snapshot.collaboration.assignments = vec![ipc::AssignmentSummary {
@@ -3270,6 +3280,7 @@ async fn reconnect_refreshes_history_for_selected_work_unit() {
         objective: "Reload collaboration snapshot.".to_string(),
         status: WorkstreamStatus::Active,
         priority: "high".to_string(),
+        source_kind: ipc::PlanningSummarySourceKind::Collaboration,
         updated_at: Utc::now(),
     }];
     recovered.collaboration.work_units = vec![ipc::WorkUnitSummary {
@@ -3281,6 +3292,7 @@ async fn reconnect_refreshes_history_for_selected_work_unit() {
         current_assignment_id: Some("assignment-9".to_string()),
         latest_report_id: Some("report-9".to_string()),
         proposal: None,
+        source_kind: ipc::PlanningSummarySourceKind::Collaboration,
         updated_at: Utc::now(),
     }];
     recovered.collaboration.assignments = vec![ipc::AssignmentSummary {
@@ -3427,6 +3439,7 @@ async fn event_refresh_does_not_leave_invalid_parent_child_selection() {
                     current_assignment_id: None,
                     latest_report_id: None,
                     proposal: None,
+                    source_kind: ipc::PlanningSummarySourceKind::Collaboration,
                     updated_at: Utc::now(),
                 },
             },
@@ -3460,6 +3473,7 @@ async fn reconnect_reconciles_collaboration_selection_to_authoritative_snapshot(
         objective: "Replace stale selection.".to_string(),
         status: WorkstreamStatus::Active,
         priority: "high".to_string(),
+        source_kind: ipc::PlanningSummarySourceKind::Collaboration,
         updated_at: Utc::now(),
     }];
     recovered.collaboration.work_units = vec![ipc::WorkUnitSummary {
@@ -3474,6 +3488,7 @@ async fn reconnect_reconciles_collaboration_selection_to_authoritative_snapshot(
             latest_failure_stage: Some(SupervisorProposalFailureStage::Backend),
             ..sample_proposal_summary(SupervisorProposalStatus::GenerationFailed, None)
         }),
+        source_kind: ipc::PlanningSummarySourceKind::Collaboration,
         updated_at: Utc::now(),
     }];
     recovered.collaboration.assignments = vec![ipc::AssignmentSummary {
@@ -3885,11 +3900,42 @@ async fn create_tracked_thread_under_selected_work_unit_routes_through_authority
 }
 
 #[tokio::test]
+async fn edit_selected_main_entity_loads_authority_detail_before_opening_form() {
+    let mut harness = AppHarness::new(sample_main_surface_snapshot())
+        .await
+        .unwrap();
+
+    harness.fail_next_command("detail unavailable").await;
+    harness.dispatch(UserAction::CollapseSelectedInView).await;
+    harness.dispatch(UserAction::EditSelectedMainEntity).await;
+    assert!(matches!(
+        harness.state().authority_main.footer,
+        MainFooterState::Inspect
+    ));
+    let banner = harness
+        .state()
+        .banner
+        .as_ref()
+        .expect("warning banner should be visible while detail loads");
+    assert_eq!(banner.level, BannerLevel::Warning);
+    assert!(banner.message.contains("detail is still loading"));
+    assert!(matches!(
+        harness.recorded_commands().await.last(),
+        Some(BackendCommand::GetAuthorityWorkUnit { .. })
+    ));
+}
+
+#[tokio::test]
 async fn edit_workstream_work_unit_and_tracked_thread_flow_through_authority_backend() {
     let mut harness = AppHarness::new(sample_main_surface_snapshot())
         .await
         .unwrap();
 
+    harness.dispatch(UserAction::EditSelectedMainEntity).await;
+    assert!(matches!(
+        harness.recorded_commands().await.last(),
+        Some(BackendCommand::GetAuthorityTrackedThread { .. })
+    ));
     harness.dispatch(UserAction::EditSelectedMainEntity).await;
     clear_main_footer_text(&mut harness, "thread-1".len()).await;
     type_main_footer_text(&mut harness, "tracked local").await;
@@ -3907,6 +3953,11 @@ async fn edit_workstream_work_unit_and_tracked_thread_flow_through_authority_bac
 
     harness.dispatch(UserAction::CollapseSelectedInView).await;
     harness.dispatch(UserAction::EditSelectedMainEntity).await;
+    assert!(matches!(
+        harness.recorded_commands().await.last(),
+        Some(BackendCommand::GetAuthorityWorkUnit { .. })
+    ));
+    harness.dispatch(UserAction::EditSelectedMainEntity).await;
     clear_main_footer_text(&mut harness, "Snapshot wiring".len()).await;
     type_main_footer_text(&mut harness, "Snapshot reducer").await;
     harness.dispatch(UserAction::SubmitMainFooter).await;
@@ -3920,6 +3971,11 @@ async fn edit_workstream_work_unit_and_tracked_thread_flow_through_authority_bac
 
     harness.dispatch(UserAction::CollapseSelectedInView).await;
     harness.dispatch(UserAction::CollapseSelectedInView).await;
+    harness.dispatch(UserAction::EditSelectedMainEntity).await;
+    assert!(matches!(
+        harness.recorded_commands().await.last(),
+        Some(BackendCommand::GetAuthorityWorkstream { .. })
+    ));
     harness.dispatch(UserAction::EditSelectedMainEntity).await;
     clear_main_footer_text(&mut harness, "Collaboration hardening".len()).await;
     type_main_footer_text(&mut harness, "Authority hardening").await;

@@ -121,7 +121,7 @@ async fn delete_plan(
 }
 
 #[tokio::test]
-async fn authority_hierarchy_projects_into_collaboration_state_and_events() {
+async fn authority_hierarchy_is_canonical_while_events_expose_authority_projection_summaries() {
     let mut daemon = TestDaemon::spawn("authority-bridge").await;
     let client = daemon.connect().await;
     let fixture = AuthorityFixture::new();
@@ -164,6 +164,10 @@ async fn authority_hierarchy_projects_into_collaboration_state_and_events() {
             assert_eq!(action, ipc::CollaborationLifecycleAction::Created);
             assert_eq!(workstream.id, workstream.id);
             assert_eq!(workstream.title, "Bridged Workstream");
+            assert_eq!(
+                workstream.source_kind,
+                ipc::PlanningSummarySourceKind::AuthorityProjection
+            );
         }
         other => panic!("expected workstream lifecycle event, got {other:?}"),
     }
@@ -183,6 +187,10 @@ async fn authority_hierarchy_projects_into_collaboration_state_and_events() {
             assert_eq!(work_unit.id, work_unit.id);
             assert_eq!(work_unit.workstream_id, workstream.id.as_str());
             assert_eq!(work_unit.title, "Bridged Work Unit");
+            assert_eq!(
+                work_unit.source_kind,
+                ipc::PlanningSummarySourceKind::AuthorityProjection
+            );
         }
         other => panic!("expected work unit lifecycle event, got {other:?}"),
     }
@@ -190,33 +198,41 @@ async fn authority_hierarchy_projects_into_collaboration_state_and_events() {
     let projected = client
         .state_get()
         .await
-        .expect("state/get after authority projection");
-    let projected_workstream = projected
-        .snapshot
-        .collaboration
-        .workstreams
-        .iter()
-        .find(|summary| summary.id == workstream.id.as_str())
-        .expect("authority workstream should project into collaboration snapshot");
-    assert_eq!(projected_workstream.title, "Bridged Workstream");
-    assert_eq!(projected_workstream.status, WorkstreamStatus::Active);
+        .expect("state/get after authority create");
+    assert!(
+        projected
+            .snapshot
+            .collaboration
+            .workstreams
+            .iter()
+            .all(|summary| summary.id != workstream.id.as_str())
+    );
+    assert!(
+        projected
+            .snapshot
+            .collaboration
+            .work_units
+            .iter()
+            .all(|summary| summary.id != work_unit.id.as_str())
+    );
 
-    let projected_work_unit = projected
-        .snapshot
-        .collaboration
-        .work_units
-        .iter()
-        .find(|summary| summary.id == work_unit.id.as_str())
-        .expect("authority work unit should project into collaboration snapshot");
-    assert_eq!(projected_work_unit.workstream_id, workstream.id.as_str());
-    assert_eq!(projected_work_unit.title, "Bridged Work Unit");
-    assert_eq!(projected_work_unit.status, WorkUnitStatus::Ready);
+    let hierarchy = client
+        .authority_hierarchy_get(&ipc::AuthorityHierarchyGetRequest::default())
+        .await
+        .expect("authority hierarchy after create");
+    assert!(hierarchy.hierarchy.workstreams.iter().any(|node| {
+        node.workstream.id == workstream.id
+            && node
+                .work_units
+                .iter()
+                .any(|summary| summary.work_unit.id == work_unit.id)
+    }));
 
     daemon.stop().await;
 }
 
 #[tokio::test]
-async fn projected_authority_hierarchy_persists_into_state_after_restart() {
+async fn authority_hierarchy_remains_canonical_after_restart() {
     let mut daemon = TestDaemon::spawn("authority-bridge-restart").await;
     let fixture = AuthorityFixture::new();
 
@@ -251,8 +267,7 @@ async fn projected_authority_hierarchy_persists_into_state_after_restart() {
             .collaboration
             .workstreams
             .iter()
-            .any(|summary| summary.id == workstream.id.as_str()
-                && summary.title == "Restart Bridge Workstream")
+            .all(|summary| summary.id != workstream.id.as_str())
     );
     assert!(
         projected
@@ -260,10 +275,20 @@ async fn projected_authority_hierarchy_persists_into_state_after_restart() {
             .collaboration
             .work_units
             .iter()
-            .any(|summary| summary.id == work_unit.id.as_str()
-                && summary.workstream_id == workstream.id.as_str()
-                && summary.title == "Restart Bridge Work Unit")
+            .all(|summary| summary.id != work_unit.id.as_str())
     );
+
+    let hierarchy = second_client
+        .authority_hierarchy_get(&ipc::AuthorityHierarchyGetRequest::default())
+        .await
+        .expect("authority hierarchy after restart");
+    assert!(hierarchy.hierarchy.workstreams.iter().any(|node| {
+        node.workstream.id == workstream.id
+            && node
+                .work_units
+                .iter()
+                .any(|summary| summary.work_unit.id == work_unit.id)
+    }));
 
     daemon.stop().await;
 }
@@ -299,6 +324,10 @@ async fn authority_mutations_emit_post_commit_events_for_all_authority_entities(
             assert_eq!(action, ipc::CollaborationLifecycleAction::Created);
             assert_eq!(workstream.id, "authority-events-ws");
             assert_eq!(workstream.title, "Evented Workstream");
+            assert_eq!(
+                workstream.source_kind,
+                ipc::PlanningSummarySourceKind::AuthorityProjection
+            );
         }
         other => panic!("expected workstream create event, got {other:?}"),
     }
@@ -347,6 +376,10 @@ async fn authority_mutations_emit_post_commit_events_for_all_authority_entities(
             assert_eq!(action, ipc::CollaborationLifecycleAction::Updated);
             assert_eq!(workstream.title, "Evented Workstream Updated");
             assert_eq!(workstream.status, WorkstreamStatus::Completed);
+            assert_eq!(
+                workstream.source_kind,
+                ipc::PlanningSummarySourceKind::AuthorityProjection
+            );
         }
         other => panic!("expected workstream update event, got {other:?}"),
     }
@@ -373,6 +406,10 @@ async fn authority_mutations_emit_post_commit_events_for_all_authority_entities(
             assert_eq!(action, ipc::CollaborationLifecycleAction::Created);
             assert_eq!(work_unit.id, "authority-events-wu");
             assert_eq!(work_unit.workstream_id, edited_workstream.id.as_str());
+            assert_eq!(
+                work_unit.source_kind,
+                ipc::PlanningSummarySourceKind::AuthorityProjection
+            );
         }
         other => panic!("expected work unit create event, got {other:?}"),
     }
@@ -407,6 +444,10 @@ async fn authority_mutations_emit_post_commit_events_for_all_authority_entities(
             assert_eq!(action, ipc::CollaborationLifecycleAction::Updated);
             assert_eq!(work_unit.title, "Evented Work Unit Updated");
             assert_eq!(work_unit.status, WorkUnitStatus::Running);
+            assert_eq!(
+                work_unit.source_kind,
+                ipc::PlanningSummarySourceKind::AuthorityProjection
+            );
         }
         other => panic!("expected work unit update event, got {other:?}"),
     }
@@ -593,6 +634,10 @@ async fn authority_mutations_emit_post_commit_events_for_all_authority_entities(
         ipc::DaemonEvent::WorkUnitLifecycle { action, work_unit } => {
             assert_eq!(action, ipc::CollaborationLifecycleAction::Deleted);
             assert_eq!(work_unit.id, edited_work_unit.id.as_str());
+            assert_eq!(
+                work_unit.source_kind,
+                ipc::PlanningSummarySourceKind::AuthorityProjection
+            );
         }
         other => panic!("expected work unit delete event, got {other:?}"),
     }
@@ -628,16 +673,34 @@ async fn authority_mutations_emit_post_commit_events_for_all_authority_entities(
         ipc::DaemonEvent::WorkstreamLifecycle { action, workstream } => {
             assert_eq!(action, ipc::CollaborationLifecycleAction::Deleted);
             assert_eq!(workstream.id, edited_workstream.id.as_str());
+            assert_eq!(
+                workstream.source_kind,
+                ipc::PlanningSummarySourceKind::AuthorityProjection
+            );
         }
         other => panic!("expected workstream delete event, got {other:?}"),
     }
 
-    // The delete event is the contract under test here. Phase 2 does not assert that every
-    // legacy collaboration projection has already been scrubbed from `state/get`.
-    let _ = client
+    let snapshot_after_delete = client
         .state_get()
         .await
         .expect("state/get after authority deletes");
+    assert!(
+        snapshot_after_delete
+            .snapshot
+            .collaboration
+            .workstreams
+            .iter()
+            .all(|summary| summary.id != edited_workstream.id.as_str())
+    );
+    assert!(
+        snapshot_after_delete
+            .snapshot
+            .collaboration
+            .work_units
+            .iter()
+            .all(|summary| summary.id != edited_work_unit.id.as_str())
+    );
     let hierarchy_after_delete = client
         .authority_hierarchy_get(&ipc::AuthorityHierarchyGetRequest {
             include_deleted: false,

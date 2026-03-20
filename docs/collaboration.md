@@ -21,7 +21,7 @@ Orcas currently models work across two daemon-owned stores plus one TUI-local se
 
 - Legacy collaboration state lives in daemon memory and is persisted to `state.json`.
 - Authority state for authority workstreams, authority work units, and tracked threads lives in SQLite `state.db`.
-- `state/get` is a merged derived snapshot that combines daemon state with projected authority summaries.
+- `state/get` is a merged derived snapshot that combines daemon state with collaboration-owned summaries plus any explicit authority compatibility bridge rows needed for assignment execution.
 - `authority/hierarchy/get` is an authority-only hierarchy query over the SQLite store.
 - The TUI also keeps local PTY-backed `codex resume` session state that is not daemon-owned.
 
@@ -36,9 +36,9 @@ The important rule is that ORCAS does not currently present a single uniform wor
 | Object or state class | Authoritative owner | Durable persistence owner | Canonical mutation path | Canonical read path(s) | In `state/get` | In `authority/hierarchy/get` |
 | --- | --- | --- | --- | --- | --- | --- |
 | Workstream, legacy collaboration record | Daemon collaboration state | `state.json` | `workstream/create` and internal daemon updates | `state/get`, `workstream/list`, `workstream/get` | Yes | No |
-| Workstream, authority record | Authority SQLite store | `state.db` | `authority/workstream/create`, `authority/workstream/edit`, `authority/workstream/delete` | `authority/hierarchy/get`, `authority/workstream/get`, projected into `state/get` | Yes, as a projected collaboration-shaped summary | Yes |
+| Workstream, authority record | Authority SQLite store | `state.db` | `authority/workstream/create`, `authority/workstream/edit`, `authority/workstream/delete` | `authority/hierarchy/get`, `authority/workstream/get`; `state/get` only after explicit assignment-compatibility bridging | Only if explicitly bridged as a collaboration-shaped summary with `source_kind = authority_compatibility_bridge` | Yes |
 | Work unit, legacy collaboration record | Daemon collaboration state | `state.json` | `workunit/create` and internal daemon updates | `state/get`, `workunit/list`, `workunit/get` | Yes | No |
-| Work unit, authority record | Authority SQLite store | `state.db` | `authority/workunit/create`, `authority/workunit/edit`, `authority/workunit/delete` | `authority/hierarchy/get`, `authority/workunit/get`, projected into `state/get`, and injected into collaboration state for assignment start compatibility | Yes, as a projected or bridged collaboration-shaped summary | Yes |
+| Work unit, authority record | Authority SQLite store | `state.db` | `authority/workunit/create`, `authority/workunit/edit`, `authority/workunit/delete` | `authority/hierarchy/get`, `authority/workunit/get`; `state/get` only after explicit assignment-compatibility bridging | Only if explicitly bridged as a collaboration-shaped summary with `source_kind = authority_compatibility_bridge` | Yes |
 | Tracked thread, authority record | Authority SQLite store | `state.db` | `authority/tracked_thread/create`, `authority/tracked_thread/edit`, `authority/tracked_thread/delete` | `authority/hierarchy/get`, `authority/workunit/get`, `authority/tracked_thread/get` | No tracked-thread rows appear directly in `state/get` | Yes |
 | Assignment | Daemon collaboration state | `state.json` | `assignment/start` plus daemon-owned lifecycle transitions | `state/get`, `assignment/get` | Yes | No |
 | Proposal | Daemon collaboration state | `state.json` | `proposal/create`, `proposal/approve`, `proposal/reject`, plus daemon-owned generation and supersession | `proposal/get`, `proposal/list_for_workunit`, event stream, and nested proposal summary inside collaboration work unit summaries | No top-level proposal list in `state/get`; proposal summary can appear inside collaboration work unit summaries | No |
@@ -54,10 +54,10 @@ The important rule is that ORCAS does not currently present a single uniform wor
 | Object or state class | Projected, derived, or synthesized notes | Current event visibility | Restart and reconnect behavior |
 | --- | --- | --- | --- |
 | Workstream, legacy collaboration record | Collaboration-shaped native record | `WorkstreamLifecycle` for collaboration updates | Survives daemon restart through `state.json`; clients reload via snapshot-first flow |
-| Workstream, authority record | Projected into `state/get` as `ipc::WorkstreamSummary`; no authority revision, tombstone, or origin metadata in the projected row. A workstream can also be copied into legacy collaboration state when a dependent authority work unit is bridged for assignment compatibility. | `authority/workstream/create`, `authority/workstream/edit`, and `authority/workstream/delete` emit `WorkstreamLifecycle` with `created`, `updated`, and `deleted` actions | Survives daemon restart through `state.db`; projected rows reload from authority state, and any previously bridged collaboration copy also survives through `state.json` |
+| Workstream, authority record | Not globally projected into `state/get`. A workstream can appear there only as an explicit assignment-compatibility bridge row, and that row is still collaboration-shaped rather than authority-shaped. | `authority/workstream/create`, `authority/workstream/edit`, and `authority/workstream/delete` emit `WorkstreamLifecycle` with `created`, `updated`, and `deleted` actions | Survives daemon restart through `state.db`; previously bridged collaboration copies also survive in `state.json`, but `state/get` hides bridged rows whose authority source is now tombstoned |
 | Work unit, legacy collaboration record | Collaboration-shaped native record | `WorkUnitLifecycle` for collaboration updates | Survives daemon restart through `state.json`; clients reload via snapshot-first flow |
-| Work unit, authority record | Appears in `state/get` either as a projected authority summary or, after assignment compatibility bridging, as an injected collaboration record | `authority/workunit/create`, `authority/workunit/edit`, and `authority/workunit/delete` emit `WorkUnitLifecycle` with `created`, `updated`, and `deleted` actions | Survives daemon restart through `state.db`; assignment-created collaboration compatibility state also survives through `state.json` |
-| Tracked thread, authority record | Not projected into `state/get`; TUI can synthesize partial records from hierarchy summaries when detail is not loaded | `authority/tracked_thread/create`, `authority/tracked_thread/edit`, and `authority/tracked_thread/delete` emit `TrackedThreadLifecycle` with `created`, `updated`, and `deleted` actions | Survives daemon restart through `state.db`; clients still reload authority hierarchy or detail queries when they need the current read model rather than just the lifecycle notification |
+| Work unit, authority record | Not globally projected into `state/get`. It appears there only after assignment compatibility bridging has injected a collaboration-shaped row. | `authority/workunit/create`, `authority/workunit/edit`, and `authority/workunit/delete` emit `WorkUnitLifecycle` with `created`, `updated`, and `deleted` actions | Survives daemon restart through `state.db`; assignment-created collaboration compatibility state also survives in `state.json`, but `state/get` hides bridged rows whose authority source is now tombstoned |
+| Tracked thread, authority record | Not projected into `state/get`; the TUI now reloads authority detail instead of synthesizing local authority records for edit flows | `authority/tracked_thread/create`, `authority/tracked_thread/edit`, and `authority/tracked_thread/delete` emit `TrackedThreadLifecycle` with `created`, `updated`, and `deleted` actions | Survives daemon restart through `state.db`; clients still reload authority hierarchy or detail queries when they need the current read model rather than just the lifecycle notification |
 | Assignment | Collaboration-native | `AssignmentLifecycle` | Survives daemon restart through `state.json`; clients reload via snapshot-first flow |
 | Proposal | Collaboration-native; there is no top-level proposal list in `state/get`, though collaboration work unit summaries can carry nested proposal summaries | `ProposalLifecycle` | Survives daemon restart through `state.json`; clients must re-query proposal RPCs after reconnect when they need full proposal records |
 | Decision | Collaboration-native | `DecisionApplied` | Survives daemon restart through `state.json`; visible again through `state/get` |
@@ -71,7 +71,7 @@ The important rule is that ORCAS does not currently present a single uniform wor
 
 Orcas IPC uses a local Unix domain socket and JSON-RPC 2.0 style messages. Messages are newline-delimited JSON records. Clients issue requests for commands and queries, receive responses for results, and subscribe to notifications for incremental updates.
 
-The daemon exposes a snapshot-first interaction pattern. Clients typically request current state first, then subscribe to live events. That keeps reconnect behavior deterministic and avoids rebuilding UI state from raw event gaps. The important caveat is that `state/get` is not the full authority hierarchy, and event coverage for authority mutations is currently incomplete.
+The daemon exposes a snapshot-first interaction pattern. Clients typically request current state first, then subscribe to live events. That keeps reconnect behavior deterministic and avoids rebuilding UI state from raw event gaps. The important caveat is that `state/get` is not the full authority hierarchy, and authority lifecycle events are visibility signals rather than full read-model convergence.
 
 Current request families include:
 
@@ -149,7 +149,7 @@ Notifications are delivered on `events/notification` with Orcas-owned event enve
 - a collaboration-shaped snapshot of workstreams, work units, assignments, codex thread assignments, supervisor decisions, reports, and decisions
 - recent daemon event summaries
 
-`state/get` is not a single-store source-of-truth dump. It is assembled from daemon memory and then augmented with authority workstream and work unit projections.
+`state/get` is not a single-store source-of-truth dump. It is assembled from daemon memory plus any explicitly bridged authority workstream and work unit compatibility rows that already exist in collaboration state.
 
 `state/get` does not contain:
 
@@ -162,10 +162,11 @@ Notifications are delivered on `events/notification` with Orcas-owned event enve
 Current limitations of the merged collaboration snapshot:
 
 - workstream and work unit lists can contain mixed semantics
-- authority workstreams appear as collaboration-shaped summaries
-- authority work units projected directly from SQLite carry only limited collaboration fields
-- projected authority work units currently use defaulted collaboration summary fields such as no dependency count, no current assignment id, no latest report id, and no proposal summary until a compatibility bridge has injected a collaboration record for that id
-- authority deletes do not currently scrub previously bridged collaboration copies from `state.json`, so `state/get` can retain stale authority-derived workstreams or work units after the corresponding authority row has been tombstoned
+- authority compatibility bridge rows appear as collaboration-shaped summaries rather than authority-shaped records
+- bridge rows carry a narrower contract than authority hierarchy/detail reads; callers that need revisions, tombstones, origin metadata, tracked threads, or exact authority detail must use authority RPCs
+- bridged authority rows now expose `source_kind = authority_compatibility_bridge` so clients can distinguish them from native collaboration rows
+- authority deletes do not currently scrub previously bridged collaboration copies from `state.json`, but `state/get` hides those bridged rows once the authority source has been tombstoned
+- later daemon-owned lifecycle updates on bridged rows, such as assignment-driven work-unit status changes, retain `source_kind = authority_compatibility_bridge` instead of masquerading as native collaboration rows
 
 ### `authority/hierarchy/get`
 
@@ -173,6 +174,7 @@ Current limitations of the merged collaboration snapshot:
 
 This read model is the current source for:
 
+- canonical planning hierarchy reads for authority workstreams, authority work units, and tracked threads
 - tracked-thread hierarchy
 - authority revisions
 - authority tombstones when `include_deleted = true`
@@ -197,11 +199,10 @@ This read model is the current source for:
 
 ### Current Client-Side Synthesis
 
-The TUI currently synthesizes some authority-shaped records locally when detail data has not been loaded yet.
+The TUI no longer synthesizes authority-shaped edit records from hierarchy summaries.
 
-- It can derive edit-form workstream and tracked-thread records from hierarchy summaries.
-- Those synthesized records do not carry the full authority detail surface.
-- This is a current implementation convenience, not a guarantee that hierarchy summaries and detail records are interchangeable.
+- Edit forms now wait for `authority/workstream/get`, `authority/workunit/get`, or `authority/tracked_thread/get` to return.
+- Hierarchy summaries are treated as navigation data, not as interchangeable authority detail records.
 
 ## Mutation And Event Visibility
 
@@ -209,15 +210,15 @@ The TUI currently synthesizes some authority-shaped records locally when detail 
 
 | Mutation | Durable write target | Read-after-write visibility | Event visibility today | What subscribers can rely on today |
 | --- | --- | --- | --- | --- |
-| `authority/workstream/create` | `state.db` | Appears in `authority/hierarchy/get` immediately after commit; appears in `state/get` as a projected workstream summary on the next snapshot read | Emits `WorkstreamLifecycle { action = created }` | Subscribers can observe a post-commit create notification for that workstream id, but the event payload is collaboration-shaped and omits authority metadata |
-| `authority/workstream/edit` | `state.db` | Updated in `authority/hierarchy/get` after commit; projected changes appear in the next `state/get` snapshot | Emits `WorkstreamLifecycle { action = updated }` | Subscribers can observe a post-commit update notification for that workstream id, but should reload if they need authority revision or delete state |
-| `authority/workstream/delete` | `state.db` tombstone | Hidden from default `authority/hierarchy/get`. In `state/get`, purely projected rows disappear on reload, but any previously bridged collaboration copy can remain because authority delete does not currently scrub legacy collaboration state. | Emits `WorkstreamLifecycle { action = deleted }` | Subscribers can observe a post-commit delete notification for that workstream id. They must not infer that all read surfaces are already converged or that stale bridged copies were removed from `state/get`. |
-| `authority/workunit/create` | `state.db` | Appears in `authority/hierarchy/get` immediately after commit; appears in `state/get` as a projected work unit summary on the next snapshot read | Emits `WorkUnitLifecycle { action = created }` | Subscribers can observe a post-commit create notification for that work unit id, but the summary is collaboration-shaped and authority-specific fields are not included |
-| `authority/workunit/edit` | `state.db` | Updated in `authority/hierarchy/get` after commit; projected changes appear in the next `state/get` snapshot | Emits `WorkUnitLifecycle { action = updated }` | Subscribers can observe a post-commit update notification for that work unit id, but should reload if they need the authority-shaped row |
-| `authority/workunit/delete` | `state.db` tombstone | Hidden from default `authority/hierarchy/get`. In `state/get`, purely projected rows disappear on reload, but any previously bridged collaboration copy can remain because authority delete does not currently scrub legacy collaboration state. | Emits `WorkUnitLifecycle { action = deleted }` | Subscribers can observe a post-commit delete notification for that work unit id. They must not infer that `state/get` and authority reads are now normalized. |
+| `authority/workstream/create` | `state.db` | Appears in `authority/hierarchy/get` immediately after commit. It does not appear in `state/get` unless a later assignment compatibility bridge injects it into collaboration state. | Emits `WorkstreamLifecycle { action = created }` with `source_kind = authority_projection` | Subscribers can observe a post-commit create notification for that workstream id, but should treat the event as a visibility signal and reload authority reads for canonical data |
+| `authority/workstream/edit` | `state.db` | Updated in `authority/hierarchy/get` after commit. Any existing bridge row is reflected in `state/get` on the next snapshot read because the bridge is stored in collaboration state. | Emits `WorkstreamLifecycle { action = updated }` with `source_kind = authority_projection` | Subscribers can observe a post-commit update notification for that workstream id, but should reload if they need authority revision, tombstone state, or exact authority detail |
+| `authority/workstream/delete` | `state.db` tombstone | Hidden from default `authority/hierarchy/get`. `state/get` also hides any previously bridged collaboration copy on the next snapshot read, even though the bridged legacy row can still remain persisted in `state.json`. | Emits `WorkstreamLifecycle { action = deleted }` with `source_kind = authority_projection` | Subscribers can observe a post-commit delete notification for that workstream id. They must not infer that the legacy collaboration store was physically scrubbed. |
+| `authority/workunit/create` | `state.db` | Appears in `authority/hierarchy/get` immediately after commit. It does not appear in `state/get` unless a later assignment compatibility bridge injects it into collaboration state. | Emits `WorkUnitLifecycle { action = created }` with `source_kind = authority_projection` | Subscribers can observe a post-commit create notification for that work unit id, but should reload authority reads for canonical planning data |
+| `authority/workunit/edit` | `state.db` | Updated in `authority/hierarchy/get` after commit. Any existing bridge row is reflected in `state/get` on the next snapshot read because the bridge is stored in collaboration state. | Emits `WorkUnitLifecycle { action = updated }` with `source_kind = authority_projection` | Subscribers can observe a post-commit update notification for that work unit id, but should reload if they need the authority-shaped row |
+| `authority/workunit/delete` | `state.db` tombstone | Hidden from default `authority/hierarchy/get`. `state/get` also hides any previously bridged collaboration copy on the next snapshot read, even though the bridged legacy row can still remain persisted in `state.json`. | Emits `WorkUnitLifecycle { action = deleted }` with `source_kind = authority_projection` | Subscribers can observe a post-commit delete notification for that work unit id. They must not infer that collaboration persistence and authority persistence are now physically unified. |
 | `authority/tracked_thread/create` | `state.db` | Appears in `authority/hierarchy/get`, `authority/workunit/get`, and `authority/tracked_thread/get` after commit | Emits `TrackedThreadLifecycle { action = created }` | Subscribers can observe a post-commit create notification for that tracked thread id, but should reload authority queries if they need the full tracked-thread record |
 | `authority/tracked_thread/edit` | `state.db` | Updated in authority detail and hierarchy queries after commit | Emits `TrackedThreadLifecycle { action = updated }` | Subscribers can observe a post-commit update notification for that tracked thread id, but should reload authority queries if they need full detail |
-| `authority/tracked_thread/delete` | `state.db` tombstone | Hidden from default authority queries after commit | Emits `TrackedThreadLifecycle { action = deleted }` | Subscribers can observe a post-commit delete notification for that tracked thread id. They must not infer that any client-local synthesized copy has already been cleared. |
+| `authority/tracked_thread/delete` | `state.db` tombstone | Hidden from default authority queries after commit | Emits `TrackedThreadLifecycle { action = deleted }` | Subscribers can observe a post-commit delete notification for that tracked thread id. They must not infer that every client-local cache has already been refreshed. |
 
 Parent deletes also surface their explicit child tombstones through the daemon event stream:
 
@@ -292,10 +293,9 @@ The one intentional exception is the TUI's local PTY-backed `codex resume` helpe
 
 ## Known Limitations Carried Into Later Phases
 
-- `state/get` contains mixed-semantics workstream and work unit lists.
-- Authority deletes do not currently guarantee cleanup of previously bridged collaboration copies in `state/get`.
+- `state/get` still contains mixed-semantics workstream and work unit lists because collaboration-native rows and explicit compatibility bridge rows share summary types.
+- Authority deletes hide previously bridged rows from `state/get`, but do not currently scrub the underlying bridge copy from `state.json`.
 - Tracked-thread lifecycle events do not remove the need for authority query reloads when a client needs full record detail rather than an event summary.
 - The CLI and TUI currently operate different CRUD surfaces for workflow hierarchy objects.
-- The TUI still synthesizes some authority-shaped records locally when detail is missing.
 
 These are current implementation truths, not guarantees that later hardening phases will preserve unchanged. Later phases can normalize the boundary, but this document intentionally describes the boundary as it exists today.

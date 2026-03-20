@@ -369,6 +369,8 @@ pub struct WorkstreamSummary {
     pub objective: String,
     pub status: WorkstreamStatus,
     pub priority: String,
+    #[serde(default)]
+    pub source_kind: PlanningSummarySourceKind,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -383,7 +385,18 @@ pub struct WorkUnitSummary {
     pub latest_report_id: Option<String>,
     #[serde(default)]
     pub proposal: Option<WorkUnitProposalSummary>,
+    #[serde(default)]
+    pub source_kind: PlanningSummarySourceKind,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningSummarySourceKind {
+    #[default]
+    Collaboration,
+    AuthorityCompatibilityBridge,
+    AuthorityProjection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -597,6 +610,7 @@ mod tests {
                 current_assignment_id: None,
                 latest_report_id: None,
                 proposal: None,
+                source_kind: super::PlanningSummarySourceKind::Collaboration,
                 updated_at: Utc::now(),
             },
         };

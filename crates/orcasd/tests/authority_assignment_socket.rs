@@ -83,8 +83,19 @@ async fn create_authority_workunit(
         .work_unit
 }
 
+async fn delete_plan(
+    client: &orcasd::OrcasIpcClient,
+    target: authority::DeleteTarget,
+) -> authority::DeletePlan {
+    client
+        .authority_delete_plan(&ipc::AuthorityDeletePlanRequest { target })
+        .await
+        .expect("load authority delete plan")
+        .delete_plan
+}
+
 #[tokio::test]
-async fn assignment_start_consumes_projected_authority_work_unit_and_updates_state() {
+async fn assignment_start_bridges_authority_work_unit_into_state_and_updates_it() {
     let fake_codex = FakeCodexAppServer::spawn().await;
     let mut daemon = TestDaemon::spawn_with_env(
         "authority-assignment",
@@ -96,6 +107,10 @@ async fn assignment_start_consumes_projected_authority_work_unit_and_updates_sta
     .await;
     let client = daemon.connect().await;
     let fixture = AuthorityFixture::new();
+    let (mut events, _) = client
+        .subscribe_events(false)
+        .await
+        .expect("subscribe to daemon events");
 
     let workstream = create_authority_workstream(
         &client,
@@ -123,9 +138,7 @@ async fn assignment_start_consumes_projected_authority_work_unit_and_updates_sta
             .collaboration
             .work_units
             .iter()
-            .any(|summary| {
-                summary.id == work_unit.id.as_str() && summary.status == WorkUnitStatus::Ready
-            })
+            .all(|summary| summary.id != work_unit.id.as_str())
     );
 
     let started = client
@@ -147,6 +160,28 @@ async fn assignment_start_consumes_projected_authority_work_unit_and_updates_sta
     assert_eq!(started.worker.id, "worker-1");
     assert_eq!(started.report.work_unit_id, work_unit.id.as_str());
     assert_eq!(started.report.assignment_id, started.assignment.id);
+    let bridged_work_unit_event = TestDaemon::next_event_matching(&mut events, |envelope| {
+        matches!(
+            &envelope.event,
+            ipc::DaemonEvent::WorkUnitLifecycle { action, work_unit: summary }
+                if *action == ipc::CollaborationLifecycleAction::Updated
+                    && summary.id == work_unit.id.as_str()
+                    && summary.source_kind
+                        == ipc::PlanningSummarySourceKind::AuthorityCompatibilityBridge
+        )
+    })
+    .await;
+    match bridged_work_unit_event.event {
+        ipc::DaemonEvent::WorkUnitLifecycle { action, work_unit } => {
+            assert_eq!(action, ipc::CollaborationLifecycleAction::Updated);
+            assert_eq!(work_unit.id, "authority-assignment-wu");
+            assert_eq!(
+                work_unit.source_kind,
+                ipc::PlanningSummarySourceKind::AuthorityCompatibilityBridge
+            );
+        }
+        other => panic!("expected bridged work-unit lifecycle event, got {other:?}"),
+    }
 
     let follow_up_client = daemon.connect().await;
     let assignment_id = started.assignment.id.clone();
@@ -170,7 +205,7 @@ async fn assignment_start_consumes_projected_authority_work_unit_and_updates_sta
             .work_units
             .iter()
             .find(|summary| summary.id == work_unit.id.as_str())
-            .expect("projected work unit should remain visible");
+            .expect("bridged work unit should remain visible");
         if assignment_summary.status == AssignmentStatus::AwaitingDecision
             && work_unit_summary.status == WorkUnitStatus::AwaitingDecision
         {
@@ -219,8 +254,23 @@ async fn assignment_start_consumes_projected_authority_work_unit_and_updates_sta
         .work_units
         .iter()
         .find(|summary| summary.id == work_unit.id.as_str())
-        .expect("projected work unit should remain visible");
+        .expect("bridged work unit should remain visible");
+    let bridged_workstream = settled_snapshot
+        .snapshot
+        .collaboration
+        .workstreams
+        .iter()
+        .find(|summary| summary.id == workstream.id.as_str())
+        .expect("bridged workstream should remain visible");
+    assert_eq!(
+        bridged_workstream.source_kind,
+        ipc::PlanningSummarySourceKind::AuthorityCompatibilityBridge
+    );
     assert_eq!(projected_work_unit.status, WorkUnitStatus::AwaitingDecision);
+    assert_eq!(
+        projected_work_unit.source_kind,
+        ipc::PlanningSummarySourceKind::AuthorityCompatibilityBridge
+    );
     assert_eq!(
         projected_work_unit.current_assignment_id.as_deref(),
         Some(assignment_id.as_str())
@@ -242,6 +292,113 @@ async fn assignment_start_consumes_projected_authority_work_unit_and_updates_sta
             .iter()
             .any(|event| { event.kind == "report" && event.message.contains(&started.report.id) })
     );
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn deleted_authority_rows_are_hidden_from_state_even_after_assignment_bridge() {
+    let fake_codex = FakeCodexAppServer::spawn().await;
+    let mut daemon = TestDaemon::spawn_with_env(
+        "authority-assignment-delete",
+        vec![(
+            "ORCAS_CODEX_LISTEN_URL".to_string(),
+            fake_codex.endpoint.clone(),
+        )],
+    )
+    .await;
+    let client = daemon.connect().await;
+    let fixture = AuthorityFixture::new();
+
+    let workstream = create_authority_workstream(
+        &client,
+        &fixture,
+        "authority-assignment-delete-ws",
+        "Delete Root",
+    )
+    .await;
+    let work_unit = create_authority_workunit(
+        &client,
+        &fixture,
+        "authority-assignment-delete-wu",
+        &workstream.id,
+        "Delete Unit",
+    )
+    .await;
+
+    client
+        .assignment_start(&ipc::AssignmentStartRequest {
+            work_unit_id: work_unit.id.to_string(),
+            worker_id: "worker-bridge".to_string(),
+            worker_kind: Some("codex".to_string()),
+            instructions: Some("Bridge then delete".to_string()),
+            model: None,
+            cwd: None,
+        })
+        .await
+        .expect("assignment start should bridge authority work unit");
+
+    let bridged = client.state_get().await.expect("state/get after bridge");
+    assert!(
+        bridged
+            .snapshot
+            .collaboration
+            .work_units
+            .iter()
+            .any(|summary| {
+                summary.id == work_unit.id.as_str()
+                    && summary.source_kind
+                        == ipc::PlanningSummarySourceKind::AuthorityCompatibilityBridge
+            })
+    );
+
+    let delete_plan = delete_plan(
+        &client,
+        authority::DeleteTarget::Workstream {
+            workstream_id: workstream.id.clone(),
+        },
+    )
+    .await;
+    client
+        .authority_workstream_delete(&ipc::AuthorityWorkstreamDeleteRequest {
+            command: authority::DeleteWorkstream {
+                metadata: fixture.metadata("assignment-ws-delete"),
+                workstream_id: workstream.id.clone(),
+                expected_revision: delete_plan.expected_revision,
+                delete_token: delete_plan.confirmation_token,
+            },
+        })
+        .await
+        .expect("delete bridged authority workstream");
+
+    let snapshot_after_delete = client
+        .state_get()
+        .await
+        .expect("state/get after bridged authority delete");
+    assert!(
+        snapshot_after_delete
+            .snapshot
+            .collaboration
+            .workstreams
+            .iter()
+            .all(|summary| summary.id != workstream.id.as_str())
+    );
+    assert!(
+        snapshot_after_delete
+            .snapshot
+            .collaboration
+            .work_units
+            .iter()
+            .all(|summary| summary.id != work_unit.id.as_str())
+    );
+
+    let hierarchy_after_delete = client
+        .authority_hierarchy_get(&ipc::AuthorityHierarchyGetRequest {
+            include_deleted: false,
+        })
+        .await
+        .expect("authority hierarchy after bridged delete");
+    assert!(hierarchy_after_delete.hierarchy.workstreams.is_empty());
 
     daemon.stop().await;
 }

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,6 +63,32 @@ struct DaemonState {
     turns: HashMap<TurnKey, ipc::TurnStateView>,
     recent_thread_id: Option<String>,
     collaboration: CollaborationState,
+}
+
+#[derive(Debug, Default)]
+struct BridgeSnapshotMetadata {
+    workstream_bridge_ids: BTreeSet<String>,
+    work_unit_bridge_ids: BTreeSet<String>,
+    hidden_workstream_ids: BTreeSet<String>,
+    hidden_work_unit_ids: BTreeSet<String>,
+}
+
+impl BridgeSnapshotMetadata {
+    fn workstream_source_kind(&self, workstream_id: &str) -> ipc::PlanningSummarySourceKind {
+        if self.workstream_bridge_ids.contains(workstream_id) {
+            ipc::PlanningSummarySourceKind::AuthorityCompatibilityBridge
+        } else {
+            ipc::PlanningSummarySourceKind::Collaboration
+        }
+    }
+
+    fn work_unit_source_kind(&self, work_unit_id: &str) -> ipc::PlanningSummarySourceKind {
+        if self.work_unit_bridge_ids.contains(work_unit_id) {
+            ipc::PlanningSummarySourceKind::AuthorityCompatibilityBridge
+        } else {
+            ipc::PlanningSummarySourceKind::Collaboration
+        }
+    }
 }
 
 impl Default for DaemonState {
@@ -6049,24 +6075,19 @@ impl OrcasDaemonService {
         work_unit_id: &str,
     ) -> OrcasResult<()> {
         // Compatibility bridge: assignment execution still reads collaboration-owned work units,
-        // so an authority work unit is injected into collaboration state on demand before start.
-        if self
-            .state
-            .read()
-            .await
-            .collaboration
-            .work_units
-            .contains_key(work_unit_id)
-        {
-            return Ok(());
-        }
-
+        // but planning hierarchy reads come from authority queries. Only assignment-start paths
+        // inject authority rows into collaboration state, and those rows are tracked explicitly.
         let authority_work_unit_id = orcas_core::authority::WorkUnitId::parse(work_unit_id)?;
         let authority_work_unit = self
             .authority_store
             .get_work_unit(&authority_work_unit_id)
             .await?
             .ok_or_else(|| OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`")))?;
+        if authority_work_unit.deleted_at.is_some() {
+            return Err(OrcasError::Protocol(format!(
+                "authority work unit `{work_unit_id}` has been deleted"
+            )));
+        }
         let authority_workstream = self
             .authority_store
             .get_workstream(&authority_work_unit.workstream_id)
@@ -6077,6 +6098,12 @@ impl OrcasDaemonService {
                     authority_work_unit.workstream_id
                 ))
             })?;
+        if authority_workstream.deleted_at.is_some() {
+            return Err(OrcasError::Protocol(format!(
+                "authority workstream `{}` has been deleted",
+                authority_workstream.id
+            )));
+        }
 
         let mut state = self.state.write().await;
         state
@@ -6088,11 +6115,19 @@ impl OrcasDaemonService {
             });
         state
             .collaboration
+            .authority_workstream_bridges
+            .insert(authority_workstream.id.to_string());
+        state
+            .collaboration
             .work_units
             .entry(authority_work_unit.id.to_string())
             .or_insert_with(|| {
                 Self::authority_work_unit_record_to_collaboration(&authority_work_unit)
             });
+        state
+            .collaboration
+            .authority_work_unit_bridges
+            .insert(authority_work_unit.id.to_string());
         Ok(())
     }
 
@@ -6321,9 +6356,21 @@ impl OrcasDaemonService {
         action: ipc::CollaborationLifecycleAction,
         workstream: &Workstream,
     ) {
+        let source_kind = {
+            let state = self.state.read().await;
+            if state
+                .collaboration
+                .authority_workstream_bridges
+                .contains(&workstream.id)
+            {
+                ipc::PlanningSummarySourceKind::AuthorityCompatibilityBridge
+            } else {
+                ipc::PlanningSummarySourceKind::Collaboration
+            }
+        };
         self.emit(ipc::DaemonEvent::WorkstreamLifecycle {
             action,
-            workstream: Self::workstream_summary(workstream),
+            workstream: Self::workstream_summary(workstream, source_kind),
         })
         .await;
     }
@@ -6335,15 +6382,32 @@ impl OrcasDaemonService {
     ) {
         let work_unit = {
             let state = self.state.read().await;
+            let source_kind = if state
+                .collaboration
+                .authority_work_unit_bridges
+                .contains(&work_unit.id)
+            {
+                ipc::PlanningSummarySourceKind::AuthorityCompatibilityBridge
+            } else {
+                ipc::PlanningSummarySourceKind::Collaboration
+            };
             state
                 .collaboration
                 .work_units
                 .get(&work_unit.id)
                 .map(|work_unit| {
-                    Self::work_unit_summary_for_collaboration(work_unit, &state.collaboration)
+                    Self::work_unit_summary_for_collaboration(
+                        work_unit,
+                        &state.collaboration,
+                        source_kind,
+                    )
                 })
                 .unwrap_or_else(|| {
-                    Self::work_unit_summary_for_collaboration(work_unit, &state.collaboration)
+                    Self::work_unit_summary_for_collaboration(
+                        work_unit,
+                        &state.collaboration,
+                        source_kind,
+                    )
                 })
         };
         self.emit(ipc::DaemonEvent::WorkUnitLifecycle { action, work_unit })
@@ -6413,7 +6477,19 @@ impl OrcasDaemonService {
                 .work_units
                 .get(&proposal.primary_work_unit_id)
                 .map(|work_unit| {
-                    Self::work_unit_summary_for_collaboration(work_unit, &state.collaboration)
+                    Self::work_unit_summary_for_collaboration(
+                        work_unit,
+                        &state.collaboration,
+                        if state
+                            .collaboration
+                            .authority_work_unit_bridges
+                            .contains(&proposal.primary_work_unit_id)
+                        {
+                            ipc::PlanningSummarySourceKind::AuthorityCompatibilityBridge
+                        } else {
+                            ipc::PlanningSummarySourceKind::Collaboration
+                        },
+                    )
                 })
                 .unwrap_or_else(|| ipc::WorkUnitSummary {
                     id: proposal.primary_work_unit_id.clone(),
@@ -6426,6 +6502,15 @@ impl OrcasDaemonService {
                     ),
                     latest_report_id: Some(proposal.source_report_id.clone()),
                     proposal: None,
+                    source_kind: if state
+                        .collaboration
+                        .authority_work_unit_bridges
+                        .contains(&proposal.primary_work_unit_id)
+                    {
+                        ipc::PlanningSummarySourceKind::AuthorityCompatibilityBridge
+                    } else {
+                        ipc::PlanningSummarySourceKind::Collaboration
+                    },
                     updated_at: proposal.created_at,
                 })
         };
@@ -6443,13 +6528,14 @@ impl OrcasDaemonService {
         let threads = Self::scoped_thread_summaries(&state.threads);
         let active_thread = Self::focus_thread_view(&state, &threads);
         let session = state.session.clone();
-        let collaboration = Self::collaboration_snapshot(&state.collaboration);
+        let collaboration_state = state.collaboration.clone();
         drop(state);
-        // `state/get` is a merged read model: collaboration state comes from daemon memory and
-        // authority workstream/work unit summaries are projected in afterward from SQLite.
-        let collaboration = self
-            .merge_authority_projection_into_collaboration_snapshot(collaboration)
-            .await?;
+        // `state/get` is now a collaboration-first snapshot plus explicit assignment-compatibility
+        // bridges. Authority planning hierarchy reads come from authority queries, not from this
+        // summary surface. Bridged collaboration rows are hidden if their authority source has
+        // been tombstoned, even though the legacy collaboration copy may still exist on disk.
+        let bridge_metadata = self.bridge_snapshot_metadata(&collaboration_state).await?;
+        let collaboration = Self::collaboration_snapshot(&collaboration_state, &bridge_metadata);
 
         Ok(ipc::StateSnapshot {
             daemon,
@@ -6465,11 +6551,74 @@ impl OrcasDaemonService {
         format!("{prefix}-{}", Uuid::new_v4().simple())
     }
 
-    fn collaboration_snapshot(collaboration: &CollaborationState) -> ipc::CollaborationSnapshot {
+    async fn bridge_snapshot_metadata(
+        &self,
+        collaboration: &CollaborationState,
+    ) -> OrcasResult<BridgeSnapshotMetadata> {
+        let mut metadata = BridgeSnapshotMetadata {
+            workstream_bridge_ids: collaboration.authority_workstream_bridges.clone(),
+            work_unit_bridge_ids: collaboration.authority_work_unit_bridges.clone(),
+            ..BridgeSnapshotMetadata::default()
+        };
+        if metadata.workstream_bridge_ids.is_empty() && metadata.work_unit_bridge_ids.is_empty() {
+            return Ok(metadata);
+        }
+
+        let live_workstream_ids = self
+            .authority_store
+            .list_workstreams(false)
+            .await?
+            .into_iter()
+            .map(|workstream| workstream.id.to_string())
+            .collect::<BTreeSet<_>>();
+        let live_work_unit_parents = self
+            .authority_store
+            .list_work_units(None, false)
+            .await?
+            .into_iter()
+            .map(|work_unit| {
+                (
+                    work_unit.id.to_string(),
+                    work_unit.workstream_id.to_string(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        for workstream_id in &metadata.workstream_bridge_ids {
+            if !live_workstream_ids.contains(workstream_id) {
+                metadata.hidden_workstream_ids.insert(workstream_id.clone());
+            }
+        }
+        for work_unit_id in &metadata.work_unit_bridge_ids {
+            match live_work_unit_parents.get(work_unit_id) {
+                Some(parent_id) if !metadata.hidden_workstream_ids.contains(parent_id) => {}
+                _ => {
+                    metadata.hidden_work_unit_ids.insert(work_unit_id.clone());
+                }
+            }
+        }
+
+        Ok(metadata)
+    }
+
+    fn collaboration_snapshot(
+        collaboration: &CollaborationState,
+        bridge_metadata: &BridgeSnapshotMetadata,
+    ) -> ipc::CollaborationSnapshot {
         let mut workstreams = collaboration
             .workstreams
             .values()
-            .map(Self::workstream_summary)
+            .filter(|workstream| {
+                !bridge_metadata
+                    .hidden_workstream_ids
+                    .contains(&workstream.id)
+            })
+            .map(|workstream| {
+                Self::workstream_summary(
+                    workstream,
+                    bridge_metadata.workstream_source_kind(&workstream.id),
+                )
+            })
             .collect::<Vec<_>>();
         workstreams.sort_by(|left, right| {
             right
@@ -6481,7 +6630,14 @@ impl OrcasDaemonService {
         let mut work_units = collaboration
             .work_units
             .values()
-            .map(|work_unit| Self::work_unit_summary_for_collaboration(work_unit, collaboration))
+            .filter(|work_unit| !bridge_metadata.hidden_work_unit_ids.contains(&work_unit.id))
+            .map(|work_unit| {
+                Self::work_unit_summary_for_collaboration(
+                    work_unit,
+                    collaboration,
+                    bridge_metadata.work_unit_source_kind(&work_unit.id),
+                )
+            })
             .collect::<Vec<_>>();
         work_units.sort_by(|left, right| {
             right
@@ -6562,71 +6718,17 @@ impl OrcasDaemonService {
         }
     }
 
-    async fn merge_authority_projection_into_collaboration_snapshot(
-        &self,
-        mut collaboration: ipc::CollaborationSnapshot,
-    ) -> OrcasResult<ipc::CollaborationSnapshot> {
-        let authority_workstreams = self.authority_store.list_workstreams(false).await?;
-        for workstream in authority_workstreams {
-            if collaboration
-                .workstreams
-                .iter()
-                .all(|existing| existing.id != workstream.id.as_str())
-            {
-                collaboration
-                    .workstreams
-                    .push(Self::authority_workstream_summary(&workstream));
-            }
-        }
-        collaboration.workstreams.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-
-        let authority_work_units = self.authority_store.list_work_units(None, false).await?;
-        for work_unit in authority_work_units {
-            if collaboration
-                .work_units
-                .iter()
-                .all(|existing| existing.id != work_unit.id.as_str())
-            {
-                collaboration
-                    .work_units
-                    .push(Self::authority_work_unit_summary(&work_unit));
-            }
-        }
-        collaboration.work_units.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-
-        Ok(collaboration)
-    }
-
-    fn workstream_summary(workstream: &Workstream) -> ipc::WorkstreamSummary {
+    fn workstream_summary(
+        workstream: &Workstream,
+        source_kind: ipc::PlanningSummarySourceKind,
+    ) -> ipc::WorkstreamSummary {
         ipc::WorkstreamSummary {
             id: workstream.id.clone(),
             title: workstream.title.clone(),
             objective: workstream.objective.clone(),
             status: workstream.status,
             priority: workstream.priority.clone(),
-            updated_at: workstream.updated_at,
-        }
-    }
-
-    fn authority_workstream_summary(
-        workstream: &orcas_core::authority::WorkstreamSummary,
-    ) -> ipc::WorkstreamSummary {
-        ipc::WorkstreamSummary {
-            id: workstream.id.to_string(),
-            title: workstream.title.clone(),
-            objective: workstream.objective.clone(),
-            status: workstream.status,
-            priority: workstream.priority.clone(),
+            source_kind,
             updated_at: workstream.updated_at,
         }
     }
@@ -6642,22 +6744,6 @@ impl OrcasDaemonService {
             priority: workstream.priority.clone(),
             created_at: workstream.created_at,
             updated_at: workstream.updated_at,
-        }
-    }
-
-    fn authority_work_unit_summary(
-        work_unit: &orcas_core::authority::WorkUnitSummary,
-    ) -> ipc::WorkUnitSummary {
-        ipc::WorkUnitSummary {
-            id: work_unit.id.to_string(),
-            workstream_id: work_unit.workstream_id.to_string(),
-            title: work_unit.title.clone(),
-            status: work_unit.status,
-            dependency_count: 0,
-            current_assignment_id: None,
-            latest_report_id: None,
-            proposal: None,
-            updated_at: work_unit.updated_at,
         }
     }
 
@@ -6691,6 +6777,7 @@ impl OrcasDaemonService {
                 objective: workstream.objective.clone(),
                 status: workstream.status,
                 priority: workstream.priority.clone(),
+                source_kind: ipc::PlanningSummarySourceKind::AuthorityProjection,
                 updated_at: workstream.updated_at,
             },
         })
@@ -6713,6 +6800,7 @@ impl OrcasDaemonService {
                 current_assignment_id: None,
                 latest_report_id: None,
                 proposal: None,
+                source_kind: ipc::PlanningSummarySourceKind::AuthorityProjection,
                 updated_at: work_unit.updated_at,
             },
         })
@@ -6734,6 +6822,7 @@ impl OrcasDaemonService {
     fn work_unit_summary_for_collaboration(
         work_unit: &WorkUnit,
         collaboration: &CollaborationState,
+        source_kind: ipc::PlanningSummarySourceKind,
     ) -> ipc::WorkUnitSummary {
         ipc::WorkUnitSummary {
             id: work_unit.id.clone(),
@@ -6744,6 +6833,7 @@ impl OrcasDaemonService {
             current_assignment_id: work_unit.current_assignment_id.clone(),
             latest_report_id: work_unit.latest_report_id.clone(),
             proposal: Self::work_unit_proposal_summary(collaboration, &work_unit.id),
+            source_kind,
             updated_at: work_unit.updated_at,
         }
     }

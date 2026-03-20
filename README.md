@@ -91,8 +91,8 @@ meta:    ${XDG_RUNTIME_DIR:-~/.local/share/orcas/runtime}/orcas/orcasd.json
 
 The current read model is split:
 
-- `state/get` is a merged daemon snapshot that includes collaboration state plus projected authority workstream and work unit summaries
-- `authority/hierarchy/get` is the authority-only hierarchy query used by the TUI for tracked threads and authority metadata
+- `state/get` is a merged daemon snapshot that includes collaboration state plus any explicit authority compatibility bridge summaries needed for assignment execution
+- `authority/hierarchy/get` is the canonical authority-only hierarchy query used by the TUI for planning hierarchy, tracked threads, revisions, and other authority metadata
 
 `RUST_LOG` controls tracing verbosity. Orcas-specific overrides use `ORCAS_*` environment variables, including the Codex binary path and upstream listen URL.
 

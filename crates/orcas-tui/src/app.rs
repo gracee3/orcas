@@ -1598,7 +1598,25 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             reconcile_main_view(state);
         }
         UiEvent::WorkstreamLifecycle { action, workstream } => {
-            if action != ipc::CollaborationLifecycleAction::Deleted {
+            if workstream.source_kind == ipc::PlanningSummarySourceKind::AuthorityProjection {
+                if action == ipc::CollaborationLifecycleAction::Deleted {
+                    state
+                        .authority_main
+                        .workstream_details
+                        .remove(workstream.id.as_str());
+                }
+                effects.push(Effect::LoadAuthorityHierarchy);
+                if matches!(
+                    state.main_view.selected.as_ref(),
+                    Some(MainHierarchySelection::Workstream { workstream_id })
+                        if workstream_id == workstream.id.as_str()
+                ) && action != ipc::CollaborationLifecycleAction::Deleted
+                {
+                    effects.push(Effect::LoadAuthorityWorkstreamDetail {
+                        workstream_id: workstream.id.clone(),
+                    });
+                }
+            } else if action != ipc::CollaborationLifecycleAction::Deleted {
                 upsert_workstream_summary(&mut state.collaboration.workstreams, workstream);
                 effects.extend(load_selected_work_unit_detail_if_needed(state));
             }
@@ -1607,7 +1625,25 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::WorkUnitLifecycle { action, work_unit } => {
             let selected = state.selected_work_unit_id.as_deref() == Some(work_unit.id.as_str());
-            if action != ipc::CollaborationLifecycleAction::Deleted {
+            if work_unit.source_kind == ipc::PlanningSummarySourceKind::AuthorityProjection {
+                if action == ipc::CollaborationLifecycleAction::Deleted {
+                    state
+                        .authority_main
+                        .work_unit_details
+                        .remove(work_unit.id.as_str());
+                }
+                effects.push(Effect::LoadAuthorityHierarchy);
+                if matches!(
+                    state.main_view.selected.as_ref(),
+                    Some(MainHierarchySelection::WorkUnit { work_unit_id, .. })
+                        if work_unit_id == work_unit.id.as_str()
+                ) && action != ipc::CollaborationLifecycleAction::Deleted
+                {
+                    effects.push(Effect::LoadAuthorityWorkUnitDetail {
+                        work_unit_id: work_unit.id.clone(),
+                    });
+                }
+            } else if action != ipc::CollaborationLifecycleAction::Deleted {
                 upsert_work_unit_summary(&mut state.collaboration.work_units, work_unit);
                 if selected {
                     effects.extend(load_selected_work_unit_detail(state));
@@ -2873,16 +2909,7 @@ fn open_main_footer_for_edit(state: &mut AppState) -> Vec<Effect> {
                 .authority_main
                 .workstream_details
                 .get(workstream_id)
-                .map(|detail| detail.workstream.clone())
-                .or_else(|| {
-                    state
-                        .authority_main
-                        .hierarchy
-                        .workstreams
-                        .iter()
-                        .find(|node| node.workstream.id.as_str() == workstream_id)
-                        .map(|node| authority_workstream_record_from_summary(&node.workstream))
-                });
+                .map(|detail| detail.workstream.clone());
             let Some(workstream) = workstream else {
                 state.banner = Some(StatusBanner {
                     level: BannerLevel::Warning,
@@ -2908,8 +2935,7 @@ fn open_main_footer_for_edit(state: &mut AppState) -> Vec<Effect> {
                 .authority_main
                 .work_unit_details
                 .get(work_unit_id)
-                .map(|detail| detail.work_unit.clone())
-                .or_else(|| find_authority_work_unit_record(state, work_unit_id));
+                .map(|detail| detail.work_unit.clone());
             let Some(work_unit) = work_unit else {
                 state.banner = Some(StatusBanner {
                     level: BannerLevel::Warning,
@@ -2936,8 +2962,7 @@ fn open_main_footer_for_edit(state: &mut AppState) -> Vec<Effect> {
                 .authority_main
                 .tracked_thread_details
                 .get(thread_id)
-                .map(|detail| detail.tracked_thread.clone())
-                .or_else(|| find_authority_tracked_thread_record(state, thread_id));
+                .map(|detail| detail.tracked_thread.clone());
             let Some(tracked_thread) = tracked_thread else {
                 state.banner = Some(StatusBanner {
                     level: BannerLevel::Warning,
@@ -3386,90 +3411,6 @@ fn work_unit_id_for_tracked_thread(state: &AppState, tracked_thread_id: &str) ->
                     .then(|| work_unit.work_unit.id.to_string())
             })
         })
-}
-
-fn find_authority_work_unit_record(
-    state: &AppState,
-    work_unit_id: &str,
-) -> Option<authority::WorkUnitRecord> {
-    state
-        .authority_main
-        .hierarchy
-        .workstreams
-        .iter()
-        .find_map(|workstream| {
-            workstream.work_units.iter().find_map(|work_unit| {
-                (work_unit.work_unit.id.as_str() == work_unit_id).then(|| {
-                    authority::WorkUnitRecord {
-                        id: work_unit.work_unit.id.clone(),
-                        workstream_id: workstream.workstream.id.clone(),
-                        title: work_unit.work_unit.title.clone(),
-                        task_statement: work_unit.work_unit.title.clone(),
-                        status: work_unit.work_unit.status,
-                        revision: work_unit.work_unit.revision,
-                        origin_node_id: authority::OriginNodeId::parse("orcas-tui")
-                            .expect("static origin node id"),
-                        created_at: work_unit.work_unit.updated_at,
-                        updated_at: work_unit.work_unit.updated_at,
-                        deleted_at: work_unit.work_unit.deleted_at,
-                    }
-                })
-            })
-        })
-}
-
-fn find_authority_tracked_thread_record(
-    state: &AppState,
-    tracked_thread_id: &str,
-) -> Option<authority::TrackedThreadRecord> {
-    state
-        .authority_main
-        .hierarchy
-        .workstreams
-        .iter()
-        .find_map(|workstream| {
-            workstream.work_units.iter().find_map(|work_unit| {
-                work_unit.tracked_threads.iter().find_map(|tracked_thread| {
-                    (tracked_thread.id.as_str() == tracked_thread_id).then(|| {
-                        authority::TrackedThreadRecord {
-                            id: tracked_thread.id.clone(),
-                            work_unit_id: work_unit.work_unit.id.clone(),
-                            title: tracked_thread.title.clone(),
-                            notes: None,
-                            backend_kind: tracked_thread.backend_kind,
-                            upstream_thread_id: tracked_thread.upstream_thread_id.clone(),
-                            binding_state: tracked_thread.binding_state,
-                            preferred_cwd: None,
-                            preferred_model: None,
-                            last_seen_turn_id: None,
-                            revision: tracked_thread.revision,
-                            origin_node_id: authority::OriginNodeId::parse("orcas-tui")
-                                .expect("static origin node id"),
-                            created_at: tracked_thread.updated_at,
-                            updated_at: tracked_thread.updated_at,
-                            deleted_at: tracked_thread.deleted_at,
-                        }
-                    })
-                })
-            })
-        })
-}
-
-fn authority_workstream_record_from_summary(
-    summary: &authority::WorkstreamSummary,
-) -> authority::WorkstreamRecord {
-    authority::WorkstreamRecord {
-        id: summary.id.clone(),
-        title: summary.title.clone(),
-        objective: summary.objective.clone(),
-        status: summary.status,
-        priority: summary.priority.clone(),
-        revision: summary.revision,
-        origin_node_id: authority::OriginNodeId::parse("orcas-tui").expect("static origin node id"),
-        created_at: summary.updated_at,
-        updated_at: summary.updated_at,
-        deleted_at: summary.deleted_at,
-    }
 }
 
 fn ensure_thread_detail(state: &mut AppState, thread_id: &str) {

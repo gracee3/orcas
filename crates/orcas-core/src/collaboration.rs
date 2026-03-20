@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,11 @@ pub struct CollaborationState {
     #[serde(default)]
     pub workstreams: BTreeMap<String, Workstream>,
     #[serde(default)]
+    pub authority_workstream_bridges: BTreeSet<String>,
+    #[serde(default)]
     pub work_units: BTreeMap<String, WorkUnit>,
+    #[serde(default)]
+    pub authority_work_unit_bridges: BTreeSet<String>,
     #[serde(default)]
     pub assignments: BTreeMap<String, Assignment>,
     #[serde(default)]
