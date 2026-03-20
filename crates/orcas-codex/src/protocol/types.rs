@@ -519,3 +519,150 @@ impl TurnStatus {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        ClientInfo, InitializeParams, InitializeResponse, SandboxPolicy, TextElement,
+        ThreadStartParams, ThreadStatus, TurnStatus, UserInput,
+    };
+
+    #[test]
+    fn initialize_params_omits_optional_capabilities_when_absent() {
+        let params = InitializeParams {
+            client_info: ClientInfo {
+                name: "orcas".to_string(),
+                title: None,
+                version: "0.1.0".to_string(),
+            },
+            capabilities: None,
+        };
+
+        let value = serde_json::to_value(&params).expect("serialize initialize params");
+        assert_eq!(value["clientInfo"]["name"], "orcas");
+        assert!(value.get("capabilities").is_none());
+
+        let round_trip: InitializeParams =
+            serde_json::from_value(value).expect("deserialize initialize params");
+        assert!(round_trip.capabilities.is_none());
+    }
+
+    #[test]
+    fn initialize_response_defaults_missing_optional_fields_to_none() {
+        let response =
+            serde_json::from_value::<InitializeResponse>(json!({})).expect("deserialize response");
+
+        assert!(response.server_info.is_none());
+        assert!(response.user_agent.is_none());
+        assert!(response.platform_family.is_none());
+        assert!(response.platform_os.is_none());
+    }
+
+    #[test]
+    fn thread_start_params_default_matches_expected_operator_contract() {
+        let params = ThreadStartParams::default();
+        let value = serde_json::to_value(&params).expect("serialize thread start params");
+
+        assert_eq!(value["serviceName"], "orcas");
+        assert_eq!(value["approvalPolicy"], "never");
+        assert_eq!(value["ephemeral"], false);
+        assert_eq!(value["experimentalRawEvents"], false);
+        assert_eq!(value["persistExtendedHistory"], true);
+    }
+
+    #[test]
+    fn thread_start_params_deserialize_missing_booleans_with_defaults() {
+        let params = serde_json::from_value::<ThreadStartParams>(json!({}))
+            .expect("deserialize thread start params");
+
+        assert!(!params.experimental_raw_events);
+        assert!(params.persist_extended_history);
+        assert!(matches!(params.approval_policy, None));
+        assert!(params.ephemeral.is_none());
+    }
+
+    #[test]
+    fn sandbox_policy_uses_stable_tagged_shape() {
+        let policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec!["/repo".to_string()],
+            read_only_access: json!({"kind":"minimal"}),
+            network_access: true,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: true,
+        };
+
+        let value = serde_json::to_value(&policy).expect("serialize sandbox policy");
+        assert_eq!(value["type"], "workspaceWrite");
+        assert_eq!(value["writable_roots"][0], "/repo");
+
+        let round_trip: SandboxPolicy =
+            serde_json::from_value(value).expect("deserialize sandbox policy");
+        match round_trip {
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots,
+                network_access,
+                exclude_tmpdir_env_var,
+                exclude_slash_tmp,
+                ..
+            } => {
+                assert_eq!(writable_roots, vec!["/repo".to_string()]);
+                assert!(network_access);
+                assert!(!exclude_tmpdir_env_var);
+                assert!(exclude_slash_tmp);
+            }
+            other => panic!("unexpected sandbox policy: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_input_text_preserves_tag_and_default_text_elements() {
+        let input = serde_json::from_value::<UserInput>(json!({
+            "type": "text",
+            "text": "hello"
+        }))
+        .expect("deserialize user input");
+
+        match input {
+            UserInput::Text {
+                text,
+                text_elements,
+            } => {
+                assert_eq!(text, "hello");
+                assert!(text_elements.is_empty());
+            }
+        }
+
+        let serialized = serde_json::to_value(&UserInput::Text {
+            text: "hello".to_string(),
+            text_elements: vec![TextElement::default()],
+        })
+        .expect("serialize user input");
+        assert_eq!(serialized["type"], "text");
+        assert_eq!(serialized["text"], "hello");
+    }
+
+    #[test]
+    fn thread_status_active_defaults_active_flags_when_missing() {
+        let status = serde_json::from_value::<ThreadStatus>(json!({
+            "type": "active"
+        }))
+        .expect("deserialize thread status");
+
+        match status {
+            ThreadStatus::Active { active_flags } => assert!(active_flags.is_empty()),
+            other => panic!("unexpected thread status: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_status_serializes_with_camel_case_variant_names() {
+        let value = serde_json::to_value(TurnStatus::InProgress).expect("serialize turn status");
+        assert_eq!(value, json!("inProgress"));
+
+        let round_trip: TurnStatus =
+            serde_json::from_value(value).expect("deserialize turn status");
+        assert!(matches!(round_trip, TurnStatus::InProgress));
+    }
+}

@@ -390,3 +390,267 @@ impl SupervisorProposalEdits {
             && self.expected_report_fields.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+
+    use super::{
+        DraftAssignment, ProposedDecision, SupervisorContextPack, SupervisorPackLimits,
+        SupervisorPackTruncation, SupervisorProposal, SupervisorProposalEdits,
+        SupervisorProposalFailure, SupervisorProposalFailureStage, SupervisorProposalRecord,
+        SupervisorProposalStatus, SupervisorProposalTrigger, SupervisorProposalTriggerKind,
+        SupervisorSourceReportContext, SupervisorStateAnchor, SupervisorSummary,
+        SupervisorWorkUnitContext,
+    };
+    use crate::{DecisionType, ReportConfidence, ReportDisposition, ReportParseResult};
+
+    fn fixed_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 5, 6, 7, 8, 9)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    fn sample_context_pack() -> SupervisorContextPack {
+        SupervisorContextPack {
+            schema_version: "supervisor_context_pack.v1".to_string(),
+            generated_at: fixed_now(),
+            trigger: SupervisorProposalTrigger {
+                kind: SupervisorProposalTriggerKind::ReportRecorded,
+                requested_at: fixed_now(),
+                requested_by: "daemon".to_string(),
+                source_report_id: "report-1".to_string(),
+                note: None,
+            },
+            pack_limits: SupervisorPackLimits {
+                max_related_work_units: 8,
+                max_prior_reports: 3,
+                max_prior_decisions: 3,
+                max_artifacts: 0,
+                max_raw_report_chars: 3_000,
+            },
+            truncation: SupervisorPackTruncation::default(),
+            state_anchor: SupervisorStateAnchor {
+                workstream_id: "ws-1".to_string(),
+                primary_work_unit_id: "wu-1".to_string(),
+                source_report_id: "report-1".to_string(),
+                source_report_created_at: fixed_now(),
+                current_assignment_id: Some("assignment-1".to_string()),
+                primary_work_unit_updated_at: fixed_now(),
+                latest_decision_id: None,
+                latest_decision_created_at: None,
+            },
+            decision_policy: super::DecisionPolicy {
+                supported_decisions: vec![DecisionType::Continue, DecisionType::EscalateToHuman],
+                allowed_decisions: vec![DecisionType::Continue, DecisionType::EscalateToHuman],
+                disallowed_decisions: Vec::new(),
+                disallowed_reasons_by_decision: Default::default(),
+                assignment_required_for: vec![DecisionType::Continue, DecisionType::Redirect],
+                assignment_forbidden_for: vec![
+                    DecisionType::Accept,
+                    DecisionType::MarkComplete,
+                    DecisionType::EscalateToHuman,
+                ],
+                human_review_required: true,
+            },
+            workstream: super::SupervisorWorkstreamContext {
+                id: "ws-1".to_string(),
+                title: "Workstream".to_string(),
+                objective: "Objective".to_string(),
+                status: "active".to_string(),
+                priority: "high".to_string(),
+                success_criteria: Vec::new(),
+                constraints: Vec::new(),
+                summary: None,
+                open_work_unit_count: 1,
+                blocked_work_unit_count: 0,
+                completed_work_unit_count: 0,
+            },
+            primary_work_unit: SupervisorWorkUnitContext {
+                id: "wu-1".to_string(),
+                title: "Work unit".to_string(),
+                task_statement: "Task".to_string(),
+                status: "awaiting_decision".to_string(),
+                dependencies: Vec::new(),
+                current_assignment_id: Some("assignment-1".to_string()),
+                latest_report_id: Some("report-1".to_string()),
+                acceptance_criteria: Vec::new(),
+                stop_conditions: Vec::new(),
+                result_summary: None,
+            },
+            source_report: SupervisorSourceReportContext {
+                id: "report-1".to_string(),
+                assignment_id: "assignment-1".to_string(),
+                worker_id: "worker-1".to_string(),
+                worker_session_id: Some("session-1".to_string()),
+                submitted_at: fixed_now(),
+                disposition: ReportDisposition::Completed,
+                summary: "Completed".to_string(),
+                findings: Vec::new(),
+                blockers: Vec::new(),
+                questions: Vec::new(),
+                recommended_next_actions: Vec::new(),
+                confidence: ReportConfidence::High,
+                parse_result: ReportParseResult::Parsed,
+                needs_supervisor_review: false,
+                raw_output_excerpt: "raw".to_string(),
+            },
+            current_assignment: super::SupervisorAssignmentContext {
+                id: "assignment-1".to_string(),
+                status: "awaiting_decision".to_string(),
+                attempt_number: 1,
+                worker_id: "worker-1".to_string(),
+                worker_session_id: "session-1".to_string(),
+                instructions: "Do the task".to_string(),
+                created_at: fixed_now(),
+                updated_at: fixed_now(),
+            },
+            worker_session: super::SupervisorWorkerSessionContext {
+                id: "session-1".to_string(),
+                worker_id: "worker-1".to_string(),
+                backend_type: "codex".to_string(),
+                thread_id: Some("thread-1".to_string()),
+                active_turn_id: None,
+                runtime_status: "completed".to_string(),
+                attachability: "attachable".to_string(),
+                updated_at: fixed_now(),
+            },
+            dependency_context: Default::default(),
+            related_work_units: Vec::new(),
+            recent_primary_history: Default::default(),
+            relevant_artifacts: Vec::new(),
+            operator_request: None,
+        }
+    }
+
+    #[test]
+    fn supervisor_proposal_round_trips_nested_draft_and_defaults() {
+        let proposal = SupervisorProposal {
+            schema_version: "supervisor_proposal.v1".to_string(),
+            summary: SupervisorSummary {
+                headline: "headline".to_string(),
+                situation: "situation".to_string(),
+                recommended_action: "action".to_string(),
+                key_evidence: vec!["evidence".to_string()],
+                risks: Vec::new(),
+                review_focus: vec!["focus".to_string()],
+            },
+            proposed_decision: ProposedDecision {
+                decision_type: DecisionType::Continue,
+                target_work_unit_id: "wu-1".to_string(),
+                source_report_id: "report-1".to_string(),
+                rationale: "rationale".to_string(),
+                expected_work_unit_status: "ready".to_string(),
+                requires_assignment: true,
+            },
+            draft_next_assignment: Some(DraftAssignment {
+                target_work_unit_id: "wu-1".to_string(),
+                predecessor_assignment_id: "assignment-1".to_string(),
+                derived_from_decision_type: DecisionType::Continue,
+                preferred_worker_id: None,
+                worker_kind: Some("codex".to_string()),
+                objective: "Follow-up objective".to_string(),
+                instructions: vec!["step".to_string()],
+                acceptance_criteria: vec!["criterion".to_string()],
+                stop_conditions: vec!["stop".to_string()],
+                required_context_refs: vec!["report-1".to_string()],
+                expected_report_fields: vec!["summary".to_string()],
+                boundedness_note: "bounded".to_string(),
+            }),
+            confidence: ReportConfidence::Medium,
+            warnings: Vec::new(),
+            open_questions: vec!["question".to_string()],
+        };
+
+        let value = serde_json::to_value(&proposal).expect("serialize proposal");
+        assert_eq!(value["proposed_decision"]["decision_type"], "continue");
+        assert_eq!(
+            value["draft_next_assignment"]["derived_from_decision_type"],
+            "continue"
+        );
+
+        let round_trip: SupervisorProposal =
+            serde_json::from_value(value).expect("deserialize proposal");
+        assert_eq!(
+            round_trip.proposed_decision.decision_type,
+            DecisionType::Continue
+        );
+        assert_eq!(
+            round_trip
+                .draft_next_assignment
+                .expect("draft")
+                .expected_report_fields,
+            vec!["summary".to_string()]
+        );
+        assert!(round_trip.warnings.is_empty());
+        assert_eq!(round_trip.open_questions, vec!["question".to_string()]);
+    }
+
+    #[test]
+    fn supervisor_proposal_edits_defaults_missing_fields_and_is_empty() {
+        let edits = serde_json::from_value::<SupervisorProposalEdits>(json!({}))
+            .expect("deserialize edits");
+
+        assert!(edits.is_empty());
+        assert!(edits.instructions.is_empty());
+        assert!(edits.acceptance_criteria.is_empty());
+        assert!(edits.stop_conditions.is_empty());
+        assert!(edits.expected_report_fields.is_empty());
+    }
+
+    #[test]
+    fn supervisor_proposal_record_defaults_status_and_optional_fields() {
+        let record = serde_json::from_value::<SupervisorProposalRecord>(json!({
+            "id": "proposal-1",
+            "workstream_id": "ws-1",
+            "primary_work_unit_id": "wu-1",
+            "source_report_id": "report-1",
+            "trigger": {
+                "kind": "report_recorded",
+                "requested_at": fixed_now(),
+                "requested_by": "daemon",
+                "source_report_id": "report-1",
+                "note": null
+            },
+            "created_at": fixed_now(),
+            "reasoner_backend": "responses_api",
+            "reasoner_model": "gpt-test",
+            "reasoner_response_id": null,
+            "reasoner_usage": null,
+            "context_pack": sample_context_pack(),
+            "proposal": null,
+            "approved_proposal": null,
+            "validated_at": null,
+            "reviewed_at": null,
+            "reviewed_by": null,
+            "review_note": null,
+            "approved_decision_id": null,
+            "approved_assignment_id": null
+        }))
+        .expect("deserialize proposal record");
+
+        assert_eq!(record.status, SupervisorProposalStatus::Open);
+        assert!(record.reasoner_output_text.is_none());
+        assert!(record.approval_edits.is_none());
+        assert!(record.generation_failure.is_none());
+    }
+
+    #[test]
+    fn supervisor_proposal_failure_stage_uses_stable_snake_case_shape() {
+        let failure = SupervisorProposalFailure {
+            stage: SupervisorProposalFailureStage::ProposalValidation,
+            message: "bad proposal".to_string(),
+        };
+
+        let value = serde_json::to_value(&failure).expect("serialize failure");
+        assert_eq!(value["stage"], "proposal_validation");
+
+        let round_trip: SupervisorProposalFailure =
+            serde_json::from_value(value).expect("deserialize failure");
+        assert_eq!(
+            round_trip.stage,
+            SupervisorProposalFailureStage::ProposalValidation
+        );
+    }
+}

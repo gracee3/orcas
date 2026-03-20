@@ -499,7 +499,7 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
 
-    use super::{DecisionSummary, StateSnapshot};
+    use super::{DaemonEvent, DecisionSummary, EventsSubscribeRequest, StateSnapshot};
     use crate::{DecisionType, WorkstreamStatus};
 
     #[test]
@@ -577,6 +577,56 @@ mod tests {
         }))
         .expect("legacy work unit summary should deserialize");
         assert!(work_unit.proposal.is_none());
+    }
+
+    #[test]
+    fn daemon_event_uses_stable_snake_case_tagged_shape() {
+        let event = DaemonEvent::WorkUnitLifecycle {
+            action: super::CollaborationLifecycleAction::Updated,
+            work_unit: super::WorkUnitSummary {
+                id: "wu-1".to_string(),
+                workstream_id: "ws-1".to_string(),
+                title: "Unit".to_string(),
+                status: crate::WorkUnitStatus::Ready,
+                dependency_count: 0,
+                current_assignment_id: None,
+                latest_report_id: None,
+                proposal: None,
+                updated_at: Utc::now(),
+            },
+        };
+
+        let value = serde_json::to_value(&event).expect("serialize daemon event");
+        assert_eq!(value["type"], "work_unit_lifecycle");
+        assert_eq!(value["action"], "updated");
+        assert_eq!(value["work_unit"]["id"], "wu-1");
+
+        let round_trip: DaemonEvent =
+            serde_json::from_value(value).expect("deserialize daemon event");
+        match round_trip {
+            DaemonEvent::WorkUnitLifecycle { action, work_unit } => {
+                assert_eq!(action, super::CollaborationLifecycleAction::Updated);
+                assert_eq!(work_unit.id, "wu-1");
+            }
+            other => panic!("unexpected event variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn events_subscribe_request_requires_explicit_include_snapshot_flag() {
+        let error =
+            serde_json::from_value::<EventsSubscribeRequest>(json!({})).expect_err("missing field");
+        assert!(
+            error
+                .to_string()
+                .contains("missing field `include_snapshot`")
+        );
+
+        let request = EventsSubscribeRequest {
+            include_snapshot: false,
+        };
+        let serialized = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(serialized, json!({ "include_snapshot": false }));
     }
 }
 
