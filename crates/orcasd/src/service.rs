@@ -1658,12 +1658,60 @@ impl OrcasDaemonService {
         &self,
         params: ipc::AuthorityWorkstreamDeleteRequest,
     ) -> OrcasResult<ipc::AuthorityWorkstreamDeleteResponse> {
+        let affected_work_units = self
+            .authority_store
+            .list_work_units(Some(&params.command.workstream_id), false)
+            .await?;
+        let mut affected_tracked_thread_ids = Vec::new();
+        for work_unit in &affected_work_units {
+            let tracked_threads = self
+                .authority_store
+                .list_tracked_threads(&work_unit.id, false)
+                .await?;
+            affected_tracked_thread_ids.extend(
+                tracked_threads
+                    .into_iter()
+                    .map(|tracked_thread| tracked_thread.id),
+            );
+        }
         match self
             .authority_store
             .execute_command(AuthorityCommand::DeleteWorkstream(params.command))
             .await?
         {
             AuthorityMutationResult::Workstream(workstream) => {
+                self.emit_authority_workstream_lifecycle(
+                    ipc::CollaborationLifecycleAction::Deleted,
+                    &workstream,
+                )
+                .await;
+                for work_unit_id in affected_work_units
+                    .into_iter()
+                    .map(|work_unit| work_unit.id)
+                {
+                    if let Some(work_unit) =
+                        self.authority_store.get_work_unit(&work_unit_id).await?
+                    {
+                        self.emit_authority_work_unit_lifecycle(
+                            ipc::CollaborationLifecycleAction::Deleted,
+                            &work_unit,
+                        )
+                        .await;
+                    }
+                }
+                for tracked_thread_id in affected_tracked_thread_ids {
+                    if let Some(tracked_thread) = self
+                        .authority_store
+                        .get_tracked_thread(&tracked_thread_id)
+                        .await?
+                    {
+                        self.emit_authority_tracked_thread_lifecycle(
+                            ipc::CollaborationLifecycleAction::Deleted,
+                            &tracked_thread,
+                        )
+                        .await;
+                    }
+                }
                 Ok(ipc::AuthorityWorkstreamDeleteResponse { workstream })
             }
             AuthorityMutationResult::WorkUnit(_) | AuthorityMutationResult::TrackedThread(_) => {
@@ -1764,12 +1812,37 @@ impl OrcasDaemonService {
         &self,
         params: ipc::AuthorityWorkunitDeleteRequest,
     ) -> OrcasResult<ipc::AuthorityWorkunitDeleteResponse> {
+        let affected_tracked_thread_ids = self
+            .authority_store
+            .list_tracked_threads(&params.command.work_unit_id, false)
+            .await?
+            .into_iter()
+            .map(|tracked_thread| tracked_thread.id)
+            .collect::<Vec<_>>();
         match self
             .authority_store
             .execute_command(AuthorityCommand::DeleteWorkUnit(params.command))
             .await?
         {
             AuthorityMutationResult::WorkUnit(work_unit) => {
+                self.emit_authority_work_unit_lifecycle(
+                    ipc::CollaborationLifecycleAction::Deleted,
+                    &work_unit,
+                )
+                .await;
+                for tracked_thread_id in affected_tracked_thread_ids {
+                    if let Some(tracked_thread) = self
+                        .authority_store
+                        .get_tracked_thread(&tracked_thread_id)
+                        .await?
+                    {
+                        self.emit_authority_tracked_thread_lifecycle(
+                            ipc::CollaborationLifecycleAction::Deleted,
+                            &tracked_thread,
+                        )
+                        .await;
+                    }
+                }
                 Ok(ipc::AuthorityWorkunitDeleteResponse { work_unit })
             }
             AuthorityMutationResult::Workstream(_) | AuthorityMutationResult::TrackedThread(_) => {
@@ -1826,6 +1899,11 @@ impl OrcasDaemonService {
             .await?
         {
             AuthorityMutationResult::TrackedThread(tracked_thread) => {
+                self.emit_authority_tracked_thread_lifecycle(
+                    ipc::CollaborationLifecycleAction::Created,
+                    &tracked_thread,
+                )
+                .await;
                 Ok(ipc::AuthorityTrackedThreadCreateResponse { tracked_thread })
             }
             AuthorityMutationResult::Workstream(_) | AuthorityMutationResult::WorkUnit(_) => {
@@ -1846,6 +1924,11 @@ impl OrcasDaemonService {
             .await?
         {
             AuthorityMutationResult::TrackedThread(tracked_thread) => {
+                self.emit_authority_tracked_thread_lifecycle(
+                    ipc::CollaborationLifecycleAction::Updated,
+                    &tracked_thread,
+                )
+                .await;
                 Ok(ipc::AuthorityTrackedThreadEditResponse { tracked_thread })
             }
             AuthorityMutationResult::Workstream(_) | AuthorityMutationResult::WorkUnit(_) => {
@@ -1866,6 +1949,11 @@ impl OrcasDaemonService {
             .await?
         {
             AuthorityMutationResult::TrackedThread(tracked_thread) => {
+                self.emit_authority_tracked_thread_lifecycle(
+                    ipc::CollaborationLifecycleAction::Deleted,
+                    &tracked_thread,
+                )
+                .await;
                 Ok(ipc::AuthorityTrackedThreadDeleteResponse { tracked_thread })
             }
             AuthorityMutationResult::Workstream(_) | AuthorityMutationResult::WorkUnit(_) => {
@@ -6631,6 +6719,18 @@ impl OrcasDaemonService {
         .await;
     }
 
+    async fn emit_authority_tracked_thread_lifecycle(
+        &self,
+        action: ipc::CollaborationLifecycleAction,
+        tracked_thread: &orcas_core::authority::TrackedThreadRecord,
+    ) {
+        self.emit(ipc::DaemonEvent::TrackedThreadLifecycle {
+            action,
+            tracked_thread: tracked_thread.into(),
+        })
+        .await;
+    }
+
     fn work_unit_summary_for_collaboration(
         work_unit: &WorkUnit,
         collaboration: &CollaborationState,
@@ -8468,6 +8568,15 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             ipc::DaemonEvent::WorkUnitLifecycle { action, work_unit } => (
                 "work_unit",
                 format!("work_unit {} {:?}", work_unit.id, action),
+                None,
+                None,
+            ),
+            ipc::DaemonEvent::TrackedThreadLifecycle {
+                action,
+                tracked_thread,
+            } => (
+                "tracked_thread",
+                format!("tracked_thread {} {:?}", tracked_thread.id, action),
                 None,
                 None,
             ),

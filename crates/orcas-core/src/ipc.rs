@@ -276,6 +276,10 @@ pub enum DaemonEvent {
         action: CollaborationLifecycleAction,
         work_unit: WorkUnitSummary,
     },
+    TrackedThreadLifecycle {
+        action: CollaborationLifecycleAction,
+        tracked_thread: authority::TrackedThreadSummary,
+    },
     AssignmentLifecycle {
         action: AssignmentLifecycleAction,
         assignment: AssignmentSummary,
@@ -309,6 +313,7 @@ pub enum DaemonEvent {
 pub enum CollaborationLifecycleAction {
     Created,
     Updated,
+    Deleted,
     Completed,
     Escalated,
 }

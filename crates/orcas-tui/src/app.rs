@@ -408,6 +408,10 @@ pub enum UiEvent {
         action: ipc::CollaborationLifecycleAction,
         work_unit: ipc::WorkUnitSummary,
     },
+    TrackedThreadLifecycle {
+        action: ipc::CollaborationLifecycleAction,
+        tracked_thread: authority::TrackedThreadSummary,
+    },
     AssignmentLifecycle {
         action: ipc::AssignmentLifecycleAction,
         assignment: ipc::AssignmentSummary,
@@ -463,6 +467,13 @@ impl UiEvent {
             ipc::DaemonEvent::WorkUnitLifecycle { action, work_unit } => {
                 Self::WorkUnitLifecycle { action, work_unit }
             }
+            ipc::DaemonEvent::TrackedThreadLifecycle {
+                action,
+                tracked_thread,
+            } => Self::TrackedThreadLifecycle {
+                action,
+                tracked_thread,
+            },
             ipc::DaemonEvent::AssignmentLifecycle { action, assignment } => {
                 Self::AssignmentLifecycle { action, assignment }
             }
@@ -1586,22 +1597,49 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             }
             reconcile_main_view(state);
         }
-        UiEvent::WorkstreamLifecycle { workstream, .. } => {
-            upsert_workstream_summary(&mut state.collaboration.workstreams, workstream);
-            reconcile_collaboration_selection(state);
-            reconcile_main_view(state);
-            effects.extend(load_selected_work_unit_detail_if_needed(state));
-        }
-        UiEvent::WorkUnitLifecycle { work_unit, .. } => {
-            let selected = state.selected_work_unit_id.as_deref() == Some(work_unit.id.as_str());
-            upsert_work_unit_summary(&mut state.collaboration.work_units, work_unit);
-            reconcile_collaboration_selection(state);
-            reconcile_main_view(state);
-            if selected {
-                effects.extend(load_selected_work_unit_detail(state));
-            } else {
+        UiEvent::WorkstreamLifecycle { action, workstream } => {
+            if action != ipc::CollaborationLifecycleAction::Deleted {
+                upsert_workstream_summary(&mut state.collaboration.workstreams, workstream);
                 effects.extend(load_selected_work_unit_detail_if_needed(state));
             }
+            reconcile_collaboration_selection(state);
+            reconcile_main_view(state);
+        }
+        UiEvent::WorkUnitLifecycle { action, work_unit } => {
+            let selected = state.selected_work_unit_id.as_deref() == Some(work_unit.id.as_str());
+            if action != ipc::CollaborationLifecycleAction::Deleted {
+                upsert_work_unit_summary(&mut state.collaboration.work_units, work_unit);
+                if selected {
+                    effects.extend(load_selected_work_unit_detail(state));
+                } else {
+                    effects.extend(load_selected_work_unit_detail_if_needed(state));
+                }
+            }
+            reconcile_collaboration_selection(state);
+            reconcile_main_view(state);
+        }
+        UiEvent::TrackedThreadLifecycle {
+            action,
+            tracked_thread,
+        } => {
+            if action == ipc::CollaborationLifecycleAction::Deleted {
+                state
+                    .authority_main
+                    .tracked_thread_details
+                    .remove(tracked_thread.id.as_str());
+            }
+            effects.push(Effect::LoadAuthorityHierarchy);
+            if matches!(
+                state.main_view.selected.as_ref(),
+                Some(MainHierarchySelection::Thread { thread_id, .. })
+                    if thread_id == tracked_thread.id.as_str()
+            ) && action != ipc::CollaborationLifecycleAction::Deleted
+            {
+                effects.push(Effect::LoadAuthorityTrackedThreadDetail {
+                    tracked_thread_id: tracked_thread.id.to_string(),
+                });
+            }
+            reconcile_main_view(state);
         }
         UiEvent::AssignmentLifecycle { assignment, .. } => {
             let selected =
@@ -4159,6 +4197,19 @@ fn event_summary_from_ui_event(event: &UiEvent) -> Option<ipc::EventSummary> {
             tracked_thread.upstream_thread_id.clone(),
             None,
         ),
+        UiEvent::TrackedThreadLifecycle {
+            action,
+            tracked_thread,
+        } => (
+            "tracked_thread",
+            format!(
+                "tracked thread {} {}",
+                tracked_thread.id,
+                collaboration_action_label(*action)
+            ),
+            tracked_thread.upstream_thread_id.clone(),
+            None,
+        ),
         UiEvent::ThreadAttached(response) => (
             "thread_attach",
             if response.attached {
@@ -4342,6 +4393,7 @@ fn collaboration_action_label(action: ipc::CollaborationLifecycleAction) -> &'st
     match action {
         ipc::CollaborationLifecycleAction::Created => "created",
         ipc::CollaborationLifecycleAction::Updated => "updated",
+        ipc::CollaborationLifecycleAction::Deleted => "deleted",
         ipc::CollaborationLifecycleAction::Completed => "completed",
         ipc::CollaborationLifecycleAction::Escalated => "escalated",
     }
