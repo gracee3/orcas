@@ -21,10 +21,11 @@ use serde_json::Value;
 use crate::authority;
 use crate::collaboration::{
     Assignment, AssignmentStatus, CodexThreadAssignment, CodexThreadAssignmentStatus,
-    CodexThreadBootstrapState, CodexThreadSendPolicy, Decision, DecisionType, Report,
-    ReportConfidence, ReportDisposition, ReportParseResult, SupervisorTurnDecision,
-    SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus, SupervisorTurnProposalKind, WorkUnit,
-    WorkUnitStatus, Worker, WorkerSession, WorkspaceOperationRecord, Workstream, WorkstreamStatus,
+    CodexThreadBootstrapState, CodexThreadSendPolicy, Decision, DecisionType,
+    LandingAuthorizationRecord, Report, ReportConfidence, ReportDisposition, ReportParseResult,
+    SupervisorTurnDecision, SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus,
+    SupervisorTurnProposalKind, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
+    WorkspaceOperationRecord, Workstream, WorkstreamStatus,
 };
 use crate::communication::AssignmentCommunicationRecord;
 use crate::events::ConnectionState;
@@ -88,6 +89,8 @@ pub mod methods {
     pub const AUTHORITY_TRACKED_THREAD_REFRESH_WORKSPACE: &str =
         "authority/tracked_thread/refresh_workspace";
     pub const AUTHORITY_TRACKED_THREAD_MERGE_PREP: &str = "authority/tracked_thread/merge_prep";
+    pub const AUTHORITY_TRACKED_THREAD_AUTHORIZE_MERGE: &str =
+        "authority/tracked_thread/authorize_merge";
     pub const ASSIGNMENT_START: &str = "assignment/start";
     pub const ASSIGNMENT_GET: &str = "assignment/get";
     pub const ASSIGNMENT_COMMUNICATION_GET: &str = "assignment_communication/get";
@@ -1381,6 +1384,10 @@ pub struct AuthorityTrackedThreadGetResponse {
     pub workspace_operation: Option<WorkspaceOperationRecord>,
     #[serde(default)]
     pub merge_prep_assessment: Option<TrackedThreadMergePrepAssessment>,
+    #[serde(default)]
+    pub landing_authorization: Option<LandingAuthorizationRecord>,
+    #[serde(default)]
+    pub landing_authorization_is_current: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1451,6 +1458,27 @@ pub struct AuthorityTrackedThreadMergePrepResponse {
     pub report: Report,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityTrackedThreadAuthorizeMergeRequest {
+    pub tracked_thread_id: authority::TrackedThreadId,
+    #[serde(default)]
+    pub authorized_by: Option<String>,
+    #[serde(default)]
+    pub request_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityTrackedThreadAuthorizeMergeResponse {
+    pub landing_authorization: LandingAuthorizationRecord,
+    #[serde(default)]
+    pub landing_authorization_is_current: Option<bool>,
+    #[serde(default)]
+    pub merge_prep_assessment: Option<TrackedThreadMergePrepAssessment>,
+    #[serde(default)]
+    pub workspace_inspection: Option<TrackedThreadWorkspaceInspection>,
+    pub tracked_thread: authority::TrackedThreadRecord,
+}
+
 /// Read-only daemon-side inspection of a tracked-thread workspace.
 ///
 /// This is an observed-state payload only. It does not replace the canonical
@@ -1502,12 +1530,13 @@ pub enum TrackedThreadWorkspaceInspectionWarning {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TrackedThreadMergePrepReadiness {
     Ready,
     NotReady,
     Blocked,
+    #[default]
     Unknown,
 }
 

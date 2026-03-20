@@ -69,6 +69,82 @@ fn print_merge_prep_assessment(assessment: &ipc::TrackedThreadMergePrepAssessmen
     }
 }
 
+fn print_landing_authorization(authorization: &orcas_core::LandingAuthorizationRecord) {
+    println!("workspace_scope: landing_authorization");
+    println!("landing_authorization_id: {}", authorization.id);
+    println!("landing_authorization_status: {:?}", authorization.status);
+    println!(
+        "landing_authorization_tracked_thread_id: {}",
+        authorization.tracked_thread_id
+    );
+    println!(
+        "landing_authorization_work_unit_id: {}",
+        authorization.work_unit_id
+    );
+    println!(
+        "landing_authorization_worker_id: {}",
+        authorization.worker_id.as_deref().unwrap_or("unset")
+    );
+    println!(
+        "landing_authorization_worker_session_id: {}",
+        authorization
+            .worker_session_id
+            .as_deref()
+            .unwrap_or("unset")
+    );
+    println!(
+        "landing_authorization_authorized_head_commit: {}",
+        authorization.authorized_head_commit
+    );
+    println!(
+        "landing_authorization_landing_target: {}",
+        authorization.landing_target
+    );
+    println!(
+        "landing_authorization_linked_merge_prep_operation_id: {}",
+        authorization.linked_merge_prep_operation_id
+    );
+    println!(
+        "landing_authorization_merge_prep_assessed_at: {}",
+        authorization.merge_prep_assessed_at.to_rfc3339()
+    );
+    println!(
+        "landing_authorization_merge_prep_readiness: {:?}",
+        authorization.merge_prep_readiness
+    );
+    if authorization.merge_prep_reasons.is_empty() {
+        println!("landing_authorization_merge_prep_reasons: none");
+    } else {
+        for reason in &authorization.merge_prep_reasons {
+            println!("landing_authorization_merge_prep_reason: {:?}", reason);
+        }
+    }
+    println!(
+        "landing_authorization_authorized_by: {}",
+        authorization.authorized_by
+    );
+    println!(
+        "landing_authorization_authorized_at: {}",
+        authorization.authorized_at.to_rfc3339()
+    );
+    println!(
+        "landing_authorization_updated_at: {}",
+        authorization.updated_at.to_rfc3339()
+    );
+    if let Some(note) = authorization.request_note.as_ref() {
+        println!("landing_authorization_request_note: {note}");
+    }
+    if let Some(report_id) = authorization.merge_prep_report_id.as_ref() {
+        println!("landing_authorization_merge_prep_report_id: {report_id}");
+    }
+    if let Some(disposition) = authorization.merge_prep_report_disposition.as_ref() {
+        println!(
+            "landing_authorization_merge_prep_report_disposition: {:?}",
+            disposition
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProposalArtifactExportFormat {
     Json,
@@ -1061,6 +1137,16 @@ impl SupervisorService {
         if let Some(assessment) = response.merge_prep_assessment.as_ref() {
             print_merge_prep_assessment(assessment);
         }
+        if let Some(authorization) = response.landing_authorization.as_ref() {
+            println!(
+                "landing_authorization_is_current: {}",
+                response
+                    .landing_authorization_is_current
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unset".to_string())
+            );
+            print_landing_authorization(authorization);
+        }
         Ok(())
     }
 
@@ -1239,6 +1325,52 @@ impl SupervisorService {
         if let Some(assessment) = response.merge_prep_assessment.as_ref() {
             print_merge_prep_assessment(assessment);
         }
+        Ok(())
+    }
+
+    pub async fn tracked_thread_authorize_merge(&self, tracked_thread_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let tracked_thread = client
+            .authority_tracked_thread_get(&ipc::AuthorityTrackedThreadGetRequest {
+                tracked_thread_id: authority::TrackedThreadId::parse(
+                    tracked_thread_id.to_string(),
+                )?,
+            })
+            .await?
+            .tracked_thread;
+        let response = client
+            .authority_tracked_thread_authorize_merge(
+                &ipc::AuthorityTrackedThreadAuthorizeMergeRequest {
+                    tracked_thread_id: tracked_thread.id.clone(),
+                    authorized_by: Some(SUPERVISOR_CLI_OPERATOR.to_string()),
+                    request_note: None,
+                },
+            )
+            .await?;
+        println!("surface: landing_authorization");
+        println!(
+            "landing_authorization_is_current: {}",
+            response
+                .landing_authorization_is_current
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unset".to_string())
+        );
+        print_landing_authorization(&response.landing_authorization);
+        if let Some(assessment) = response.merge_prep_assessment.as_ref() {
+            print_merge_prep_assessment(assessment);
+        }
+        if let Some(inspection) = response.workspace_inspection.as_ref() {
+            println!("workspace_scope: daemon_inspection");
+            println!(
+                "workspace_inspected_at: {}",
+                inspection.inspected_at.to_rfc3339()
+            );
+            println!(
+                "workspace_local_head_commit: {}",
+                inspection.current_head_commit.as_deref().unwrap_or("unset")
+            );
+        }
+        println!("tracked_thread_id: {}", response.tracked_thread.id);
         Ok(())
     }
 

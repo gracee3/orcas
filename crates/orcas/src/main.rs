@@ -181,6 +181,7 @@ enum TrackedThreadsCommand {
     PrepareWorkspace(TrackedThreadRefArgs),
     RefreshWorkspace(TrackedThreadRefArgs),
     MergePrep(TrackedThreadRefArgs),
+    AuthorizeMerge(TrackedThreadRefArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -917,6 +918,11 @@ async fn main() -> Result<()> {
                 TrackedThreadsCommand::MergePrep(args) => {
                     service
                         .tracked_thread_merge_prep(&args.tracked_thread)
+                        .await?;
+                }
+                TrackedThreadsCommand::AuthorizeMerge(args) => {
+                    service
+                        .tracked_thread_authorize_merge(&args.tracked_thread)
                         .await?;
                 }
             }

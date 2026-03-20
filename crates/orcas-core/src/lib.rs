@@ -15,10 +15,11 @@ pub mod supervisor;
 pub use collaboration::{
     Assignment, AssignmentStatus, CodexThreadAssignment, CodexThreadAssignmentStatus,
     CodexThreadBootstrapState, CodexThreadSendPolicy, CollaborationState, Decision, DecisionType,
-    Report, ReportConfidence, ReportDisposition, ReportParseResult, SupervisorTurnDecision,
-    SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus, SupervisorTurnProposalKind, WorkUnit,
-    WorkUnitStatus, Worker, WorkerSession, WorkerSessionAttachability, WorkerSessionRuntimeStatus,
-    WorkerStatus, WorkspaceOperationRecord, Workstream, WorkstreamStatus,
+    LandingAuthorizationRecord, LandingAuthorizationStatus, Report, ReportConfidence,
+    ReportDisposition, ReportParseResult, SupervisorTurnDecision, SupervisorTurnDecisionKind,
+    SupervisorTurnDecisionStatus, SupervisorTurnProposalKind, WorkUnit, WorkUnitStatus, Worker,
+    WorkerSession, WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus,
+    WorkspaceOperationRecord, Workstream, WorkstreamStatus,
 };
 pub use communication::{
     AcceptanceCriterionStatus, AcceptanceResult, AssignmentChangePolicy, AssignmentChecklistItem,

@@ -498,6 +498,17 @@ impl OrcasIpcClient {
             .await
     }
 
+    pub async fn authority_tracked_thread_authorize_merge(
+        &self,
+        params: &ipc::AuthorityTrackedThreadAuthorizeMergeRequest,
+    ) -> OrcasResult<ipc::AuthorityTrackedThreadAuthorizeMergeResponse> {
+        self.request(
+            ipc::methods::AUTHORITY_TRACKED_THREAD_AUTHORIZE_MERGE,
+            params,
+        )
+        .await
+    }
+
     pub async fn assignment_start(
         &self,
         params: &ipc::AssignmentStartRequest,

@@ -263,6 +263,11 @@ fn hierarchy_rows(state: &AppState) -> Vec<MainHierarchyRowViewModel> {
                 {
                     badges.push(tracked_thread_merge_prep_assessment_label(assessment));
                 }
+                if let Some(authorization) =
+                    detail.and_then(|detail| detail.landing_authorization.as_ref())
+                {
+                    badges.push(tracked_thread_landing_authorization_label(authorization));
+                }
                 rows.push(MainHierarchyRowViewModel {
                     kind: HierarchyRowKind::Thread,
                     selection: MainHierarchySelection::Thread {
@@ -528,6 +533,71 @@ fn main_detail_panel(state: &AppState) -> PanelViewModel {
                     }
                 } else {
                     lines.push("merge prep assessment: none".to_string());
+                }
+                if let Some(authorization) = detail.landing_authorization.as_ref() {
+                    lines.push("landing authorization:".to_string());
+                    lines.push(format!(
+                        "  status: {}  current: {}",
+                        tracked_thread_landing_authorization_status_label(authorization.status),
+                        detail
+                            .landing_authorization_is_current
+                            .map(|value| if value {
+                                "yes".to_string()
+                            } else {
+                                "no".to_string()
+                            })
+                            .unwrap_or_else(|| "unknown".to_string())
+                    ));
+                    lines.push(format!("  id: {}", authorization.id));
+                    lines.push(format!(
+                        "  authorized head: {}",
+                        authorization.authorized_head_commit
+                    ));
+                    lines.push(format!(
+                        "  landing target: {}",
+                        authorization.landing_target
+                    ));
+                    lines.push(format!("  authorized by: {}", authorization.authorized_by));
+                    lines.push(format!(
+                        "  authorized at: {}",
+                        authorization.authorized_at.to_rfc3339()
+                    ));
+                    lines.push(format!(
+                        "  merge prep op: {}",
+                        authorization.linked_merge_prep_operation_id
+                    ));
+                    lines.push(format!(
+                        "  merge prep assessed at: {}",
+                        authorization.merge_prep_assessed_at.to_rfc3339()
+                    ));
+                    lines.push(format!(
+                        "  merge prep readiness: {}",
+                        tracked_thread_merge_prep_readiness_label(
+                            authorization.merge_prep_readiness
+                        )
+                    ));
+                    if authorization.merge_prep_reasons.is_empty() {
+                        lines.push("  merge prep reasons: none".to_string());
+                    } else {
+                        for reason in &authorization.merge_prep_reasons {
+                            lines.push(format!(
+                                "  merge prep reason: {}",
+                                tracked_thread_merge_prep_reason_label(*reason)
+                            ));
+                        }
+                    }
+                    if let Some(report_id) = authorization.merge_prep_report_id.as_ref() {
+                        lines.push(format!("  merge prep report id: {report_id}"));
+                    }
+                    if let Some(disposition) = authorization.merge_prep_report_disposition.as_ref()
+                    {
+                        lines.push(format!(
+                            "  merge prep report disposition: {:?}",
+                            disposition
+                        ));
+                    }
+                } else {
+                    lines.push("landing authorization: none".to_string());
                 }
                 lines.push("delete semantics: local only".to_string());
                 PanelViewModel {
@@ -967,6 +1037,28 @@ fn tracked_thread_merge_prep_assessment_label(
     format!(
         "merge={}",
         tracked_thread_merge_prep_readiness_label(assessment.readiness)
+    )
+}
+
+fn tracked_thread_landing_authorization_status_label(
+    status: orcas_core::LandingAuthorizationStatus,
+) -> &'static str {
+    match status {
+        orcas_core::LandingAuthorizationStatus::Requested => "requested",
+        orcas_core::LandingAuthorizationStatus::Authorized => "authorized",
+        orcas_core::LandingAuthorizationStatus::Superseded => "superseded",
+        orcas_core::LandingAuthorizationStatus::Revoked => "revoked",
+        orcas_core::LandingAuthorizationStatus::Completed => "completed",
+        orcas_core::LandingAuthorizationStatus::Failed => "failed",
+    }
+}
+
+fn tracked_thread_landing_authorization_label(
+    authorization: &orcas_core::LandingAuthorizationRecord,
+) -> String {
+    format!(
+        "auth={}",
+        tracked_thread_landing_authorization_status_label(authorization.status)
     )
 }
 

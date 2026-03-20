@@ -45,13 +45,14 @@ use orcas_core::{
     AssignmentCommunicationSeed, AssignmentModeSpec, AssignmentStatus, AssignmentWorkspaceContract,
     CodexConnectionMode, CodexThreadAssignment, CodexThreadAssignmentStatus,
     CodexThreadBootstrapState, CollaborationState, ConnectionState, Decision, DecisionType,
-    DraftAssignment, EventEnvelope, ImplementModeSpec, JsonSessionStore, OrcasError, OrcasEvent,
-    OrcasResult, OrcasSessionStore, Report, ReportDisposition, ReportParseResult,
-    SupervisorContextPack, SupervisorProposal, SupervisorProposalFailure,
-    SupervisorProposalFailureStage, SupervisorProposalRecord, SupervisorProposalStatus,
-    SupervisorProposalTriggerKind, SupervisorReasonerUsage, SupervisorTurnDecision,
-    SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus, SupervisorTurnProposalKind,
-    ThreadMetadata, TrackedThreadWorkspaceOperationContract, TrackedThreadWorkspaceOperationKind,
+    DraftAssignment, EventEnvelope, ImplementModeSpec, JsonSessionStore,
+    LandingAuthorizationRecord, LandingAuthorizationStatus, OrcasError, OrcasEvent, OrcasResult,
+    OrcasSessionStore, Report, ReportDisposition, ReportParseResult, SupervisorContextPack,
+    SupervisorProposal, SupervisorProposalFailure, SupervisorProposalFailureStage,
+    SupervisorProposalRecord, SupervisorProposalStatus, SupervisorProposalTriggerKind,
+    SupervisorReasonerUsage, SupervisorTurnDecision, SupervisorTurnDecisionKind,
+    SupervisorTurnDecisionStatus, SupervisorTurnProposalKind, ThreadMetadata,
+    TrackedThreadWorkspaceOperationContract, TrackedThreadWorkspaceOperationKind,
     TrackedThreadWorkspaceOperationStatus, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
     WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, WorkspaceOperationRecord,
     Workstream, WorkstreamStatus,
@@ -62,6 +63,7 @@ use crate::assignment_comm::policy::validate_assignment_packet;
 use crate::assignment_comm::render::build_assignment_communication_record;
 use crate::assignment_comm::stable_fingerprint;
 use crate::authority_store::{AuthorityMutationResult, AuthoritySqliteStore};
+use crate::landing_authorization::landing_authorization_is_current;
 use crate::merge_prep::assess_merge_prep;
 use crate::process::{OrcasDaemonProcessManager, OrcasRuntimeOverrides, apply_runtime_overrides};
 use crate::supervisor::{
@@ -746,6 +748,14 @@ impl OrcasDaemonService {
                 let params: ipc::AuthorityTrackedThreadMergePrepRequest =
                     Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.authority_tracked_thread_merge_prep(params).await?)?
+            }
+            ipc::methods::AUTHORITY_TRACKED_THREAD_AUTHORIZE_MERGE => {
+                let params: ipc::AuthorityTrackedThreadAuthorizeMergeRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(
+                    self.authority_tracked_thread_authorize_merge(params)
+                        .await?,
+                )?
             }
             ipc::methods::ASSIGNMENT_START => {
                 let params: ipc::AssignmentStartRequest =
@@ -2107,17 +2117,27 @@ impl OrcasDaemonService {
             .latest_workspace_operation_for_tracked_thread(&params.tracked_thread_id)
             .await?;
         let merge_prep_assessment = self
-            .tracked_thread_merge_prep_assessment(
+            .latest_merge_prep_assessment_for_tracked_thread(
                 &tracked_thread,
                 workspace_inspection.as_ref(),
-                workspace_operation.as_ref(),
             )
             .await?;
+        let landing_authorization = self
+            .latest_landing_authorization_for_tracked_thread(&params.tracked_thread_id)
+            .await?;
+        let landing_authorization_is_current = self.landing_authorization_is_current(
+            landing_authorization.as_ref(),
+            workspace_inspection.as_ref(),
+            merge_prep_assessment.as_ref(),
+            tracked_thread.workspace.as_ref(),
+        );
         Ok(ipc::AuthorityTrackedThreadGetResponse {
             tracked_thread,
             workspace_inspection,
             workspace_operation,
             merge_prep_assessment,
+            landing_authorization,
+            landing_authorization_is_current,
         })
     }
 
@@ -2189,10 +2209,9 @@ impl OrcasDaemonService {
             None
         };
         let merge_prep_assessment = self
-            .tracked_thread_merge_prep_assessment(
+            .latest_merge_prep_assessment_for_tracked_thread(
                 &tracked_thread,
                 workspace_inspection.as_ref(),
-                Some(&response.workspace_operation),
             )
             .await?;
         Ok(ipc::AuthorityTrackedThreadMergePrepResponse {
@@ -2202,6 +2221,129 @@ impl OrcasDaemonService {
             worker: response.worker,
             worker_session: response.worker_session,
             report: response.report,
+        })
+    }
+
+    async fn authority_tracked_thread_authorize_merge(
+        &self,
+        params: ipc::AuthorityTrackedThreadAuthorizeMergeRequest,
+    ) -> OrcasResult<ipc::AuthorityTrackedThreadAuthorizeMergeResponse> {
+        let requested_by = params
+            .authorized_by
+            .unwrap_or_else(|| "supervisor_cli_operator".to_string());
+        let tracked_thread = self
+            .authority_store
+            .get_tracked_thread(&params.tracked_thread_id)
+            .await?
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!(
+                    "unknown authority tracked thread `{}`",
+                    params.tracked_thread_id
+                ))
+            })?;
+        let Some(workspace) = tracked_thread.workspace.clone() else {
+            return Err(OrcasError::Protocol(format!(
+                "tracked thread `{}` has no declared workspace",
+                tracked_thread.id
+            )));
+        };
+        let workspace_inspection =
+            Some(crate::workspace_inspection::inspect_tracked_thread_workspace(&workspace).await);
+        let merge_prep_assessment = self
+            .latest_merge_prep_assessment_for_tracked_thread(
+                &tracked_thread,
+                workspace_inspection.as_ref(),
+            )
+            .await?;
+        let Some(merge_prep_assessment) = merge_prep_assessment.as_ref() else {
+            return Err(OrcasError::Protocol(format!(
+                "tracked thread `{}` has no successful merge_prep basis",
+                tracked_thread.id
+            )));
+        };
+        if merge_prep_assessment.readiness != ipc::TrackedThreadMergePrepReadiness::Ready {
+            return Err(OrcasError::Protocol(format!(
+                "tracked thread `{}` merge_prep is not ready for authorization",
+                tracked_thread.id
+            )));
+        }
+        let authorized_head_commit =
+            merge_prep_assessment
+                .local_head_commit
+                .clone()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "tracked thread `{}` merge_prep assessment has no local head commit",
+                        tracked_thread.id
+                    ))
+                })?;
+        let landing_target = workspace.landing_target.clone();
+        let linked_merge_prep_operation = self
+            .latest_workspace_operation_for_tracked_thread_kind(
+                &tracked_thread.id,
+                Some(TrackedThreadWorkspaceOperationKind::MergePrep),
+            )
+            .await?
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!(
+                    "tracked thread `{}` has no merge_prep operation to authorize",
+                    tracked_thread.id
+                ))
+            })?;
+        let linked_merge_prep_operation_id = linked_merge_prep_operation.id.clone();
+        let mut state = self.state.write().await;
+        for record in state
+            .collaboration
+            .landing_authorizations
+            .values_mut()
+            .filter(|record| {
+                record.tracked_thread_id == tracked_thread.id
+                    && record.status == LandingAuthorizationStatus::Authorized
+            })
+        {
+            record.status = LandingAuthorizationStatus::Superseded;
+            record.updated_at = Utc::now();
+        }
+        let now = Utc::now();
+        let authorization = LandingAuthorizationRecord {
+            id: Self::new_object_id("landing-auth"),
+            tracked_thread_id: tracked_thread.id.clone(),
+            work_unit_id: tracked_thread.work_unit_id.clone(),
+            worker_id: linked_merge_prep_operation.worker_id.clone(),
+            worker_session_id: linked_merge_prep_operation.worker_session_id.clone(),
+            authorized_head_commit: authorized_head_commit.clone(),
+            landing_target: landing_target.clone(),
+            linked_merge_prep_operation_id,
+            merge_prep_assessed_at: merge_prep_assessment.assessed_at,
+            merge_prep_readiness: merge_prep_assessment.readiness,
+            merge_prep_reasons: merge_prep_assessment.reasons.clone(),
+            merge_prep_report_id: merge_prep_assessment.report_id.clone(),
+            merge_prep_report_disposition: merge_prep_assessment.report_disposition,
+            authorized_by: requested_by,
+            authorized_at: now,
+            updated_at: now,
+            status: LandingAuthorizationStatus::Authorized,
+            request_note: params.request_note.clone(),
+            outcome_summary: None,
+        };
+        state
+            .collaboration
+            .landing_authorizations
+            .insert(authorization.id.clone(), authorization.clone());
+        drop(state);
+        self.persist_collaboration_state().await?;
+        let landing_authorization_is_current = self.landing_authorization_is_current(
+            Some(&authorization),
+            workspace_inspection.as_ref(),
+            Some(merge_prep_assessment),
+            tracked_thread.workspace.as_ref(),
+        );
+        Ok(ipc::AuthorityTrackedThreadAuthorizeMergeResponse {
+            landing_authorization: authorization,
+            landing_authorization_is_current,
+            merge_prep_assessment: Some(merge_prep_assessment.clone()),
+            workspace_inspection,
+            tracked_thread,
         })
     }
 
@@ -2637,12 +2779,24 @@ impl OrcasDaemonService {
         &self,
         tracked_thread_id: &orcas_core::authority::TrackedThreadId,
     ) -> OrcasResult<Option<WorkspaceOperationRecord>> {
+        self.latest_workspace_operation_for_tracked_thread_kind(tracked_thread_id, None)
+            .await
+    }
+
+    async fn latest_workspace_operation_for_tracked_thread_kind(
+        &self,
+        tracked_thread_id: &orcas_core::authority::TrackedThreadId,
+        kind: Option<TrackedThreadWorkspaceOperationKind>,
+    ) -> OrcasResult<Option<WorkspaceOperationRecord>> {
         let state = self.state.read().await;
         Ok(state
             .collaboration
             .workspace_operations
             .values()
-            .filter(|operation| &operation.tracked_thread_id == tracked_thread_id)
+            .filter(|operation| {
+                &operation.tracked_thread_id == tracked_thread_id
+                    && kind.is_none_or(|kind| operation.kind == kind)
+            })
             .max_by(|left, right| {
                 left.updated_at
                     .cmp(&right.updated_at)
@@ -2651,20 +2805,58 @@ impl OrcasDaemonService {
             .cloned())
     }
 
-    async fn tracked_thread_merge_prep_assessment(
+    async fn latest_merge_prep_assessment_for_tracked_thread(
         &self,
         tracked_thread: &authority::TrackedThreadRecord,
         workspace_inspection: Option<&ipc::TrackedThreadWorkspaceInspection>,
-        workspace_operation: Option<&WorkspaceOperationRecord>,
     ) -> OrcasResult<Option<ipc::TrackedThreadMergePrepAssessment>> {
         let Some(workspace) = tracked_thread.workspace.as_ref() else {
             return Ok(None);
         };
+        let workspace_operation = self
+            .latest_workspace_operation_for_tracked_thread_kind(
+                &tracked_thread.id,
+                Some(TrackedThreadWorkspaceOperationKind::MergePrep),
+            )
+            .await?;
         Ok(assess_merge_prep(
             workspace,
             workspace_inspection,
-            workspace_operation,
+            workspace_operation.as_ref(),
         ))
+    }
+
+    fn landing_authorization_is_current(
+        &self,
+        landing_authorization: Option<&LandingAuthorizationRecord>,
+        workspace_inspection: Option<&ipc::TrackedThreadWorkspaceInspection>,
+        merge_prep_assessment: Option<&ipc::TrackedThreadMergePrepAssessment>,
+        workspace: Option<&authority::TrackedThreadWorkspace>,
+    ) -> Option<bool> {
+        landing_authorization_is_current(
+            landing_authorization,
+            workspace_inspection,
+            merge_prep_assessment,
+            workspace,
+        )
+    }
+
+    async fn latest_landing_authorization_for_tracked_thread(
+        &self,
+        tracked_thread_id: &orcas_core::authority::TrackedThreadId,
+    ) -> OrcasResult<Option<LandingAuthorizationRecord>> {
+        let state = self.state.read().await;
+        Ok(state
+            .collaboration
+            .landing_authorizations
+            .values()
+            .filter(|record| &record.tracked_thread_id == tracked_thread_id)
+            .max_by(|left, right| {
+                left.updated_at
+                    .cmp(&right.updated_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+            .cloned())
     }
 
     fn workspace_operation_status_is_terminal(
