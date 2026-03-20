@@ -1522,3 +1522,544 @@ fn proposal_json_schema() -> Value {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use orcas_core::supervisor::{
+        DecisionPolicy, DraftAssignment, ProposedDecision, SupervisorAssignmentContext,
+        SupervisorContextPack, SupervisorPackLimits, SupervisorPackTruncation, SupervisorProposal,
+        SupervisorProposalEdits, SupervisorProposalTrigger, SupervisorProposalTriggerKind,
+        SupervisorSourceReportContext, SupervisorStateAnchor, SupervisorSummary,
+        SupervisorWorkUnitContext, SupervisorWorkerSessionContext, SupervisorWorkstreamContext,
+    };
+    use orcas_core::{
+        Assignment, CollaborationState, Decision, DecisionType, Report, ReportConfidence,
+        ReportDisposition, ReportParseResult, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
+        WorkerSessionAttachability, WorkerSessionRuntimeStatus, Workstream, WorkstreamStatus,
+    };
+
+    use super::{
+        PROPOSAL_SCHEMA_VERSION, apply_edits, build_decision_policy,
+        compile_assignment_instructions, decision_requires_assignment, expected_work_unit_status,
+        state_anchor_freshness_error, validate_proposal,
+    };
+
+    fn fixed_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 4, 5, 6, 7, 8)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    fn sample_workstream() -> Workstream {
+        Workstream {
+            id: "ws-1".to_string(),
+            title: "Workstream".to_string(),
+            objective: "Complete bounded supervisor validation.".to_string(),
+            status: WorkstreamStatus::Active,
+            priority: "high".to_string(),
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_work_unit() -> WorkUnit {
+        WorkUnit {
+            id: "wu-1".to_string(),
+            workstream_id: "ws-1".to_string(),
+            title: "Primary work unit".to_string(),
+            task_statement: "Validate one proposal cleanly.".to_string(),
+            status: WorkUnitStatus::AwaitingDecision,
+            dependencies: Vec::new(),
+            latest_report_id: Some("report-1".to_string()),
+            current_assignment_id: Some("assignment-1".to_string()),
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_assignment() -> Assignment {
+        Assignment {
+            id: "assignment-1".to_string(),
+            work_unit_id: "wu-1".to_string(),
+            worker_id: "worker-1".to_string(),
+            worker_session_id: "session-1".to_string(),
+            instructions: "Stay inside the bounded task.".to_string(),
+            communication_seed: None,
+            status: orcas_core::AssignmentStatus::AwaitingDecision,
+            attempt_number: 1,
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_worker() -> Worker {
+        Worker {
+            id: "worker-1".to_string(),
+            kind: "codex".to_string(),
+            status: Default::default(),
+            current_assignment_id: Some("assignment-1".to_string()),
+        }
+    }
+
+    fn sample_worker_session() -> WorkerSession {
+        WorkerSession {
+            id: "session-1".to_string(),
+            worker_id: "worker-1".to_string(),
+            backend_type: "codex".to_string(),
+            thread_id: Some("thread-1".to_string()),
+            active_turn_id: None,
+            runtime_status: WorkerSessionRuntimeStatus::Completed,
+            attachability: WorkerSessionAttachability::Attachable,
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_report() -> Report {
+        Report {
+            id: "report-1".to_string(),
+            work_unit_id: "wu-1".to_string(),
+            assignment_id: "assignment-1".to_string(),
+            worker_id: "worker-1".to_string(),
+            disposition: ReportDisposition::Completed,
+            summary: "Bounded work completed cleanly.".to_string(),
+            findings: vec!["Parser contract tightened.".to_string()],
+            blockers: Vec::new(),
+            questions: Vec::new(),
+            recommended_next_actions: Vec::new(),
+            confidence: ReportConfidence::High,
+            raw_output: "raw output".to_string(),
+            parse_result: ReportParseResult::Parsed,
+            needs_supervisor_review: false,
+            created_at: fixed_now(),
+        }
+    }
+
+    fn sample_collaboration() -> CollaborationState {
+        let mut collaboration = CollaborationState::default();
+        collaboration
+            .workstreams
+            .insert("ws-1".to_string(), sample_workstream());
+        collaboration
+            .work_units
+            .insert("wu-1".to_string(), sample_work_unit());
+        collaboration
+            .assignments
+            .insert("assignment-1".to_string(), sample_assignment());
+        collaboration
+            .workers
+            .insert("worker-1".to_string(), sample_worker());
+        collaboration
+            .worker_sessions
+            .insert("session-1".to_string(), sample_worker_session());
+        collaboration
+            .reports
+            .insert("report-1".to_string(), sample_report());
+        collaboration
+    }
+
+    fn sample_decision_policy(allowed_decisions: Vec<DecisionType>) -> DecisionPolicy {
+        let supported_decisions = vec![
+            DecisionType::Accept,
+            DecisionType::Continue,
+            DecisionType::Redirect,
+            DecisionType::MarkComplete,
+            DecisionType::EscalateToHuman,
+        ];
+        let disallowed_decisions = supported_decisions
+            .iter()
+            .copied()
+            .filter(|decision| !allowed_decisions.contains(decision))
+            .collect::<Vec<_>>();
+        DecisionPolicy {
+            supported_decisions,
+            allowed_decisions,
+            disallowed_decisions,
+            disallowed_reasons_by_decision: std::collections::BTreeMap::new(),
+            assignment_required_for: vec![DecisionType::Continue, DecisionType::Redirect],
+            assignment_forbidden_for: vec![
+                DecisionType::Accept,
+                DecisionType::MarkComplete,
+                DecisionType::EscalateToHuman,
+            ],
+            human_review_required: true,
+        }
+    }
+
+    fn sample_pack(allowed_decisions: Vec<DecisionType>) -> SupervisorContextPack {
+        SupervisorContextPack {
+            schema_version: "supervisor_context_pack.v1".to_string(),
+            generated_at: fixed_now(),
+            trigger: SupervisorProposalTrigger {
+                kind: SupervisorProposalTriggerKind::HumanRequested,
+                requested_at: fixed_now(),
+                requested_by: "operator".to_string(),
+                source_report_id: "report-1".to_string(),
+                note: Some("review this".to_string()),
+            },
+            pack_limits: SupervisorPackLimits {
+                max_related_work_units: 8,
+                max_prior_reports: 3,
+                max_prior_decisions: 3,
+                max_artifacts: 0,
+                max_raw_report_chars: 3000,
+            },
+            truncation: SupervisorPackTruncation::default(),
+            state_anchor: SupervisorStateAnchor {
+                workstream_id: "ws-1".to_string(),
+                primary_work_unit_id: "wu-1".to_string(),
+                source_report_id: "report-1".to_string(),
+                source_report_created_at: fixed_now(),
+                current_assignment_id: Some("assignment-1".to_string()),
+                primary_work_unit_updated_at: fixed_now(),
+                latest_decision_id: None,
+                latest_decision_created_at: None,
+            },
+            decision_policy: sample_decision_policy(allowed_decisions),
+            workstream: SupervisorWorkstreamContext {
+                id: "ws-1".to_string(),
+                title: "Workstream".to_string(),
+                objective: "Complete bounded supervisor validation.".to_string(),
+                status: "active".to_string(),
+                priority: "high".to_string(),
+                success_criteria: Vec::new(),
+                constraints: Vec::new(),
+                summary: None,
+                open_work_unit_count: 1,
+                blocked_work_unit_count: 0,
+                completed_work_unit_count: 0,
+            },
+            primary_work_unit: SupervisorWorkUnitContext {
+                id: "wu-1".to_string(),
+                title: "Primary work unit".to_string(),
+                task_statement: "Validate one proposal cleanly.".to_string(),
+                status: "awaiting_decision".to_string(),
+                dependencies: Vec::new(),
+                current_assignment_id: Some("assignment-1".to_string()),
+                latest_report_id: Some("report-1".to_string()),
+                acceptance_criteria: Vec::new(),
+                stop_conditions: Vec::new(),
+                result_summary: None,
+            },
+            source_report: SupervisorSourceReportContext {
+                id: "report-1".to_string(),
+                assignment_id: "assignment-1".to_string(),
+                worker_id: "worker-1".to_string(),
+                worker_session_id: Some("session-1".to_string()),
+                submitted_at: fixed_now(),
+                disposition: ReportDisposition::Completed,
+                summary: "Bounded work completed cleanly.".to_string(),
+                findings: vec!["Parser contract tightened.".to_string()],
+                blockers: Vec::new(),
+                questions: Vec::new(),
+                recommended_next_actions: Vec::new(),
+                confidence: ReportConfidence::High,
+                parse_result: ReportParseResult::Parsed,
+                needs_supervisor_review: false,
+                raw_output_excerpt: "raw output".to_string(),
+            },
+            current_assignment: SupervisorAssignmentContext {
+                id: "assignment-1".to_string(),
+                status: "awaiting_decision".to_string(),
+                attempt_number: 1,
+                worker_id: "worker-1".to_string(),
+                worker_session_id: "session-1".to_string(),
+                instructions: "Stay inside the bounded task.".to_string(),
+                created_at: fixed_now(),
+                updated_at: fixed_now(),
+            },
+            worker_session: SupervisorWorkerSessionContext {
+                id: "session-1".to_string(),
+                worker_id: "worker-1".to_string(),
+                backend_type: "codex".to_string(),
+                thread_id: Some("thread-1".to_string()),
+                active_turn_id: None,
+                runtime_status: "completed".to_string(),
+                attachability: "attachable".to_string(),
+                updated_at: fixed_now(),
+            },
+            dependency_context: Default::default(),
+            related_work_units: Vec::new(),
+            recent_primary_history: Default::default(),
+            relevant_artifacts: Vec::new(),
+            operator_request: None,
+        }
+    }
+
+    fn sample_draft(decision: DecisionType) -> DraftAssignment {
+        DraftAssignment {
+            target_work_unit_id: "wu-1".to_string(),
+            predecessor_assignment_id: "assignment-1".to_string(),
+            derived_from_decision_type: decision,
+            preferred_worker_id: Some("worker-1".to_string()),
+            worker_kind: Some("codex".to_string()),
+            objective: "Follow up on the bounded task.".to_string(),
+            instructions: vec!["Inspect the bounded failure and fix it.".to_string()],
+            acceptance_criteria: vec!["Keep the change bounded.".to_string()],
+            stop_conditions: vec!["Stop if more scope is required.".to_string()],
+            required_context_refs: vec!["ws-1".to_string(), "report-1".to_string()],
+            expected_report_fields: vec!["summary".to_string(), "findings".to_string()],
+            boundedness_note: "Do not broaden beyond the follow-up work.".to_string(),
+        }
+    }
+
+    fn sample_proposal(decision: DecisionType) -> SupervisorProposal {
+        SupervisorProposal {
+            schema_version: PROPOSAL_SCHEMA_VERSION.to_string(),
+            summary: SupervisorSummary {
+                headline: "Bounded recommendation".to_string(),
+                situation: "A bounded supervisor decision is required.".to_string(),
+                recommended_action: "Proceed with the chosen action.".to_string(),
+                key_evidence: vec!["clean report".to_string()],
+                risks: Vec::new(),
+                review_focus: Vec::new(),
+            },
+            proposed_decision: ProposedDecision {
+                decision_type: decision,
+                target_work_unit_id: "wu-1".to_string(),
+                source_report_id: "report-1".to_string(),
+                rationale: "The bounded evidence supports this action.".to_string(),
+                expected_work_unit_status: expected_work_unit_status(decision).to_string(),
+                requires_assignment: decision_requires_assignment(decision),
+            },
+            draft_next_assignment: if decision_requires_assignment(decision) {
+                Some(sample_draft(decision))
+            } else {
+                None
+            },
+            confidence: ReportConfidence::High,
+            warnings: Vec::new(),
+            open_questions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn build_decision_policy_allows_completion_decisions_for_clean_completed_report() {
+        let collaboration = sample_collaboration();
+        let work_unit = collaboration.work_units["wu-1"].clone();
+        let report = collaboration.reports["report-1"].clone();
+        let worker_session = collaboration.worker_sessions["session-1"].clone();
+
+        let policy = build_decision_policy(&collaboration, &work_unit, &report, &worker_session)
+            .expect("decision policy");
+
+        assert!(policy.allowed_decisions.contains(&DecisionType::Accept));
+        assert!(
+            policy
+                .allowed_decisions
+                .contains(&DecisionType::MarkComplete)
+        );
+        assert!(
+            policy
+                .allowed_decisions
+                .contains(&DecisionType::EscalateToHuman)
+        );
+        assert!(policy.disallowed_decisions.is_empty());
+    }
+
+    #[test]
+    fn build_decision_policy_for_ambiguous_report_disallows_completion() {
+        let collaboration = sample_collaboration();
+        let work_unit = collaboration.work_units["wu-1"].clone();
+        let mut report = collaboration.reports["report-1"].clone();
+        report.needs_supervisor_review = true;
+        let worker_session = collaboration.worker_sessions["session-1"].clone();
+
+        let policy = build_decision_policy(&collaboration, &work_unit, &report, &worker_session)
+            .expect("decision policy");
+
+        assert!(!policy.allowed_decisions.contains(&DecisionType::Accept));
+        assert!(
+            !policy
+                .allowed_decisions
+                .contains(&DecisionType::MarkComplete)
+        );
+        assert!(policy.allowed_decisions.contains(&DecisionType::Continue));
+        assert!(policy.allowed_decisions.contains(&DecisionType::Redirect));
+        assert_eq!(
+            policy.disallowed_reasons_by_decision["accept"],
+            "ambiguous report parsing forces review instead of completion"
+        );
+    }
+
+    #[test]
+    fn validate_proposal_accepts_clean_continue_proposal() {
+        let collaboration = sample_collaboration();
+        let pack = sample_pack(vec![
+            DecisionType::Continue,
+            DecisionType::Redirect,
+            DecisionType::EscalateToHuman,
+        ]);
+        let proposal = sample_proposal(DecisionType::Continue);
+
+        validate_proposal(&proposal, &pack, &collaboration).expect("proposal should validate");
+    }
+
+    #[test]
+    fn validate_proposal_rejects_disallowed_decision_type() {
+        let collaboration = sample_collaboration();
+        let pack = sample_pack(vec![DecisionType::EscalateToHuman]);
+        let proposal = sample_proposal(DecisionType::Accept);
+
+        let error =
+            validate_proposal(&proposal, &pack, &collaboration).expect_err("proposal should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("proposal decision `accept` is not allowed")
+        );
+    }
+
+    #[test]
+    fn validate_proposal_rejects_unknown_context_ref_in_draft() {
+        let collaboration = sample_collaboration();
+        let pack = sample_pack(vec![
+            DecisionType::Continue,
+            DecisionType::Redirect,
+            DecisionType::EscalateToHuman,
+        ]);
+        let mut proposal = sample_proposal(DecisionType::Continue);
+        proposal
+            .draft_next_assignment
+            .as_mut()
+            .expect("draft")
+            .required_context_refs
+            .push("missing-context".to_string());
+
+        let error =
+            validate_proposal(&proposal, &pack, &collaboration).expect_err("proposal should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("draft assignment referenced an unknown context ref `missing-context`")
+        );
+    }
+
+    #[test]
+    fn apply_edits_updates_decision_type_and_clears_forbidden_draft() {
+        let proposal = sample_proposal(DecisionType::Continue);
+        let edits = SupervisorProposalEdits {
+            decision_type: Some(DecisionType::Accept),
+            decision_rationale: Some("Accept the bounded work.".to_string()),
+            ..Default::default()
+        };
+
+        let updated = apply_edits(&proposal, &edits);
+
+        assert_eq!(
+            updated.proposed_decision.decision_type,
+            DecisionType::Accept
+        );
+        assert!(!updated.proposed_decision.requires_assignment);
+        assert_eq!(
+            updated.proposed_decision.expected_work_unit_status,
+            "accepted"
+        );
+        assert_eq!(
+            updated.proposed_decision.rationale,
+            "Accept the bounded work."
+        );
+        assert!(updated.draft_next_assignment.is_none());
+    }
+
+    #[test]
+    fn apply_edits_updates_existing_draft_fields_without_touching_others() {
+        let proposal = sample_proposal(DecisionType::Continue);
+        let edits = SupervisorProposalEdits {
+            preferred_worker_id: Some("worker-1".to_string()),
+            worker_kind: Some("codex-plus".to_string()),
+            objective: Some("Investigate the remaining bounded issue.".to_string()),
+            instructions: vec!["Reproduce the issue narrowly.".to_string()],
+            acceptance_criteria: vec!["Document the bounded outcome.".to_string()],
+            stop_conditions: vec!["Stop if a broader refactor is needed.".to_string()],
+            expected_report_fields: vec!["questions".to_string()],
+            ..Default::default()
+        };
+
+        let updated = apply_edits(&proposal, &edits);
+        let draft = updated.draft_next_assignment.expect("draft should remain");
+
+        assert_eq!(draft.preferred_worker_id.as_deref(), Some("worker-1"));
+        assert_eq!(draft.worker_kind.as_deref(), Some("codex-plus"));
+        assert_eq!(draft.objective, "Investigate the remaining bounded issue.");
+        assert_eq!(
+            draft.instructions,
+            vec!["Reproduce the issue narrowly.".to_string()]
+        );
+        assert_eq!(
+            draft.acceptance_criteria,
+            vec!["Document the bounded outcome.".to_string()]
+        );
+        assert_eq!(
+            draft.stop_conditions,
+            vec!["Stop if a broader refactor is needed.".to_string()]
+        );
+        assert_eq!(draft.expected_report_fields, vec!["questions".to_string()]);
+        assert_eq!(draft.derived_from_decision_type, DecisionType::Continue);
+    }
+
+    #[test]
+    fn compile_assignment_instructions_renders_optional_sections_only_when_present() {
+        let draft = DraftAssignment {
+            target_work_unit_id: "wu-1".to_string(),
+            predecessor_assignment_id: "assignment-1".to_string(),
+            derived_from_decision_type: DecisionType::Redirect,
+            preferred_worker_id: None,
+            worker_kind: None,
+            objective: "Follow the bounded redirect.".to_string(),
+            instructions: vec!["Inspect the alternative bounded path.".to_string()],
+            acceptance_criteria: vec!["Stay within redirect scope.".to_string()],
+            stop_conditions: vec!["Stop when supervisor review is needed.".to_string()],
+            required_context_refs: vec!["report-1".to_string()],
+            expected_report_fields: vec!["summary".to_string(), "questions".to_string()],
+            boundedness_note: "Do not broaden beyond the redirected task.".to_string(),
+        };
+
+        let rendered = compile_assignment_instructions(&draft, "report-1");
+
+        assert!(rendered.contains("Objective: Follow the bounded redirect."));
+        assert!(rendered.contains("Derived decision: redirect"));
+        assert!(rendered.contains("Predecessor assignment: assignment-1"));
+        assert!(rendered.contains("Source report: report-1"));
+        assert!(rendered.contains("Required context refs: report-1"));
+        assert!(rendered.contains("Instructions:\n- Inspect the alternative bounded path."));
+        assert!(rendered.contains("Acceptance criteria:\n- Stay within redirect scope."));
+        assert!(rendered.contains("Stop conditions:\n- Stop when supervisor review is needed."));
+        assert!(rendered.contains("Expected report fields: summary, questions"));
+        assert!(rendered.contains("Boundedness note: Do not broaden beyond the redirected task."));
+    }
+
+    #[test]
+    fn state_anchor_freshness_error_detects_newer_report_for_work_unit() {
+        let mut collaboration = sample_collaboration();
+        let now = fixed_now();
+        collaboration.decisions.insert(
+            "decision-1".to_string(),
+            Decision {
+                id: "decision-1".to_string(),
+                work_unit_id: "wu-1".to_string(),
+                report_id: Some("report-1".to_string()),
+                decision_type: DecisionType::Continue,
+                rationale: "Keep going".to_string(),
+                created_at: now,
+            },
+        );
+
+        let mut anchor = sample_pack(vec![DecisionType::EscalateToHuman]).state_anchor;
+        anchor.latest_decision_id = Some("decision-1".to_string());
+        anchor.latest_decision_created_at = Some(now);
+        collaboration
+            .work_units
+            .get_mut("wu-1")
+            .expect("work unit")
+            .latest_report_id = Some("report-2".to_string());
+
+        let error = state_anchor_freshness_error(&anchor, &collaboration);
+
+        assert_eq!(
+            error.as_deref(),
+            Some("a newer report exists for the work unit")
+        );
+    }
+}
