@@ -87,6 +87,7 @@ pub mod methods {
     pub const PROPOSAL_GET: &str = "proposal/get";
     pub const PROPOSAL_ARTIFACT_SUMMARY_GET: &str = "proposal/artifact_summary/get";
     pub const PROPOSAL_ARTIFACT_DETAIL_GET: &str = "proposal/artifact_detail/get";
+    pub const PROPOSAL_ARTIFACT_EXPORT_GET: &str = "proposal/artifact_export/get";
     pub const PROPOSAL_ARTIFACT_SUMMARY_LIST_FOR_WORKUNIT: &str =
         "proposal/artifact_summary/list_for_workunit";
     pub const PROPOSAL_LIST_FOR_WORKUNIT: &str = "proposal/list_for_workunit";
@@ -562,6 +563,27 @@ pub struct SupervisorProposalArtifactDetail {
     pub approved_proposal: Option<SupervisorProposal>,
     #[serde(default)]
     pub generation_failure: Option<SupervisorProposalFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorProposalArtifactExport {
+    pub proposal_id: String,
+    pub primary_work_unit_id: String,
+    pub source_report_id: String,
+    pub proposal_status: SupervisorProposalStatus,
+    pub created_at: DateTime<Utc>,
+    pub validated_at: Option<DateTime<Utc>>,
+    pub reviewed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub reviewed_by: Option<String>,
+    #[serde(default)]
+    pub review_note: Option<String>,
+    #[serde(default)]
+    pub approved_decision_id: Option<String>,
+    #[serde(default)]
+    pub approved_assignment_id: Option<String>,
+    pub artifact_summary: SupervisorProposalArtifactSummary,
+    pub artifact_detail: SupervisorProposalArtifactDetail,
 }
 
 #[cfg(test)]
@@ -1598,6 +1620,16 @@ pub struct ProposalArtifactDetailGetRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalArtifactDetailGetResponse {
     pub detail: SupervisorProposalArtifactDetail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalArtifactExportGetRequest {
+    pub proposal_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalArtifactExportGetResponse {
+    pub export: SupervisorProposalArtifactExport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -819,6 +819,11 @@ impl OrcasDaemonService {
                     Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.proposal_artifact_detail_get(params).await?)?
             }
+            ipc::methods::PROPOSAL_ARTIFACT_EXPORT_GET => {
+                let params: ipc::ProposalArtifactExportGetRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.proposal_artifact_export_get(params).await?)?
+            }
             ipc::methods::PROPOSAL_ARTIFACT_SUMMARY_LIST_FOR_WORKUNIT => {
                 let params: ipc::ProposalArtifactSummaryListForWorkunitRequest =
                     Self::decode_params(request.params.clone())?;
@@ -5245,6 +5250,46 @@ impl OrcasDaemonService {
         })
     }
 
+    async fn proposal_artifact_export_get(
+        &self,
+        params: ipc::ProposalArtifactExportGetRequest,
+    ) -> OrcasResult<ipc::ProposalArtifactExportGetResponse> {
+        let (proposal, stale_proposals) = {
+            let mut state = self.state.write().await;
+            let work_unit_id = state
+                .collaboration
+                .supervisor_proposals
+                .get(&params.proposal_id)
+                .map(|proposal| proposal.primary_work_unit_id.clone())
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
+                })?;
+            let stale_proposals = Self::refresh_stale_proposals_for_work_unit(
+                &mut state.collaboration,
+                &work_unit_id,
+            );
+            let proposal = state
+                .collaboration
+                .supervisor_proposals
+                .get(&params.proposal_id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
+                })?;
+            (proposal, stale_proposals)
+        };
+        if !stale_proposals.is_empty() {
+            self.persist_collaboration_state().await?;
+            for proposal in &stale_proposals {
+                self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                    .await;
+            }
+        }
+        Ok(ipc::ProposalArtifactExportGetResponse {
+            export: Self::proposal_artifact_export(&proposal),
+        })
+    }
+
     async fn proposal_artifact_summary_list_for_workunit(
         &self,
         params: ipc::ProposalArtifactSummaryListForWorkunitRequest,
@@ -7829,6 +7874,26 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             parsed_proposal: proposal.proposal.clone(),
             approved_proposal: proposal.approved_proposal.clone(),
             generation_failure: proposal.generation_failure.clone(),
+        }
+    }
+
+    fn proposal_artifact_export(
+        proposal: &SupervisorProposalRecord,
+    ) -> ipc::SupervisorProposalArtifactExport {
+        ipc::SupervisorProposalArtifactExport {
+            proposal_id: proposal.id.clone(),
+            primary_work_unit_id: proposal.primary_work_unit_id.clone(),
+            source_report_id: proposal.source_report_id.clone(),
+            proposal_status: proposal.status,
+            created_at: proposal.created_at,
+            validated_at: proposal.validated_at,
+            reviewed_at: proposal.reviewed_at,
+            reviewed_by: proposal.reviewed_by.clone(),
+            review_note: proposal.review_note.clone(),
+            approved_decision_id: proposal.approved_decision_id.clone(),
+            approved_assignment_id: proposal.approved_assignment_id.clone(),
+            artifact_summary: Self::proposal_artifact_summary(proposal),
+            artifact_detail: Self::proposal_artifact_detail(proposal),
         }
     }
 
@@ -11852,6 +11917,41 @@ ORCAS_REPORT_END"#
     }
 
     #[tokio::test]
+    async fn proposal_artifact_export_get_exposes_successful_evidence_bundle() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_manual_proposal_fixture(&service, "artifact-export").await;
+        let proposal =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
+
+        let response = service
+            .proposal_artifact_export_get(ipc::ProposalArtifactExportGetRequest {
+                proposal_id: proposal.id.clone(),
+            })
+            .await
+            .expect("proposal artifact export");
+        let export = response.export;
+
+        assert_eq!(export.proposal_id, proposal.id);
+        assert_eq!(export.primary_work_unit_id, work_unit.id);
+        assert_eq!(export.source_report_id, report.id);
+        assert_eq!(export.proposal_status, SupervisorProposalStatus::Open);
+        assert!(export.artifact_summary.prompt_artifact_present);
+        assert!(export.artifact_summary.response_artifact_present);
+        assert!(export.artifact_detail.prompt_render.is_some());
+        assert!(export.artifact_detail.response_artifact.is_some());
+        assert_eq!(
+            export.artifact_detail.reasoner_output_text,
+            proposal.reasoner_output_text
+        );
+        assert!(export.artifact_detail.parsed_proposal.is_some());
+        assert!(export.artifact_detail.generation_failure.is_none());
+    }
+
+    #[tokio::test]
     async fn proposal_approve_continue_creates_decision_and_next_assignment() {
         let reasoner = Arc::new(StaticSupervisorReasoner::default());
         let service = test_service_with_reasoner(reasoner.clone()).await;
@@ -12622,6 +12722,67 @@ ORCAS_REPORT_END"#
         );
         assert_eq!(
             detail.reasoner_output_text.as_deref(),
+            Some("{\"schema_version\":\"supervisor_proposal.v1\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_failed_proposal_artifact_export_includes_failure_evidence() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, _assignment, report) =
+            seed_manual_proposal_fixture(&service, "artifact-export-failed").await;
+
+        reasoner
+            .set_failure(
+                SupervisorProposalFailureStage::ProposalMalformed,
+                "failed to decode supervisor proposal JSON: missing field `summary`",
+                Some("{\"schema_version\":\"supervisor_proposal.v1\"}".to_string()),
+            )
+            .await;
+        let _ = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect_err("malformed output failure");
+
+        let failed = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        let response = service
+            .proposal_artifact_export_get(ipc::ProposalArtifactExportGetRequest {
+                proposal_id: failed.id.clone(),
+            })
+            .await
+            .expect("failed artifact export");
+        let export = response.export;
+
+        assert_eq!(export.proposal_id, failed.id);
+        assert_eq!(
+            export.proposal_status,
+            SupervisorProposalStatus::GenerationFailed
+        );
+        assert_eq!(export.primary_work_unit_id, work_unit.id);
+        assert_eq!(export.source_report_id, report.id);
+        assert!(export.artifact_summary.prompt_artifact_present);
+        assert!(export.artifact_summary.response_artifact_present);
+        assert!(export.artifact_detail.prompt_render.is_some());
+        assert!(export.artifact_detail.response_artifact.is_some());
+        assert!(export.artifact_detail.parsed_proposal.is_none());
+        assert_eq!(
+            export
+                .artifact_detail
+                .generation_failure
+                .as_ref()
+                .expect("failure")
+                .stage,
+            SupervisorProposalFailureStage::ProposalMalformed
+        );
+        assert_eq!(
+            export.artifact_detail.reasoner_output_text.as_deref(),
             Some("{\"schema_version\":\"supervisor_proposal.v1\"}")
         );
     }

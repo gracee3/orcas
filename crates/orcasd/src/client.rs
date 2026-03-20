@@ -573,6 +573,14 @@ impl OrcasIpcClient {
             .await
     }
 
+    pub async fn proposal_artifact_export_get(
+        &self,
+        params: &ipc::ProposalArtifactExportGetRequest,
+    ) -> OrcasResult<ipc::ProposalArtifactExportGetResponse> {
+        self.request(ipc::methods::PROPOSAL_ARTIFACT_EXPORT_GET, params)
+            .await
+    }
+
     pub async fn proposal_artifact_summary_list_for_workunit(
         &self,
         params: &ipc::ProposalArtifactSummaryListForWorkunitRequest,
