@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Instant;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -9,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::time::{Duration, timeout};
+use tracing::{debug, info, warn};
 
 use orcas_core::ipc;
 use orcas_core::jsonrpc::{
@@ -25,12 +27,16 @@ pub struct OrcasIpcClient {
     outbound: mpsc::Sender<String>,
     event_tx: broadcast::Sender<ipc::DaemonEventEnvelope>,
     next_request_id: AtomicI64,
+    socket: String,
 }
 
 impl OrcasIpcClient {
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
     pub async fn connect(paths: &AppPaths) -> OrcasResult<Arc<Self>> {
+        let start = Instant::now();
+        let socket = paths.socket_file.display().to_string();
+        info!(socket, "connecting Orcas IPC client");
         let stream = UnixStream::connect(&paths.socket_file)
             .await
             .map_err(|error| {
@@ -39,10 +45,23 @@ impl OrcasIpcClient {
                     paths.socket_file.display()
                 ))
             })?;
-        Self::from_stream(stream)
+        let client = Self::from_stream(stream, socket.clone());
+        if client.is_ok() {
+            info!(
+                socket,
+                connected = true,
+                duration_ms = start.elapsed().as_millis() as u64,
+                "Orcas IPC client connected"
+            );
+        }
+        client
     }
 
     pub fn subscribe(&self) -> EventSubscription {
+        debug!(
+            socket = self.socket.as_str(),
+            "subscribing to Orcas daemon events"
+        );
         self.event_tx.subscribe()
     }
 
@@ -593,6 +612,10 @@ impl OrcasIpcClient {
         &self,
         include_snapshot: bool,
     ) -> OrcasResult<(EventSubscription, Option<ipc::StateSnapshot>)> {
+        debug!(
+            socket = self.socket.as_str(),
+            include_snapshot, "starting Orcas daemon event subscription"
+        );
         let events = self.subscribe();
         let response: ipc::EventsSubscribeResponse = self
             .request(
@@ -600,10 +623,16 @@ impl OrcasIpcClient {
                 &ipc::EventsSubscribeRequest { include_snapshot },
             )
             .await?;
+        info!(
+            socket = self.socket.as_str(),
+            include_snapshot,
+            snapshot_included = response.snapshot.is_some(),
+            "Orcas daemon event subscription ready"
+        );
         Ok((events, response.snapshot))
     }
 
-    fn from_stream(stream: UnixStream) -> OrcasResult<Arc<Self>> {
+    fn from_stream(stream: UnixStream, socket: String) -> OrcasResult<Arc<Self>> {
         let (read_half, mut write_half) = stream.into_split();
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<String>(256);
         let (event_tx, _) = broadcast::channel(512);
@@ -612,17 +641,33 @@ impl OrcasIpcClient {
             outbound: outbound_tx,
             event_tx,
             next_request_id: AtomicI64::new(1),
+            socket,
         });
 
+        let client_write = Arc::clone(&client);
         tokio::spawn(async move {
             while let Some(raw) = outbound_rx.recv().await {
-                if write_half.write_all(raw.as_bytes()).await.is_err() {
+                if let Err(error) = write_half.write_all(raw.as_bytes()).await {
+                    warn!(
+                        socket = client_write.socket.as_str(),
+                        error = %error,
+                        "Orcas IPC client write failed"
+                    );
                     break;
                 }
-                if write_half.write_all(b"\n").await.is_err() {
+                if let Err(error) = write_half.write_all(b"\n").await {
+                    warn!(
+                        socket = client_write.socket.as_str(),
+                        error = %error,
+                        "Orcas IPC client write framing failed"
+                    );
                     break;
                 }
             }
+            debug!(
+                socket = client_write.socket.as_str(),
+                "Orcas IPC client write loop stopped"
+            );
         });
 
         let client_read = Arc::clone(&client);
@@ -632,17 +677,31 @@ impl OrcasIpcClient {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
                         if let Err(error) = client_read.handle_line(&line).await {
+                            warn!(
+                                socket = client_read.socket.as_str(),
+                                error = %error,
+                                "Orcas IPC client protocol handling failed"
+                            );
                             client_read.fail_pending(error.to_string().as_str()).await;
                             break;
                         }
                     }
                     Ok(None) => {
+                        info!(
+                            socket = client_read.socket.as_str(),
+                            "Orcas IPC client disconnected"
+                        );
                         client_read
                             .fail_pending("Orcas daemon connection closed")
                             .await;
                         break;
                     }
                     Err(error) => {
+                        warn!(
+                            socket = client_read.socket.as_str(),
+                            error = %error,
+                            "Orcas IPC client read failed"
+                        );
                         client_read
                             .fail_pending(format!("Orcas daemon read failed: {error}").as_str())
                             .await;
@@ -656,7 +715,14 @@ impl OrcasIpcClient {
     }
 
     async fn handle_line(&self, raw: &str) -> OrcasResult<()> {
-        let message: JsonRpcMessage = serde_json::from_str(raw)?;
+        let message: JsonRpcMessage = serde_json::from_str(raw).map_err(|error| {
+            warn!(
+                socket = self.socket.as_str(),
+                error = %error,
+                "failed to decode Orcas daemon JSON-RPC message"
+            );
+            error
+        })?;
         match message {
             JsonRpcMessage::Response(response) => self.resolve_response(response).await,
             JsonRpcMessage::Error(error) => self.resolve_error(error).await,
@@ -717,15 +783,30 @@ impl OrcasIpcClient {
     where
         T: DeserializeOwned,
     {
+        let start = Instant::now();
         let payload = serde_json::to_value(params)?;
         let request_id = RequestId::Integer(self.next_request_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(request_id.clone(), tx);
 
+        debug!(
+            socket = self.socket.as_str(),
+            request_id = %request_id_label(&request_id),
+            method,
+            "sending Orcas IPC request"
+        );
         let request = JsonRpcRequest::new(request_id.clone(), method, Some(payload));
         let raw = serde_json::to_string(&request)?;
         if let Err(error) = self.outbound.send(raw).await {
             self.pending.lock().await.remove(&request_id);
+            warn!(
+                socket = self.socket.as_str(),
+                request_id = %request_id_label(&request_id),
+                method,
+                duration_ms = start.elapsed().as_millis() as u64,
+                error = %error,
+                "failed to send Orcas IPC request"
+            );
             return Err(OrcasError::Transport(format!(
                 "failed to send `{method}` request: {error}"
             )));
@@ -736,17 +817,56 @@ impl OrcasIpcClient {
             Ok(response) => response,
             Err(_) => {
                 self.pending.lock().await.remove(&request_id);
+                warn!(
+                    socket = self.socket.as_str(),
+                    request_id = %request_id_label(&request_id),
+                    method,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "Orcas IPC request timed out"
+                );
                 return Err(OrcasError::Transport(format!(
                     "timed out waiting for `{method}` response"
                 )));
             }
         };
         let response = response.map_err(|error| {
+            warn!(
+                socket = self.socket.as_str(),
+                request_id = %request_id_label(&request_id),
+                method,
+                duration_ms = start.elapsed().as_millis() as u64,
+                error = %error,
+                "Orcas IPC response channel dropped"
+            );
             OrcasError::Transport(format!("response channel dropped for `{method}`: {error}"))
         })?;
         let response = response?;
+        let decoded = serde_json::from_value(response).map_err(|error| {
+            warn!(
+                socket = self.socket.as_str(),
+                request_id = %request_id_label(&request_id),
+                method,
+                duration_ms = start.elapsed().as_millis() as u64,
+                error = %error,
+                "failed to decode Orcas IPC response"
+            );
+            error
+        })?;
+        debug!(
+            socket = self.socket.as_str(),
+            request_id = %request_id_label(&request_id),
+            method,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "Orcas IPC request completed"
+        );
+        Ok(decoded)
+    }
+}
 
-        serde_json::from_value(response).map_err(Into::into)
+fn request_id_label(request_id: &RequestId) -> String {
+    match request_id {
+        RequestId::Integer(value) => value.to_string(),
+        RequestId::String(value) => value.clone(),
     }
 }
 
@@ -807,7 +927,9 @@ mod tests {
 
     fn test_client_and_server() -> (Arc<OrcasIpcClient>, IpcTestServer) {
         let (client_stream, server_stream) = UnixStream::pair().expect("create UnixStream pair");
-        let client = OrcasIpcClient::from_stream(client_stream).expect("create ipc client");
+        let client =
+            OrcasIpcClient::from_stream(client_stream, "/tmp/test-orcasd.sock".to_string())
+                .expect("create ipc client");
         let (read_half, write_half) = server_stream.into_split();
         (
             client,

@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, error, info, warn};
 
 use orcas_core::{
     ConnectionState, EventEnvelope, OrcasError, OrcasEvent, OrcasResult, ReconnectPolicy,
@@ -80,8 +80,25 @@ impl CodexClient {
     }
 
     pub async fn connect(self: &Arc<Self>) -> OrcasResult<()> {
+        info!(endpoint = %self.transport.endpoint(), "starting Codex client connection");
         self.ensure_connection_task().await;
-        self.wait_until_connected(Duration::from_secs(10)).await
+        let start = Instant::now();
+        let result = self.wait_until_connected(Duration::from_secs(10)).await;
+        match &result {
+            Ok(()) => info!(
+                endpoint = %self.transport.endpoint(),
+                connected = true,
+                duration_ms = start.elapsed().as_millis() as u64,
+                "Codex client connected"
+            ),
+            Err(error) => warn!(
+                endpoint = %self.transport.endpoint(),
+                duration_ms = start.elapsed().as_millis() as u64,
+                error = %error,
+                "Codex client failed to connect before timeout"
+            ),
+        }
+        result
     }
 
     pub async fn initialize(
@@ -95,11 +112,19 @@ impl CodexClient {
         if *self.initialized.lock().await {
             return Ok(types::InitializeResponse::default());
         }
+        let start = Instant::now();
+        info!(endpoint = %self.transport.endpoint(), "initializing Codex client");
         let response: types::InitializeResponse = self
             .request_without_initialize(methods::INITIALIZE, &params)
             .await?;
         self.notify(methods::INITIALIZED, None).await?;
         *self.initialized.lock().await = true;
+        info!(
+            endpoint = %self.transport.endpoint(),
+            initialized = true,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "Codex client initialized"
+        );
         Ok(response)
     }
 
@@ -209,16 +234,31 @@ impl CodexClient {
     where
         T: DeserializeOwned,
     {
+        let start = Instant::now();
         let payload = serde_json::to_value(params)?;
         let outbound = self.active_outbound().await?;
         let request_id = RequestId::Integer(self.next_request_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(request_id.clone(), tx);
 
+        debug!(
+            endpoint = %self.transport.endpoint(),
+            request_id = %request_id_label(&request_id),
+            method,
+            "sending Codex request"
+        );
         let request = JsonRpcRequest::new(request_id.clone(), method, Some(payload));
         let raw = serde_json::to_string(&request)?;
         if let Err(error) = outbound.send(raw).await {
             self.pending.lock().await.remove(&request_id);
+            warn!(
+                endpoint = %self.transport.endpoint(),
+                request_id = %request_id_label(&request_id),
+                method,
+                duration_ms = start.elapsed().as_millis() as u64,
+                error = %error,
+                "failed to send Codex request"
+            );
             return Err(OrcasError::Transport(format!(
                 "failed to send `{method}` request: {error}"
             )));
@@ -229,15 +269,48 @@ impl CodexClient {
             Ok(response) => response,
             Err(_) => {
                 self.pending.lock().await.remove(&request_id);
+                warn!(
+                    endpoint = %self.transport.endpoint(),
+                    request_id = %request_id_label(&request_id),
+                    method,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "Codex request timed out"
+                );
                 return Err(OrcasError::Transport(format!(
                     "timed out waiting for `{method}` response"
                 )));
             }
         };
         let response = response.map_err(|error| {
+            warn!(
+                endpoint = %self.transport.endpoint(),
+                request_id = %request_id_label(&request_id),
+                method,
+                duration_ms = start.elapsed().as_millis() as u64,
+                error = %error,
+                "Codex response channel dropped"
+            );
             OrcasError::Transport(format!("response channel dropped for `{method}`: {error}"))
         })??;
-        serde_json::from_value(response).map_err(Into::into)
+        let decoded = serde_json::from_value(response).map_err(|error| {
+            warn!(
+                endpoint = %self.transport.endpoint(),
+                request_id = %request_id_label(&request_id),
+                method,
+                duration_ms = start.elapsed().as_millis() as u64,
+                error = %error,
+                "failed to decode Codex response"
+            );
+            error
+        })?;
+        debug!(
+            endpoint = %self.transport.endpoint(),
+            request_id = %request_id_label(&request_id),
+            method,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "Codex request completed"
+        );
+        Ok(decoded)
     }
 
     async fn notify(&self, method: &str, params: Option<Value>) -> OrcasResult<()> {
@@ -257,11 +330,22 @@ impl CodexClient {
         let params = self.initialize_params.lock().await.clone().ok_or_else(|| {
             OrcasError::Protocol("Codex client has not been initialized".to_string())
         })?;
+        let start = Instant::now();
+        info!(
+            endpoint = %self.transport.endpoint(),
+            "initializing Codex client after reconnect"
+        );
         let _: types::InitializeResponse = self
             .request_without_initialize(methods::INITIALIZE, &params)
             .await?;
         self.notify(methods::INITIALIZED, None).await?;
         *self.initialized.lock().await = true;
+        info!(
+            endpoint = %self.transport.endpoint(),
+            initialized = true,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "Codex client ready after reconnect"
+        );
         Ok(())
     }
 
@@ -269,6 +353,11 @@ impl CodexClient {
         if let Some(outbound) = self.outbound.lock().await.clone() {
             return Ok(outbound);
         }
+        warn!(
+            endpoint = %self.transport.endpoint(),
+            connected = false,
+            "Codex transport is not connected"
+        );
         Err(OrcasError::Transport(format!(
             "Codex transport is not connected to {}",
             self.transport.endpoint()
@@ -305,6 +394,12 @@ impl CodexClient {
     async fn connection_loop(self: Arc<Self>) {
         let mut attempt = 0_u32;
         loop {
+            let attempt_number = attempt.saturating_add(1);
+            info!(
+                endpoint = %self.transport.endpoint(),
+                attempt = attempt_number,
+                "starting Codex transport connection attempt"
+            );
             self.emit(EventEnvelope::new(
                 self.transport.endpoint(),
                 OrcasEvent::ConnectionStateChanged(ConnectionState {
@@ -318,6 +413,12 @@ impl CodexClient {
                     attempt = 0;
                     *self.outbound.lock().await = Some(connection.outbound.clone());
                     *self.initialized.lock().await = false;
+                    info!(
+                        endpoint = %self.transport.endpoint(),
+                        attempt = attempt_number,
+                        connected = true,
+                        "Codex transport connected"
+                    );
                     self.emit(EventEnvelope::new(
                         self.transport.endpoint(),
                         OrcasEvent::ConnectionStateChanged(ConnectionState {
@@ -330,6 +431,11 @@ impl CodexClient {
                         .await;
                     *self.outbound.lock().await = None;
                     self.fail_pending("transport disconnected").await;
+                    warn!(
+                        endpoint = %self.transport.endpoint(),
+                        connected = false,
+                        "Codex transport disconnected"
+                    );
                     self.emit(EventEnvelope::new(
                         self.transport.endpoint(),
                         OrcasEvent::ConnectionStateChanged(ConnectionState {
@@ -340,7 +446,12 @@ impl CodexClient {
                     ));
                 }
                 Err(error) => {
-                    warn!(endpoint = %self.transport.endpoint(), %error, "transport connect failed");
+                    warn!(
+                        endpoint = %self.transport.endpoint(),
+                        attempt = attempt_number,
+                        error = %error,
+                        "Codex transport connect failed"
+                    );
                     self.emit(EventEnvelope::new(
                         self.transport.endpoint(),
                         OrcasEvent::ConnectionStateChanged(ConnectionState {
@@ -353,9 +464,20 @@ impl CodexClient {
             }
 
             if !self.reconnect.should_retry(attempt) {
+                error!(
+                    endpoint = %self.transport.endpoint(),
+                    attempts = attempt_number,
+                    "Codex transport exhausted reconnect attempts"
+                );
                 break;
             }
             let delay = self.reconnect.delay_for_attempt(attempt);
+            info!(
+                endpoint = %self.transport.endpoint(),
+                attempt = attempt_number.saturating_add(1),
+                delay_ms = delay.as_millis() as u64,
+                "scheduling Codex transport reconnect"
+            );
             attempt = attempt.saturating_add(1);
             tokio::time::sleep(delay).await;
         }
@@ -366,6 +488,11 @@ impl CodexClient {
             let message: JsonRpcMessage = match serde_json::from_str(&raw) {
                 Ok(message) => message,
                 Err(error) => {
+                    warn!(
+                        endpoint = %self.transport.endpoint(),
+                        error = %error,
+                        "failed to decode Codex JSON-RPC message"
+                    );
                     self.emit(EventEnvelope::new(
                         self.transport.endpoint(),
                         OrcasEvent::Warning {
@@ -584,6 +711,13 @@ impl CodexClient {
 
     fn emit(&self, event: EventEnvelope) {
         let _ = self.event_tx.send(event);
+    }
+}
+
+fn request_id_label(request_id: &RequestId) -> String {
+    match request_id {
+        RequestId::Integer(value) => value.to_string(),
+        RequestId::String(value) => value.clone(),
     }
 }
 
