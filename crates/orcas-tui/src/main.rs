@@ -1,16 +1,20 @@
 #![allow(unused_crate_dependencies)]
 
 use std::io::{self, IsTerminal};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
+use clap::{Args, Parser};
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use orcas_core::{AppPaths, init_file_logger};
 use orcas_tui::app::{Action, MainFooterState, ProgramView, TopLevelView, UserAction};
@@ -21,14 +25,45 @@ use orcas_tui::codex::{
 use orcas_tui::render;
 use orcas_tui::runtime::AppRuntime;
 
+#[derive(Debug, Parser)]
+#[command(name = "orcas-tui", version, about = "Orcas terminal UI")]
+struct TuiCli {
+    #[command(flatten)]
+    runtime: TuiRuntimeArgs,
+}
+
+#[derive(Debug, Clone, Args, Default, PartialEq, Eq)]
+struct TuiRuntimeArgs {
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
+    #[arg(long)]
+    listen_url: Option<String>,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, default_value_t = false)]
+    connect_only: bool,
+    #[arg(long, default_value_t = false)]
+    force_spawn: bool,
+}
+
+impl TuiRuntimeArgs {
+    fn into_runtime_overrides(self) -> orcasd::OrcasRuntimeOverrides {
+        orcasd::OrcasRuntimeOverrides {
+            codex_bin: self.codex_bin,
+            listen_url: self.listen_url,
+            cwd: self.cwd,
+            model: self.model,
+            connect_only: self.connect_only,
+            force_spawn: self.force_spawn,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::args().any(|arg| matches!(arg.as_str(), "--help" | "-h")) {
-        println!("orcas-tui");
-        println!("Usage: orcas-tui");
-        println!("A terminal UI for Orcas daemon state inspection.");
-        return Ok(());
-    }
+    let cli = TuiCli::parse();
 
     let paths = AppPaths::discover()?;
     paths.ensure().await?;
@@ -39,22 +74,28 @@ async fn main() -> Result<()> {
         anyhow::bail!("orcas-tui requires an interactive terminal (TTY)");
     }
 
-    let backend = Arc::new(OrcasDaemonBackend::discover().await?);
+    let runtime_overrides =
+        orcasd::OrcasRuntimeOverrides::from_env().overlay(&cli.runtime.into_runtime_overrides());
+    let backend = Arc::new(OrcasDaemonBackend::discover_with_overrides(runtime_overrides).await?);
     let mut runtime = AppRuntime::new(backend);
     runtime.bootstrap().await;
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    let mut codex_sessions = CodexSessionManager::new(DEFAULT_PTY_RING_BUFFER_CAPACITY);
+    let shutdown_requested = codex_sessions.shutdown_handle();
+    let _shutdown_watcher = spawn_shutdown_watcher(Arc::clone(&shutdown_requested));
+    let _terminal_guard = TuiSessionGuard::enter()?;
+    let stdout = io::stdout();
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = OrcasTerminal::new(backend)?;
-    let mut codex_sessions = CodexSessionManager::new(DEFAULT_PTY_RING_BUFFER_CAPACITY);
 
-    let result = run_app(&mut terminal, &mut runtime, &mut codex_sessions).await;
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let result = run_app(
+        &mut terminal,
+        &mut runtime,
+        &mut codex_sessions,
+        shutdown_requested,
+    )
+    .await;
+    codex_sessions.shutdown();
     result
 }
 
@@ -62,14 +103,21 @@ async fn run_app(
     terminal: &mut OrcasTerminal,
     runtime: &mut AppRuntime<OrcasDaemonBackend>,
     codex_sessions: &mut CodexSessionManager,
+    shutdown_requested: Arc<AtomicBool>,
 ) -> Result<()> {
     loop {
+        if shutdown_requested.load(Ordering::Relaxed) {
+            break;
+        }
         sync_codex_sessions(runtime, codex_sessions)?;
         runtime.process_all().await;
         sync_codex_sessions(runtime, codex_sessions)?;
         terminal.draw(|frame| render::render(frame, runtime.state()))?;
 
         if event::poll(Duration::from_millis(100))? {
+            if shutdown_requested.load(Ordering::Relaxed) {
+                break;
+            }
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -82,6 +130,67 @@ async fn run_app(
     }
 
     Ok(())
+}
+
+fn spawn_shutdown_watcher(shutdown_requested: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    warn!(%error, "failed to listen for SIGTERM");
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        warn!(%error, "failed to listen for ctrl-c");
+                    }
+                    shutdown_requested.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => {
+                    if let Err(error) = signal {
+                        warn!(%error, "failed to listen for ctrl-c");
+                    }
+                }
+                _ = sigterm.recv() => {}
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                warn!(%error, "failed to listen for shutdown signal");
+            }
+        }
+
+        shutdown_requested.store(true, Ordering::Relaxed);
+    })
+}
+
+struct TuiSessionGuard;
+
+impl TuiSessionGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide) {
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for TuiSessionGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen, Show);
+    }
 }
 
 async fn handle_key(
@@ -279,8 +388,97 @@ fn action_for_key(state: &orcas_tui::app::AppState, key: KeyEvent) -> Option<Use
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory, Parser};
     use crossterm::event::{KeyCode, KeyModifiers};
     use orcas_core::WorkstreamStatus;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parses_direct_tui_runtime_flags() {
+        let cli = TuiCli::parse_from([
+            "orcas-tui",
+            "--codex-bin",
+            "/tmp/codex",
+            "--listen-url",
+            "ws://127.0.0.1:4510",
+            "--cwd",
+            "/tmp/work",
+            "--model",
+            "gpt-5.4",
+            "--connect-only",
+        ]);
+
+        assert_eq!(
+            cli.runtime.codex_bin.as_deref(),
+            Some(std::path::Path::new("/tmp/codex"))
+        );
+        assert_eq!(
+            cli.runtime.listen_url.as_deref(),
+            Some("ws://127.0.0.1:4510")
+        );
+        assert_eq!(
+            cli.runtime.cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/work"))
+        );
+        assert_eq!(cli.runtime.model.as_deref(), Some("gpt-5.4"));
+        assert!(cli.runtime.connect_only);
+        assert!(!cli.runtime.force_spawn);
+    }
+
+    #[test]
+    fn tui_runtime_args_default_cleanly() {
+        let runtime = TuiRuntimeArgs::default();
+
+        assert!(runtime.codex_bin.is_none());
+        assert!(runtime.listen_url.is_none());
+        assert!(runtime.cwd.is_none());
+        assert!(runtime.model.is_none());
+        assert!(!runtime.connect_only);
+        assert!(!runtime.force_spawn);
+    }
+
+    #[test]
+    fn tui_runtime_args_convert_to_runtime_overrides() {
+        let runtime = TuiRuntimeArgs {
+            codex_bin: Some(PathBuf::from("/tmp/codex")),
+            listen_url: Some("ws://127.0.0.1:4510".to_string()),
+            cwd: Some(PathBuf::from("/tmp/work")),
+            model: Some("gpt-5.4".to_string()),
+            connect_only: true,
+            force_spawn: false,
+        };
+
+        let overrides = runtime.into_runtime_overrides();
+
+        assert_eq!(
+            overrides.codex_bin.as_deref(),
+            Some(std::path::Path::new("/tmp/codex"))
+        );
+        assert_eq!(overrides.listen_url.as_deref(), Some("ws://127.0.0.1:4510"));
+        assert_eq!(
+            overrides.cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/work"))
+        );
+        assert_eq!(overrides.model.as_deref(), Some("gpt-5.4"));
+        assert!(overrides.connect_only);
+        assert!(!overrides.force_spawn);
+    }
+
+    #[test]
+    fn tui_help_mentions_the_terminal_ui() {
+        let help = TuiCli::command().render_help().to_string();
+
+        assert!(help.contains("Orcas terminal UI"));
+        assert!(help.contains("--connect-only"));
+        assert!(help.contains("--force-spawn"));
+    }
+
+    #[test]
+    fn tui_version_matches_crate_version() {
+        let version = TuiCli::command().render_version().to_string();
+
+        assert!(version.contains(env!("CARGO_PKG_VERSION")));
+    }
 
     #[test]
     fn left_and_right_cycle_top_level_views_outside_main_surface() {

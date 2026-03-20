@@ -403,6 +403,7 @@ pub struct CodexSessionManager {
     hosts: BTreeMap<CodexSessionId, CodexSessionHost>,
     event_tx: mpsc::Sender<BackgroundEvent>,
     event_rx: mpsc::Receiver<BackgroundEvent>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 impl CodexSessionManager {
@@ -416,7 +417,22 @@ impl CodexSessionManager {
             hosts: BTreeMap::new(),
             event_tx,
             event_rx,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[must_use]
+    pub fn shutdown_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_requested)
+    }
+
+    pub fn shutdown(&mut self) {
+        self.shutdown_requested.store(true, Ordering::Relaxed);
+        let session_ids = self.hosts.keys().copied().collect::<Vec<_>>();
+        for session_id in session_ids {
+            self.terminate_host(session_id);
+        }
+        self.hosts.clear();
     }
 
     #[must_use]
@@ -598,11 +614,17 @@ impl CodexSessionManager {
                 .ok_or_else(|| anyhow!("missing PTY host for session {}", session_id))?
                 .writer,
         );
-        let (stop, input_thread, control_rx) = spawn_input_relay_thread(writer)?;
+        let shutdown_requested = self.shutdown_handle();
+        let (stop, input_thread, control_rx) =
+            spawn_input_relay_thread(writer, shutdown_requested)?;
         let mut stdout = io::stdout().lock();
         let mut last_size = current_pty_size();
 
         loop {
+            if self.shutdown_requested.load(Ordering::Relaxed) {
+                self.terminate_host(session_id);
+                break;
+            }
             self.drain_background_events_for_attached(session_id, &mut stdout)?;
             if matches!(
                 control_rx.try_recv(),
@@ -868,6 +890,7 @@ fn spawn_wait_thread(
 
 fn spawn_input_relay_thread(
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    shutdown_requested: Arc<AtomicBool>,
 ) -> Result<(
     Arc<AtomicBool>,
     thread::JoinHandle<Result<()>>,
@@ -887,7 +910,9 @@ fn spawn_input_relay_thread(
             let mut pending_detach_prefix: Option<Instant> = None;
 
             loop {
-                if stop_for_thread.load(Ordering::Relaxed) {
+                if stop_for_thread.load(Ordering::Relaxed)
+                    || shutdown_requested.load(Ordering::Relaxed)
+                {
                     break;
                 }
 
@@ -929,7 +954,10 @@ fn spawn_input_relay_thread(
                 }
             }
 
-            if pending_detach_prefix.is_some() && !stop_for_thread.load(Ordering::Relaxed) {
+            if pending_detach_prefix.is_some()
+                && !stop_for_thread.load(Ordering::Relaxed)
+                && !shutdown_requested.load(Ordering::Relaxed)
+            {
                 forward_input_bytes(&writer, &[DETACH_PREFIX])?;
             }
 
@@ -1038,6 +1066,7 @@ mod tests {
     use orcas_core::ipc;
     use portable_pty::ExitStatus as PtyExitStatus;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn session_transitions_cover_launch_attach_detach_reattach_exit() {
@@ -1234,6 +1263,17 @@ mod tests {
         );
         assert_eq!(thread_sessions.sessions[0].output_preview.lines.len(), 1);
         assert!(thread_sessions.sessions[0].output_preview.lines[0].starts_with("line-"));
+    }
+
+    #[test]
+    fn shutdown_handle_is_shared_across_clones() {
+        let manager = CodexSessionManager::default();
+        let first = manager.shutdown_handle();
+        let second = manager.shutdown_handle();
+
+        assert!(!first.load(Ordering::Relaxed));
+        first.store(true, Ordering::Relaxed);
+        assert!(second.load(Ordering::Relaxed));
     }
 
     fn sample_descriptor(thread_id: &str) -> CodexResumeDescriptor {
