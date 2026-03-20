@@ -1566,6 +1566,11 @@ impl OrcasDaemonService {
             .await?
         {
             AuthorityMutationResult::Workstream(workstream) => {
+                self.emit_authority_workstream_lifecycle(
+                    ipc::CollaborationLifecycleAction::Created,
+                    &workstream,
+                )
+                .await;
                 Ok(ipc::AuthorityWorkstreamCreateResponse { workstream })
             }
             AuthorityMutationResult::WorkUnit(_) | AuthorityMutationResult::TrackedThread(_) => {
@@ -1586,6 +1591,11 @@ impl OrcasDaemonService {
             .await?
         {
             AuthorityMutationResult::Workstream(workstream) => {
+                self.emit_authority_workstream_lifecycle(
+                    ipc::CollaborationLifecycleAction::Updated,
+                    &workstream,
+                )
+                .await;
                 Ok(ipc::AuthorityWorkstreamEditResponse { workstream })
             }
             AuthorityMutationResult::WorkUnit(_) | AuthorityMutationResult::TrackedThread(_) => {
@@ -1662,6 +1672,11 @@ impl OrcasDaemonService {
             .await?
         {
             AuthorityMutationResult::WorkUnit(work_unit) => {
+                self.emit_authority_work_unit_lifecycle(
+                    ipc::CollaborationLifecycleAction::Created,
+                    &work_unit,
+                )
+                .await;
                 Ok(ipc::AuthorityWorkunitCreateResponse { work_unit })
             }
             AuthorityMutationResult::Workstream(_) | AuthorityMutationResult::TrackedThread(_) => {
@@ -1682,6 +1697,11 @@ impl OrcasDaemonService {
             .await?
         {
             AuthorityMutationResult::WorkUnit(work_unit) => {
+                self.emit_authority_work_unit_lifecycle(
+                    ipc::CollaborationLifecycleAction::Updated,
+                    &work_unit,
+                )
+                .await;
                 Ok(ipc::AuthorityWorkunitEditResponse { work_unit })
             }
             AuthorityMutationResult::Workstream(_) | AuthorityMutationResult::TrackedThread(_) => {
@@ -5717,6 +5737,9 @@ impl OrcasDaemonService {
         let session = state.session.clone();
         let collaboration = Self::collaboration_snapshot(&state.collaboration);
         drop(state);
+        let collaboration = self
+            .merge_authority_projection_into_collaboration_snapshot(collaboration)
+            .await?;
 
         Ok(ipc::StateSnapshot {
             daemon,
@@ -5829,6 +5852,51 @@ impl OrcasDaemonService {
         }
     }
 
+    async fn merge_authority_projection_into_collaboration_snapshot(
+        &self,
+        mut collaboration: ipc::CollaborationSnapshot,
+    ) -> OrcasResult<ipc::CollaborationSnapshot> {
+        let authority_workstreams = self.authority_store.list_workstreams(false).await?;
+        for workstream in authority_workstreams {
+            if collaboration
+                .workstreams
+                .iter()
+                .all(|existing| existing.id != workstream.id.as_str())
+            {
+                collaboration
+                    .workstreams
+                    .push(Self::authority_workstream_summary(&workstream));
+            }
+        }
+        collaboration.workstreams.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let authority_work_units = self.authority_store.list_work_units(None, false).await?;
+        for work_unit in authority_work_units {
+            if collaboration
+                .work_units
+                .iter()
+                .all(|existing| existing.id != work_unit.id.as_str())
+            {
+                collaboration
+                    .work_units
+                    .push(Self::authority_work_unit_summary(&work_unit));
+            }
+        }
+        collaboration.work_units.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        Ok(collaboration)
+    }
+
     fn workstream_summary(workstream: &Workstream) -> ipc::WorkstreamSummary {
         ipc::WorkstreamSummary {
             id: workstream.id.clone(),
@@ -5838,6 +5906,76 @@ impl OrcasDaemonService {
             priority: workstream.priority.clone(),
             updated_at: workstream.updated_at,
         }
+    }
+
+    fn authority_workstream_summary(
+        workstream: &orcas_core::authority::WorkstreamSummary,
+    ) -> ipc::WorkstreamSummary {
+        ipc::WorkstreamSummary {
+            id: workstream.id.to_string(),
+            title: workstream.title.clone(),
+            objective: workstream.objective.clone(),
+            status: workstream.status,
+            priority: workstream.priority.clone(),
+            updated_at: workstream.updated_at,
+        }
+    }
+
+    fn authority_work_unit_summary(
+        work_unit: &orcas_core::authority::WorkUnitSummary,
+    ) -> ipc::WorkUnitSummary {
+        ipc::WorkUnitSummary {
+            id: work_unit.id.to_string(),
+            workstream_id: work_unit.workstream_id.to_string(),
+            title: work_unit.title.clone(),
+            status: work_unit.status,
+            dependency_count: 0,
+            current_assignment_id: None,
+            latest_report_id: None,
+            proposal: None,
+            updated_at: work_unit.updated_at,
+        }
+    }
+
+    async fn emit_authority_workstream_lifecycle(
+        &self,
+        action: ipc::CollaborationLifecycleAction,
+        workstream: &orcas_core::authority::WorkstreamRecord,
+    ) {
+        self.emit(ipc::DaemonEvent::WorkstreamLifecycle {
+            action,
+            workstream: ipc::WorkstreamSummary {
+                id: workstream.id.to_string(),
+                title: workstream.title.clone(),
+                objective: workstream.objective.clone(),
+                status: workstream.status,
+                priority: workstream.priority.clone(),
+                updated_at: workstream.updated_at,
+            },
+        })
+        .await;
+    }
+
+    async fn emit_authority_work_unit_lifecycle(
+        &self,
+        action: ipc::CollaborationLifecycleAction,
+        work_unit: &orcas_core::authority::WorkUnitRecord,
+    ) {
+        self.emit(ipc::DaemonEvent::WorkUnitLifecycle {
+            action,
+            work_unit: ipc::WorkUnitSummary {
+                id: work_unit.id.to_string(),
+                workstream_id: work_unit.workstream_id.to_string(),
+                title: work_unit.title.clone(),
+                status: work_unit.status,
+                dependency_count: 0,
+                current_assignment_id: None,
+                latest_report_id: None,
+                proposal: None,
+                updated_at: work_unit.updated_at,
+            },
+        })
+        .await;
     }
 
     fn work_unit_summary_for_collaboration(
