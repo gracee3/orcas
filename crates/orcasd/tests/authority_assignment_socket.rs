@@ -149,6 +149,11 @@ async fn assignment_start_bridges_authority_work_unit_into_state_and_updates_it(
             instructions: Some("Handle the projected authority task".to_string()),
             model: None,
             cwd: None,
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: orcas_core::PlanExecutionKind::DirectExecution,
+            alignment_rationale: None,
         })
         .await
         .expect("assignment start over projected authority work unit");
@@ -334,6 +339,11 @@ async fn deleted_authority_rows_are_hidden_from_state_even_after_assignment_brid
             instructions: Some("Bridge then delete".to_string()),
             model: None,
             cwd: None,
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: orcas_core::PlanExecutionKind::DirectExecution,
+            alignment_rationale: None,
         })
         .await
         .expect("assignment start should bridge authority work unit");
@@ -441,6 +451,11 @@ async fn assignment_bridge_and_authority_hierarchy_remain_coherent_after_restart
             instructions: Some("Bridge before restart".to_string()),
             model: None,
             cwd: None,
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: orcas_core::PlanExecutionKind::DirectExecution,
+            alignment_rationale: None,
         })
         .await
         .expect("assignment start should bridge authority work unit");

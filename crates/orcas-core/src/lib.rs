@@ -8,6 +8,7 @@ pub mod ipc;
 pub mod jsonrpc;
 pub mod logging;
 pub mod paths;
+pub mod planning;
 pub mod session;
 pub mod store;
 pub mod supervisor;
@@ -42,6 +43,7 @@ pub use jsonrpc::{
 };
 pub use logging::init_file_logger;
 pub use paths::AppPaths;
+pub use planning::*;
 pub use session::{ThreadDescriptor, ThreadMetadata, ThreadRegistry, TurnDescriptor};
 pub use store::{JsonSessionStore, OrcasSessionStore, StoredState};
 pub use supervisor::*;

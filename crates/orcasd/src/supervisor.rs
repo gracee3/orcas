@@ -19,6 +19,7 @@ use orcas_core::supervisor::{
     SupervisorProposalRecord, SupervisorResponseArtifact, SupervisorResponseContentPart,
     SupervisorResponseOutputItem, SupervisorSourceReportContext, SupervisorStateAnchor,
     SupervisorWorkUnitContext, SupervisorWorkerSessionContext, SupervisorWorkstreamContext,
+    SupervisorWorkstreamPlanContext,
 };
 use orcas_core::{
     AppConfig, Assignment, CollaborationState, Decision, DecisionType, OrcasError, OrcasResult,
@@ -27,8 +28,8 @@ use orcas_core::{
     WorkerSession,
 };
 
-const CONTEXT_SCHEMA_VERSION: &str = "supervisor_context_pack.v1";
-const PROPOSAL_SCHEMA_VERSION: &str = "supervisor_proposal.v1";
+const CONTEXT_SCHEMA_VERSION: &str = "supervisor_context_pack.v2";
+const PROPOSAL_SCHEMA_VERSION: &str = "supervisor_proposal.v2";
 pub const SUPERVISOR_PROMPT_TEMPLATE_VERSION: &str = "supervisor_prompt.v1";
 const SUPERVISOR_PROPOSAL_SCHEMA_NAME: &str = "supervisor_proposal";
 const SUPERVISOR_PROMPT_STYLE: &str = "instructions_plus_json_context";
@@ -525,7 +526,7 @@ pub fn render_supervisor_prompt(
     rendered_at: DateTime<Utc>,
 ) -> OrcasResult<SupervisorPromptRenderArtifact> {
     let context_pack_text = serde_json::to_string_pretty(pack)?;
-    let instructions_text = "You are the Orcas supervisor reasoner. Orcas state in the provided packet is the only source of truth. Choose exactly one allowed decision for the primary work unit. Never invent ids, hidden context, or extra work units. If the decision is continue or redirect, return one bounded draft next assignment. Return JSON only, matching the requested schema.".to_string();
+    let instructions_text = "You are the Orcas supervisor reasoner. Orcas state in the provided packet is the only source of truth. Use the canonical workstream plan, current focus item, exploration policy, and recent alignment assessments when deciding what to do next. Choose exactly one allowed decision for the primary work unit. Never invent ids, hidden context, or extra work units. Do not silently change the canonical plan; structural changes must be proposed for operator approval. Every assignment must be tied to a plan item or a narrow special activity kind. If the decision is continue or redirect, return one bounded draft next assignment. Return JSON only, matching the requested schema.".to_string();
     let user_content_text = format!(
         "Return a supervisor proposal JSON object for this Orcas decision point.\nThe packet already contains the allowed decision set and the canonical workstream state.\n\nSupervisorContextPack:\n{context_pack_text}"
     );
@@ -653,6 +654,7 @@ pub fn build_context_pack(
         .ok_or_else(|| {
             OrcasError::Protocol(format!("unknown workstream `{}`", work_unit.workstream_id))
         })?;
+    let workstream_plan = build_workstream_plan_context(collaboration, &workstream.id);
     let latest_decision = latest_decision_for_work_unit(collaboration, &work_unit.id);
     let decision_policy =
         build_decision_policy(collaboration, &work_unit, &source_report, &worker_session)?;
@@ -701,6 +703,7 @@ pub fn build_context_pack(
         },
         decision_policy,
         workstream: build_workstream_context(collaboration, &workstream),
+        workstream_plan,
         primary_work_unit: SupervisorWorkUnitContext {
             id: work_unit.id.clone(),
             title: work_unit.title.clone(),
@@ -734,6 +737,14 @@ pub fn build_context_pack(
             id: current_assignment.id.clone(),
             status: label(&current_assignment.status)?,
             attempt_number: current_assignment.attempt_number,
+            plan_id: current_assignment.plan_id.as_ref().map(ToString::to_string),
+            plan_version: current_assignment.plan_version,
+            plan_item_id: current_assignment
+                .plan_item_id
+                .as_ref()
+                .map(ToString::to_string),
+            execution_kind: current_assignment.execution_kind,
+            alignment_rationale: current_assignment.alignment_rationale.clone(),
             worker_id: current_assignment.worker_id.clone(),
             worker_session_id: current_assignment.worker_session_id.clone(),
             instructions: current_assignment.instructions.clone(),
@@ -851,6 +862,13 @@ pub fn validate_proposal(
                 proposal.proposed_decision.expected_work_unit_status
             )),
         );
+    }
+
+    if let Some(plan_revision) = proposal.plan_revision_proposal.as_ref() {
+        validate_plan_revision_proposal(plan_revision, pack)?;
+    }
+    if let Some(assessment) = proposal.plan_assessment.as_ref() {
+        validate_plan_assessment(assessment, pack)?;
     }
 
     match (&proposal.draft_next_assignment, requires_assignment) {
@@ -1118,6 +1136,27 @@ fn build_workstream_context(
         blocked_work_unit_count,
         completed_work_unit_count,
     }
+}
+
+fn build_workstream_plan_context(
+    collaboration: &CollaborationState,
+    workstream_id: &str,
+) -> Option<SupervisorWorkstreamPlanContext> {
+    let active_plan = collaboration.planning.active_plan(workstream_id)?.clone();
+    let recent_assessments = collaboration
+        .planning
+        .recent_assessments_for_workstream(workstream_id, 5);
+    let pending_revision_proposals = collaboration
+        .planning
+        .pending_revision_proposals_for_workstream(workstream_id)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    Some(SupervisorWorkstreamPlanContext {
+        active_plan,
+        recent_assessments,
+        pending_revision_proposals,
+    })
 }
 
 fn build_decision_policy(
@@ -1399,6 +1438,83 @@ fn validate_draft_assignment(
         ));
     }
 
+    Ok(())
+}
+
+fn validate_plan_revision_proposal(
+    proposal: &orcas_core::planning::PlanRevisionProposal,
+    pack: &SupervisorContextPack,
+) -> OrcasResult<()> {
+    let Some(plan_context) = pack.workstream_plan.as_ref() else {
+        return Err(OrcasError::Protocol(
+            "plan revision proposal included without an active plan context".to_string(),
+        ));
+    };
+    if proposal.workstream_id != pack.workstream.id {
+        return Err(OrcasError::Protocol(
+            "plan revision proposal targeted a different workstream".to_string(),
+        ));
+    }
+    if proposal.base_plan_id != plan_context.active_plan.plan_id {
+        return Err(OrcasError::Protocol(
+            "plan revision proposal targeted a different active plan".to_string(),
+        ));
+    }
+    if proposal.base_plan_version != plan_context.active_plan.version {
+        return Err(OrcasError::Protocol(
+            "plan revision proposal targeted a stale plan version".to_string(),
+        ));
+    }
+    if proposal.ops.is_empty() {
+        return Err(OrcasError::Protocol(
+            "plan revision proposal must include at least one operation".to_string(),
+        ));
+    }
+    if proposal.rationale.trim().is_empty() {
+        return Err(OrcasError::Protocol(
+            "plan revision proposal rationale was empty".to_string(),
+        ));
+    }
+    if proposal.expected_benefit.trim().is_empty() || proposal.urgency.trim().is_empty() {
+        return Err(OrcasError::Protocol(
+            "plan revision proposal must include urgency and expected benefit".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plan_assessment(
+    assessment: &orcas_core::planning::PlanAssessment,
+    pack: &SupervisorContextPack,
+) -> OrcasResult<()> {
+    let Some(plan_context) = pack.workstream_plan.as_ref() else {
+        return Err(OrcasError::Protocol(
+            "plan assessment included without an active plan context".to_string(),
+        ));
+    };
+    if assessment.workstream_id != pack.workstream.id {
+        return Err(OrcasError::Protocol(
+            "plan assessment targeted a different workstream".to_string(),
+        ));
+    }
+    if assessment.plan_id != plan_context.active_plan.plan_id {
+        return Err(OrcasError::Protocol(
+            "plan assessment targeted a different active plan".to_string(),
+        ));
+    }
+    if assessment.plan_version != plan_context.active_plan.version {
+        return Err(OrcasError::Protocol(
+            "plan assessment targeted a stale plan version".to_string(),
+        ));
+    }
+    if assessment.progress_summary.trim().is_empty()
+        || assessment.recommended_next_action.trim().is_empty()
+    {
+        return Err(OrcasError::Protocol(
+            "plan assessment must include progress_summary and recommended_next_action"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -1743,6 +1859,11 @@ fn proposal_json_schema() -> Value {
                     "target_work_unit_id",
                     "predecessor_assignment_id",
                     "derived_from_decision_type",
+                    "plan_id",
+                    "plan_version",
+                    "plan_item_id",
+                    "execution_kind",
+                    "alignment_rationale",
                     "preferred_worker_id",
                     "worker_kind",
                     "objective",
@@ -1760,6 +1881,20 @@ fn proposal_json_schema() -> Value {
                         "type": "string",
                         "enum": ["continue", "redirect"]
                     },
+                    "plan_id": { "type": ["string", "null"] },
+                    "plan_version": { "type": ["integer", "null"] },
+                    "plan_item_id": { "type": ["string", "null"] },
+                    "execution_kind": {
+                        "type": "string",
+                        "enum": [
+                            "direct_execution",
+                            "plan_bootstrap",
+                            "plan_review",
+                            "blocker_investigation",
+                            "closure_synthesis"
+                        ]
+                    },
+                    "alignment_rationale": { "type": ["string", "null"] },
                     "preferred_worker_id": { "type": ["string", "null"] },
                     "worker_kind": { "type": ["string", "null"] },
                     "objective": { "type": "string" },
@@ -1787,6 +1922,108 @@ fn proposal_json_schema() -> Value {
                         }
                     },
                     "boundedness_note": { "type": "string" }
+                }
+            },
+            "plan_assessment": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "required": [
+                    "assessment_id",
+                    "workstream_id",
+                    "plan_id",
+                    "plan_version",
+                    "alignment_status",
+                    "progress_summary",
+                    "drift_risk",
+                    "recommended_next_action",
+                    "proposed_revision_needed",
+                    "execution_kind",
+                    "created_at",
+                    "created_by"
+                ],
+                "properties": {
+                    "assessment_id": { "type": "string" },
+                    "workstream_id": { "type": "string" },
+                    "plan_id": { "type": "string" },
+                    "plan_version": { "type": "integer" },
+                    "assignment_id": { "type": ["string", "null"] },
+                    "plan_item_id": { "type": ["string", "null"] },
+                    "alignment_status": {
+                        "type": "string",
+                        "enum": [
+                            "on_track",
+                            "slight_drift",
+                            "off_track",
+                            "blocked",
+                            "complete"
+                        ]
+                    },
+                    "progress_summary": { "type": "string" },
+                    "drift_risk": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"]
+                    },
+                    "blocker_summary": { "type": ["string", "null"] },
+                    "recommended_next_action": { "type": "string" },
+                    "proposed_revision_needed": { "type": "boolean" },
+                    "execution_kind": {
+                        "type": "string",
+                        "enum": [
+                            "direct_execution",
+                            "plan_bootstrap",
+                            "plan_review",
+                            "blocker_investigation",
+                            "closure_synthesis"
+                        ]
+                    },
+                    "created_at": { "type": "string" },
+                    "created_by": { "type": "string" }
+                }
+            },
+            "plan_revision_proposal": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "required": [
+                    "proposal_id",
+                    "workstream_id",
+                    "base_plan_id",
+                    "base_plan_version",
+                    "rationale",
+                    "urgency",
+                    "expected_benefit",
+                    "tradeoffs",
+                    "ops"
+                ],
+                "properties": {
+                    "proposal_id": { "type": "string" },
+                    "workstream_id": { "type": "string" },
+                    "base_plan_id": { "type": "string" },
+                    "base_plan_version": { "type": "integer" },
+                    "rationale": { "type": "string" },
+                    "urgency": { "type": "string" },
+                    "expected_benefit": { "type": "string" },
+                    "tradeoffs": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "ops": {
+                        "type": "array",
+                        "items": {
+                            "type": "object"
+                        }
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "pending",
+                            "approved",
+                            "rejected",
+                            "applied",
+                            "superseded"
+                        ]
+                    },
+                    "created_at": { "type": ["string", "null"] },
+                    "created_by": { "type": ["string", "null"] }
                 }
             },
             "confidence": {
@@ -1821,6 +2058,7 @@ mod tests {
         ReportDisposition, ReportParseResult, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
         WorkerSessionAttachability, WorkerSessionRuntimeStatus, Workstream, WorkstreamStatus,
     };
+    use orcas_core::planning::PlanExecutionKind;
 
     use super::{
         PROPOSAL_SCHEMA_VERSION, SUPERVISOR_PROMPT_TEMPLATE_VERSION, apply_edits,
@@ -1866,6 +2104,11 @@ mod tests {
         Assignment {
             id: "assignment-1".to_string(),
             work_unit_id: "wu-1".to_string(),
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: PlanExecutionKind::DirectExecution,
+            alignment_rationale: None,
             worker_id: "worker-1".to_string(),
             worker_session_id: "session-1".to_string(),
             instructions: "Stay inside the bounded task.".to_string(),
@@ -2001,6 +2244,7 @@ mod tests {
                 latest_decision_created_at: None,
             },
             decision_policy: sample_decision_policy(allowed_decisions),
+            workstream_plan: None,
             workstream: SupervisorWorkstreamContext {
                 id: "ws-1".to_string(),
                 title: "Workstream".to_string(),
@@ -2047,6 +2291,11 @@ mod tests {
                 id: "assignment-1".to_string(),
                 status: "awaiting_decision".to_string(),
                 attempt_number: 1,
+                plan_id: None,
+                plan_version: None,
+                plan_item_id: None,
+                execution_kind: PlanExecutionKind::DirectExecution,
+                alignment_rationale: None,
                 worker_id: "worker-1".to_string(),
                 worker_session_id: "session-1".to_string(),
                 instructions: "Stay inside the bounded task.".to_string(),
@@ -2076,6 +2325,11 @@ mod tests {
             target_work_unit_id: "wu-1".to_string(),
             predecessor_assignment_id: "assignment-1".to_string(),
             derived_from_decision_type: decision,
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: PlanExecutionKind::DirectExecution,
+            alignment_rationale: None,
             preferred_worker_id: Some("worker-1".to_string()),
             worker_kind: Some("codex".to_string()),
             objective: "Follow up on the bounded task.".to_string(),
@@ -2203,6 +2457,8 @@ mod tests {
                 None
             },
             confidence: ReportConfidence::High,
+            plan_assessment: None,
+            plan_revision_proposal: None,
             warnings: Vec::new(),
             open_questions: Vec::new(),
         }
@@ -2379,6 +2635,11 @@ mod tests {
             target_work_unit_id: "wu-1".to_string(),
             predecessor_assignment_id: "assignment-1".to_string(),
             derived_from_decision_type: DecisionType::Redirect,
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: PlanExecutionKind::DirectExecution,
+            alignment_rationale: None,
             preferred_worker_id: None,
             worker_kind: None,
             objective: "Follow the bounded redirect.".to_string(),

@@ -48,6 +48,29 @@ ORCAS now treats public and internal surfaces as belonging to one of four bucket
 
 New planning features should land only on canonical surfaces. Runtime-detail exceptions, compatibility surfaces, and test-only helpers are not expansion targets for new operator-facing planning behavior.
 
+## Workstream Plan
+
+Orcas now persists a canonical plan per workstream in daemon collaboration state. The plan is not a per-work-unit authority; work units and assignments can reference it, but they do not own it.
+
+The persisted plan records:
+
+- a stable plan id and version
+- workstream overview, goals, ordered plan items, success criteria, and constraints
+- a supervisor execution policy (`Strict`, `Balanced`, or `Exploratory`)
+- the current focus item for supervision
+- assessments and revision proposals tied to that plan version
+
+Supervisor execution may update plan-adjacent runtime fields without operator approval:
+
+- assignment linkage to a plan item or a narrow special execution kind
+- work item status updates such as `in_progress`, `blocked`, or `done`
+- alignment and drift assessments
+- notes, evidence refs, and recommended next focus within the current plan
+
+Structural plan changes require operator approval before they become canonical. That includes adding or removing goals or items, changing ordering or priority, changing success criteria or constraints, and changing the exploration policy. The supervisor may propose such changes, but the daemon only applies them as a new plan version after approval.
+
+When a supervisor proposes a revision, the daemon stores the proposal against the active plan version, validates it against the current canonical plan, and preserves the prior version for historical inspection. Assignment start and supervisor prompt generation both include plan linkage so tactical work stays anchored to the workstream plan rather than drifting into free-form local context.
+
 ## Source-Of-Truth Matrix
 
 ### Ownership And Read Paths

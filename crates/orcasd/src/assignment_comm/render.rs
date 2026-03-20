@@ -181,6 +181,11 @@ pub fn build_assignment_communication_record(
         assignment_id: assignment.id.clone(),
         work_unit_id: work_unit.id.clone(),
         workstream_id: workstream.id.clone(),
+        plan_id: assignment.plan_id.clone(),
+        plan_version: assignment.plan_version,
+        plan_item_id: assignment.plan_item_id.clone(),
+        execution_kind: assignment.execution_kind,
+        alignment_rationale: assignment.alignment_rationale.clone(),
         created_at: now,
         packet,
         prompt_render: prompt_render.clone(),
@@ -251,6 +256,17 @@ fn build_packet_from_seed(
         assignment_id: assignment.id.clone(),
         workstream_id: workstream.id.clone(),
         work_unit_id: work_unit.id.clone(),
+        plan_id: assignment.plan_id.clone().or_else(|| seed.plan_id.clone()),
+        plan_version: assignment.plan_version.or(seed.plan_version),
+        plan_item_id: assignment
+            .plan_item_id
+            .clone()
+            .or_else(|| seed.plan_item_id.clone()),
+        execution_kind: assignment.execution_kind,
+        alignment_rationale: assignment
+            .alignment_rationale
+            .clone()
+            .or_else(|| seed.alignment_rationale.clone()),
         worker_id: assignment.worker_id.clone(),
         worker_session_id: assignment.worker_session_id.clone(),
         created_at: now,
@@ -305,6 +321,11 @@ fn build_packet_from_legacy_assignment_instructions(
         assignment_id: assignment.id.clone(),
         workstream_id: workstream.id.clone(),
         work_unit_id: work_unit.id.clone(),
+        plan_id: assignment.plan_id.clone(),
+        plan_version: assignment.plan_version,
+        plan_item_id: assignment.plan_item_id.clone(),
+        execution_kind: assignment.execution_kind,
+        alignment_rationale: assignment.alignment_rationale.clone(),
         worker_id: assignment.worker_id.clone(),
         worker_session_id: assignment.worker_session_id.clone(),
         created_at: now,
@@ -1025,6 +1046,11 @@ mod tests {
         Assignment {
             id: "assignment-1".to_string(),
             work_unit_id: "work-unit-1".to_string(),
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: orcas_core::PlanExecutionKind::DirectExecution,
+            alignment_rationale: None,
             worker_id: "worker-1".to_string(),
             worker_session_id: "session-1".to_string(),
             instructions: instructions.to_string(),
@@ -1099,6 +1125,11 @@ mod tests {
 
     fn sample_seed() -> AssignmentCommunicationSeed {
         AssignmentCommunicationSeed {
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: orcas_core::PlanExecutionKind::DirectExecution,
+            alignment_rationale: None,
             source_decision_id: Some("decision-1".to_string()),
             source_report_id: Some("report-1".to_string()),
             source_proposal_id: Some("proposal-1".to_string()),
@@ -1194,6 +1225,11 @@ mod tests {
             assignment_id: "assignment-1".to_string(),
             workstream_id: "workstream-1".to_string(),
             work_unit_id: "work-unit-1".to_string(),
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+            alignment_rationale: None,
             worker_id: "worker-1".to_string(),
             worker_session_id: "session-1".to_string(),
             created_at: fixed_now(),

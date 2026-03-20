@@ -1,11 +1,12 @@
 use crate::app::{AppState, CollaborationFocus};
+use orcas_core::planning::{AlignmentStatus, DriftRisk, PlanExecutionKind, PlanItemStatus};
 use orcas_core::{
     AssignmentStatus, DecisionType, ReportConfidence, ReportDisposition, ReportParseResult,
     SupervisorProposalEdits, SupervisorProposalFailureStage, SupervisorProposalStatus,
     WorkUnitStatus, WorkstreamStatus, ipc,
 };
 
-use super::shared::{abbreviate, compact_line, short_id, timestamp_label};
+use super::shared::{PanelViewModel, abbreviate, compact_line, short_id, timestamp_label};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollaborationStatusViewModel {
@@ -90,6 +91,138 @@ pub struct CollaborationViewModel {
     pub work_units: WorkUnitListViewModel,
     pub detail: CollaborationDetailViewModel,
     pub history: CollaborationHistoryViewModel,
+}
+
+pub fn workstream_plan_panel(state: &AppState, workstream_id: &str) -> Option<PanelViewModel> {
+    let plan = state.collaboration.planning.active_plan(workstream_id)?;
+    let mut lines = vec![
+        format!("plan: {}", plan.title),
+        format!("id: {}", short_id(plan.plan_id.as_str())),
+        format!(
+            "version: {} status: {}",
+            plan.version,
+            plan_status_label(plan.status)
+        ),
+        format!(
+            "overview: {}",
+            plan.overview
+                .as_deref()
+                .map(|text| abbreviate(&compact_line(text), 88))
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        format!(
+            "goals: {} items: {} criteria: {} constraints: {}",
+            plan.goals.len(),
+            plan.plan_items.len(),
+            plan.success_criteria.len(),
+            plan.constraints.len()
+        ),
+    ];
+
+    if let Some(focus) = plan.active_focus_item() {
+        lines.push(format!(
+            "focus: {} [{}]",
+            abbreviate(&focus.title, 40),
+            plan_item_status_label(focus.status)
+        ));
+        if let Some(purpose) = focus.purpose.as_deref() {
+            lines.push(format!(
+                "focus_purpose: {}",
+                abbreviate(&compact_line(purpose), 88)
+            ));
+        }
+    } else {
+        lines.push("focus: -".to_string());
+    }
+
+    lines.push(format!(
+        "exploration: {} branch_depth={} blocker_investigations={} speculative_side_paths={} checkpoint={}",
+        exploration_mode_label(plan.exploration_policy.mode),
+        plan.exploration_policy
+            .max_branch_depth
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        plan.exploration_policy.allow_blocker_investigations,
+        plan.exploration_policy.allow_speculative_side_paths,
+        plan.exploration_policy
+            .checkpoint_interval
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+
+    if let Some(threshold) = plan.exploration_policy.drift_alert_threshold.as_deref() {
+        lines.push(format!("drift_alert: {threshold}"));
+    }
+
+    let recent_assessments = state
+        .collaboration
+        .planning
+        .recent_assessments_for_workstream(workstream_id, 2);
+    if recent_assessments.is_empty() {
+        lines.push("assessments: none".to_string());
+    } else {
+        lines.push(format!("assessments: {}", recent_assessments.len()));
+        for assessment in recent_assessments {
+            let item_label = assessment
+                .plan_item_id
+                .as_ref()
+                .map(|item_id| short_id(item_id.as_str()))
+                .unwrap_or_else(|| "-".to_string());
+            lines.push(format!(
+                "assessment: {} drift={} kind={} item={} rev={}",
+                alignment_status_label(assessment.alignment_status),
+                drift_risk_label(assessment.drift_risk),
+                plan_execution_kind_label(assessment.execution_kind),
+                item_label,
+                assessment.proposed_revision_needed
+            ));
+            lines.push(format!(
+                "assessment_summary: {}",
+                abbreviate(&compact_line(&assessment.progress_summary), 88)
+            ));
+            lines.push(format!(
+                "next_action: {}",
+                abbreviate(&compact_line(&assessment.recommended_next_action), 88)
+            ));
+            if let Some(blocker_summary) = assessment.blocker_summary.as_deref() {
+                lines.push(format!(
+                    "blocker: {}",
+                    abbreviate(&compact_line(blocker_summary), 88)
+                ));
+            }
+        }
+    }
+
+    let pending_revision_proposals = state
+        .collaboration
+        .planning
+        .pending_revision_proposals_for_workstream(workstream_id);
+    if pending_revision_proposals.is_empty() {
+        lines.push("pending_revisions: none".to_string());
+    } else {
+        lines.push(format!(
+            "pending_revisions: {}",
+            pending_revision_proposals.len()
+        ));
+        for proposal in pending_revision_proposals.into_iter().take(2) {
+            lines.push(format!(
+                "revision: {} base_v{} ops={} urgency={}",
+                short_id(proposal.proposal_id.as_str()),
+                proposal.base_plan_version,
+                proposal.ops.len(),
+                proposal.urgency
+            ));
+            lines.push(format!(
+                "revision_rationale: {}",
+                abbreviate(&compact_line(&proposal.rationale), 88)
+            ));
+        }
+    }
+
+    Some(PanelViewModel {
+        title: format!("Plan {}", abbreviate(&plan.title, 24)),
+        lines,
+    })
 }
 
 pub fn collaboration_status(state: &AppState) -> CollaborationStatusViewModel {
@@ -211,20 +344,26 @@ pub fn workstream_detail(state: &AppState) -> WorkstreamDetailViewModel {
         })
         .count();
 
+    let mut lines = vec![
+        format!("id: {}", workstream.id),
+        format!("status: {}", collaboration_status_label(workstream.status)),
+        format!("priority: {}", workstream.priority),
+        format!("objective: {}", compact_line(&workstream.objective)),
+        format!(
+            "units: total={} completed={} review={}",
+            work_units.len(),
+            completed_count,
+            review_count
+        ),
+    ];
+    if let Some(plan_panel) = workstream_plan_panel(state, &workstream.id) {
+        lines.push(String::new());
+        lines.extend(plan_panel.lines);
+    }
+
     WorkstreamDetailViewModel {
         title: format!("Workstream {}", workstream.title),
-        lines: vec![
-            format!("id: {}", workstream.id),
-            format!("status: {}", collaboration_status_label(workstream.status)),
-            format!("priority: {}", workstream.priority),
-            format!("objective: {}", compact_line(&workstream.objective)),
-            format!(
-                "units: total={} completed={} review={}",
-                work_units.len(),
-                completed_count,
-                review_count
-            ),
-        ],
+        lines,
     }
 }
 
@@ -376,13 +515,39 @@ pub fn collaboration_detail(state: &AppState) -> CollaborationDetailViewModel {
     }
 
     if let Some(assignment) = assignment {
-        lines.push(format!(
+        let mut assignment_line = format!(
             "assignment: {} [{}] worker={} session={}",
             assignment.id,
             assignment_status_label(assignment.status),
             assignment.worker_id,
             assignment.worker_session_id
+        );
+        if let Some(plan_id) = assignment.plan_id.as_deref() {
+            assignment_line.push_str(&format!(
+                " plan={} v{} item={}",
+                short_id(plan_id),
+                assignment
+                    .plan_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                assignment
+                    .plan_item_id
+                    .as_ref()
+                    .map(|item_id| short_id(item_id.as_str()))
+                    .unwrap_or_else(|| "-".to_string())
+            ));
+        }
+        assignment_line.push_str(&format!(
+            " kind={}",
+            plan_execution_kind_label(assignment.execution_kind)
         ));
+        lines.push(assignment_line);
+        if let Some(rationale) = assignment.alignment_rationale.as_deref() {
+            lines.push(format!(
+                "assignment_alignment: {}",
+                abbreviate(&compact_line(rationale), 84)
+            ));
+        }
     } else {
         lines.push("assignment: -".to_string());
     }
@@ -669,6 +834,60 @@ fn assignment_status_label(status: AssignmentStatus) -> String {
         AssignmentStatus::Closed => "closed".to_string(),
         AssignmentStatus::Interrupted => "interrupted".to_string(),
         AssignmentStatus::Lost => "lost".to_string(),
+    }
+}
+
+pub(crate) fn plan_status_label(status: orcas_core::planning::PlanStatus) -> &'static str {
+    match status {
+        orcas_core::planning::PlanStatus::Draft => "draft",
+        orcas_core::planning::PlanStatus::Active => "active",
+        orcas_core::planning::PlanStatus::Superseded => "superseded",
+    }
+}
+
+fn plan_item_status_label(status: PlanItemStatus) -> &'static str {
+    match status {
+        PlanItemStatus::Pending => "pending",
+        PlanItemStatus::InProgress => "in_progress",
+        PlanItemStatus::Blocked => "blocked",
+        PlanItemStatus::Done => "done",
+        PlanItemStatus::Dropped => "dropped",
+    }
+}
+
+fn alignment_status_label(status: AlignmentStatus) -> &'static str {
+    match status {
+        AlignmentStatus::OnTrack => "on_track",
+        AlignmentStatus::SlightDrift => "slight_drift",
+        AlignmentStatus::OffTrack => "off_track",
+        AlignmentStatus::Blocked => "blocked",
+        AlignmentStatus::Complete => "complete",
+    }
+}
+
+fn drift_risk_label(risk: DriftRisk) -> &'static str {
+    match risk {
+        DriftRisk::Low => "low",
+        DriftRisk::Medium => "medium",
+        DriftRisk::High => "high",
+    }
+}
+
+fn plan_execution_kind_label(kind: PlanExecutionKind) -> &'static str {
+    match kind {
+        PlanExecutionKind::DirectExecution => "direct_execution",
+        PlanExecutionKind::PlanBootstrap => "plan_bootstrap",
+        PlanExecutionKind::PlanReview => "plan_review",
+        PlanExecutionKind::BlockerInvestigation => "blocker_investigation",
+        PlanExecutionKind::ClosureSynthesis => "closure_synthesis",
+    }
+}
+
+fn exploration_mode_label(mode: orcas_core::planning::ExplorationMode) -> &'static str {
+    match mode {
+        orcas_core::planning::ExplorationMode::Strict => "strict",
+        orcas_core::planning::ExplorationMode::Balanced => "balanced",
+        orcas_core::planning::ExplorationMode::Exploratory => "exploratory",
     }
 }
 

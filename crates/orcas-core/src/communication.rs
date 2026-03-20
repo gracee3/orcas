@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::authority;
 use crate::collaboration::{ReportConfidence, ReportDisposition, ReportParseResult};
+use crate::planning::{PlanExecutionKind, PlanId, PlanItemId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +125,16 @@ impl AssignmentModeSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssignmentCommunicationSeed {
     #[serde(default)]
+    pub plan_id: Option<PlanId>,
+    #[serde(default)]
+    pub plan_version: Option<u64>,
+    #[serde(default)]
+    pub plan_item_id: Option<PlanItemId>,
+    #[serde(default)]
+    pub execution_kind: PlanExecutionKind,
+    #[serde(default)]
+    pub alignment_rationale: Option<String>,
+    #[serde(default)]
     pub source_decision_id: Option<String>,
     #[serde(default)]
     pub source_report_id: Option<String>,
@@ -207,6 +218,16 @@ pub struct AssignmentCommunicationPacket {
     pub assignment_id: String,
     pub workstream_id: String,
     pub work_unit_id: String,
+    #[serde(default)]
+    pub plan_id: Option<PlanId>,
+    #[serde(default)]
+    pub plan_version: Option<u64>,
+    #[serde(default)]
+    pub plan_item_id: Option<PlanItemId>,
+    #[serde(default)]
+    pub execution_kind: PlanExecutionKind,
+    #[serde(default)]
+    pub alignment_rationale: Option<String>,
     pub worker_id: String,
     pub worker_session_id: String,
     pub created_at: DateTime<Utc>,
@@ -351,6 +372,16 @@ pub struct AssignmentCommunicationRecord {
     pub assignment_id: String,
     pub work_unit_id: String,
     pub workstream_id: String,
+    #[serde(default)]
+    pub plan_id: Option<PlanId>,
+    #[serde(default)]
+    pub plan_version: Option<u64>,
+    #[serde(default)]
+    pub plan_item_id: Option<PlanItemId>,
+    #[serde(default)]
+    pub execution_kind: PlanExecutionKind,
+    #[serde(default)]
+    pub alignment_rationale: Option<String>,
     pub created_at: DateTime<Utc>,
     pub packet: AssignmentCommunicationPacket,
     pub prompt_render: PromptRenderArtifact,
@@ -396,6 +427,11 @@ mod tests {
             assignment_id: "assignment-1".to_string(),
             workstream_id: "ws-1".to_string(),
             work_unit_id: "wu-1".to_string(),
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: crate::planning::PlanExecutionKind::DirectExecution,
+            alignment_rationale: None,
             worker_id: "worker-1".to_string(),
             worker_session_id: "session-1".to_string(),
             created_at: fixed_now(),
@@ -465,6 +501,11 @@ mod tests {
     #[test]
     fn assignment_communication_seed_round_trips_optional_and_default_lists() {
         let seed = AssignmentCommunicationSeed {
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: crate::planning::PlanExecutionKind::DirectExecution,
+            alignment_rationale: None,
             source_decision_id: Some("decision-1".to_string()),
             source_report_id: None,
             source_proposal_id: Some("proposal-1".to_string()),

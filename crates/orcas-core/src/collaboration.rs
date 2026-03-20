@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::authority;
 use crate::communication::{AssignmentCommunicationRecord, AssignmentCommunicationSeed};
+use crate::planning::{PlanExecutionKind, PlanId, PlanItemId, PlanningState};
 use crate::supervisor::SupervisorProposalRecord;
 
 /// Daemon-owned collaboration and execution/runtime state.
@@ -57,6 +58,8 @@ pub struct CollaborationState {
     pub codex_thread_assignments: BTreeMap<String, CodexThreadAssignment>,
     #[serde(default)]
     pub supervisor_turn_decisions: BTreeMap<String, SupervisorTurnDecision>,
+    #[serde(default)]
+    pub planning: PlanningState,
 }
 
 /// Lifecycle of a Codex thread assignment mirror in collaboration state.
@@ -293,6 +296,16 @@ pub enum AssignmentStatus {
 pub struct Assignment {
     pub id: String,
     pub work_unit_id: String,
+    #[serde(default)]
+    pub plan_id: Option<PlanId>,
+    #[serde(default)]
+    pub plan_version: Option<u64>,
+    #[serde(default)]
+    pub plan_item_id: Option<PlanItemId>,
+    #[serde(default)]
+    pub execution_kind: PlanExecutionKind,
+    #[serde(default)]
+    pub alignment_rationale: Option<String>,
     pub worker_id: String,
     pub worker_session_id: String,
     pub instructions: String,

@@ -323,6 +323,11 @@ fn sample_proposal_record(
             target_work_unit_id: work_unit_id.to_string(),
             predecessor_assignment_id: assignment_id.to_string(),
             derived_from_decision_type: decision_type,
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+            alignment_rationale: None,
             preferred_worker_id: Some("worker-a".to_string()),
             worker_kind: Some("codex".to_string()),
             objective: "Resolve one bounded follow-up question.".to_string(),
@@ -337,6 +342,8 @@ fn sample_proposal_record(
             boundedness_note: "Stay within one bounded follow-up.".to_string(),
         }),
         confidence: ReportConfidence::High,
+        plan_assessment: None,
+        plan_revision_proposal: None,
         warnings: Vec::new(),
         open_questions: Vec::new(),
     };
@@ -470,6 +477,7 @@ fn sample_proposal_record(
                 blocked_work_unit_count: 0,
                 completed_work_unit_count: 0,
             },
+            workstream_plan: None,
             primary_work_unit: SupervisorWorkUnitContext {
                 id: work_unit_id.to_string(),
                 title: "Snapshot wiring".to_string(),
@@ -503,6 +511,11 @@ fn sample_proposal_record(
                 id: assignment_id.to_string(),
                 status: "awaiting_decision".to_string(),
                 attempt_number: 2,
+                plan_id: None,
+                plan_version: None,
+                plan_item_id: None,
+                execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+                alignment_rationale: None,
                 worker_id: "worker-a".to_string(),
                 worker_session_id: "session-1".to_string(),
                 instructions: "Second bounded pass".to_string(),
@@ -618,6 +631,11 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
             ipc::AssignmentSummary {
                 id: "assignment-2".to_string(),
                 work_unit_id: "wu-1".to_string(),
+                plan_id: None,
+                plan_version: None,
+                plan_item_id: None,
+                execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+                alignment_rationale: None,
                 worker_id: "worker-a".to_string(),
                 worker_session_id: "session-1".to_string(),
                 status: AssignmentStatus::AwaitingDecision,
@@ -627,6 +645,11 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
             ipc::AssignmentSummary {
                 id: "assignment-3".to_string(),
                 work_unit_id: "wu-2".to_string(),
+                plan_id: None,
+                plan_version: None,
+                plan_item_id: None,
+                execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+                alignment_rationale: None,
                 worker_id: "worker-a".to_string(),
                 worker_session_id: "session-1".to_string(),
                 status: AssignmentStatus::Created,
@@ -670,6 +693,7 @@ fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
             rationale: "Need one more bounded pass.".to_string(),
             created_at: Utc::now(),
         }],
+        planning: Default::default(),
     }
 }
 
@@ -716,6 +740,124 @@ fn sample_snapshot() -> ipc::StateSnapshot {
             turn_id: None,
         }],
     }
+}
+
+fn sample_snapshot_with_plan() -> ipc::StateSnapshot {
+    let mut snapshot = sample_snapshot();
+    let now = Utc::now();
+    let goal_id = orcas_core::planning::PlanGoalId::parse("goal-1").expect("goal id");
+    let item_id = orcas_core::planning::PlanItemId::parse("item-1").expect("item id");
+    let plan_id = orcas_core::planning::PlanId::parse("plan-1").expect("plan id");
+    let proposal_id =
+        orcas_core::planning::PlanRevisionProposalId::parse("rev-1").expect("proposal id");
+    snapshot.collaboration.planning.workstream_plans.insert(
+        "ws-1".to_string(),
+        vec![orcas_core::planning::WorkstreamPlan {
+            plan_id: plan_id.clone(),
+            workstream_id: "ws-1".to_string(),
+            version: 1,
+            status: orcas_core::planning::PlanStatus::Active,
+            title: "Collaboration hardening plan".to_string(),
+            overview: Some("Keep the operator aligned with the canonical workstream.".to_string()),
+            goals: vec![orcas_core::planning::PlanGoal {
+                goal_id: goal_id.clone(),
+                title: "Stabilize collaboration snapshot".to_string(),
+                description: Some("Make the runtime view durable and plan-aware.".to_string()),
+                priority: "high".to_string(),
+                status: orcas_core::planning::PlanGoalStatus::InProgress,
+            }],
+            plan_items: vec![orcas_core::planning::PlanItem {
+                item_id: item_id.clone(),
+                goal_id: goal_id.clone(),
+                title: "Show canonical plan summary in the operator UI".to_string(),
+                purpose: Some(
+                    "Keep the supervisor and operator anchored to the current workstream."
+                        .to_string(),
+                ),
+                priority: "high".to_string(),
+                status: orcas_core::planning::PlanItemStatus::InProgress,
+                acceptance_criteria: vec![
+                    "The current focus item is visible.".to_string(),
+                    "The exploration policy is visible.".to_string(),
+                ],
+                dependency_item_ids: Vec::new(),
+                notes: Some("Seeded by the TUI test fixture.".to_string()),
+                linked_work_unit_id: Some("wu-1".to_string()),
+                linked_assignment_ids: vec!["assignment-2".to_string()],
+                evidence_refs: vec!["report-2".to_string()],
+            }],
+            success_criteria: vec!["Operators can inspect the active plan quickly.".to_string()],
+            constraints: vec!["Do not mutate the canonical plan silently.".to_string()],
+            exploration_policy: orcas_core::planning::ExplorationPolicy {
+                mode: orcas_core::planning::ExplorationMode::Balanced,
+                max_branch_depth: Some(1),
+                allow_blocker_investigations: true,
+                allow_speculative_side_paths: false,
+                checkpoint_interval: Some(2),
+                drift_alert_threshold: Some("medium".to_string()),
+            },
+            current_focus_item_id: Some(item_id.clone()),
+            created_at: now,
+            updated_at: now,
+            created_by: "tester".to_string(),
+            updated_by: "tester".to_string(),
+            superseded_by_plan_id: None,
+            source_revision_proposal_id: None,
+        }],
+    );
+    snapshot
+        .collaboration
+        .planning
+        .assessments
+        .insert(
+            "assessment-1".to_string(),
+            orcas_core::planning::PlanAssessment {
+                assessment_id: orcas_core::planning::PlanAssessmentId::parse("assessment-1")
+                    .expect("assessment id"),
+                workstream_id: "ws-1".to_string(),
+                plan_id,
+                plan_version: 1,
+                assignment_id: Some("assignment-2".to_string()),
+                plan_item_id: Some(item_id.clone()),
+                alignment_status: orcas_core::planning::AlignmentStatus::SlightDrift,
+                progress_summary: "The work is still aligned, but the supervisor should keep an eye on scope creep.".to_string(),
+                drift_risk: orcas_core::planning::DriftRisk::Medium,
+                blocker_summary: Some("Waiting on one more read-only render pass.".to_string()),
+                recommended_next_action: "Continue the bounded UI pass and reassess once the plan panel renders.".to_string(),
+                proposed_revision_needed: true,
+                execution_kind: orcas_core::planning::PlanExecutionKind::PlanReview,
+                created_at: now,
+                created_by: "tester".to_string(),
+            },
+        );
+    snapshot.collaboration.planning.revision_proposals.insert(
+        proposal_id.to_string(),
+        orcas_core::planning::PlanRevisionProposal {
+            proposal_id,
+            workstream_id: "ws-1".to_string(),
+            base_plan_id: orcas_core::planning::PlanId::parse("plan-1").expect("plan id"),
+            base_plan_version: 1,
+            rationale: "The workstream needs an explicit plan item for the UI summary.".to_string(),
+            urgency: "medium".to_string(),
+            expected_benefit: "Keep operator attention on the canonical plan.".to_string(),
+            tradeoffs: vec!["Adds one more review step before changing the plan.".to_string()],
+            ops: vec![orcas_core::planning::PlanRevisionOp::UpdateConstraints {
+                constraints: vec![
+                    "Preserve the canonical plan as the source of truth.".to_string(),
+                ],
+            }],
+            status: orcas_core::planning::PlanRevisionProposalStatus::Pending,
+            created_at: now,
+            created_by: "supervisor-a".to_string(),
+            reviewed_at: None,
+            reviewed_by: None,
+            review_note: None,
+            applied_plan_id: None,
+            applied_plan_version: None,
+            source_supervisor_proposal_id: Some("proposal-1".to_string()),
+        },
+    );
+    snapshot
 }
 
 fn sample_disconnected_snapshot() -> ipc::StateSnapshot {
@@ -801,6 +943,11 @@ fn sample_workunit_detail(work_unit_id: &str) -> ipc::WorkunitGetResponse {
                     Assignment {
                         id: "assignment-1".to_string(),
                         work_unit_id: "wu-1".to_string(),
+                        plan_id: None,
+                        plan_version: None,
+                        plan_item_id: None,
+                        execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+                        alignment_rationale: None,
                         worker_id: "worker-a".to_string(),
                         worker_session_id: "session-1".to_string(),
                         instructions: "Initial snapshot pass".to_string(),
@@ -813,6 +960,11 @@ fn sample_workunit_detail(work_unit_id: &str) -> ipc::WorkunitGetResponse {
                     Assignment {
                         id: "assignment-2".to_string(),
                         work_unit_id: "wu-1".to_string(),
+                        plan_id: None,
+                        plan_version: None,
+                        plan_item_id: None,
+                        execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+                        alignment_rationale: None,
                         worker_id: "worker-a".to_string(),
                         worker_session_id: "session-1".to_string(),
                         instructions: "Second bounded pass".to_string(),
@@ -901,6 +1053,11 @@ fn sample_workunit_detail(work_unit_id: &str) -> ipc::WorkunitGetResponse {
                 assignments: vec![Assignment {
                     id: "assignment-3".to_string(),
                     work_unit_id: "wu-2".to_string(),
+                    plan_id: None,
+                    plan_version: None,
+                    plan_item_id: None,
+                    execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+                    alignment_rationale: None,
                     worker_id: "worker-a".to_string(),
                     worker_session_id: "session-1".to_string(),
                     instructions: "Prepare event surface".to_string(),
@@ -2234,7 +2391,21 @@ async fn reconnect_recovers_with_snapshot_then_resubscribe() {
 
 #[tokio::test]
 async fn collaboration_snapshot_drives_rendering() {
-    let mut harness = AppHarness::new(sample_snapshot()).await.unwrap();
+    let mut snapshot = sample_snapshot_with_plan();
+    if let Some(assignment) = snapshot
+        .collaboration
+        .assignments
+        .iter_mut()
+        .find(|assignment| assignment.id == "assignment-2")
+    {
+        assignment.plan_id = Some("plan-1".to_string());
+        assignment.plan_version = Some(1);
+        assignment.plan_item_id = Some("item-1".to_string());
+        assignment.execution_kind = orcas_core::planning::PlanExecutionKind::PlanReview;
+        assignment.alignment_rationale =
+            Some("Keep the work anchored to the canonical plan item.".to_string());
+    }
+    let mut harness = AppHarness::new(snapshot).await.unwrap();
     harness
         .set_workunit_detail(sample_workunit_detail("wu-1"))
         .await;
@@ -2250,7 +2421,25 @@ async fn collaboration_snapshot_drives_rendering() {
         workstream_detail
             .lines
             .iter()
-            .any(|line| line.contains("Harden collaboration snapshot semantics."))
+            .any(|line| line.contains("Collaboration hardening plan"))
+    );
+    assert!(
+        workstream_detail
+            .lines
+            .iter()
+            .any(|line| line.contains("focus: Show canonical plan summary in the operator UI"))
+    );
+    assert!(
+        workstream_detail
+            .lines
+            .iter()
+            .any(|line| line.contains("exploration: balanced"))
+    );
+    assert!(
+        workstream_detail
+            .lines
+            .iter()
+            .any(|line| line.contains("pending_revisions: 1"))
     );
     assert!(
         work_units
@@ -2264,6 +2453,13 @@ async fn collaboration_snapshot_drives_rendering() {
             .iter()
             .any(|row| row.id == "assignment-2" && row.worker_session_id == "session-1")
     );
+    assert!(detail
+        .lines
+        .iter()
+        .any(|line| line.contains("assignment: assignment-2 [awaiting_decision] worker=worker-a session=session-1 plan=plan-1 v1 item=item-1 kind=plan_review")));
+    assert!(detail.lines.iter().any(|line| {
+        line.contains("assignment_alignment: Keep the work anchored to the canonical plan item.")
+    }));
     assert!(
         detail
             .lines
@@ -2396,6 +2592,7 @@ async fn proposal_lifecycle_event_refreshes_selected_work_unit_detail() {
                     created_at: Utc::now(),
                     reviewed_at: Some(Utc::now()),
                     has_approval_edits: true,
+                    has_plan_revision_proposal: false,
                     generation_failure_stage: None,
                     reasoner_model: "test-supervisor".to_string(),
                 },
@@ -2469,6 +2666,11 @@ async fn collaboration_events_refresh_summaries_incrementally() {
                 assignment: ipc::AssignmentSummary {
                     id: "assignment-4".to_string(),
                     work_unit_id: "wu-4".to_string(),
+                    plan_id: None,
+                    plan_version: None,
+                    plan_item_id: None,
+                    execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+                    alignment_rationale: None,
                     worker_id: "worker-b".to_string(),
                     worker_session_id: "session-4".to_string(),
                     status: AssignmentStatus::Running,
@@ -2662,6 +2864,11 @@ async fn collaboration_history_shows_failed_interrupted_and_lost_states_explicit
     snapshot.collaboration.assignments = vec![ipc::AssignmentSummary {
         id: "assignment-i".to_string(),
         work_unit_id: "wu-f".to_string(),
+        plan_id: None,
+        plan_version: None,
+        plan_item_id: None,
+        execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+        alignment_rationale: None,
         worker_id: "worker-a".to_string(),
         worker_session_id: "session-2".to_string(),
         status: AssignmentStatus::Interrupted,
@@ -2708,6 +2915,11 @@ async fn collaboration_history_shows_failed_interrupted_and_lost_states_explicit
                 Assignment {
                     id: "assignment-f".to_string(),
                     work_unit_id: "wu-f".to_string(),
+                    plan_id: None,
+                    plan_version: None,
+                    plan_item_id: None,
+                    execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+                    alignment_rationale: None,
                     worker_id: "worker-a".to_string(),
                     worker_session_id: "session-1".to_string(),
                     instructions: "Failed start".to_string(),
@@ -2720,6 +2932,11 @@ async fn collaboration_history_shows_failed_interrupted_and_lost_states_explicit
                 Assignment {
                     id: "assignment-i".to_string(),
                     work_unit_id: "wu-f".to_string(),
+                    plan_id: None,
+                    plan_version: None,
+                    plan_item_id: None,
+                    execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+                    alignment_rationale: None,
                     worker_id: "worker-a".to_string(),
                     worker_session_id: "session-2".to_string(),
                     instructions: "Interrupted run".to_string(),
@@ -2862,6 +3079,22 @@ async fn supervisor_view_loads_models_and_renders_available_models() {
             .await
             .contains(&BackendCommand::LoadModels)
     );
+}
+
+#[tokio::test]
+async fn supervisor_view_surfaces_active_plan_summary_and_pending_revision() {
+    let mut harness = AppHarness::new(sample_snapshot_with_plan()).await.unwrap();
+
+    harness
+        .dispatch(UserAction::ShowView(TopLevelView::Supervisor))
+        .await;
+
+    let rendered = harness.render_text(160, 42);
+    assert!(rendered.contains("planning:"));
+    assert!(rendered.contains("Collaboration hardening plan"));
+    assert!(rendered.contains("focus: Show canonical plan summary in the operator UI"));
+    assert!(rendered.contains("exploration: balanced"));
+    assert!(rendered.contains("pending_revisions: 1"));
 }
 
 #[tokio::test]
@@ -3390,6 +3623,11 @@ async fn reconnect_refreshes_history_for_selected_work_unit() {
     recovered.collaboration.assignments = vec![ipc::AssignmentSummary {
         id: "assignment-9".to_string(),
         work_unit_id: "wu-9".to_string(),
+        plan_id: None,
+        plan_version: None,
+        plan_item_id: None,
+        execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+        alignment_rationale: None,
         worker_id: "worker-r".to_string(),
         worker_session_id: "session-9".to_string(),
         status: AssignmentStatus::Failed,
@@ -3434,6 +3672,11 @@ async fn reconnect_refreshes_history_for_selected_work_unit() {
             assignments: vec![Assignment {
                 id: "assignment-9".to_string(),
                 work_unit_id: "wu-9".to_string(),
+                plan_id: None,
+                plan_version: None,
+                plan_item_id: None,
+                execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+                alignment_rationale: None,
                 worker_id: "worker-r".to_string(),
                 worker_session_id: "session-9".to_string(),
                 instructions: "Recovered work".to_string(),
@@ -3586,6 +3829,11 @@ async fn reconnect_reconciles_collaboration_selection_to_authoritative_snapshot(
     recovered.collaboration.assignments = vec![ipc::AssignmentSummary {
         id: "assignment-r".to_string(),
         work_unit_id: "wu-r".to_string(),
+        plan_id: None,
+        plan_version: None,
+        plan_item_id: None,
+        execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
+        alignment_rationale: None,
         worker_id: "worker-r".to_string(),
         worker_session_id: "session-r".to_string(),
         status: AssignmentStatus::Failed,

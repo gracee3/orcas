@@ -1,5 +1,6 @@
 use crate::app::{AppState, BannerLevel};
 
+use super::collaboration::workstream_plan_panel;
 use super::shared::{
     PanelViewModel, connection_status, daemon_phase_label, event_log, lifecycle_label,
     status_banner, timestamp_label,
@@ -32,6 +33,23 @@ pub fn overview_view(state: &AppState) -> OverviewViewModel {
     }
 
     let active_turn_lines = active_turn_lines(state);
+    let mut active_work_lines = active_turn_lines;
+    if let Some(workstream_id) = state.selected_workstream_id.as_deref()
+        && let Some(plan_panel) = workstream_plan_panel(state, workstream_id)
+    {
+        active_work_lines.push(String::new());
+        active_work_lines.extend(plan_panel.lines.into_iter().take(8));
+    } else if let Some(work_unit_id) = state.selected_work_unit_id.as_deref()
+        && let Some(work_unit) = state
+            .collaboration
+            .work_units
+            .iter()
+            .find(|work_unit| work_unit.id == work_unit_id)
+        && let Some(plan_panel) = workstream_plan_panel(state, &work_unit.workstream_id)
+    {
+        active_work_lines.push(String::new());
+        active_work_lines.extend(plan_panel.lines.into_iter().take(8));
+    }
     let mut warning_lines = warning_lines(state);
     if warning_lines.is_empty() {
         warning_lines.push("No recent warnings.".to_string());
@@ -55,7 +73,7 @@ pub fn overview_view(state: &AppState) -> OverviewViewModel {
         },
         active_work: PanelViewModel {
             title: "Active Work".to_string(),
-            lines: active_turn_lines,
+            lines: active_work_lines,
         },
         warnings: PanelViewModel {
             title: "Recent Warnings".to_string(),

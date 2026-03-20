@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::planning::{PlanAssessment, PlanExecutionKind, PlanRevisionProposal, WorkstreamPlan};
 use crate::{DecisionType, ReportConfidence, ReportDisposition, ReportParseResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +82,15 @@ pub struct SupervisorWorkstreamContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorWorkstreamPlanContext {
+    pub active_plan: WorkstreamPlan,
+    #[serde(default)]
+    pub recent_assessments: Vec<PlanAssessment>,
+    #[serde(default)]
+    pub pending_revision_proposals: Vec<PlanRevisionProposal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorWorkUnitContext {
     pub id: String,
     pub title: String,
@@ -125,6 +135,16 @@ pub struct SupervisorAssignmentContext {
     pub id: String,
     pub status: String,
     pub attempt_number: u32,
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    #[serde(default)]
+    pub plan_version: Option<u64>,
+    #[serde(default)]
+    pub plan_item_id: Option<String>,
+    #[serde(default)]
+    pub execution_kind: PlanExecutionKind,
+    #[serde(default)]
+    pub alignment_rationale: Option<String>,
     pub worker_id: String,
     pub worker_session_id: String,
     pub instructions: String,
@@ -224,6 +244,8 @@ pub struct SupervisorContextPack {
     pub state_anchor: SupervisorStateAnchor,
     pub decision_policy: DecisionPolicy,
     pub workstream: SupervisorWorkstreamContext,
+    #[serde(default)]
+    pub workstream_plan: Option<SupervisorWorkstreamPlanContext>,
     pub primary_work_unit: SupervisorWorkUnitContext,
     pub source_report: SupervisorSourceReportContext,
     pub current_assignment: SupervisorAssignmentContext,
@@ -265,6 +287,16 @@ pub struct DraftAssignment {
     pub target_work_unit_id: String,
     pub predecessor_assignment_id: String,
     pub derived_from_decision_type: DecisionType,
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    #[serde(default)]
+    pub plan_version: Option<u64>,
+    #[serde(default)]
+    pub plan_item_id: Option<String>,
+    #[serde(default)]
+    pub execution_kind: PlanExecutionKind,
+    #[serde(default)]
+    pub alignment_rationale: Option<String>,
     pub preferred_worker_id: Option<String>,
     pub worker_kind: Option<String>,
     pub objective: String,
@@ -288,6 +320,10 @@ pub struct SupervisorProposal {
     pub proposed_decision: ProposedDecision,
     pub draft_next_assignment: Option<DraftAssignment>,
     pub confidence: ReportConfidence,
+    #[serde(default)]
+    pub plan_assessment: Option<PlanAssessment>,
+    #[serde(default)]
+    pub plan_revision_proposal: Option<PlanRevisionProposal>,
     #[serde(default)]
     pub warnings: Vec<String>,
     #[serde(default)]
@@ -467,9 +503,12 @@ mod tests {
         SupervisorProposalFailure, SupervisorProposalFailureStage, SupervisorProposalRecord,
         SupervisorProposalStatus, SupervisorProposalTrigger, SupervisorProposalTriggerKind,
         SupervisorSourceReportContext, SupervisorStateAnchor, SupervisorSummary,
-        SupervisorWorkUnitContext,
+        SupervisorWorkUnitContext, SupervisorWorkstreamPlanContext,
     };
-    use crate::{DecisionType, ReportConfidence, ReportDisposition, ReportParseResult};
+    use crate::{
+        DecisionType, ReportConfidence, ReportDisposition, ReportParseResult,
+        planning::{PlanExecutionKind, PlanningState},
+    };
 
     fn fixed_now() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2025, 5, 6, 7, 8, 9)
@@ -479,7 +518,7 @@ mod tests {
 
     fn sample_context_pack() -> SupervisorContextPack {
         SupervisorContextPack {
-            schema_version: "supervisor_context_pack.v1".to_string(),
+            schema_version: "supervisor_context_pack.v2".to_string(),
             generated_at: fixed_now(),
             trigger: SupervisorProposalTrigger {
                 kind: SupervisorProposalTriggerKind::ReportRecorded,
@@ -532,6 +571,7 @@ mod tests {
                 blocked_work_unit_count: 0,
                 completed_work_unit_count: 0,
             },
+            workstream_plan: None,
             primary_work_unit: SupervisorWorkUnitContext {
                 id: "wu-1".to_string(),
                 title: "Work unit".to_string(),
@@ -565,6 +605,11 @@ mod tests {
                 id: "assignment-1".to_string(),
                 status: "awaiting_decision".to_string(),
                 attempt_number: 1,
+                plan_id: None,
+                plan_version: None,
+                plan_item_id: None,
+                execution_kind: PlanExecutionKind::DirectExecution,
+                alignment_rationale: None,
                 worker_id: "worker-1".to_string(),
                 worker_session_id: "session-1".to_string(),
                 instructions: "Do the task".to_string(),
@@ -592,7 +637,7 @@ mod tests {
     #[test]
     fn supervisor_proposal_round_trips_nested_draft_and_defaults() {
         let proposal = SupervisorProposal {
-            schema_version: "supervisor_proposal.v1".to_string(),
+            schema_version: "supervisor_proposal.v2".to_string(),
             summary: SupervisorSummary {
                 headline: "headline".to_string(),
                 situation: "situation".to_string(),
@@ -613,6 +658,11 @@ mod tests {
                 target_work_unit_id: "wu-1".to_string(),
                 predecessor_assignment_id: "assignment-1".to_string(),
                 derived_from_decision_type: DecisionType::Continue,
+                plan_id: None,
+                plan_version: None,
+                plan_item_id: None,
+                execution_kind: PlanExecutionKind::DirectExecution,
+                alignment_rationale: None,
                 preferred_worker_id: None,
                 worker_kind: Some("codex".to_string()),
                 objective: "Follow-up objective".to_string(),
@@ -624,6 +674,8 @@ mod tests {
                 boundedness_note: "bounded".to_string(),
             }),
             confidence: ReportConfidence::Medium,
+            plan_assessment: None,
+            plan_revision_proposal: None,
             warnings: Vec::new(),
             open_questions: vec!["question".to_string()],
         };

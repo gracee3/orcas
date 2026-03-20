@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{AppState, DaemonLifecycleState, TopLevelView};
 
+use crate::view_model::collaboration::workstream_plan_panel;
 use crate::view_model::shared::{daemon_lifecycle_label, daemon_phase_label};
 
 use super::shared::{
@@ -217,6 +218,27 @@ fn render_controls(state: &AppState, compact: bool) -> Paragraph<'static> {
         Span::styled("R", key_hint_style()),
         Span::styled(" restart daemon", metadata_style()),
     ]));
+
+    if let Some(workstream_id) = state.selected_workstream_id.as_deref()
+        && let Some(plan_panel) = workstream_plan_panel(state, workstream_id)
+    {
+        lines.push(Line::styled(
+            format!("planning: {}", plan_panel.title),
+            label_style(),
+        ));
+        for line in plan_panel
+            .lines
+            .into_iter()
+            .take(if compact { 5 } else { 8 })
+        {
+            lines.push(Line::styled(format!("  {line}"), metadata_style()));
+        }
+    } else {
+        lines.push(Line::styled(
+            "planning: no selected workstream",
+            metadata_style(),
+        ));
+    }
 
     if compact {
         lines.push(Line::styled(

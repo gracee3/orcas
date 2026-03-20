@@ -28,6 +28,7 @@ use crate::collaboration::{
 };
 use crate::communication::AssignmentCommunicationRecord;
 use crate::events::ConnectionState;
+use crate::planning::{PlanAssessment, PlanRevisionProposal, PlanningState, WorkstreamPlan};
 use crate::supervisor::{
     SupervisorPromptRenderArtifact, SupervisorProposal, SupervisorProposalEdits,
     SupervisorProposalFailure, SupervisorProposalFailureStage, SupervisorProposalRecord,
@@ -83,6 +84,10 @@ pub mod methods {
     pub const AUTHORITY_TRACKED_THREAD_DELETE: &str = "authority/tracked_thread/delete";
     pub const AUTHORITY_TRACKED_THREAD_LIST: &str = "authority/tracked_thread/list";
     pub const AUTHORITY_TRACKED_THREAD_GET: &str = "authority/tracked_thread/get";
+    pub const WORKSTREAM_PLAN_GET: &str = "workstream_plan/get";
+    pub const WORKSTREAM_PLAN_LIST: &str = "workstream_plan/list";
+    pub const PLAN_ASSESSMENT_LIST: &str = "plan_assessment/list";
+    pub const PLAN_REVISION_PROPOSAL_LIST: &str = "plan_revision_proposal/list";
     pub const ASSIGNMENT_START: &str = "assignment/start";
     pub const ASSIGNMENT_GET: &str = "assignment/get";
     pub const ASSIGNMENT_COMMUNICATION_GET: &str = "assignment_communication/get";
@@ -238,6 +243,8 @@ pub struct CollaborationSnapshot {
     pub supervisor_turn_decisions: Vec<SupervisorTurnDecisionSummary>,
     pub reports: Vec<ReportSummary>,
     pub decisions: Vec<DecisionSummary>,
+    #[serde(default)]
+    pub planning: PlanningState,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -492,6 +499,16 @@ pub struct WorkUnitProposalSummary {
 pub struct AssignmentSummary {
     pub id: String,
     pub work_unit_id: String,
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    #[serde(default)]
+    pub plan_version: Option<u64>,
+    #[serde(default)]
+    pub plan_item_id: Option<String>,
+    #[serde(default)]
+    pub execution_kind: crate::planning::PlanExecutionKind,
+    #[serde(default)]
+    pub alignment_rationale: Option<String>,
     pub worker_id: String,
     pub worker_session_id: String,
     pub status: AssignmentStatus,
@@ -591,6 +608,8 @@ pub struct ProposalSummary {
     pub reviewed_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub has_approval_edits: bool,
+    #[serde(default)]
+    pub has_plan_revision_proposal: bool,
     pub generation_failure_stage: Option<SupervisorProposalFailureStage>,
     pub reasoner_model: String,
 }
@@ -1373,6 +1392,53 @@ pub struct AuthorityTrackedThreadGetResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkstreamPlanGetRequest {
+    pub workstream_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkstreamPlanGetResponse {
+    pub plan: WorkstreamPlan,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkstreamPlanListRequest {
+    #[serde(default)]
+    pub include_superseded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkstreamPlanListResponse {
+    pub plans: Vec<WorkstreamPlan>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlanAssessmentListRequest {
+    #[serde(default)]
+    pub workstream_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanAssessmentListResponse {
+    pub assessments: Vec<PlanAssessment>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlanRevisionProposalListRequest {
+    #[serde(default)]
+    pub workstream_id: Option<String>,
+    #[serde(default)]
+    pub include_closed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanRevisionProposalListResponse {
+    pub proposals: Vec<PlanRevisionProposal>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssignmentStartRequest {
     pub work_unit_id: String,
     pub worker_id: String,
@@ -1380,6 +1446,16 @@ pub struct AssignmentStartRequest {
     pub instructions: Option<String>,
     pub model: Option<String>,
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    #[serde(default)]
+    pub plan_version: Option<u64>,
+    #[serde(default)]
+    pub plan_item_id: Option<String>,
+    #[serde(default)]
+    pub execution_kind: crate::planning::PlanExecutionKind,
+    #[serde(default)]
+    pub alignment_rationale: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
