@@ -166,6 +166,68 @@ async fn spawn_proposal_ready_daemon(
     (fake_codex, fake_supervisor, daemon, started)
 }
 
+async fn spawn_codex_review_ready_daemon(
+    test_name: &str,
+) -> (
+    FakeCodexAppServer,
+    TestDaemon,
+    ipc::CodexAssignmentCreateResponse,
+) {
+    let fake_codex = FakeCodexAppServer::spawn().await;
+    let daemon = TestDaemon::spawn_with_env(
+        test_name,
+        vec![(
+            "ORCAS_CODEX_LISTEN_URL".to_string(),
+            fake_codex.endpoint.clone(),
+        )],
+    )
+    .await;
+    let client = daemon.connect().await;
+
+    let workstream = client
+        .workstream_create(&ipc::WorkstreamCreateRequest {
+            title: format!("{test_name} root"),
+            objective: "Exercise bounded codex review discovery surfaces.".to_string(),
+            priority: Some("high".to_string()),
+        })
+        .await
+        .expect("create workstream")
+        .workstream;
+    let work_unit = client
+        .workunit_create(&ipc::WorkunitCreateRequest {
+            workstream_id: workstream.id.clone(),
+            title: format!("{test_name} unit"),
+            task_statement: "Create one reviewable codex assignment.".to_string(),
+            dependencies: Vec::new(),
+        })
+        .await
+        .expect("create workunit")
+        .work_unit;
+    let thread = client
+        .thread_start(&ipc::ThreadStartRequest {
+            cwd: None,
+            model: None,
+            ephemeral: false,
+        })
+        .await
+        .expect("start thread")
+        .thread;
+    let assignment = client
+        .codex_assignment_create(&ipc::CodexAssignmentCreateRequest {
+            codex_thread_id: thread.id,
+            workstream_id: workstream.id,
+            work_unit_id: work_unit.id,
+            supervisor_id: "cli_operator".to_string(),
+            assigned_by: "cli_operator".to_string(),
+            send_policy: None,
+            notes: Some("Seed one review queue item".to_string()),
+        })
+        .await
+        .expect("create codex assignment");
+
+    (fake_codex, daemon, assignment)
+}
+
 fn create_proposal_via_cli(daemon: &TestDaemon, started: &ipc::AssignmentStartResponse) -> String {
     let create_output = run_orcas(
         daemon,
@@ -616,6 +678,124 @@ async fn real_cli_can_create_list_and_approve_proposal_after_real_assignment_set
     assert!(get_stdout.contains("status: Approved"));
     assert!(get_stdout.contains("reviewed_by: cli_operator"));
     assert!(get_stdout.contains("approved_decision_id:"));
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_cli_can_discover_pending_review_item_via_queue_and_history() {
+    let (_fake_codex, mut daemon, assignment) =
+        spawn_codex_review_ready_daemon("cli-review-queue").await;
+    let client = daemon.connect().await;
+    let decisions = client
+        .supervisor_decision_list(&ipc::SupervisorDecisionListRequest {
+            assignment_id: Some(assignment.assignment.assignment_id.clone()),
+            actionable_only: true,
+            ..Default::default()
+        })
+        .await
+        .expect("list seeded supervisor decisions");
+    assert_eq!(decisions.decisions.len(), 1);
+    let pending = &decisions.decisions[0];
+
+    let queue_output = run_orcas(
+        &daemon,
+        &[
+            "codex",
+            "review",
+            "queue",
+            "--assignment",
+            &assignment.assignment.assignment_id,
+        ],
+    );
+    assert!(
+        queue_output.status.success(),
+        "stderr: {}",
+        stderr(&queue_output)
+    );
+    let queue_stdout = stdout(&queue_output);
+    assert!(queue_stdout.contains(&pending.decision_id));
+    assert!(queue_stdout.contains("ProposedToHuman"));
+    assert!(queue_stdout.contains("NextTurn/Bootstrap"));
+    assert!(queue_stdout.contains(&format!(
+        "assignment={}",
+        assignment.assignment.assignment_id
+    )));
+    assert!(queue_stdout.contains(&format!("wu={}", assignment.assignment.work_unit_id)));
+
+    let history_output = run_orcas(
+        &daemon,
+        &[
+            "codex",
+            "review",
+            "history",
+            "--assignment",
+            &assignment.assignment.assignment_id,
+        ],
+    );
+    assert!(
+        history_output.status.success(),
+        "stderr: {}",
+        stderr(&history_output)
+    );
+    let history_stdout = stdout(&history_output);
+    assert!(history_stdout.contains(&format!(
+        "history_for_assignment: {}",
+        assignment.assignment.assignment_id
+    )));
+    assert!(history_stdout.contains(&pending.decision_id));
+    assert!(history_stdout.contains("NextTurn/Bootstrap"));
+    assert!(history_stdout.contains("ProposedToHuman"));
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_cli_can_fetch_pending_review_item_detail_via_get() {
+    let (_fake_codex, mut daemon, assignment) =
+        spawn_codex_review_ready_daemon("cli-review-get").await;
+    let client = daemon.connect().await;
+    let decisions = client
+        .supervisor_decision_list(&ipc::SupervisorDecisionListRequest {
+            assignment_id: Some(assignment.assignment.assignment_id.clone()),
+            actionable_only: true,
+            ..Default::default()
+        })
+        .await
+        .expect("list seeded supervisor decisions");
+    assert_eq!(decisions.decisions.len(), 1);
+    let pending = &decisions.decisions[0];
+
+    let get_output = run_orcas(
+        &daemon,
+        &["codex", "review", "get", "--decision", &pending.decision_id],
+    );
+    assert!(
+        get_output.status.success(),
+        "stderr: {}",
+        stderr(&get_output)
+    );
+
+    let get_stdout = stdout(&get_output);
+    assert!(get_stdout.contains(&format!("decision_id: {}", pending.decision_id)));
+    assert!(get_stdout.contains(&format!(
+        "assignment_id: {}",
+        assignment.assignment.assignment_id
+    )));
+    assert!(get_stdout.contains("kind: NextTurn"));
+    assert!(get_stdout.contains("proposal_kind: Bootstrap"));
+    assert!(get_stdout.contains("status: ProposedToHuman"));
+    assert!(get_stdout.contains("actionable: yes"));
+    assert!(get_stdout.contains(&format!(
+        "workstream_id: {}",
+        assignment.assignment.workstream_id
+    )));
+    assert!(get_stdout.contains(&format!(
+        "work_unit_id: {}",
+        assignment.assignment.work_unit_id
+    )));
+    assert!(get_stdout.contains("related_history:"));
+    assert!(get_stdout.contains(&pending.decision_id));
 
     daemon.stop().await;
 }
