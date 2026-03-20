@@ -1203,12 +1203,14 @@ mod tests {
     }
 
     #[test]
-    fn top_level_help_mentions_canonical_and_compatibility_planning_commands() {
+    fn top_level_help_mentions_only_canonical_planning_namespaces() {
         let help = Cli::command().render_help().to_string();
 
         assert!(help.contains("workstreams"));
         assert!(help.contains("workunits"));
         assert!(help.contains("tracked-threads"));
+        assert!(!help.contains("legacy-workstreams"));
+        assert!(!help.contains("legacy-workunits"));
     }
 
     #[test]

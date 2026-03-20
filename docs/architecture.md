@@ -18,7 +18,18 @@ The control plane stays local. Orcas owns the records that matter for supervisio
 
 Orcas uses a local Unix domain socket for IPC. The wire format is structured JSON-RPC 2.0, exchanged as line-delimited JSON messages. Clients use requests for commands and queries, responses for returned data, and notifications for state-change events.
 
-The daemon provides both snapshots and events. A client can ask for a point-in-time snapshot to bootstrap its view, then subscribe to events to keep that view current. The CLI relies on focused RPCs for authority-backed planning CRUD and on `state/get` plus focused RPCs for collaboration and runtime views. The retained legacy CLI planning surface is now list/get only for existing collaboration-native records rather than a write peer to authority planning. The TUI bootstraps from both `state/get` and `authority/hierarchy/get`, because `state/get` is now a collaboration-first snapshot plus any explicit assignment-compatibility bridge rows rather than a general authority planning read. Authority workstream, work unit, and tracked-thread CRUD mutations emit post-commit lifecycle notifications, but those notifications are still visibility signals layered on top of authority reloads rather than a replacement for canonical authority reads.
+The daemon provides both snapshots and events. A client can ask for a point-in-time snapshot to bootstrap its view, then subscribe to events to keep that view current. The CLI relies on focused RPCs for authority-backed planning CRUD and on `state/get` plus focused RPCs for collaboration and runtime views. There is no longer an operator-facing legacy planning command namespace. The TUI bootstraps from both `state/get` and `authority/hierarchy/get`, because `state/get` is now a collaboration-first snapshot plus any explicit assignment-compatibility bridge rows rather than a general authority planning read. Authority workstream, work unit, and tracked-thread CRUD mutations emit post-commit lifecycle notifications, but those notifications are still visibility signals layered on top of authority reloads rather than a replacement for canonical authority reads.
+
+One narrow collaboration planning read remains public: `workunit/get` still serves collaboration execution detail such as assignments, reports, decisions, and proposals for a selected work unit. That surface is retained for runtime detail rather than canonical planning hierarchy reads.
+
+In practice the current contract is:
+
+- canonical planning surface: authority reads and mutations
+- runtime-detail exception: `workunit/get`
+- compatibility/internal surface: bridge rows and collaboration planning mirrors that still support execution state
+- test-only surface: collaboration workstream/work-unit helpers behind `#[cfg(test)]`
+
+New planning behavior should land on the canonical authority surface rather than expanding the runtime-detail or compatibility buckets.
 
 Recovery remains snapshot-first rather than replay-based. If a daemon connection drops or the daemon restarts, old event subscriptions close with that socket lifetime. Clients reconnect, reload current state, and then establish a fresh subscription; they do not assume missed history will be replayed.
 

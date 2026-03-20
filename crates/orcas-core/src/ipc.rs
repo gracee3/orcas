@@ -87,6 +87,8 @@ pub mod methods {
     pub const PROPOSAL_GET: &str = "proposal/get";
     pub const PROPOSAL_ARTIFACT_SUMMARY_GET: &str = "proposal/artifact_summary/get";
     pub const PROPOSAL_ARTIFACT_DETAIL_GET: &str = "proposal/artifact_detail/get";
+    pub const PROPOSAL_ARTIFACT_SUMMARY_LIST_FOR_WORKUNIT: &str =
+        "proposal/artifact_summary/list_for_workunit";
     pub const PROPOSAL_LIST_FOR_WORKUNIT: &str = "proposal/list_for_workunit";
     pub const PROPOSAL_APPROVE: &str = "proposal/approve";
     pub const PROPOSAL_REJECT: &str = "proposal/reject";
@@ -391,9 +393,12 @@ pub struct WorkUnitSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanningSummarySourceKind {
+    /// Collaboration-native summary from daemon collaboration state.
     #[default]
     Collaboration,
+    /// Collaboration-shaped bridge row retained only for execution compatibility.
     AuthorityCompatibilityBridge,
+    /// Authority-owned lifecycle or summary row emitted from the authority store.
     AuthorityProjection,
 }
 
@@ -1593,6 +1598,17 @@ pub struct ProposalArtifactDetailGetRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalArtifactDetailGetResponse {
     pub detail: SupervisorProposalArtifactDetail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalArtifactSummaryListForWorkunitRequest {
+    pub work_unit_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalArtifactSummaryListForWorkunitResponse {
+    pub work_unit_id: String,
+    pub summaries: Vec<SupervisorProposalArtifactSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

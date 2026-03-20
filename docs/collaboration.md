@@ -29,15 +29,34 @@ Tracked threads are Orcas-owned local binding records, not upstream Codex thread
 
 The important rule is that ORCAS does not currently present a single uniform workflow backend. Some operator-visible objects share a name while coming from different owners and read models.
 
+## Surface Classification
+
+ORCAS now treats public and internal surfaces as belonging to one of four buckets:
+
+- Canonical:
+  - authority-backed planning CRUD and planning reads
+  - operator-facing CLI namespaces `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...`
+  - daemon authority planning RPCs such as `authority/hierarchy/get`, `authority/workstream/*`, `authority/workunit/*`, and `authority/tracked_thread/*`
+- Runtime-detail exception:
+  - `workunit/get`, which remains public because the TUI uses it for collaboration execution detail such as assignments, reports, decisions, and proposals
+- Compatibility/internal:
+  - collaboration-shaped bridge rows in `state/get`
+  - collaboration planning mirrors persisted in `state.json`
+  - bridge tracking and projection logic inside the daemon that still supports execution flows
+- Test-only:
+  - `#[cfg(test)]` collaboration workstream/work-unit helpers in `orcasd/src/service.rs`
+
+New planning features should land only on canonical surfaces. Runtime-detail exceptions, compatibility surfaces, and test-only helpers are not expansion targets for new operator-facing planning behavior.
+
 ## Source-Of-Truth Matrix
 
 ### Ownership And Read Paths
 
 | Object or state class | Authoritative owner | Durable persistence owner | Canonical mutation path | Canonical read path(s) | In `state/get` | In `authority/hierarchy/get` |
 | --- | --- | --- | --- | --- | --- | --- |
-| Workstream, legacy collaboration record | Daemon collaboration state | `state.json` | `workstream/create` and internal daemon updates | `state/get`, `workstream/list`, `workstream/get` | Yes | No |
+| Workstream, legacy collaboration record | Daemon collaboration state | `state.json` | Internal daemon updates only | `state/get` | Yes | No |
 | Workstream, authority record | Authority SQLite store | `state.db` | `authority/workstream/create`, `authority/workstream/edit`, `authority/workstream/delete` | `authority/hierarchy/get`, `authority/workstream/get`; `state/get` only after explicit assignment-compatibility bridging | Only if explicitly bridged as a collaboration-shaped summary with `source_kind = authority_compatibility_bridge` | Yes |
-| Work unit, legacy collaboration record | Daemon collaboration state | `state.json` | `workunit/create` and internal daemon updates | `state/get`, `workunit/list`, `workunit/get` | Yes | No |
+| Work unit, legacy collaboration record | Daemon collaboration state | `state.json` | Internal daemon updates only | `state/get`, `workunit/get` for execution detail | Yes | No |
 | Work unit, authority record | Authority SQLite store | `state.db` | `authority/workunit/create`, `authority/workunit/edit`, `authority/workunit/delete` | `authority/hierarchy/get`, `authority/workunit/get`; `state/get` only after explicit assignment-compatibility bridging | Only if explicitly bridged as a collaboration-shaped summary with `source_kind = authority_compatibility_bridge` | Yes |
 | Tracked thread, authority record | Authority SQLite store | `state.db` | `authority/tracked_thread/create`, `authority/tracked_thread/edit`, `authority/tracked_thread/delete` | `authority/hierarchy/get`, `authority/workunit/get`, `authority/tracked_thread/get` | No tracked-thread rows appear directly in `state/get` | Yes |
 | Assignment | Daemon collaboration state | `state.json` | `assignment/start` plus daemon-owned lifecycle transitions | `state/get`, `assignment/get` | Yes | No |
@@ -104,11 +123,6 @@ Current request families include:
   - `turn/steer`
   - `turn/interrupt`
 - workflow and authority state:
-  - `workstream/create`
-  - `workstream/list`
-  - `workstream/get`
-  - `workunit/create`
-  - `workunit/list`
   - `workunit/get`
   - `authority/hierarchy/get`
   - `authority/delete/plan`
@@ -168,6 +182,14 @@ Current limitations of the merged collaboration snapshot:
 - authority deletes do not currently scrub previously bridged collaboration copies from `state.json`, but `state/get` hides those bridged rows once the authority source has been tombstoned
 - later daemon-owned lifecycle updates on bridged rows, such as assignment-driven work-unit status changes, retain `source_kind = authority_compatibility_bridge` instead of masquerading as native collaboration rows
 
+`source_kind` on planning summaries currently means:
+
+- `collaboration`: collaboration-native summary owned by daemon collaboration state
+- `authority_compatibility_bridge`: collaboration-shaped bridge summary kept only because execution state still depends on it
+- `authority_projection`: authority lifecycle/event summary emitted from authority-owned planning state
+
+Those labels are public provenance hints, not a promise that every Orcas surface exposes a fully normalized provenance model.
+
 ### `authority/hierarchy/get`
 
 `authority/hierarchy/get` is the daemon's authority-only hierarchy query over SQLite. It returns authority workstreams, authority work units, and tracked threads using authority-shaped records and summaries.
@@ -193,9 +215,10 @@ This read model is the current source for:
 ### Which Clients Rely On Which Read Models
 
 - The CLI uses authority-backed planning CRUD for `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...`, while still using `state/get` and focused RPCs for collaboration and runtime state.
-- The CLI retains `orcas legacy-workstreams ...` and `orcas legacy-workunits ...` only as explicit list/get compatibility commands over the legacy `workstream/*` and `workunit/*` RPC family.
+- There is no longer an operator-facing legacy planning command namespace in the CLI.
 - The TUI bootstraps from both `state/get` and `authority/hierarchy/get`.
 - The TUI uses authority detail RPCs such as `authority/workstream/get`, `authority/workunit/get`, and `authority/tracked_thread/get` for focused editing surfaces.
+- The TUI still uses `workunit/get` for collaboration execution detail on a selected work unit because that read includes assignments, reports, decisions, and proposals that are not part of the authority planning hierarchy.
 - Existing subscribers should treat events as incremental hints layered on top of snapshot reloads, not as a complete replayable truth source for authority state.
 
 ### Current Client-Side Synthesis
@@ -304,8 +327,10 @@ The one intentional exception is the TUI's local PTY-backed `codex resume` helpe
 - The canonical operator CRUD surface for planning hierarchy objects is now authority-backed in both clients:
   - CLI: `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...`
   - TUI: authority CRUD plus `authority/hierarchy/get` and authority detail RPCs
-- The CLI still exposes `orcas legacy-workstreams ...` and `orcas legacy-workunits ...`, but those are explicit list/get compatibility commands for legacy collaboration records rather than peer canonical paths.
+- There is no longer an operator-facing legacy planning command namespace. Legacy collaboration planning rows can still exist in `state.json`, but they are no longer exposed as a peer CLI surface.
 - Both clients still depend on daemon snapshots and focused daemon RPCs for thread, turn, assignment, report, decision, and proposal views.
+- The TUI retains one collaboration work-unit detail read, `workunit/get`, because it carries execution detail that is outside the authority planning hierarchy.
+- Non-canonical surfaces are intentionally frozen: new planning behavior should not be added to `workunit/get`, bridge rows, or other collaboration compatibility paths.
 - The daemon event stream is shared and now carries post-commit create, update, and delete notifications for authority workstreams, work units, and tracked threads.
 - The TUI's PTY-backed `codex resume` path is local to the TUI process and should be understood as an operator convenience layer rather than a daemon-managed session model.
 
@@ -314,6 +339,6 @@ The one intentional exception is the TUI's local PTY-backed `codex resume` helpe
 - `state/get` still contains mixed-semantics workstream and work unit lists because collaboration-native rows and explicit compatibility bridge rows share summary types.
 - Authority deletes hide previously bridged rows from `state/get`, but do not currently scrub the underlying bridge copy from `state.json`.
 - Tracked-thread lifecycle events do not remove the need for authority query reloads when a client needs full record detail rather than an event summary.
-- The daemon still carries the legacy collaboration `workstream/*` and `workunit/*` RPC family for collaboration-native state and compatibility fixtures, even though the CLI now narrows that surface to list/get only.
+- The daemon still carries one collaboration planning-era public read, `workunit/get`, because the TUI uses it for execution detail that is not modeled by authority planning reads. The rest of the old `workstream/*` and `workunit/*` planning CRUD/list surface has been retired from the public daemon contract.
 
 These are current implementation truths, not guarantees that later hardening phases will preserve unchanged. Later phases can normalize the boundary, but this document intentionally describes the boundary as it exists today.
