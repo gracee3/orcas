@@ -11,6 +11,12 @@ local Orcas daemon over the Unix socket, renders the current supervision
 state, and issues control actions through the daemon rather than talking to
 Codex directly.
 
+In the current implementation, the TUI bootstraps from both the daemon's
+\fBstate/get\fR snapshot and the authority hierarchy queries. It also has one
+intentional local exception: it can launch a PTY-backed \fBcodex resume\fR
+session for interactive attachment to a selected thread. That local PTY session
+is not daemon-owned workflow state.
+
 The TUI is intended for local use on a Linux workstation or terminal session.
 It shares the same configuration, runtime state, and log locations as the rest
 of the Orcas suite.
@@ -21,7 +27,11 @@ User configuration file.
 
 .TP
 .I ~/.local/share/orcas/state.json
-Persistent workflow state.
+Legacy collaboration and thread or turn mirror state.
+
+.TP
+.I ~/.local/share/orcas/state.db
+Authority workstream, authority work unit, and tracked-thread state.
 
 .TP
 .I ~/.local/share/orcas/logs/orcas-tui.log

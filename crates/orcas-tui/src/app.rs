@@ -605,6 +605,8 @@ pub enum Effect {
 
 pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
     match action {
+        // The TUI needs both daemon surfaces at startup: `state/get` for the live supervision
+        // snapshot and `authority/hierarchy/get` for authority-only hierarchy state.
         Action::Start => vec![Effect::RefreshSnapshot, Effect::LoadAuthorityHierarchy],
         Action::User(user_action) => reduce_user_action(state, user_action),
         Action::Event(event) => reduce_event(state, event),

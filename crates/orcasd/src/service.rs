@@ -5960,6 +5960,8 @@ impl OrcasDaemonService {
         &self,
         work_unit_id: &str,
     ) -> OrcasResult<()> {
+        // Compatibility bridge: assignment execution still reads collaboration-owned work units,
+        // so an authority work unit is injected into collaboration state on demand before start.
         if self
             .state
             .read()
@@ -6355,6 +6357,8 @@ impl OrcasDaemonService {
         let session = state.session.clone();
         let collaboration = Self::collaboration_snapshot(&state.collaboration);
         drop(state);
+        // `state/get` is a merged read model: collaboration state comes from daemon memory and
+        // authority workstream/work unit summaries are projected in afterward from SQLite.
         let collaboration = self
             .merge_authority_projection_into_collaboration_snapshot(collaboration)
             .await?;

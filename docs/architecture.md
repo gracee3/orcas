@@ -2,7 +2,7 @@
 
 ## Overview
 
-Orcas is a local-first orchestration system for supervising agent workflows on a single machine. The daemon is the authority for workflow state, lifecycle transitions, and local IPC. The CLI and TUI are clients of that daemon, not direct Codex clients.
+Orcas is a local-first orchestration system for supervising agent workflows on a single machine. The daemon is the authority for workflow state, lifecycle transitions, and local IPC. The CLI is a client of that daemon. The TUI also reads and mutates supervised state through the daemon, but it has one intentional local exception: it can launch a PTY-backed `codex resume` session for interactive attachment to a selected thread.
 
 The control plane stays local. Orcas owns the records that matter for supervision, while Codex remains the execution substrate underneath those records. That separation keeps workflow state explicit and inspectable, and it gives the daemon a single place to coordinate startup, persistence, and event delivery.
 
@@ -12,15 +12,15 @@ The control plane stays local. Orcas owns the records that matter for supervisio
 
 `orcasd` is the long-lived service process. On startup it resolves configuration, ensures the runtime and data directories exist, writes runtime metadata, binds the local socket, and connects to the upstream Codex app-server. From that point on it serves local clients and owns the live in-memory view of Orcas state.
 
-`orcas-tui` is the interactive terminal client. It renders the same daemon state as the CLI, but presents it in a live UI for inspection and control. It still talks to the daemon over the local IPC layer.
+`orcas-tui` is the interactive terminal client. It renders the same daemon state as the CLI, but presents it in a live UI for inspection and control. Its supervised-state reads and writes go through the daemon over local IPC. Separately, it can launch a local PTY-backed `codex resume` helper for interactive attachment to a selected thread.
 
 ## State and Communication
 
 Orcas uses a local Unix domain socket for IPC. The wire format is structured JSON-RPC 2.0, exchanged as line-delimited JSON messages. Clients use requests for commands and queries, responses for returned data, and notifications for state-change events.
 
-The daemon provides both snapshots and events. A client can ask for a point-in-time snapshot to bootstrap its view, then subscribe to events to keep that view current. This is the basic pattern used by both the CLI and the TUI: read the current state first, then follow incremental changes.
+The daemon provides both snapshots and events. A client can ask for a point-in-time snapshot to bootstrap its view, then subscribe to events to keep that view current. The CLI mostly relies on `state/get` plus focused RPCs. The TUI bootstraps from both `state/get` and `authority/hierarchy/get`, because the merged collaboration snapshot does not contain the full authority hierarchy.
 
-The daemon’s state model is Orcas-native. It tracks workstreams, work units, assignments, worker sessions, reports, decisions, proposals, thread summaries, and turn summaries. That state is persisted locally and updated through explicit transitions rather than inferred from a transient terminal session.
+The daemon’s state model is Orcas-native, but it currently has two live local persistence systems. Legacy collaboration and thread/turn mirror state are loaded from and persisted to `state.json`. Authority-owned workstreams, work units, and tracked threads are stored in `state.db` with explicit commands, revisions, and tombstones. `state/get` is therefore a merged derived snapshot rather than a single-store read.
 
 ## Workflow Lifecycle
 
@@ -36,7 +36,7 @@ The daemon owns the upstream Codex connection and the local supervision state. S
 
 If the daemon is managed by systemd, the service is started and stopped there. If it is run manually, it behaves like a normal foreground process. In both cases the daemon is the long-lived process and the clients are transient.
 
-This separation matters operationally. Restarting the CLI or TUI does not affect the Codex connection. Restarting the daemon does, because it owns the live upstream session and the authoritative local state.
+This separation matters operationally. Restarting the CLI does not affect the Codex connection. Restarting the daemon does, because it owns the live upstream session and the supervised state surfaces. Restarting the TUI does not affect daemon-owned state, but any TUI-local PTY-backed `codex resume` session belongs to that TUI process rather than the daemon.
 
 ## Design Principles
 
@@ -48,6 +48,13 @@ Orcas follows a small set of consistent rules:
 4. Inspectability: snapshots, events, and runtime metadata are available to clients instead of being hidden inside a transcript.
 5. Minimal external surface: the daemon listens on a local socket rather than a public network port.
 
-## Current Direction
+## Current Boundary
 
-The next persistence pass moves Orcas from the current JSON snapshot store to a SQLite-backed local-authority model with explicit commands, canonical events, and read projections for the TUI. The design for that pass lives in [Local-Authority MVP Backend Design](design/local-authority-mvp-backend.md), with the tracked-thread semantics captured in [ADR 0001](adr/0001-tracked-thread-is-a-local-binding-record.md).
+The SQLite-backed local-authority model is already live for authority workstreams, authority work units, and tracked threads. It runs alongside the legacy collaboration store rather than replacing it completely today. The current daemon therefore has a real boundary between:
+
+1. collaboration-owned state persisted in `state.json`
+2. authority-owned state persisted in `state.db`
+3. merged read models such as `state/get`
+4. client-side derived state inside the TUI
+
+That boundary is the focus of the current hardening work. The detailed current-state contract lives in [Collaboration](collaboration.md). The original local-authority design rationale still lives in [Local-Authority MVP Backend Design](design/local-authority-mvp-backend.md), and tracked-thread semantics remain defined by [ADR 0001](adr/0001-tracked-thread-is-a-local-binding-record.md).

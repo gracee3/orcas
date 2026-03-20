@@ -7,7 +7,7 @@ Tracking Codex `v0.115.0`. Reference upstream: [openai/codex](https://github.com
 
 Orcas is a local Rust supervisor layer built around Codex [`app-server`](https://developers.openai.com/codex/app-server/).
 
-Orcas is for the point where one agent thread is no longer enough. It keeps the control plane close: local, durable, inspectable, and calm. `orcasd` owns workflow state, lifecycle, local IPC, snapshots, and event streams. The CLI (`orcas`) and TUI (`orcas-tui`, also available as `orcas tui`) are clients of that daemon rather than direct Codex clients.
+Orcas is for the point where one agent thread is no longer enough. It keeps the control plane close: local, durable, inspectable, and calm. `orcasd` owns workflow state, lifecycle, local IPC, snapshots, and event streams. The CLI (`orcas`) is a client of that daemon. The TUI (`orcas-tui`, also available as `orcas tui`) also reads and mutates supervised state through the daemon, while keeping one local exception for PTY-backed `codex resume` sessions.
 
 Codex remains the execution substrate. Orcas keeps the shape of the work around that execution: workstreams, work units, assignments, threads, turns, reports, and supervisor decisions. That separation matters. It means the state that matters does not vanish into terminal scrollback, and it means review stays human. Supervisor proposals are artifacts for inspection, not hidden authority.
 
@@ -81,10 +81,18 @@ Orcas follows the XDG layout on Linux. The user configuration file lives at `~/.
 ```text
 config:  ~/.config/orcas/config.toml
 state:   ~/.local/share/orcas/state.json
+db:      ~/.local/share/orcas/state.db
 logs:    ~/.local/share/orcas/logs/
 socket:  ${XDG_RUNTIME_DIR:-~/.local/share/orcas/runtime}/orcas/orcasd.sock
 meta:    ${XDG_RUNTIME_DIR:-~/.local/share/orcas/runtime}/orcas/orcasd.json
 ```
+
+`state.json` remains the live collaboration and thread/turn mirror store. `state.db` is the live authority store for authority workstreams, authority work units, and tracked threads.
+
+The current read model is split:
+
+- `state/get` is a merged daemon snapshot that includes collaboration state plus projected authority workstream and work unit summaries
+- `authority/hierarchy/get` is the authority-only hierarchy query used by the TUI for tracked threads and authority metadata
 
 `RUST_LOG` controls tracing verbosity. Orcas-specific overrides use `ORCAS_*` environment variables, including the Codex binary path and upstream listen URL.
 

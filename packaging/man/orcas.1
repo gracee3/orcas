@@ -16,6 +16,12 @@ Orcas does not talk to Codex directly. The daemon owns authoritative state,
 IPC, snapshots, and event delivery, while
 .B orcas
 acts as a client of that daemon.
+
+The current workflow boundary is mixed. Legacy collaboration state remains in
+\fIstate.json\fR, while authority workstreams, authority work units, and tracked
+threads live in \fIstate.db\fR. The
+.B orcas
+CLI currently uses the legacy workflow CRUD surface.
 .SH QUICK START
 Check the local Orcas environment:
 
@@ -48,7 +54,11 @@ User configuration file.
 
 .TP
 .I ~/.local/share/orcas/state.json
-Persistent workflow state.
+Legacy collaboration and thread or turn mirror state.
+
+.TP
+.I ~/.local/share/orcas/state.db
+Authority workstream, authority work unit, and tracked-thread state.
 
 .TP
 .I ~/.local/share/orcas/logs/orcas.log

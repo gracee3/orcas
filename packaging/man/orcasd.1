@@ -19,6 +19,11 @@ and is designed to run as a local service rather than a public network daemon.
 Orcas records workstreams, work units, assignments, reports, decisions,
 proposals, thread state, and turn state in Orcas-native storage. The CLI and
 TUI connect to the daemon for inspection and control.
+
+The current daemon owns two live persistence systems: legacy collaboration and
+thread or turn mirror state in \fIstate.json\fR, and authority state in
+\fIstate.db\fR for authority workstreams, authority work units, and tracked
+threads.
 .SH FILES
 .TP
 .I ~/.config/orcas/config.toml
@@ -26,7 +31,11 @@ User configuration file.
 
 .TP
 .I ~/.local/share/orcas/state.json
-Persistent workflow state.
+Legacy collaboration and thread or turn mirror state.
+
+.TP
+.I ~/.local/share/orcas/state.db
+Authority workstream, authority work unit, and tracked-thread state.
 
 .TP
 .I ~/.local/share/orcas/logs/orcasd.log

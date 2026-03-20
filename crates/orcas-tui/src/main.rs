@@ -80,6 +80,8 @@ async fn main() -> Result<()> {
     let mut runtime = AppRuntime::new(backend);
     runtime.bootstrap().await;
 
+    // This PTY manager is a TUI-local interactive attachment surface. It is not part of the
+    // daemon's persisted collaboration or authority state model.
     let mut codex_sessions = CodexSessionManager::new(DEFAULT_PTY_RING_BUFFER_CAPACITY);
     let shutdown_requested = codex_sessions.shutdown_handle();
     let _shutdown_watcher = spawn_shutdown_watcher(Arc::clone(&shutdown_requested));
