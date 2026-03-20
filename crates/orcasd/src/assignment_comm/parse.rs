@@ -203,3 +203,275 @@ fn extract_envelope(raw_output: &str) -> EnvelopeExtraction {
         surrounding_text: !prefix.trim().is_empty() || !suffix.trim().is_empty(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use orcas_core::{
+        Assignment, AssignmentCommunicationSeed, AssignmentModeSpec, AssignmentTaskMode,
+        ImplementModePayload, ImplementModeSpec, ReportConfidence, ReportDisposition,
+        ReportParseResult, ReviewSignal, ReviewSignalLevel, WorkUnit, WorkUnitStatus,
+        WorkerReportModePayload, Workstream, WorkstreamStatus, ipc,
+    };
+
+    use super::{extract_envelope, parse_worker_report, parse_worker_report_for_turn};
+    use crate::assignment_comm::{
+        REPORT_MARKER_BEGIN, REPORT_MARKER_END, render::build_assignment_communication_record,
+    };
+
+    fn fixed_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    fn sample_assignment() -> Assignment {
+        Assignment {
+            id: "assignment-1".to_string(),
+            work_unit_id: "work-unit-1".to_string(),
+            worker_id: "worker-1".to_string(),
+            worker_session_id: "session-1".to_string(),
+            instructions: "Implement the bounded task.".to_string(),
+            communication_seed: Some(AssignmentCommunicationSeed {
+                source_decision_id: None,
+                source_report_id: None,
+                source_proposal_id: None,
+                predecessor_assignment_id: None,
+                objective: "Implement one bounded change.".to_string(),
+                instructions: vec!["Touch only the bounded scope.".to_string()],
+                acceptance_criteria: vec!["Return a valid report envelope.".to_string()],
+                stop_conditions: vec!["Stop when blocked.".to_string()],
+                required_context_refs: Vec::new(),
+                expected_report_fields: Vec::new(),
+                boundedness_note: Some("Do not broaden scope.".to_string()),
+                mode_spec: AssignmentModeSpec::Implement(ImplementModeSpec {
+                    expected_verification_commands: Vec::new(),
+                }),
+            }),
+            status: Default::default(),
+            attempt_number: 1,
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_workstream() -> Workstream {
+        Workstream {
+            id: "workstream-1".to_string(),
+            title: "Workstream".to_string(),
+            objective: "Primary objective".to_string(),
+            status: WorkstreamStatus::Active,
+            priority: "high".to_string(),
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_work_unit() -> WorkUnit {
+        WorkUnit {
+            id: "work-unit-1".to_string(),
+            workstream_id: "workstream-1".to_string(),
+            title: "Work Unit".to_string(),
+            task_statement: "Implement the targeted change.".to_string(),
+            status: WorkUnitStatus::Ready,
+            dependencies: Vec::new(),
+            latest_report_id: None,
+            current_assignment_id: None,
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_record(assignment: &Assignment) -> orcas_core::AssignmentCommunicationRecord {
+        let mut collaboration = orcas_core::CollaborationState::default();
+        collaboration
+            .workstreams
+            .insert("workstream-1".to_string(), sample_workstream());
+        collaboration
+            .work_units
+            .insert("work-unit-1".to_string(), sample_work_unit());
+        build_assignment_communication_record(
+            &collaboration,
+            assignment,
+            Some("gpt-test".to_string()),
+            Some("/repo".to_string()),
+            None,
+            fixed_now(),
+        )
+        .expect("build assignment communication record")
+    }
+
+    fn sample_envelope(
+        assignment: &Assignment,
+        packet_id: &str,
+    ) -> orcas_core::WorkerReportEnvelope {
+        orcas_core::WorkerReportEnvelope {
+            schema_version: "worker_report_envelope.v1".to_string(),
+            assignment_id: assignment.id.clone(),
+            packet_id: packet_id.to_string(),
+            task_mode: AssignmentTaskMode::Implement,
+            disposition: ReportDisposition::Completed,
+            summary: "Completed the bounded change.".to_string(),
+            confidence: ReportConfidence::High,
+            acceptance_results: Vec::new(),
+            triggered_stop_condition_ids: Vec::new(),
+            touched_files: Vec::new(),
+            commands_run: vec!["cargo test -p orcasd assignment_comm".to_string()],
+            artifacts: Vec::new(),
+            blockers: vec!["none".to_string()],
+            questions: vec!["Should we add follow-up coverage?".to_string()],
+            recommended_next_actions: vec!["Request supervisor review.".to_string()],
+            uncertainties: Vec::new(),
+            review_signal: ReviewSignal {
+                level: ReviewSignalLevel::Normal,
+                reasons: Vec::new(),
+                focus: Vec::new(),
+            },
+            mode_payload: WorkerReportModePayload::Implement(ImplementModePayload {
+                semantic_changes: vec!["Updated the parser boundary.".to_string()],
+                tests_run: vec!["cargo test -p orcasd assignment_comm".to_string()],
+                rough_edges: vec!["No additional rough edges.".to_string()],
+            }),
+        }
+    }
+
+    fn wrap_report(json_payload: &str) -> String {
+        format!("{REPORT_MARKER_BEGIN}\n{json_payload}\n{REPORT_MARKER_END}")
+    }
+
+    #[test]
+    fn extract_envelope_marks_surrounding_noise_without_losing_payload() {
+        let extraction = extract_envelope(
+            "worker preamble\nORCAS_REPORT_BEGIN\n{\"summary\":\"ok\"}\nORCAS_REPORT_END\nworker epilogue",
+        );
+
+        assert_eq!(
+            extraction.json_payload.as_deref(),
+            Some("{\"summary\":\"ok\"}")
+        );
+        assert!(extraction.surrounding_text);
+    }
+
+    #[test]
+    fn extract_envelope_rejects_missing_end_marker() {
+        let extraction = extract_envelope("ORCAS_REPORT_BEGIN\n{\"summary\":\"unterminated\"}");
+
+        assert!(extraction.json_payload.is_none());
+        assert!(!extraction.surrounding_text);
+    }
+
+    #[test]
+    fn extract_envelope_rejects_multiple_envelopes_in_one_payload() {
+        let extraction = extract_envelope(
+            "ORCAS_REPORT_BEGIN\n{\"summary\":\"first\"}\nORCAS_REPORT_END\nORCAS_REPORT_BEGIN\n{\"summary\":\"second\"}\nORCAS_REPORT_END",
+        );
+
+        assert!(extraction.json_payload.is_none());
+        assert!(!extraction.surrounding_text);
+    }
+
+    #[test]
+    fn parse_worker_report_marks_surrounding_noise_as_ambiguous_but_keeps_report_contents() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+        let envelope = sample_envelope(&assignment, &record.packet.packet_id);
+        let raw = format!(
+            "debug line before\n{}\nextra trailing line",
+            wrap_report(&serde_json::to_string(&envelope).expect("serialize envelope"))
+        );
+
+        let parsed = parse_worker_report(&raw, &assignment, &record);
+
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Ambiguous);
+        assert!(parsed.validation.needs_supervisor_review);
+        assert!(
+            parsed
+                .validation
+                .structural_issues
+                .iter()
+                .any(|issue| issue.contains("extra text outside the Orcas report envelope"))
+        );
+        assert_eq!(parsed.disposition, ReportDisposition::Completed);
+        assert_eq!(parsed.summary, "Completed the bounded change.");
+        assert_eq!(
+            parsed.findings,
+            vec!["Updated the parser boundary.".to_string()]
+        );
+        assert_eq!(
+            parsed.recommended_next_actions,
+            vec!["Request supervisor review.".to_string()]
+        );
+        assert!(parsed.envelope.is_some());
+    }
+
+    #[test]
+    fn parse_worker_report_rejects_missing_begin_marker() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+
+        let parsed = parse_worker_report("{\"summary\":\"not wrapped\"}", &assignment, &record);
+
+        assert!(parsed.envelope.is_none());
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Invalid);
+        assert!(parsed.validation.needs_supervisor_review);
+        assert!(
+            parsed
+                .validation
+                .structural_issues
+                .iter()
+                .any(|issue| issue.contains("did not contain exactly one Orcas report envelope"))
+        );
+    }
+
+    #[test]
+    fn parse_worker_report_rejects_malformed_json_inside_envelope() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+
+        let parsed = parse_worker_report(&wrap_report("{ not valid json }"), &assignment, &record);
+
+        assert!(parsed.envelope.is_none());
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Invalid);
+        assert!(
+            parsed
+                .validation
+                .structural_issues
+                .iter()
+                .any(|issue| issue.contains("JSON could not be decoded"))
+        );
+    }
+
+    #[test]
+    fn interrupted_turn_downgrades_even_valid_report_and_clears_details() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+        let raw = wrap_report(
+            &serde_json::to_string(&sample_envelope(&assignment, &record.packet.packet_id))
+                .expect("serialize envelope"),
+        );
+
+        let parsed = parse_worker_report_for_turn(
+            &raw,
+            ipc::TurnLifecycleState::Interrupted,
+            &assignment,
+            &record,
+        );
+
+        assert_eq!(parsed.disposition, ReportDisposition::Interrupted);
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Ambiguous);
+        assert!(parsed.validation.needs_supervisor_review);
+        assert!(
+            parsed
+                .validation
+                .semantic_issues
+                .iter()
+                .any(|issue| issue.contains("runtime interrupted the turn"))
+        );
+        assert!(parsed.findings.is_empty());
+        assert!(parsed.blockers.is_empty());
+        assert!(parsed.questions.is_empty());
+        assert!(parsed.recommended_next_actions.is_empty());
+        assert_eq!(parsed.confidence, ReportConfidence::Unknown);
+    }
+}

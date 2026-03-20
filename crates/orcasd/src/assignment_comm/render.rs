@@ -846,3 +846,367 @@ fn change_policy_label(policy: AssignmentChangePolicy) -> &'static str {
         AssignmentChangePolicy::TestsOnly => "tests_only",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use chrono::{TimeZone, Utc};
+
+    use orcas_core::{
+        Assignment, AssignmentCommunicationSeed, AssignmentModeSpec, AssignmentTaskMode,
+        CollaborationState, ImplementModeSpec, Report, ReportConfidence, ReportDisposition,
+        ReportParseResult, WorkUnit, WorkUnitStatus, Workstream, WorkstreamStatus,
+    };
+
+    use super::{
+        REPORT_MARKER_BEGIN, REPORT_MARKER_END, build_assignment_communication_record,
+        render_prompt, worker_report_contract,
+    };
+
+    fn fixed_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 2, 3, 4, 5, 6)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    fn sample_assignment(
+        seed: Option<AssignmentCommunicationSeed>,
+        instructions: &str,
+    ) -> Assignment {
+        Assignment {
+            id: "assignment-1".to_string(),
+            work_unit_id: "work-unit-1".to_string(),
+            worker_id: "worker-1".to_string(),
+            worker_session_id: "session-1".to_string(),
+            instructions: instructions.to_string(),
+            communication_seed: seed,
+            status: Default::default(),
+            attempt_number: 1,
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_workstream() -> Workstream {
+        Workstream {
+            id: "workstream-1".to_string(),
+            title: "Core Workstream".to_string(),
+            objective: "Ship one bounded improvement.".to_string(),
+            status: WorkstreamStatus::Active,
+            priority: "high".to_string(),
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_work_unit() -> WorkUnit {
+        WorkUnit {
+            id: "work-unit-1".to_string(),
+            workstream_id: "workstream-1".to_string(),
+            title: "Parser hardening".to_string(),
+            task_statement: "Strengthen parsing without broadening scope.".to_string(),
+            status: WorkUnitStatus::Ready,
+            dependencies: Vec::new(),
+            latest_report_id: Some("report-1".to_string()),
+            current_assignment_id: None,
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_report() -> Report {
+        Report {
+            id: "report-1".to_string(),
+            work_unit_id: "work-unit-1".to_string(),
+            assignment_id: "assignment-0".to_string(),
+            worker_id: "worker-0".to_string(),
+            disposition: ReportDisposition::Partial,
+            summary: "Previous bounded attempt found one remaining edge case.".to_string(),
+            findings: vec!["Marker extraction needs stricter regression tests.".to_string()],
+            blockers: Vec::new(),
+            questions: Vec::new(),
+            recommended_next_actions: Vec::new(),
+            confidence: ReportConfidence::Medium,
+            raw_output: "prior raw output".to_string(),
+            parse_result: ReportParseResult::Parsed,
+            needs_supervisor_review: false,
+            created_at: fixed_now(),
+        }
+    }
+
+    fn sample_collaboration() -> CollaborationState {
+        let mut collaboration = CollaborationState::default();
+        collaboration
+            .workstreams
+            .insert("workstream-1".to_string(), sample_workstream());
+        collaboration
+            .work_units
+            .insert("work-unit-1".to_string(), sample_work_unit());
+        collaboration
+            .reports
+            .insert("report-1".to_string(), sample_report());
+        collaboration
+    }
+
+    fn sample_seed() -> AssignmentCommunicationSeed {
+        AssignmentCommunicationSeed {
+            source_decision_id: Some("decision-1".to_string()),
+            source_report_id: Some("report-1".to_string()),
+            source_proposal_id: Some("proposal-1".to_string()),
+            predecessor_assignment_id: Some("assignment-0".to_string()),
+            objective: "Close the remaining parser edge case.".to_string(),
+            instructions: vec![
+                "Keep the change bounded to parser and prompt logic.".to_string(),
+                "Add regression coverage for ambiguity handling.".to_string(),
+            ],
+            acceptance_criteria: vec![
+                "Parser rejects malformed envelopes safely.".to_string(),
+                "Prompt contract remains explicit about sentinels.".to_string(),
+            ],
+            stop_conditions: vec!["Stop if the parser contract becomes ambiguous.".to_string()],
+            required_context_refs: vec![
+                "crates/orcasd/src/assignment_comm/parse.rs".to_string(),
+                "crates/orcasd/src/assignment_comm/render.rs".to_string(),
+            ],
+            expected_report_fields: vec!["summary".to_string()],
+            boundedness_note: Some("Do not change runtime orchestration.".to_string()),
+            mode_spec: AssignmentModeSpec::Implement(ImplementModeSpec {
+                expected_verification_commands: vec![
+                    "cargo test -p orcasd assignment_comm".to_string(),
+                ],
+            }),
+        }
+    }
+
+    #[test]
+    fn worker_report_contract_uses_exact_markers_and_single_envelope_policy() {
+        let contract = worker_report_contract();
+
+        assert_eq!(contract.schema_version, "worker_report_contract.v1");
+        assert_eq!(contract.task_mode, AssignmentTaskMode::Implement);
+        assert_eq!(contract.marker_begin, REPORT_MARKER_BEGIN);
+        assert_eq!(contract.marker_end, REPORT_MARKER_END);
+        assert!(contract.strict_single_envelope);
+        assert!(
+            contract
+                .required_common_fields
+                .contains(&"summary".to_string())
+        );
+        assert!(
+            contract
+                .required_mode_fields
+                .contains(&"mode_payload.semantic_changes".to_string())
+        );
+    }
+
+    #[test]
+    fn render_prompt_includes_required_sections_and_example_envelope() {
+        let collaboration = sample_collaboration();
+        let assignment = sample_assignment(Some(sample_seed()), "unused legacy text");
+        let record = build_assignment_communication_record(
+            &collaboration,
+            &assignment,
+            Some("gpt-5".to_string()),
+            Some("/repo".to_string()),
+            None,
+            fixed_now(),
+        )
+        .expect("build communication record");
+
+        let prompt = &record.prompt_render.prompt_text;
+        assert!(prompt.contains("You are an Orcas worker executing one bounded assignment."));
+        assert!(prompt.contains("Template version: assignment_prompt.v1"));
+        assert!(prompt.contains("Objective:\nClose the remaining parser edge case."));
+        assert!(
+            prompt.contains("Instructions:\n- Keep the change bounded to parser and prompt logic.")
+        );
+        assert!(prompt.contains("Scope And Non-Goals:"));
+        assert!(prompt.contains(
+            "Acceptance Criteria:\n- [acceptance_1] Parser rejects malformed envelopes safely."
+        ));
+        assert!(prompt.contains(
+            "Stop Conditions:\n- [stop_1] Stop if the parser contract becomes ambiguous."
+        ));
+        assert!(prompt.contains("Included Context:"));
+        assert!(prompt.contains("- [report] Source report (report-1)"));
+        assert!(prompt.contains("Response Contract:\n- Emit exactly one JSON envelope between ORCAS_REPORT_BEGIN and ORCAS_REPORT_END."));
+        assert!(prompt.contains("- Do not wrap the envelope in markdown fences."));
+        assert!(prompt.contains("Response Example:\nORCAS_REPORT_BEGIN\n{"));
+        assert!(prompt.contains("\nORCAS_REPORT_END\n"));
+        assert!(prompt.contains(&format!("- Packet fingerprint: {}", record.packet_hash)));
+    }
+
+    #[test]
+    fn render_prompt_uses_stable_fallbacks_for_empty_optional_sections() {
+        let packet = orcas_core::AssignmentCommunicationPacket {
+            schema_version: "assignment_communication_packet.v1".to_string(),
+            packet_id: "packet-1".to_string(),
+            assignment_id: "assignment-1".to_string(),
+            workstream_id: "workstream-1".to_string(),
+            work_unit_id: "work-unit-1".to_string(),
+            worker_id: "worker-1".to_string(),
+            worker_session_id: "session-1".to_string(),
+            created_at: fixed_now(),
+            source_decision_id: None,
+            source_report_id: None,
+            source_proposal_id: None,
+            predecessor_assignment_id: None,
+            task_mode: AssignmentTaskMode::Implement,
+            mode_spec: AssignmentModeSpec::Implement(ImplementModeSpec {
+                expected_verification_commands: Vec::new(),
+            }),
+            execution_context: orcas_core::AssignmentExecutionContext {
+                runtime_kind: "codex_app_server".to_string(),
+                repo_root: Some("/repo".to_string()),
+                cwd: Some("/repo".to_string()),
+                related_repo_roots: Vec::new(),
+                requested_model: None,
+                shell: None,
+            },
+            objective: "Stay bounded.".to_string(),
+            instructions: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            stop_conditions: Vec::new(),
+            allowed_scope: orcas_core::AssignmentScopeBoundary {
+                change_policy: orcas_core::AssignmentChangePolicy::CodeAllowed,
+                allowed_operations: Vec::new(),
+                allowed_write_paths: Vec::new(),
+                disallowed_paths: Vec::new(),
+            },
+            disallowed_scope: Vec::new(),
+            non_goals: Vec::new(),
+            included_context: Vec::new(),
+            response_contract: worker_report_contract(),
+            policy: orcas_core::AssignmentCommunicationPolicy {
+                stop_at_boundary: true,
+                single_report_required: true,
+                recommendations_are_non_authoritative: true,
+                enforce_scope_boundary: true,
+            },
+        };
+
+        let artifact = render_prompt(&packet, "packet-hash-1", fixed_now()).expect("render prompt");
+        let prompt = artifact.prompt_text;
+
+        assert!(prompt.contains("Instructions:\n- No additional instructions."));
+        assert!(prompt.contains("- Allowed operations: none"));
+        assert!(prompt.contains("- Allowed write paths: none"));
+        assert!(prompt.contains("- Disallowed paths: none"));
+        assert!(prompt.contains("- Disallowed scope: none"));
+        assert!(prompt.contains("- Non-goals: none"));
+        assert!(prompt.contains("Included Context:\n- No additional context blocks."));
+    }
+
+    #[test]
+    fn build_assignment_record_from_seed_includes_source_report_and_context_refs() {
+        let collaboration = sample_collaboration();
+        let assignment = sample_assignment(Some(sample_seed()), "legacy instructions unused");
+
+        let record = build_assignment_communication_record(
+            &collaboration,
+            &assignment,
+            Some("gpt-5".to_string()),
+            Some("/repo".to_string()),
+            Some(&PathBuf::from("/fallback")),
+            fixed_now(),
+        )
+        .expect("build communication record");
+
+        assert_eq!(record.packet.source_report_id.as_deref(), Some("report-1"));
+        assert_eq!(
+            record.packet.predecessor_assignment_id.as_deref(),
+            Some("assignment-0")
+        );
+        assert_eq!(
+            record.packet.execution_context.repo_root.as_deref(),
+            Some("/repo")
+        );
+        assert_eq!(
+            record.packet.objective,
+            "Close the remaining parser edge case."
+        );
+        assert_eq!(record.packet.instructions.len(), 2);
+        assert!(
+            record
+                .packet
+                .included_context
+                .iter()
+                .any(|block| block.id == "source_report"
+                    && block.lines.iter().any(|line| line
+                        .contains("Previous bounded attempt found one remaining edge case.")))
+        );
+        assert!(record.packet.included_context.iter().any(|block| {
+            block.id == "required_context_refs"
+                && block
+                    .lines
+                    .contains(&"crates/orcasd/src/assignment_comm/parse.rs".to_string())
+        }));
+        assert!(
+            record
+                .prompt_render
+                .prompt_text
+                .contains("Summary: Previous bounded attempt found one remaining edge case.")
+        );
+    }
+
+    #[test]
+    fn build_assignment_record_recovers_legacy_sections_and_repo_root() {
+        let collaboration = sample_collaboration();
+        let assignment = sample_assignment(
+            None,
+            "Objective: Restore a bounded legacy packet\n\
+Predecessor assignment: assignment-legacy\n\
+Source report: report-1\n\
+Required context refs: alpha.rs, beta.rs\n\
+Boundedness note: Do not broaden beyond the legacy packet.\n\
+Instructions:\n\
+- Preserve the legacy contract\n\
+Acceptance criteria:\n\
+- Keep the report markers stable\n\
+Stop conditions:\n\
+- Stop if the contract is unclear\n\
+Repo root: /legacy/repo",
+        );
+
+        let record = build_assignment_communication_record(
+            &collaboration,
+            &assignment,
+            None,
+            None,
+            None,
+            fixed_now(),
+        )
+        .expect("build legacy communication record");
+
+        assert_eq!(record.packet.objective, "Restore a bounded legacy packet");
+        assert_eq!(
+            record.packet.predecessor_assignment_id.as_deref(),
+            Some("assignment-legacy")
+        );
+        assert_eq!(record.packet.source_report_id.as_deref(), Some("report-1"));
+        assert_eq!(record.packet.execution_context.repo_root, None);
+        assert_eq!(
+            record.packet.allowed_scope.allowed_write_paths,
+            vec!["/legacy/repo".to_string()]
+        );
+        assert_eq!(
+            record.packet.instructions,
+            vec!["Preserve the legacy contract".to_string()]
+        );
+        assert_eq!(record.packet.acceptance_criteria.len(), 1);
+        assert_eq!(record.packet.stop_conditions.len(), 1);
+        assert_eq!(
+            record.packet.non_goals,
+            vec!["Do not broaden beyond the legacy packet.".to_string()]
+        );
+        assert!(
+            record
+                .packet
+                .included_context
+                .iter()
+                .any(|block| block.id == "required_context_refs"
+                    && block.lines == vec!["alpha.rs".to_string(), "beta.rs".to_string()])
+        );
+    }
+}
