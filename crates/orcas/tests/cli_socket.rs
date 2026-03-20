@@ -228,6 +228,20 @@ async fn spawn_codex_review_ready_daemon(
     (fake_codex, daemon, assignment)
 }
 
+async fn pending_review_decision_id(daemon: &TestDaemon, assignment_id: &str) -> String {
+    let client = daemon.connect().await;
+    let decisions = client
+        .supervisor_decision_list(&ipc::SupervisorDecisionListRequest {
+            assignment_id: Some(assignment_id.to_string()),
+            actionable_only: true,
+            ..Default::default()
+        })
+        .await
+        .expect("list seeded supervisor decisions");
+    assert_eq!(decisions.decisions.len(), 1);
+    decisions.decisions[0].decision_id.clone()
+}
+
 fn create_proposal_via_cli(daemon: &TestDaemon, started: &ipc::AssignmentStartResponse) -> String {
     let create_output = run_orcas(
         daemon,
@@ -686,17 +700,8 @@ async fn real_cli_can_create_list_and_approve_proposal_after_real_assignment_set
 async fn real_cli_can_discover_pending_review_item_via_queue_and_history() {
     let (_fake_codex, mut daemon, assignment) =
         spawn_codex_review_ready_daemon("cli-review-queue").await;
-    let client = daemon.connect().await;
-    let decisions = client
-        .supervisor_decision_list(&ipc::SupervisorDecisionListRequest {
-            assignment_id: Some(assignment.assignment.assignment_id.clone()),
-            actionable_only: true,
-            ..Default::default()
-        })
-        .await
-        .expect("list seeded supervisor decisions");
-    assert_eq!(decisions.decisions.len(), 1);
-    let pending = &decisions.decisions[0];
+    let pending_decision_id =
+        pending_review_decision_id(&daemon, &assignment.assignment.assignment_id).await;
 
     let queue_output = run_orcas(
         &daemon,
@@ -714,7 +719,7 @@ async fn real_cli_can_discover_pending_review_item_via_queue_and_history() {
         stderr(&queue_output)
     );
     let queue_stdout = stdout(&queue_output);
-    assert!(queue_stdout.contains(&pending.decision_id));
+    assert!(queue_stdout.contains(&pending_decision_id));
     assert!(queue_stdout.contains("ProposedToHuman"));
     assert!(queue_stdout.contains("NextTurn/Bootstrap"));
     assert!(queue_stdout.contains(&format!(
@@ -743,7 +748,7 @@ async fn real_cli_can_discover_pending_review_item_via_queue_and_history() {
         "history_for_assignment: {}",
         assignment.assignment.assignment_id
     )));
-    assert!(history_stdout.contains(&pending.decision_id));
+    assert!(history_stdout.contains(&pending_decision_id));
     assert!(history_stdout.contains("NextTurn/Bootstrap"));
     assert!(history_stdout.contains("ProposedToHuman"));
 
@@ -754,21 +759,12 @@ async fn real_cli_can_discover_pending_review_item_via_queue_and_history() {
 async fn real_cli_can_fetch_pending_review_item_detail_via_get() {
     let (_fake_codex, mut daemon, assignment) =
         spawn_codex_review_ready_daemon("cli-review-get").await;
-    let client = daemon.connect().await;
-    let decisions = client
-        .supervisor_decision_list(&ipc::SupervisorDecisionListRequest {
-            assignment_id: Some(assignment.assignment.assignment_id.clone()),
-            actionable_only: true,
-            ..Default::default()
-        })
-        .await
-        .expect("list seeded supervisor decisions");
-    assert_eq!(decisions.decisions.len(), 1);
-    let pending = &decisions.decisions[0];
+    let pending_decision_id =
+        pending_review_decision_id(&daemon, &assignment.assignment.assignment_id).await;
 
     let get_output = run_orcas(
         &daemon,
-        &["codex", "review", "get", "--decision", &pending.decision_id],
+        &["codex", "review", "get", "--decision", &pending_decision_id],
     );
     assert!(
         get_output.status.success(),
@@ -777,7 +773,7 @@ async fn real_cli_can_fetch_pending_review_item_detail_via_get() {
     );
 
     let get_stdout = stdout(&get_output);
-    assert!(get_stdout.contains(&format!("decision_id: {}", pending.decision_id)));
+    assert!(get_stdout.contains(&format!("decision_id: {}", pending_decision_id)));
     assert!(get_stdout.contains(&format!(
         "assignment_id: {}",
         assignment.assignment.assignment_id
@@ -795,7 +791,88 @@ async fn real_cli_can_fetch_pending_review_item_detail_via_get() {
         assignment.assignment.work_unit_id
     )));
     assert!(get_stdout.contains("related_history:"));
-    assert!(get_stdout.contains(&pending.decision_id));
+    assert!(get_stdout.contains(&pending_decision_id));
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_cli_can_approve_pending_review_item() {
+    let (_fake_codex, mut daemon, assignment) =
+        spawn_codex_review_ready_daemon("cli-review-approve").await;
+    let pending_decision_id =
+        pending_review_decision_id(&daemon, &assignment.assignment.assignment_id).await;
+
+    let approve_output = run_orcas(
+        &daemon,
+        &[
+            "codex",
+            "review",
+            "approve",
+            "--decision",
+            &pending_decision_id,
+            "--reviewed-by",
+            "cli_operator",
+            "--review-note",
+            "Approve the bounded pending review item",
+        ],
+    );
+    assert!(
+        approve_output.status.success(),
+        "stderr: {}",
+        stderr(&approve_output)
+    );
+
+    let approve_stdout = stdout(&approve_output);
+    assert!(approve_stdout.contains(&format!("decision_id: {}", pending_decision_id)));
+    assert!(approve_stdout.contains(&format!(
+        "assignment_id: {}",
+        assignment.assignment.assignment_id
+    )));
+    assert!(approve_stdout.contains("kind: NextTurn"));
+    assert!(approve_stdout.contains("proposal_kind: Bootstrap"));
+    assert!(approve_stdout.contains("status: Sent"));
+    assert!(approve_stdout.contains("actionable: no"));
+    assert!(approve_stdout.contains("approved_at:"));
+    assert!(approve_stdout.contains("sent_at:"));
+
+    let get_output = run_orcas(
+        &daemon,
+        &["codex", "review", "get", "--decision", &pending_decision_id],
+    );
+    assert!(
+        get_output.status.success(),
+        "stderr: {}",
+        stderr(&get_output)
+    );
+
+    let get_stdout = stdout(&get_output);
+    assert!(get_stdout.contains(&format!("decision_id: {}", pending_decision_id)));
+    assert!(get_stdout.contains("status: Sent"));
+    assert!(get_stdout.contains("actionable: no"));
+    assert!(get_stdout.contains("approved_at:"));
+    assert!(get_stdout.contains("sent_at:"));
+    assert!(get_stdout.contains("related_history:"));
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_cli_reports_missing_review_item_with_nonzero_exit() {
+    let (_fake_codex, mut daemon, _assignment) =
+        spawn_codex_review_ready_daemon("cli-review-missing").await;
+
+    let output = run_orcas(
+        &daemon,
+        &["codex", "review", "get", "--decision", "missing-decision"],
+    );
+    assert!(!output.status.success());
+    assert!(stdout(&output).is_empty());
+    assert!(
+        stderr(&output).contains("unknown supervisor decision `missing-decision`"),
+        "stderr: {}",
+        stderr(&output)
+    );
 
     daemon.stop().await;
 }
