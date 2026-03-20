@@ -158,6 +158,14 @@ enum ProposalsCommand {
 
 #[derive(Debug, Subcommand)]
 enum CodexCommand {
+    Review {
+        #[command(subcommand)]
+        command: CodexReviewCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CodexReviewCommand {
     List(CodexDecisionListArgs),
     Queue(CodexDecisionQueueArgs),
     History(CodexDecisionHistoryArgs),
@@ -732,110 +740,112 @@ async fn main() -> Result<()> {
         TopCommand::Codex { command } => {
             let service = SupervisorService::load(&overrides).await?;
             match command {
-                CodexCommand::List(args) => {
-                    service
-                        .codex_decision_list(
-                            args.filters.thread.as_deref(),
-                            args.filters.assignment.as_deref(),
-                            args.filters.workstream.as_deref(),
-                            args.filters.workunit.as_deref(),
-                            args.filters.supervisor.as_deref(),
-                            args.filters.status.map(Into::into),
-                            args.filters.kind.map(Into::into),
-                            args.include_closed,
-                            args.filters.include_superseded,
-                            false,
-                            args.filters.limit,
-                        )
-                        .await?;
-                }
-                CodexCommand::Queue(args) => {
-                    service
-                        .codex_decision_list(
-                            args.filters.thread.as_deref(),
-                            args.filters.assignment.as_deref(),
-                            args.filters.workstream.as_deref(),
-                            args.filters.workunit.as_deref(),
-                            args.filters.supervisor.as_deref(),
-                            args.filters.status.map(Into::into),
-                            args.filters.kind.map(Into::into),
-                            false,
-                            args.filters.include_superseded,
-                            true,
-                            args.filters.limit,
-                        )
-                        .await?;
-                }
-                CodexCommand::History(args) => {
-                    service
-                        .codex_decision_history(
-                            args.thread.as_deref(),
-                            args.assignment.as_deref(),
-                            args.include_superseded,
-                            args.limit,
-                        )
-                        .await?;
-                }
-                CodexCommand::Get(args) => {
-                    service.codex_decision_get(&args.decision).await?;
-                }
-                CodexCommand::ProposeSteer(args) => {
-                    service
-                        .codex_decision_propose_steer(
-                            &args.thread,
-                            &args.text,
-                            args.requested_by,
-                            args.rationale_note,
-                        )
-                        .await?;
-                }
-                CodexCommand::ReplacePendingSteer(args) => {
-                    service
-                        .codex_decision_replace_pending_steer(
-                            &args.decision,
-                            &args.text,
-                            args.requested_by,
-                            args.rationale_note,
-                        )
-                        .await?;
-                }
-                CodexCommand::RecordNoAction(args) => {
-                    service
-                        .codex_decision_record_no_action(
-                            &args.decision,
-                            args.reviewed_by,
-                            args.review_note,
-                        )
-                        .await?;
-                }
-                CodexCommand::ManualRefresh(args) => {
-                    service
-                        .codex_decision_manual_refresh(
-                            args.thread.as_deref(),
-                            args.assignment.as_deref(),
-                            args.requested_by,
-                            args.rationale_note,
-                        )
-                        .await?;
-                }
-                CodexCommand::Approve(args) => {
-                    service
-                        .codex_decision_approve_and_send(
-                            &args.decision,
-                            args.reviewed_by,
-                            args.review_note,
-                        )
-                        .await?;
-                }
-                CodexCommand::Reject(args) => {
-                    service
-                        .codex_decision_reject(
-                            &args.decision,
-                            args.reviewed_by,
-                            args.review_note,
-                        )
-                        .await?;
-                }
+                CodexCommand::Review { command } => match command {
+                    CodexReviewCommand::List(args) => {
+                        service
+                            .codex_decision_list(
+                                args.filters.thread.as_deref(),
+                                args.filters.assignment.as_deref(),
+                                args.filters.workstream.as_deref(),
+                                args.filters.workunit.as_deref(),
+                                args.filters.supervisor.as_deref(),
+                                args.filters.status.map(Into::into),
+                                args.filters.kind.map(Into::into),
+                                args.include_closed,
+                                args.filters.include_superseded,
+                                false,
+                                args.filters.limit,
+                            )
+                            .await?;
+                    }
+                    CodexReviewCommand::Queue(args) => {
+                        service
+                            .codex_decision_list(
+                                args.filters.thread.as_deref(),
+                                args.filters.assignment.as_deref(),
+                                args.filters.workstream.as_deref(),
+                                args.filters.workunit.as_deref(),
+                                args.filters.supervisor.as_deref(),
+                                args.filters.status.map(Into::into),
+                                args.filters.kind.map(Into::into),
+                                false,
+                                args.filters.include_superseded,
+                                true,
+                                args.filters.limit,
+                            )
+                            .await?;
+                    }
+                    CodexReviewCommand::History(args) => {
+                        service
+                            .codex_decision_history(
+                                args.thread.as_deref(),
+                                args.assignment.as_deref(),
+                                args.include_superseded,
+                                args.limit,
+                            )
+                            .await?;
+                    }
+                    CodexReviewCommand::Get(args) => {
+                        service.codex_decision_get(&args.decision).await?;
+                    }
+                    CodexReviewCommand::ProposeSteer(args) => {
+                        service
+                            .codex_decision_propose_steer(
+                                &args.thread,
+                                &args.text,
+                                args.requested_by,
+                                args.rationale_note,
+                            )
+                            .await?;
+                    }
+                    CodexReviewCommand::ReplacePendingSteer(args) => {
+                        service
+                            .codex_decision_replace_pending_steer(
+                                &args.decision,
+                                &args.text,
+                                args.requested_by,
+                                args.rationale_note,
+                            )
+                            .await?;
+                    }
+                    CodexReviewCommand::RecordNoAction(args) => {
+                        service
+                            .codex_decision_record_no_action(
+                                &args.decision,
+                                args.reviewed_by,
+                                args.review_note,
+                            )
+                            .await?;
+                    }
+                    CodexReviewCommand::ManualRefresh(args) => {
+                        service
+                            .codex_decision_manual_refresh(
+                                args.thread.as_deref(),
+                                args.assignment.as_deref(),
+                                args.requested_by,
+                                args.rationale_note,
+                            )
+                            .await?;
+                    }
+                    CodexReviewCommand::Approve(args) => {
+                        service
+                            .codex_decision_approve_and_send(
+                                &args.decision,
+                                args.reviewed_by,
+                                args.review_note,
+                            )
+                            .await?;
+                    }
+                    CodexReviewCommand::Reject(args) => {
+                        service
+                            .codex_decision_reject(
+                                &args.decision,
+                                args.reviewed_by,
+                                args.review_note,
+                            )
+                            .await?;
+                    }
+                },
             }
         }
         TopCommand::Prompt(args) => {
@@ -926,10 +936,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_decision_propose_steer_command() {
+    fn parses_codex_review_propose_steer_command() {
         let cli = Cli::parse_from([
             "orcas",
             "codex",
+            "review",
             "propose-steer",
             "--thread",
             "thread-1",
@@ -941,7 +952,10 @@ mod tests {
 
         match cli.command {
             TopCommand::Codex {
-                command: CodexCommand::ProposeSteer(args),
+                command:
+                    CodexCommand::Review {
+                        command: CodexReviewCommand::ProposeSteer(args),
+                    },
             } => {
                 assert_eq!(args.thread, "thread-1");
                 assert_eq!(args.text, "stay focused");
@@ -952,10 +966,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_decision_replace_pending_steer_command() {
+    fn parses_codex_review_replace_pending_steer_command() {
         let cli = Cli::parse_from([
             "orcas",
             "codex",
+            "review",
             "replace-pending-steer",
             "--decision",
             "std-7",
@@ -965,7 +980,10 @@ mod tests {
 
         match cli.command {
             TopCommand::Codex {
-                command: CodexCommand::ReplacePendingSteer(args),
+                command:
+                    CodexCommand::Review {
+                        command: CodexReviewCommand::ReplacePendingSteer(args),
+                    },
             } => {
                 assert_eq!(args.decision, "std-7");
                 assert_eq!(args.text, "updated steer text");
@@ -975,10 +993,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_decision_record_no_action_command() {
+    fn parses_codex_review_record_no_action_command() {
         let cli = Cli::parse_from([
             "orcas",
             "codex",
+            "review",
             "record-no-action",
             "--decision",
             "std-7",
@@ -988,7 +1007,10 @@ mod tests {
 
         match cli.command {
             TopCommand::Codex {
-                command: CodexCommand::RecordNoAction(args),
+                command:
+                    CodexCommand::Review {
+                        command: CodexReviewCommand::RecordNoAction(args),
+                    },
             } => {
                 assert_eq!(args.decision, "std-7");
                 assert_eq!(args.reviewed_by.as_deref(), Some("cli_user"));
@@ -998,10 +1020,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_decision_manual_refresh_command() {
+    fn parses_codex_review_manual_refresh_command() {
         let cli = Cli::parse_from([
             "orcas",
             "codex",
+            "review",
             "manual-refresh",
             "--thread",
             "thread-1",
@@ -1011,7 +1034,10 @@ mod tests {
 
         match cli.command {
             TopCommand::Codex {
-                command: CodexCommand::ManualRefresh(args),
+                command:
+                    CodexCommand::Review {
+                        command: CodexReviewCommand::ManualRefresh(args),
+                    },
             } => {
                 assert_eq!(args.thread.as_deref(), Some("thread-1"));
                 assert_eq!(args.assignment, None);
@@ -1022,10 +1048,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_decision_queue_command_with_filters() {
+    fn parses_codex_review_queue_command_with_filters() {
         let cli = Cli::parse_from([
             "orcas",
             "codex",
+            "review",
             "queue",
             "--workstream",
             "ws-1",
@@ -1037,7 +1064,10 @@ mod tests {
 
         match cli.command {
             TopCommand::Codex {
-                command: CodexCommand::Queue(args),
+                command:
+                    CodexCommand::Review {
+                        command: CodexReviewCommand::Queue(args),
+                    },
             } => {
                 assert_eq!(args.filters.workstream.as_deref(), Some("ws-1"));
                 assert!(matches!(
@@ -1051,10 +1081,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_decision_history_command() {
+    fn parses_codex_review_history_command() {
         let cli = Cli::parse_from([
             "orcas",
             "codex",
+            "review",
             "history",
             "--assignment",
             "cta-1",
@@ -1064,7 +1095,10 @@ mod tests {
 
         match cli.command {
             TopCommand::Codex {
-                command: CodexCommand::History(args),
+                command:
+                    CodexCommand::Review {
+                        command: CodexReviewCommand::History(args),
+                    },
             } => {
                 assert_eq!(args.assignment.as_deref(), Some("cta-1"));
                 assert_eq!(args.limit, Some(20));
@@ -1082,5 +1116,10 @@ mod tests {
     #[test]
     fn rejects_codex_decisions_namespace() {
         assert!(Cli::try_parse_from(["orcas", "codex", "decisions", "list"]).is_err());
+    }
+
+    #[test]
+    fn rejects_flat_codex_review_verbs() {
+        assert!(Cli::try_parse_from(["orcas", "codex", "list"]).is_err());
     }
 }
