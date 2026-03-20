@@ -69,7 +69,7 @@ impl FakeSupervisorResponsesServer {
         let requires_assignment =
             matches!(decision, DecisionType::Continue | DecisionType::Redirect);
         SupervisorProposal {
-            schema_version: "supervisor_proposal.v1".to_string(),
+            schema_version: "supervisor_proposal.v2".to_string(),
             summary: SupervisorSummary {
                 headline: format!(
                     "Deterministic proposal for {}",

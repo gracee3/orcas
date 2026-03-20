@@ -11,7 +11,7 @@
 //! `orcas_core::collaboration` for the execution/runtime state this service
 //! persists and snapshots.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,14 +49,15 @@ use orcas_core::{
     LandingAuthorizationRecord, LandingAuthorizationStatus, OrcasError, OrcasEvent, OrcasResult,
     OrcasSessionStore, PlanAssessment, PlanAssessmentId, PlanExecutionKind, PlanId, PlanItemId,
     PlanRevisionApplyFailureKind, PlanRevisionApplyPhase, PlanRevisionProposalStatus, Report,
-    ReportDisposition, ReportParseResult, SupervisorContextPack, SupervisorProposal,
+    ReportDisposition, ReportParseResult, StoredState, SupervisorContextPack, SupervisorProposal,
     SupervisorProposalFailure, SupervisorProposalFailureStage, SupervisorProposalRecord,
     SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorReasonerUsage,
     SupervisorTurnDecision, SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus,
-    SupervisorTurnProposalKind, ThreadMetadata, TrackedThreadWorkspaceOperationContract,
-    TrackedThreadWorkspaceOperationKind, TrackedThreadWorkspaceOperationStatus, WorkUnit,
-    WorkUnitStatus, Worker, WorkerSession, WorkerSessionAttachability, WorkerSessionRuntimeStatus,
-    WorkerStatus, WorkspaceOperationRecord, Workstream, WorkstreamStatus,
+    SupervisorTurnProposalKind, ThreadMetadata, ThreadRegistry,
+    TrackedThreadWorkspaceOperationContract, TrackedThreadWorkspaceOperationKind,
+    TrackedThreadWorkspaceOperationStatus, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
+    WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, WorkspaceOperationRecord,
+    Workstream, WorkstreamStatus,
 };
 
 use crate::assignment_comm::parse::parse_worker_report_for_turn;
@@ -1233,7 +1234,7 @@ impl OrcasDaemonService {
             .codex_client
             .thread_list(types::ThreadListParams::default())
             .await?;
-        self.sync_threads(&response.data, None, Some("upstream_discovered"))
+        self.sync_threads(&response.data, Some("upstream_discovered"))
             .await?;
         Ok(ipc::ThreadsListResponse {
             data: self.known_thread_summaries().await,
@@ -1284,11 +1285,7 @@ impl OrcasDaemonService {
             })
             .await?;
         let view = self
-            .sync_thread(
-                &response.thread,
-                Some(response.model.clone()),
-                Some("orcas_managed"),
-            )
+            .sync_thread(&response.thread, Some("orcas_managed"))
             .await?;
         self.set_thread_monitor_state(&view.summary.id, ipc::ThreadMonitorState::Attached)
             .await?;
@@ -1311,7 +1308,7 @@ impl OrcasDaemonService {
             })
             .await?;
         let view = self
-            .sync_thread(&response.thread, None, Some("live_observed"))
+            .sync_thread(&response.thread, Some("live_observed"))
             .await?;
         Ok(ipc::ThreadReadResponse { thread: view })
     }
@@ -1350,7 +1347,7 @@ impl OrcasDaemonService {
             })
             .await?;
         let view = self
-            .sync_thread(&response.thread, None, Some("live_observed"))
+            .sync_thread(&response.thread, Some("live_observed"))
             .await?;
         Ok(ipc::ThreadGetResponse { thread: view })
     }
@@ -1382,11 +1379,7 @@ impl OrcasDaemonService {
             })
             .await?;
         let view = self
-            .sync_thread(
-                &response.thread,
-                Some(response.model.clone()),
-                Some("orcas_managed"),
-            )
+            .sync_thread(&response.thread, Some("orcas_managed"))
             .await?;
         self.set_thread_monitor_state(&view.summary.id, ipc::ThreadMonitorState::Attached)
             .await?;
@@ -1439,11 +1432,7 @@ impl OrcasDaemonService {
         match response {
             Ok(response) => {
                 let view = self
-                    .sync_thread(
-                        &response.thread,
-                        Some(response.model),
-                        Some("live_observed"),
-                    )
+                    .sync_thread(&response.thread, Some("live_observed"))
                     .await?;
                 self.set_thread_monitor_state(&view.summary.id, ipc::ThreadMonitorState::Attached)
                     .await?;
@@ -2901,14 +2890,14 @@ impl OrcasDaemonService {
             .raw_output_for_turn(&thread_id, &turn.turn_id)
             .await
             .unwrap_or_default();
-        let (report, _assignment_after_report, _work_unit_after_report) = self
-            .ingest_assignment_turn_outcome(
+        let (report, _assignment_after_report, _work_unit_after_report) =
+            Box::pin(self.ingest_assignment_turn_outcome(
                 &assignment_id,
                 &worker_id,
                 &worker_session_id,
                 turn_state,
                 raw_output,
-            )
+            ))
             .await?;
 
         let (assignment, worker, worker_session) = {
@@ -3520,15 +3509,6 @@ impl OrcasDaemonService {
         raw_output: String,
     ) -> OrcasResult<(Report, Assignment, WorkUnit, Vec<SupervisorProposalRecord>)> {
         let started_at = Instant::now();
-        info!(
-            assignment_id,
-            worker_id,
-            worker_session_id,
-            lifecycle = ?turn_state.lifecycle,
-            attachable = turn_state.attachable,
-            raw_output_len = raw_output.len(),
-            "recording assignment turn outcome"
-        );
         self.ensure_assignment_communication_record(assignment_id, None, None)
             .await?;
         let (assignment_for_parse, communication_record) = {
@@ -3829,14 +3809,14 @@ impl OrcasDaemonService {
         turn_state: ipc::TurnStateView,
         raw_output: String,
     ) -> OrcasResult<(Report, Assignment, WorkUnit)> {
-        let (report, assignment_after_report, work_unit_after_report, stale_proposals) = self
-            .record_assignment_turn_outcome(
+        let (report, assignment_after_report, work_unit_after_report, stale_proposals) =
+            Box::pin(self.record_assignment_turn_outcome(
                 assignment_id,
                 worker_id,
                 worker_session_id,
                 turn_state,
                 raw_output,
-            )
+            ))
             .await?;
         self.persist_collaboration_state().await?;
         self.emit_report_recorded(&report).await;
@@ -8884,10 +8864,7 @@ impl OrcasDaemonService {
     }
 
     async fn persist_collaboration_state(&self) -> OrcasResult<()> {
-        let collaboration = self.state.read().await.collaboration.clone();
-        let mut stored = self.store.load().await.unwrap_or_default();
-        stored.collaboration = collaboration;
-        self.store.save(&stored).await
+        self.persist_state_snapshot().await
     }
 
     async fn emit_workstream_lifecycle(
@@ -10686,7 +10663,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             .await
         {
             let _ = self
-                .sync_threads(&response.data, None, Some("upstream_discovered"))
+                .sync_threads(&response.data, Some("upstream_discovered"))
                 .await;
         }
         Ok(())
@@ -10695,11 +10672,10 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
     async fn sync_threads(
         &self,
         threads: &[types::Thread],
-        model: Option<String>,
         scope: Option<&str>,
     ) -> OrcasResult<()> {
         for thread in threads {
-            self.sync_thread(thread, model.clone(), scope).await?;
+            self.sync_thread(thread, scope).await?;
         }
         Ok(())
     }
@@ -10707,23 +10683,42 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
     async fn sync_thread(
         &self,
         thread: &types::Thread,
-        model: Option<String>,
         scope: Option<&str>,
     ) -> OrcasResult<ipc::ThreadView> {
         let existing = self.thread_from_state(&thread.id).await;
         let view = Self::thread_view_from_codex(thread.clone(), existing.as_ref(), scope);
-        self.persist_thread_view(&view, model).await?;
+        self.persist_thread_view(&view).await?;
         let mut state = self.state.write().await;
         state.recent_thread_id = Some(view.summary.id.clone());
         state.threads.insert(view.summary.id.clone(), view.clone());
         Ok(view)
     }
 
-    async fn persist_thread_view(
-        &self,
+    async fn persist_thread_view(&self, thread: &ipc::ThreadView) -> OrcasResult<()> {
+        {
+            let mut state = self.state.write().await;
+            state.recent_thread_id = Some(thread.summary.id.clone());
+            state
+                .threads
+                .insert(thread.summary.id.clone(), thread.clone());
+        }
+        self.persist_state_snapshot().await
+    }
+
+    async fn persist_turn_state_view(&self, turn: &ipc::TurnStateView) -> OrcasResult<()> {
+        {
+            let mut state = self.state.write().await;
+            Self::upsert_turn_state(&mut state, turn.clone());
+            Self::refresh_session_from_turns(&mut state);
+        }
+        self.persist_state_snapshot().await
+    }
+
+    fn thread_metadata_from_view(
         thread: &ipc::ThreadView,
+        endpoint: &str,
         model: Option<String>,
-    ) -> OrcasResult<()> {
+    ) -> ThreadMetadata {
         let created_at = Utc
             .timestamp_opt(thread.summary.created_at, 0)
             .single()
@@ -10732,38 +10727,70 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             .timestamp_opt(thread.summary.updated_at, 0)
             .single()
             .unwrap_or(created_at);
-        self.store
-            .upsert_thread(ThreadMetadata {
-                id: thread.summary.id.clone(),
-                name: thread.summary.name.clone(),
-                preview: thread.summary.preview.clone(),
-                model,
-                model_provider: Some(thread.summary.model_provider.clone()),
-                cwd: (!thread.summary.cwd.is_empty()).then(|| PathBuf::from(&thread.summary.cwd)),
-                endpoint: Some(self.config.codex.listen_url.clone()),
-                created_at,
-                updated_at,
-                status: thread.summary.status.clone(),
-                scope: thread.summary.scope.clone(),
-                archived: thread.summary.archived,
-                loaded_status: thread.summary.loaded_status,
-                active_flags: thread.summary.active_flags.clone(),
-                active_turn_id: thread.summary.active_turn_id.clone(),
-                last_seen_turn_id: thread.summary.last_seen_turn_id.clone(),
-                recent_output: thread.summary.recent_output.clone(),
-                recent_event: thread.summary.recent_event.clone(),
-                turn_in_flight: thread.summary.turn_in_flight,
-                monitor_state: thread.summary.monitor_state,
-                last_sync_at: thread.summary.last_sync_at,
-                source_kind: thread.summary.source_kind.clone(),
-                raw_summary: thread.summary.raw_summary.clone(),
-            })
-            .await?;
-        self.store.upsert_thread_view(thread.clone()).await
+        ThreadMetadata {
+            id: thread.summary.id.clone(),
+            name: thread.summary.name.clone(),
+            preview: thread.summary.preview.clone(),
+            model,
+            model_provider: Some(thread.summary.model_provider.clone()),
+            cwd: (!thread.summary.cwd.is_empty()).then(|| PathBuf::from(&thread.summary.cwd)),
+            endpoint: Some(endpoint.to_string()),
+            created_at,
+            updated_at,
+            status: thread.summary.status.clone(),
+            scope: thread.summary.scope.clone(),
+            archived: thread.summary.archived,
+            loaded_status: thread.summary.loaded_status,
+            active_flags: thread.summary.active_flags.clone(),
+            active_turn_id: thread.summary.active_turn_id.clone(),
+            last_seen_turn_id: thread.summary.last_seen_turn_id.clone(),
+            recent_output: thread.summary.recent_output.clone(),
+            recent_event: thread.summary.recent_event.clone(),
+            turn_in_flight: thread.summary.turn_in_flight,
+            monitor_state: thread.summary.monitor_state,
+            last_sync_at: thread.summary.last_sync_at,
+            source_kind: thread.summary.source_kind.clone(),
+            raw_summary: thread.summary.raw_summary.clone(),
+        }
     }
 
-    async fn persist_turn_state_view(&self, turn: &ipc::TurnStateView) -> OrcasResult<()> {
-        self.store.upsert_turn_state(turn.clone()).await
+    async fn persist_state_snapshot(&self) -> OrcasResult<()> {
+        let stored = {
+            let state = self.state.read().await;
+            let registry = ThreadRegistry {
+                threads: state
+                    .threads
+                    .values()
+                    .map(|thread| {
+                        let metadata = Self::thread_metadata_from_view(
+                            thread,
+                            &self.config.codex.listen_url,
+                            None,
+                        );
+                        (metadata.id.clone(), metadata)
+                    })
+                    .collect(),
+                last_connected_endpoint: Some(self.config.codex.listen_url.clone()),
+            };
+            StoredState {
+                registry,
+                thread_views: state
+                    .threads
+                    .values()
+                    .cloned()
+                    .map(|thread| (thread.summary.id.clone(), thread))
+                    .collect::<BTreeMap<_, _>>(),
+                turn_states: state
+                    .turns
+                    .values()
+                    .cloned()
+                    .map(|turn| (format!("{}::{}", turn.thread_id, turn.turn_id), turn))
+                    .collect::<BTreeMap<_, _>>(),
+                collaboration: state.collaboration.clone(),
+            }
+        };
+        let result = self.store.save(&stored).await;
+        result
     }
 
     async fn set_thread_monitor_state(
@@ -10781,7 +10808,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             Some(thread.clone())
         };
         if let Some(thread) = maybe_thread.as_ref() {
-            self.persist_thread_view(thread, None).await?;
+            self.persist_thread_view(thread).await?;
         }
         Ok(())
     }
@@ -10902,7 +10929,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             (state.session.clone(), turn, thread_summary, turn_state)
         };
         if let Some(thread_view) = self.thread_from_state(thread_id).await.as_ref() {
-            let _ = self.persist_thread_view(thread_view, None).await;
+            let _ = self.persist_thread_view(thread_view).await;
         }
         let _ = self.persist_turn_state_view(&turn_state).await;
         self.emit(ipc::DaemonEvent::ThreadUpdated { thread }).await;
@@ -10936,7 +10963,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 };
                 if upstream.status != "connected" {
                     for thread in &threads_to_persist {
-                        let _ = self.persist_thread_view(thread, None).await;
+                        let _ = self.persist_thread_view(thread).await;
                     }
                     for turn in &turns_to_persist {
                         let _ = self.persist_turn_state_view(turn).await;
@@ -10958,7 +10985,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                         existing.as_ref(),
                         Some("live_observed"),
                     );
-                    let _ = self.persist_thread_view(&view, None).await;
+                    let _ = self.persist_thread_view(&view).await;
                     let mut state = self.state.write().await;
                     state.recent_thread_id = Some(view.summary.id.clone());
                     state.threads.insert(view.summary.id.clone(), view.clone());
@@ -10980,7 +11007,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     summary
                 };
                 if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view, None).await;
+                    let _ = self.persist_thread_view(thread_view).await;
                 }
                 self.emit(ipc::DaemonEvent::ThreadUpdated { thread: summary })
                     .await;
@@ -11003,7 +11030,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     summary
                 };
                 if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view, None).await;
+                    let _ = self.persist_thread_view(thread_view).await;
                 }
                 self.emit(ipc::DaemonEvent::ThreadUpdated { thread: summary })
                     .await;
@@ -11062,24 +11089,17 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     };
                     Self::upsert_turn_state(&mut state, turn_state.clone());
                     Self::refresh_session_from_turns(&mut state);
+                    state.recent_thread_id = Some(thread_id.clone());
                     if state.session.active_turns.is_empty() {
                         state.session.active_thread_id = Some(thread_id.clone());
                     }
-                    state.recent_thread_id = Some(thread_id.clone());
                     (state.session.clone(), turn, thread_summary, turn_state)
                 };
                 if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view, None).await;
+                    let _ = self.persist_thread_view(thread_view).await;
                 }
                 let _ = self.persist_turn_state_view(&turn_state).await;
-                self.emit(ipc::DaemonEvent::ThreadUpdated { thread }).await;
-                self.emit(ipc::DaemonEvent::SessionChanged { session })
-                    .await;
-                self.emit(ipc::DaemonEvent::TurnUpdated {
-                    thread_id: thread_id.clone(),
-                    turn,
-                })
-                .await;
+                let _ = (thread, session, turn);
                 let _ = self
                     .refresh_codex_supervisor_state_for_thread(&thread_id)
                     .await;
@@ -11101,7 +11121,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     )
                     .await;
                 if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view, None).await;
+                    let _ = self.persist_thread_view(thread_view).await;
                 }
                 self.emit(ipc::DaemonEvent::ItemUpdated {
                     thread_id,
@@ -11127,7 +11147,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     )
                     .await;
                 if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view, None).await;
+                    let _ = self.persist_thread_view(thread_view).await;
                 }
                 self.emit(ipc::DaemonEvent::ItemUpdated {
                     thread_id,
