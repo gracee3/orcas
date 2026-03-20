@@ -2791,18 +2791,14 @@ fn workunit_details_from_snapshot(
             .map(|assignment| Assignment {
                 id: assignment.id.clone(),
                 work_unit_id: assignment.work_unit_id.clone(),
-                plan_id: assignment
-                    .plan_id
-                    .as_ref()
-                    .map(|plan_id| orcas_core::planning::PlanId::parse(plan_id.clone()).expect("plan id")),
+                plan_id: assignment.plan_id.as_ref().map(|plan_id| {
+                    orcas_core::planning::PlanId::parse(plan_id.clone()).expect("plan id")
+                }),
                 plan_version: assignment.plan_version,
-                plan_item_id: assignment
-                    .plan_item_id
-                    .as_ref()
-                    .map(|plan_item_id| {
-                        orcas_core::planning::PlanItemId::parse(plan_item_id.clone())
-                            .expect("plan item id")
-                    }),
+                plan_item_id: assignment.plan_item_id.as_ref().map(|plan_item_id| {
+                    orcas_core::planning::PlanItemId::parse(plan_item_id.clone())
+                        .expect("plan item id")
+                }),
                 execution_kind: assignment.execution_kind,
                 alignment_rationale: assignment.alignment_rationale.clone(),
                 worker_id: assignment.worker_id.clone(),

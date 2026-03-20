@@ -69,7 +69,17 @@ Supervisor execution may update plan-adjacent runtime fields without operator ap
 
 Structural plan changes require operator approval before they become canonical. That includes adding or removing goals or items, changing ordering or priority, changing success criteria or constraints, and changing the exploration policy. The supervisor may propose such changes, but the daemon only applies them as a new plan version after approval.
 
-When a supervisor proposes a revision, the daemon stores the proposal against the active plan version, validates it against the current canonical plan, and preserves the prior version for historical inspection. Assignment start and supervisor prompt generation both include plan linkage so tactical work stays anchored to the workstream plan rather than drifting into free-form local context.
+When a supervisor proposes a revision, the daemon stores the proposal against the active plan version, validates it semantically against the current canonical plan, and preserves the prior version for historical inspection. Revision application now uses an explicit lifecycle: `pending`, `applying`, `applied`, `apply_failed`, `rejected`, or `superseded`. Orcas does not silently advance the canonical plan before downstream approval effects complete. If downstream apply fails, the revision remains inspectable with structured failure state instead of disappearing into logs.
+
+Assignment start and supervisor prompt generation both include plan linkage so tactical work stays anchored to the workstream plan rather than drifting into free-form local context. Direct execution assignments must resolve to a concrete `plan_item_id`. Narrow special execution kinds such as plan review or blocker investigation may omit a plan item, but they still attach to the active workstream plan version.
+
+Runtime execution may only synchronize a narrow subset of canonical plan fields automatically:
+
+- plan item status progression (`pending`, `in_progress`, `blocked`, `done`)
+- linked evidence and linked assignment references
+- current focus selection when execution clearly advances past a completed or dropped focus item
+
+Runtime synchronization does not mutate plan structure, ordering, priorities, acceptance criteria, constraints, or exploration policy.
 
 ## Source-Of-Truth Matrix
 

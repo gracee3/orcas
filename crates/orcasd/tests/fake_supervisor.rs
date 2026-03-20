@@ -102,11 +102,19 @@ impl FakeSupervisorResponsesServer {
                 target_work_unit_id: pack.primary_work_unit.id.clone(),
                 predecessor_assignment_id: pack.current_assignment.id.clone(),
                 derived_from_decision_type: decision,
-                plan_id: None,
-                plan_version: None,
-                plan_item_id: None,
+                plan_id: pack
+                    .current_assignment
+                    .plan_id
+                    .as_ref()
+                    .map(ToString::to_string),
+                plan_version: pack.current_assignment.plan_version,
+                plan_item_id: pack
+                    .current_assignment
+                    .plan_item_id
+                    .as_ref()
+                    .map(ToString::to_string),
                 execution_kind: orcas_core::PlanExecutionKind::DirectExecution,
-                alignment_rationale: None,
+                alignment_rationale: pack.current_assignment.alignment_rationale.clone(),
                 preferred_worker_id: Some(pack.current_assignment.worker_id.clone()),
                 worker_kind: Some("codex".to_string()),
                 objective: format!(

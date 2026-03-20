@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 
 use chrono::{DateTime, Utc};
@@ -23,7 +23,7 @@ fn default_utc_now() -> DateTime<Utc> {
 
 macro_rules! non_empty_string_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -256,6 +256,68 @@ impl WorkstreamPlan {
                 "current focus item `{focus}` does not exist on the plan"
             )));
         }
+        if self.goals.is_empty() {
+            return Err(OrcasError::Protocol(
+                "workstream plan must contain at least one goal".to_string(),
+            ));
+        }
+
+        let mut goal_ids = BTreeSet::new();
+        for goal in &self.goals {
+            if !goal_ids.insert(goal.goal_id.clone()) {
+                return Err(OrcasError::Protocol(format!(
+                    "duplicate goal `{}` on workstream plan",
+                    goal.goal_id
+                )));
+            }
+            require_non_empty(goal.title.clone(), "goal.title")?;
+            require_non_empty(goal.priority.clone(), "goal.priority")?;
+        }
+
+        let mut item_ids = BTreeSet::new();
+        for item in &self.plan_items {
+            if !item_ids.insert(item.item_id.clone()) {
+                return Err(OrcasError::Protocol(format!(
+                    "duplicate plan item `{}` on workstream plan",
+                    item.item_id
+                )));
+            }
+            if !goal_ids.contains(&item.goal_id) {
+                return Err(OrcasError::Protocol(format!(
+                    "plan item `{}` referenced unknown goal `{}`",
+                    item.item_id, item.goal_id
+                )));
+            }
+            require_non_empty(item.title.clone(), "plan_item.title")?;
+            require_non_empty(item.priority.clone(), "plan_item.priority")?;
+
+            let mut dependency_ids = BTreeSet::new();
+            for dependency_id in &item.dependency_item_ids {
+                if dependency_id == &item.item_id {
+                    return Err(OrcasError::Protocol(format!(
+                        "plan item `{}` cannot depend on itself",
+                        item.item_id
+                    )));
+                }
+                if !dependency_ids.insert(dependency_id.clone()) {
+                    return Err(OrcasError::Protocol(format!(
+                        "plan item `{}` listed dependency `{}` more than once",
+                        item.item_id, dependency_id
+                    )));
+                }
+            }
+        }
+
+        for item in &self.plan_items {
+            for dependency_id in &item.dependency_item_ids {
+                if !item_ids.contains(dependency_id) {
+                    return Err(OrcasError::Protocol(format!(
+                        "plan item `{}` referenced unknown dependency `{}`",
+                        item.item_id, dependency_id
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -379,6 +441,8 @@ pub enum PlanRevisionProposalStatus {
     #[default]
     Pending,
     Approved,
+    Applying,
+    ApplyFailed,
     Rejected,
     Applied,
     Superseded,
@@ -493,6 +557,12 @@ pub struct PlanRevisionProposal {
     pub reviewed_by: Option<String>,
     #[serde(default)]
     pub review_note: Option<String>,
+    #[serde(default)]
+    pub apply_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub apply_finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub apply_error: Option<String>,
     #[serde(default)]
     pub applied_plan_id: Option<PlanId>,
     #[serde(default)]
@@ -627,12 +697,89 @@ impl PlanningState {
                 proposal.proposal_id, proposal.base_plan_version
             )));
         }
+        let active_plan = self.active_plan(&proposal.workstream_id).ok_or_else(|| {
+            OrcasError::Protocol(format!(
+                "unknown workstream `{}` for plan revision proposal",
+                proposal.workstream_id
+            ))
+        })?;
+        validate_plan_revision_ops(active_plan, &proposal.ops)?;
         self.revision_proposals
             .insert(proposal.proposal_id.to_string(), proposal.clone());
         Ok(proposal)
     }
 
-    pub fn approve_revision(
+    pub fn begin_apply_revision(
+        &mut self,
+        proposal_id: &PlanRevisionProposalId,
+        reviewed_by: impl Into<String>,
+        review_note: Option<String>,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<PlanRevisionProposal> {
+        let reviewed_by = reviewed_by.into();
+        let proposal_snapshot = self
+            .revision_proposals
+            .get(proposal_id.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown plan revision proposal `{}`", proposal_id))
+            })?;
+        if !matches!(
+            proposal_snapshot.status,
+            PlanRevisionProposalStatus::Pending | PlanRevisionProposalStatus::ApplyFailed
+        ) {
+            return Err(OrcasError::Protocol(format!(
+                "plan revision proposal `{}` is not pending or retryable",
+                proposal_id
+            )));
+        }
+        let active_plan = self
+            .active_plan(&proposal_snapshot.workstream_id)
+            .cloned()
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!(
+                    "unknown workstream `{}` for plan revision approval",
+                    proposal_snapshot.workstream_id
+                ))
+            })?;
+        if active_plan.plan_id != proposal_snapshot.base_plan_id
+            || active_plan.version != proposal_snapshot.base_plan_version
+        {
+            if let Some(proposal) = self.revision_proposals.get_mut(proposal_id.as_str()) {
+                proposal.status = PlanRevisionProposalStatus::Superseded;
+                proposal.reviewed_at = Some(now);
+                proposal.reviewed_by = Some(reviewed_by.clone());
+                proposal.review_note =
+                    review_note.or_else(|| Some("Base plan changed before approval.".to_string()));
+                proposal.apply_finished_at = Some(now);
+                proposal.apply_error =
+                    Some("Base plan changed before revision application.".to_string());
+            }
+            return Err(OrcasError::Protocol(format!(
+                "plan revision proposal `{}` is stale",
+                proposal_id
+            )));
+        }
+        validate_plan_revision_ops(&active_plan, &proposal_snapshot.ops)?;
+        let proposal = self
+            .revision_proposals
+            .get_mut(proposal_id.as_str())
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown plan revision proposal `{}`", proposal_id))
+            })?;
+        proposal.status = PlanRevisionProposalStatus::Applying;
+        proposal.reviewed_at = Some(now);
+        proposal.reviewed_by = Some(reviewed_by);
+        proposal.review_note = review_note;
+        proposal.apply_started_at = Some(now);
+        proposal.apply_finished_at = None;
+        proposal.apply_error = None;
+        proposal.applied_plan_id = None;
+        proposal.applied_plan_version = None;
+        Ok(proposal.clone())
+    }
+
+    pub fn complete_apply_revision(
         &mut self,
         proposal_id: &PlanRevisionProposalId,
         reviewed_by: impl Into<String>,
@@ -647,9 +794,9 @@ impl PlanningState {
             .ok_or_else(|| {
                 OrcasError::Protocol(format!("unknown plan revision proposal `{}`", proposal_id))
             })?;
-        if proposal_snapshot.status != PlanRevisionProposalStatus::Pending {
+        if proposal_snapshot.status != PlanRevisionProposalStatus::Applying {
             return Err(OrcasError::Protocol(format!(
-                "plan revision proposal `{}` is not pending",
+                "plan revision proposal `{}` is not applying",
                 proposal_id
             )));
         }
@@ -671,6 +818,9 @@ impl PlanningState {
                 proposal.reviewed_by = Some(reviewed_by);
                 proposal.review_note =
                     review_note.or_else(|| Some("Base plan changed before approval.".to_string()));
+                proposal.apply_finished_at = Some(now);
+                proposal.apply_error =
+                    Some("Base plan changed before revision application.".to_string());
             }
             return Err(OrcasError::Protocol(format!(
                 "plan revision proposal `{}` is stale",
@@ -678,8 +828,8 @@ impl PlanningState {
             )));
         }
 
-        let mut updated = active_plan.clone();
-        updated.version = updated.version.saturating_add(1);
+        let mut updated = validate_plan_revision_ops(&active_plan, &proposal_snapshot.ops)?;
+        updated.version = active_plan.version.saturating_add(1);
         updated.plan_id =
             PlanId::parse(format!("plan-{}", Uuid::now_v7().simple())).expect("generated plan id");
         updated.status = PlanStatus::Active;
@@ -687,10 +837,6 @@ impl PlanningState {
         updated.updated_by = reviewed_by.clone();
         updated.superseded_by_plan_id = None;
         updated.source_revision_proposal_id = Some(proposal_snapshot.proposal_id.clone());
-
-        apply_plan_revision_ops(&active_plan, &mut updated, &proposal_snapshot.ops)?;
-
-        updated.validate()?;
 
         if let Some(series) = self
             .workstream_plans
@@ -715,11 +861,89 @@ impl PlanningState {
             proposal.reviewed_at = Some(now);
             proposal.reviewed_by = Some(reviewed_by);
             proposal.review_note = review_note;
+            proposal.apply_finished_at = Some(now);
+            proposal.apply_error = None;
             proposal.applied_plan_id = Some(updated.plan_id.clone());
             proposal.applied_plan_version = Some(updated.version);
         }
         Ok(updated)
     }
+
+    pub fn fail_apply_revision(
+        &mut self,
+        proposal_id: &PlanRevisionProposalId,
+        reviewed_by: impl Into<String>,
+        review_note: Option<String>,
+        apply_error: impl Into<String>,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<PlanRevisionProposal> {
+        let reviewed_by = reviewed_by.into();
+        let proposal = self
+            .revision_proposals
+            .get_mut(proposal_id.as_str())
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown plan revision proposal `{}`", proposal_id))
+            })?;
+        if proposal.status != PlanRevisionProposalStatus::Applying {
+            return Err(OrcasError::Protocol(format!(
+                "plan revision proposal `{}` is not applying",
+                proposal_id
+            )));
+        }
+        proposal.status = PlanRevisionProposalStatus::ApplyFailed;
+        proposal.reviewed_at = Some(now);
+        proposal.reviewed_by = Some(reviewed_by);
+        proposal.review_note = review_note;
+        proposal.apply_finished_at = Some(now);
+        proposal.apply_error = Some(apply_error.into());
+        Ok(proposal.clone())
+    }
+
+    pub fn reject_revision(
+        &mut self,
+        proposal_id: &PlanRevisionProposalId,
+        reviewed_by: impl Into<String>,
+        review_note: Option<String>,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<PlanRevisionProposal> {
+        let reviewed_by = reviewed_by.into();
+        let proposal = self
+            .revision_proposals
+            .get_mut(proposal_id.as_str())
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown plan revision proposal `{}`", proposal_id))
+            })?;
+        if !matches!(
+            proposal.status,
+            PlanRevisionProposalStatus::Pending | PlanRevisionProposalStatus::ApplyFailed
+        ) {
+            return Err(OrcasError::Protocol(format!(
+                "plan revision proposal `{}` cannot be rejected from status `{:?}`",
+                proposal_id, proposal.status
+            )));
+        }
+        proposal.status = PlanRevisionProposalStatus::Rejected;
+        proposal.reviewed_at = Some(now);
+        proposal.reviewed_by = Some(reviewed_by);
+        proposal.review_note = review_note;
+        proposal.apply_finished_at = Some(now);
+        Ok(proposal.clone())
+    }
+}
+
+pub fn validate_plan_revision_ops(
+    base: &WorkstreamPlan,
+    ops: &[PlanRevisionOp],
+) -> OrcasResult<WorkstreamPlan> {
+    if ops.is_empty() {
+        return Err(OrcasError::Protocol(
+            "plan revision proposal must include at least one operation".to_string(),
+        ));
+    }
+    let mut updated = base.clone();
+    apply_plan_revision_ops(base, &mut updated, ops)?;
+    updated.validate()?;
+    Ok(updated)
 }
 
 fn apply_plan_revision_ops(
@@ -730,6 +954,8 @@ fn apply_plan_revision_ops(
     for op in ops {
         match op {
             PlanRevisionOp::AddGoal { goal } => {
+                require_non_empty(goal.title.clone(), "goal.title")?;
+                require_non_empty(goal.priority.clone(), "goal.priority")?;
                 if updated
                     .goals
                     .iter()
@@ -762,10 +988,30 @@ fn apply_plan_revision_ops(
                 }
             }
             PlanRevisionOp::RemoveGoal { goal_id } => {
+                if !updated.goals.iter().any(|goal| &goal.goal_id == goal_id) {
+                    return Err(OrcasError::Protocol(format!("unknown goal `{goal_id}`")));
+                }
+                if updated.goals.len() == 1 {
+                    return Err(OrcasError::Protocol(
+                        "plan revision cannot remove the final goal".to_string(),
+                    ));
+                }
                 updated.goals.retain(|goal| &goal.goal_id != goal_id);
                 updated.plan_items.retain(|item| &item.goal_id != goal_id);
             }
             PlanRevisionOp::AddItem { item } => {
+                require_non_empty(item.title.clone(), "plan_item.title")?;
+                require_non_empty(item.priority.clone(), "plan_item.priority")?;
+                if !updated
+                    .goals
+                    .iter()
+                    .any(|goal| goal.goal_id == item.goal_id)
+                {
+                    return Err(OrcasError::Protocol(format!(
+                        "plan item `{}` referenced unknown goal `{}`",
+                        item.item_id, item.goal_id
+                    )));
+                }
                 if updated
                     .plan_items
                     .iter()
@@ -821,6 +1067,11 @@ fn apply_plan_revision_ops(
                 item_id,
                 before_item_id,
             } => {
+                if before_item_id.as_ref() == Some(item_id) {
+                    return Err(OrcasError::Protocol(format!(
+                        "plan item `{item_id}` cannot be moved before itself"
+                    )));
+                }
                 let index = updated
                     .plan_items
                     .iter()
@@ -873,6 +1124,11 @@ fn apply_plan_revision_ops(
                 source_item_id,
                 new_items,
             } => {
+                if new_items.is_empty() {
+                    return Err(OrcasError::Protocol(format!(
+                        "split item `{source_item_id}` must create at least one replacement item"
+                    )));
+                }
                 let source_exists = updated
                     .plan_items
                     .iter()
@@ -886,6 +1142,18 @@ fn apply_plan_revision_ops(
                     .plan_items
                     .retain(|item| &item.item_id != source_item_id);
                 for item in new_items {
+                    require_non_empty(item.title.clone(), "plan_item.title")?;
+                    require_non_empty(item.priority.clone(), "plan_item.priority")?;
+                    if !updated
+                        .goals
+                        .iter()
+                        .any(|goal| goal.goal_id == item.goal_id)
+                    {
+                        return Err(OrcasError::Protocol(format!(
+                            "split item `{}` referenced unknown goal `{}`",
+                            item.item_id, item.goal_id
+                        )));
+                    }
                     if updated
                         .plan_items
                         .iter()
@@ -907,7 +1175,18 @@ fn apply_plan_revision_ops(
                 source_item_ids,
                 merged_item,
             } => {
+                if source_item_ids.len() < 2 {
+                    return Err(OrcasError::Protocol(
+                        "merge items requires at least two source items".to_string(),
+                    ));
+                }
+                let mut seen_source_ids = BTreeSet::new();
                 for source_item_id in source_item_ids {
+                    if !seen_source_ids.insert(source_item_id.clone()) {
+                        return Err(OrcasError::Protocol(format!(
+                            "merge items referenced source item `{source_item_id}` more than once"
+                        )));
+                    }
                     if !updated
                         .plan_items
                         .iter()
@@ -918,9 +1197,31 @@ fn apply_plan_revision_ops(
                         )));
                     }
                 }
+                require_non_empty(merged_item.title.clone(), "plan_item.title")?;
+                require_non_empty(merged_item.priority.clone(), "plan_item.priority")?;
+                if !updated
+                    .goals
+                    .iter()
+                    .any(|goal| goal.goal_id == merged_item.goal_id)
+                {
+                    return Err(OrcasError::Protocol(format!(
+                        "merged item `{}` referenced unknown goal `{}`",
+                        merged_item.item_id, merged_item.goal_id
+                    )));
+                }
                 updated
                     .plan_items
                     .retain(|item| !source_item_ids.contains(&item.item_id));
+                if updated
+                    .plan_items
+                    .iter()
+                    .any(|item| item.item_id == merged_item.item_id)
+                {
+                    return Err(OrcasError::Protocol(format!(
+                        "merged item `{}` already exists",
+                        merged_item.item_id
+                    )));
+                }
                 updated.plan_items.push(merged_item.clone());
                 if source_item_ids
                     .iter()
@@ -932,4 +1233,207 @@ fn apply_plan_revision_ops(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_plan() -> WorkstreamPlan {
+        let now = Utc::now();
+        let goal_id = PlanGoalId::parse("goal-1").expect("goal id");
+        WorkstreamPlan {
+            plan_id: PlanId::parse("plan-1").expect("plan id"),
+            workstream_id: "ws-1".to_string(),
+            version: 1,
+            status: PlanStatus::Active,
+            title: "Sample plan".to_string(),
+            overview: Some("overview".to_string()),
+            goals: vec![PlanGoal {
+                goal_id: goal_id.clone(),
+                title: "Goal".to_string(),
+                description: Some("desc".to_string()),
+                priority: "high".to_string(),
+                status: PlanGoalStatus::InProgress,
+            }],
+            plan_items: vec![
+                PlanItem {
+                    item_id: PlanItemId::parse("item-1").expect("item 1"),
+                    goal_id: goal_id.clone(),
+                    title: "Item one".to_string(),
+                    purpose: Some("purpose".to_string()),
+                    priority: "high".to_string(),
+                    status: PlanItemStatus::Pending,
+                    acceptance_criteria: vec!["criterion".to_string()],
+                    dependency_item_ids: Vec::new(),
+                    notes: None,
+                    linked_work_unit_id: Some("wu-1".to_string()),
+                    linked_assignment_ids: Vec::new(),
+                    evidence_refs: Vec::new(),
+                },
+                PlanItem {
+                    item_id: PlanItemId::parse("item-2").expect("item 2"),
+                    goal_id,
+                    title: "Item two".to_string(),
+                    purpose: Some("purpose".to_string()),
+                    priority: "normal".to_string(),
+                    status: PlanItemStatus::Pending,
+                    acceptance_criteria: vec!["criterion".to_string()],
+                    dependency_item_ids: vec![PlanItemId::parse("item-1").expect("dep item")],
+                    notes: None,
+                    linked_work_unit_id: Some("wu-2".to_string()),
+                    linked_assignment_ids: Vec::new(),
+                    evidence_refs: Vec::new(),
+                },
+            ],
+            success_criteria: vec!["done".to_string()],
+            constraints: vec!["constraint".to_string()],
+            exploration_policy: ExplorationPolicy::default(),
+            current_focus_item_id: Some(PlanItemId::parse("item-1").expect("focus item")),
+            created_at: now,
+            updated_at: now,
+            created_by: "tester".to_string(),
+            updated_by: "tester".to_string(),
+            superseded_by_plan_id: None,
+            source_revision_proposal_id: None,
+        }
+    }
+
+    fn sample_planning_state() -> PlanningState {
+        let plan = sample_plan();
+        let mut state = PlanningState::default();
+        state
+            .workstream_plans
+            .insert(plan.workstream_id.clone(), vec![plan]);
+        state
+    }
+
+    fn sample_revision(ops: Vec<PlanRevisionOp>) -> PlanRevisionProposal {
+        let plan = sample_plan();
+        PlanRevisionProposal {
+            proposal_id: PlanRevisionProposalId::parse("proposal-1").expect("proposal id"),
+            workstream_id: plan.workstream_id.clone(),
+            base_plan_id: plan.plan_id.clone(),
+            base_plan_version: plan.version,
+            rationale: "need structural adjustment".to_string(),
+            urgency: "medium".to_string(),
+            expected_benefit: "better sequencing".to_string(),
+            tradeoffs: vec!["minor churn".to_string()],
+            ops,
+            status: PlanRevisionProposalStatus::Pending,
+            created_at: Utc::now(),
+            created_by: "tester".to_string(),
+            reviewed_at: None,
+            reviewed_by: None,
+            review_note: None,
+            apply_started_at: None,
+            apply_finished_at: None,
+            apply_error: None,
+            applied_plan_id: None,
+            applied_plan_version: None,
+            source_supervisor_proposal_id: None,
+        }
+    }
+
+    #[test]
+    fn validate_plan_rejects_missing_dependency() {
+        let mut plan = sample_plan();
+        plan.plan_items[1].dependency_item_ids = vec![PlanItemId::parse("missing").expect("id")];
+        let error = plan.validate().expect_err("missing dependency should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("referenced unknown dependency `missing`")
+        );
+    }
+
+    #[test]
+    fn validate_plan_revision_ops_rejects_invalid_focus_target() {
+        let plan = sample_plan();
+        let error = validate_plan_revision_ops(
+            &plan,
+            &[PlanRevisionOp::SetCurrentFocus {
+                item_id: Some(PlanItemId::parse("missing").expect("id")),
+            }],
+        )
+        .expect_err("missing focus target should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown current focus item `missing`")
+        );
+    }
+
+    #[test]
+    fn begin_and_complete_revision_use_two_phase_lifecycle() {
+        let mut state = sample_planning_state();
+        let proposal = sample_revision(vec![PlanRevisionOp::MoveItemBefore {
+            item_id: PlanItemId::parse("item-2").expect("item"),
+            before_item_id: Some(PlanItemId::parse("item-1").expect("before")),
+        }]);
+        state.propose_revision(proposal.clone()).expect("proposal");
+
+        let applying = state
+            .begin_apply_revision(&proposal.proposal_id, "reviewer", None, Utc::now())
+            .expect("begin apply");
+        assert_eq!(applying.status, PlanRevisionProposalStatus::Applying);
+
+        let applied = state
+            .complete_apply_revision(&proposal.proposal_id, "reviewer", None, Utc::now())
+            .expect("complete apply");
+        assert_eq!(applied.version, 2);
+        assert_eq!(applied.plan_items[0].item_id.as_str(), "item-2");
+        assert_eq!(
+            state.revision_proposals[proposal.proposal_id.as_str()].status,
+            PlanRevisionProposalStatus::Applied
+        );
+    }
+
+    #[test]
+    fn stale_revision_is_marked_superseded_during_begin_apply() {
+        let mut state = sample_planning_state();
+        let mut proposal = sample_revision(vec![PlanRevisionOp::UpdateConstraints {
+            constraints: vec!["new".to_string()],
+        }]);
+        proposal.base_plan_version = 0;
+        state
+            .revision_proposals
+            .insert(proposal.proposal_id.to_string(), proposal.clone());
+
+        let error = state
+            .begin_apply_revision(&proposal.proposal_id, "reviewer", None, Utc::now())
+            .expect_err("stale proposal should fail");
+        assert!(error.to_string().contains("is stale"));
+        assert_eq!(
+            state.revision_proposals[proposal.proposal_id.as_str()].status,
+            PlanRevisionProposalStatus::Superseded
+        );
+    }
+
+    #[test]
+    fn fail_apply_revision_records_structured_error() {
+        let mut state = sample_planning_state();
+        let proposal = sample_revision(vec![PlanRevisionOp::UpdateConstraints {
+            constraints: vec!["new".to_string()],
+        }]);
+        state.propose_revision(proposal.clone()).expect("proposal");
+        state
+            .begin_apply_revision(&proposal.proposal_id, "reviewer", None, Utc::now())
+            .expect("begin apply");
+
+        let failed = state
+            .fail_apply_revision(
+                &proposal.proposal_id,
+                "reviewer",
+                Some("apply failed".to_string()),
+                "downstream decision application failed",
+                Utc::now(),
+            )
+            .expect("fail apply");
+        assert_eq!(failed.status, PlanRevisionProposalStatus::ApplyFailed);
+        assert_eq!(
+            failed.apply_error.as_deref(),
+            Some("downstream decision application failed")
+        );
+    }
 }

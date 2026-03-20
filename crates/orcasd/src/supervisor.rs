@@ -1480,6 +1480,7 @@ fn validate_plan_revision_proposal(
             "plan revision proposal must include urgency and expected benefit".to_string(),
         ));
     }
+    orcas_core::planning::validate_plan_revision_ops(&plan_context.active_plan, &proposal.ops)?;
     Ok(())
 }
 
@@ -1511,8 +1512,7 @@ fn validate_plan_assessment(
         || assessment.recommended_next_action.trim().is_empty()
     {
         return Err(OrcasError::Protocol(
-            "plan assessment must include progress_summary and recommended_next_action"
-                .to_string(),
+            "plan assessment must include progress_summary and recommended_next_action".to_string(),
         ));
     }
     Ok(())
@@ -2046,6 +2046,7 @@ fn proposal_json_schema() -> Value {
 mod tests {
     use chrono::{TimeZone, Utc};
 
+    use orcas_core::planning::PlanExecutionKind;
     use orcas_core::supervisor::{
         DecisionPolicy, DraftAssignment, ProposedDecision, SupervisorAssignmentContext,
         SupervisorContextPack, SupervisorPackLimits, SupervisorPackTruncation, SupervisorProposal,
@@ -2058,7 +2059,6 @@ mod tests {
         ReportDisposition, ReportParseResult, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
         WorkerSessionAttachability, WorkerSessionRuntimeStatus, Workstream, WorkstreamStatus,
     };
-    use orcas_core::planning::PlanExecutionKind;
 
     use super::{
         PROPOSAL_SCHEMA_VERSION, SUPERVISOR_PROMPT_TEMPLATE_VERSION, apply_edits,

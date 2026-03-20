@@ -47,13 +47,12 @@ use orcas_core::{
     DraftAssignment, EventEnvelope, ImplementModeSpec, JsonSessionStore, OrcasError, OrcasEvent,
     OrcasResult, OrcasSessionStore, PlanAssessment, PlanAssessmentId, PlanExecutionKind, PlanId,
     PlanItemId, PlanRevisionProposalStatus, Report, ReportParseResult, SupervisorContextPack,
-    SupervisorProposal,
-    SupervisorProposalFailure, SupervisorProposalFailureStage, SupervisorProposalRecord,
-    SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorReasonerUsage,
-    SupervisorTurnDecision, SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus,
-    SupervisorTurnProposalKind, ThreadMetadata, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
-    WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, Workstream,
-    WorkstreamStatus,
+    SupervisorProposal, SupervisorProposalFailure, SupervisorProposalFailureStage,
+    SupervisorProposalRecord, SupervisorProposalStatus, SupervisorProposalTriggerKind,
+    SupervisorReasonerUsage, SupervisorTurnDecision, SupervisorTurnDecisionKind,
+    SupervisorTurnDecisionStatus, SupervisorTurnProposalKind, ThreadMetadata, WorkUnit,
+    WorkUnitStatus, Worker, WorkerSession, WorkerSessionAttachability, WorkerSessionRuntimeStatus,
+    WorkerStatus, Workstream, WorkstreamStatus,
 };
 
 use crate::assignment_comm::parse::parse_worker_report_for_turn;
@@ -442,10 +441,16 @@ impl OrcasDaemonService {
         work_unit_id: &str,
         now: DateTime<Utc>,
     ) -> bool {
+        // Runtime sync is intentionally narrow. Execution may reflect status,
+        // evidence, assignment linkage, and current focus progression, but it
+        // may not mutate plan structure, priorities, constraints, or policy.
         let Some(work_unit) = collaboration.work_units.get(work_unit_id).cloned() else {
             return false;
         };
-        let Some(plan) = collaboration.planning.active_plan_mut(&work_unit.workstream_id) else {
+        let Some(plan) = collaboration
+            .planning
+            .active_plan_mut(&work_unit.workstream_id)
+        else {
             return false;
         };
 
@@ -519,6 +524,86 @@ impl OrcasDaemonService {
             plan.updated_by = "daemon_execution".to_string();
         }
         changed
+    }
+
+    fn ensure_plan_item_for_work_unit(
+        collaboration: &mut CollaborationState,
+        work_unit_id: &str,
+        now: DateTime<Utc>,
+        updated_by: &str,
+    ) -> bool {
+        let Some(work_unit) = collaboration.work_units.get(work_unit_id).cloned() else {
+            return false;
+        };
+        let Some(plan) = collaboration
+            .planning
+            .active_plan_mut(&work_unit.workstream_id)
+        else {
+            return false;
+        };
+        if plan
+            .plan_items
+            .iter()
+            .any(|item| item.linked_work_unit_id.as_deref() == Some(work_unit_id))
+        {
+            return false;
+        }
+        let Some(goal_id) = plan.goals.first().map(|goal| goal.goal_id.clone()) else {
+            return false;
+        };
+        let dependency_item_ids = work_unit
+            .dependencies
+            .iter()
+            .filter_map(|dependency_work_unit_id| {
+                plan.plan_items
+                    .iter()
+                    .find(|item| {
+                        item.linked_work_unit_id.as_deref()
+                            == Some(dependency_work_unit_id.as_str())
+                    })
+                    .map(|item| item.item_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let status = match work_unit.status {
+            WorkUnitStatus::Ready | WorkUnitStatus::AwaitingDecision => {
+                orcas_core::planning::PlanItemStatus::Pending
+            }
+            WorkUnitStatus::Running => orcas_core::planning::PlanItemStatus::InProgress,
+            WorkUnitStatus::Blocked | WorkUnitStatus::NeedsHuman => {
+                orcas_core::planning::PlanItemStatus::Blocked
+            }
+            WorkUnitStatus::Accepted | WorkUnitStatus::Completed => {
+                orcas_core::planning::PlanItemStatus::Done
+            }
+        };
+        let item = orcas_core::planning::PlanItem {
+            item_id: PlanItemId::parse(format!("item-{}", Uuid::now_v7().simple()))
+                .expect("generated plan item id"),
+            goal_id,
+            title: work_unit.title.clone(),
+            purpose: Some(work_unit.task_statement.clone()),
+            priority: "normal".to_string(),
+            status,
+            acceptance_criteria: Vec::new(),
+            dependency_item_ids,
+            notes: None,
+            linked_work_unit_id: Some(work_unit.id.clone()),
+            linked_assignment_ids: work_unit
+                .current_assignment_id
+                .clone()
+                .into_iter()
+                .collect(),
+            evidence_refs: work_unit.latest_report_id.clone().into_iter().collect(),
+        };
+        plan.plan_items.push(item.clone());
+        if plan.current_focus_item_id.is_none()
+            && !matches!(item.status, orcas_core::planning::PlanItemStatus::Done)
+        {
+            plan.current_focus_item_id = Some(item.item_id.clone());
+        }
+        plan.updated_at = now;
+        plan.updated_by = updated_by.to_string();
+        true
     }
 
     fn spawn_codex_event_bridge(self: &Arc<Self>) {
@@ -1672,6 +1757,12 @@ impl OrcasDaemonService {
                 "daemon_bootstrap",
                 now,
             );
+            let _ = Self::ensure_plan_item_for_work_unit(
+                &mut state.collaboration,
+                &work_unit.id,
+                now,
+                "daemon_bootstrap",
+            );
             let workstream = state
                 .collaboration
                 .workstreams
@@ -2238,7 +2329,7 @@ impl OrcasDaemonService {
                     "unknown authority tracked thread `{}`",
                     params.tracked_thread_id
                 ))
-        })?;
+            })?;
         Ok(ipc::AuthorityTrackedThreadGetResponse { tracked_thread })
     }
 
@@ -2305,14 +2396,11 @@ impl OrcasDaemonService {
             .cloned()
             .collect::<Vec<_>>();
         assessments.sort_by(|left, right| {
-            right
-                .created_at
-                .cmp(&left.created_at)
-                .then_with(|| {
-                    left.assessment_id
-                        .as_str()
-                        .cmp(right.assessment_id.as_str())
-                })
+            right.created_at.cmp(&left.created_at).then_with(|| {
+                left.assessment_id
+                    .as_str()
+                    .cmp(right.assessment_id.as_str())
+            })
         });
         if let Some(limit) = params.limit {
             assessments.truncate(limit);
@@ -2338,8 +2426,7 @@ impl OrcasDaemonService {
                     .unwrap_or(true)
             })
             .filter(|proposal| {
-                params.include_closed
-                    || proposal.status == PlanRevisionProposalStatus::Pending
+                params.include_closed || proposal.status == PlanRevisionProposalStatus::Pending
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -5350,11 +5437,8 @@ impl OrcasDaemonService {
         }
 
         let mut proposal_model = result.proposal;
-        let plan_assessment = Self::build_plan_assessment(
-            &context_pack,
-            &proposal_model,
-            &request.requested_by,
-        )?;
+        let plan_assessment =
+            Self::build_plan_assessment(&context_pack, &proposal_model, &request.requested_by)?;
         if let Some(revision) = proposal_model.plan_revision_proposal.as_mut() {
             revision.source_supervisor_proposal_id = Some(proposal_id.clone());
         }
@@ -5978,9 +6062,15 @@ impl OrcasDaemonService {
         PlanExecutionKind,
         Option<String>,
     )> {
-        let workstream_plan = collaboration.planning.active_plan(&work_unit.workstream_id);
-        let mut resolved_plan_id = inherited.and_then(|assignment| assignment.plan_id.clone());
-        let mut resolved_plan_version = inherited.and_then(|assignment| assignment.plan_version);
+        let workstream_plan = collaboration
+            .planning
+            .active_plan(&work_unit.workstream_id)
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!(
+                    "work unit `{}` does not have an active workstream plan",
+                    work_unit.id
+                ))
+            })?;
         let mut resolved_plan_item_id =
             inherited.and_then(|assignment| assignment.plan_item_id.clone());
         let resolved_execution_kind = inherited
@@ -5990,8 +6080,7 @@ impl OrcasDaemonService {
             .or_else(|| inherited.and_then(|assignment| assignment.alignment_rationale.clone()));
 
         if let Some(plan_version) = plan_version
-            && let Some(plan) = workstream_plan
-            && plan.version != plan_version
+            && workstream_plan.version != plan_version
         {
             return Err(OrcasError::Protocol(format!(
                 "assignment referenced stale plan version {} for workstream `{}`",
@@ -5999,38 +6088,48 @@ impl OrcasDaemonService {
             )));
         }
 
-        if let Some(plan_id) = plan_id {
+        let (resolved_plan_id, resolved_plan_version) = if let Some(plan_id) = plan_id {
             let parsed = PlanId::parse(plan_id)?;
-            if let Some(plan) = workstream_plan {
-                if plan.plan_id != parsed {
-                    return Err(OrcasError::Protocol(format!(
-                        "assignment referenced stale plan `{}` for workstream `{}`",
-                        parsed, work_unit.workstream_id
-                    )));
-                }
-                resolved_plan_version = Some(plan.version);
-                if plan_item_id.is_none()
-                    && matches!(resolved_execution_kind, orcas_core::PlanExecutionKind::DirectExecution)
-                {
-                    resolved_plan_item_id =
-                        plan.active_focus_item().map(|item| item.item_id.clone());
-                }
+            if workstream_plan.plan_id != parsed {
+                return Err(OrcasError::Protocol(format!(
+                    "assignment referenced stale plan `{}` for workstream `{}`",
+                    parsed, work_unit.workstream_id
+                )));
             }
-            resolved_plan_id = Some(parsed);
-        } else if let Some(plan) = workstream_plan {
-            resolved_plan_id = Some(plan.plan_id.clone());
-            resolved_plan_version = Some(plan.version);
             if plan_item_id.is_none()
-                && matches!(resolved_execution_kind, orcas_core::PlanExecutionKind::DirectExecution)
+                && matches!(
+                    resolved_execution_kind,
+                    orcas_core::PlanExecutionKind::DirectExecution
+                )
             {
-                resolved_plan_item_id = plan.active_focus_item().map(|item| item.item_id.clone());
+                resolved_plan_item_id = workstream_plan
+                    .active_focus_item()
+                    .map(|item| item.item_id.clone());
             }
-        }
+            (Some(parsed), Some(workstream_plan.version))
+        } else {
+            if plan_item_id.is_none()
+                && matches!(
+                    resolved_execution_kind,
+                    orcas_core::PlanExecutionKind::DirectExecution
+                )
+            {
+                resolved_plan_item_id = workstream_plan
+                    .active_focus_item()
+                    .map(|item| item.item_id.clone());
+            }
+            (
+                Some(workstream_plan.plan_id.clone()),
+                Some(workstream_plan.version),
+            )
+        };
 
         if let Some(plan_item_id) = plan_item_id {
             let parsed = PlanItemId::parse(plan_item_id)?;
-            if let Some(plan) = workstream_plan
-                && !plan.plan_items.iter().any(|item| item.item_id == parsed)
+            if !workstream_plan
+                .plan_items
+                .iter()
+                .any(|item| item.item_id == parsed)
             {
                 return Err(OrcasError::Protocol(format!(
                     "assignment referenced unknown plan item `{}`",
@@ -6040,26 +6139,23 @@ impl OrcasDaemonService {
             resolved_plan_item_id = Some(parsed);
         }
 
-        if resolved_plan_id.is_some()
-            && resolved_plan_version.is_none()
-            && let Some(plan) = workstream_plan
+        if matches!(resolved_execution_kind, PlanExecutionKind::DirectExecution)
+            && resolved_plan_item_id.is_none()
         {
-            resolved_plan_version = Some(plan.version);
+            return Err(OrcasError::Protocol(format!(
+                "direct execution assignment for work unit `{}` must resolve to a plan item",
+                work_unit.id
+            )));
         }
         if resolved_plan_id.is_some() && resolved_alignment_rationale.is_none() {
             resolved_alignment_rationale = Some(match resolved_plan_item_id.as_ref() {
                 Some(plan_item_id) => format!(
                     "linked to workstream plan `{}` item `{}`",
-                    workstream_plan
-                        .map(|plan| plan.plan_id.to_string())
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    plan_item_id
+                    workstream_plan.plan_id, plan_item_id
                 ),
                 None => format!(
                     "linked to workstream plan `{}` for {}",
-                    workstream_plan
-                        .map(|plan| plan.plan_id.to_string())
-                        .unwrap_or_else(|| "unknown".to_string()),
+                    workstream_plan.plan_id,
                     match resolved_execution_kind {
                         PlanExecutionKind::PlanBootstrap => "plan bootstrap",
                         PlanExecutionKind::PlanReview => "plan review",
@@ -6089,8 +6185,9 @@ impl OrcasDaemonService {
             return Ok(None);
         };
         let source = proposal.plan_assessment.as_ref();
-        let alignment_status = source.map(|assessment| assessment.alignment_status).unwrap_or_else(
-            || {
+        let alignment_status = source
+            .map(|assessment| assessment.alignment_status)
+            .unwrap_or_else(|| {
                 if proposal.proposed_decision.decision_type == DecisionType::EscalateToHuman {
                     orcas_core::planning::AlignmentStatus::Blocked
                 } else if proposal.plan_revision_proposal.is_some() {
@@ -6100,8 +6197,7 @@ impl OrcasDaemonService {
                 } else {
                     orcas_core::planning::AlignmentStatus::OnTrack
                 }
-            },
-        );
+            });
         let drift_risk = source
             .map(|assessment| assessment.drift_risk)
             .unwrap_or_else(|| match alignment_status {
@@ -6318,7 +6414,8 @@ impl OrcasDaemonService {
             return Err(error);
         }
 
-        if let Some(revision_proposal) = approved_proposal.plan_revision_proposal.as_ref() {
+        let approved_plan_revision = approved_proposal.plan_revision_proposal.clone();
+        if let Some(revision_proposal) = approved_plan_revision.as_ref() {
             let now = Utc::now();
             let mut state = self.state.write().await;
             if !state
@@ -6335,7 +6432,7 @@ impl OrcasDaemonService {
                     .planning
                     .propose_revision(pending_revision)?;
             }
-            state.collaboration.planning.approve_revision(
+            state.collaboration.planning.begin_apply_revision(
                 &revision_proposal.proposal_id,
                 reviewed_by.clone(),
                 params.review_note.clone(),
@@ -6372,9 +6469,7 @@ impl OrcasDaemonService {
             } else {
                 (None, None, None, None)
             };
-        let approved_plan_revision = approved_proposal.plan_revision_proposal.clone();
-
-        let decision_response = self
+        let decision_response = match self
             .decision_apply_with_seed(
                 ipc::DecisionApplyRequest {
                     work_unit_id: proposal.primary_work_unit_id.clone(),
@@ -6387,29 +6482,81 @@ impl OrcasDaemonService {
                 },
                 communication_seed,
             )
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(revision) = approved_plan_revision.as_ref() {
+                    let now = Utc::now();
+                    let mut state = self.state.write().await;
+                    let _ = state.collaboration.planning.fail_apply_revision(
+                        &revision.proposal_id,
+                        reviewed_by.clone(),
+                        params.review_note.clone(),
+                        format!("Downstream decision application failed: {error}"),
+                        now,
+                    );
+                    drop(state);
+                    self.persist_collaboration_state().await?;
+                }
+                return Err(error);
+            }
+        };
 
-        let applied_plan_revision = if let Some(revision) = approved_plan_revision.as_ref() {
+        let mut plan_revision_finalize_error = None;
+        let persisted_plan_revision = if let Some(revision) = approved_plan_revision.as_ref() {
             let now = Utc::now();
             let mut state = self.state.write().await;
-            Some(state.collaboration.planning.approve_revision(
+            match state.collaboration.planning.complete_apply_revision(
                 &revision.proposal_id,
                 reviewed_by.clone(),
                 params.review_note.clone(),
                 now,
-            )?)
+            ) {
+                Ok(_applied_plan) => state
+                    .collaboration
+                    .planning
+                    .revision_proposals
+                    .get(revision.proposal_id.as_str())
+                    .cloned(),
+                Err(error) => {
+                    let error_text = error.to_string();
+                    if matches!(
+                        state
+                            .collaboration
+                            .planning
+                            .revision_proposals
+                            .get(revision.proposal_id.as_str())
+                            .map(|proposal| proposal.status),
+                        Some(PlanRevisionProposalStatus::Applying)
+                    ) {
+                        let _ = state.collaboration.planning.fail_apply_revision(
+                            &revision.proposal_id,
+                            reviewed_by.clone(),
+                            params.review_note.clone(),
+                            error_text.clone(),
+                            now,
+                        );
+                    }
+                    plan_revision_finalize_error = Some(error_text);
+                    state
+                        .collaboration
+                        .planning
+                        .revision_proposals
+                        .get(revision.proposal_id.as_str())
+                        .cloned()
+                }
+            }
         } else {
             None
         };
-        if let Some(applied_plan) = applied_plan_revision.as_ref()
-            && let Some(revision) = approved_proposal.plan_revision_proposal.as_mut()
+        if approved_plan_revision.is_some() {
+            self.persist_collaboration_state().await?;
+        }
+        if let Some(revision) = approved_proposal.plan_revision_proposal.as_mut()
+            && let Some(persisted_revision) = persisted_plan_revision
         {
-            revision.status = PlanRevisionProposalStatus::Applied;
-            revision.reviewed_at = Some(Utc::now());
-            revision.reviewed_by = Some(reviewed_by.clone());
-            revision.review_note = params.review_note.clone();
-            revision.applied_plan_id = Some(applied_plan.plan_id.clone());
-            revision.applied_plan_version = Some(applied_plan.version);
+            *revision = persisted_revision;
         }
 
         let (updated_proposal, sibling_updates) = {
@@ -6443,12 +6590,19 @@ impl OrcasDaemonService {
                 .ok_or_else(|| {
                     OrcasError::Protocol(format!("unknown proposal `{}`", proposal.id))
                 })?;
+            let final_review_note = match plan_revision_finalize_error.as_ref() {
+                Some(error) => Some(match params.review_note.as_ref() {
+                    Some(note) => format!("{note}\nPlan revision apply outcome: {error}"),
+                    None => format!("Plan revision apply outcome: {error}"),
+                }),
+                None => params.review_note.clone(),
+            };
             proposal_record.status = SupervisorProposalStatus::Approved;
             proposal_record.approval_edits = Some(params.edits.clone());
             proposal_record.approved_proposal = Some(approved_proposal);
             proposal_record.reviewed_at = Some(Utc::now());
             proposal_record.reviewed_by = Some(reviewed_by);
-            proposal_record.review_note = params.review_note.clone();
+            proposal_record.review_note = final_review_note;
             proposal_record.approved_decision_id = Some(decision_response.decision.id.clone());
             proposal_record.approved_assignment_id = decision_response
                 .next_assignment
@@ -6571,17 +6725,13 @@ impl OrcasDaemonService {
                     proposal_record.review_note.clone(),
                 )
             };
-            if let Some(revision_proposal_id) = revision_proposal_id
-                && let Some(pending_revision) = state
-                    .collaboration
-                    .planning
-                    .revision_proposals
-                    .get_mut(revision_proposal_id.as_str())
-            {
-                pending_revision.status = PlanRevisionProposalStatus::Rejected;
-                pending_revision.reviewed_at = reviewed_at;
-                pending_revision.reviewed_by = reviewed_by_value;
-                pending_revision.review_note = review_note;
+            if let Some(revision_proposal_id) = revision_proposal_id {
+                let _ = state.collaboration.planning.reject_revision(
+                    &revision_proposal_id,
+                    reviewed_by_value.unwrap_or_else(|| reviewed_by.clone()),
+                    review_note,
+                    reviewed_at.unwrap_or_else(Utc::now),
+                );
             }
             proposal
         };
@@ -7146,6 +7296,31 @@ impl OrcasDaemonService {
             .collaboration
             .authority_work_unit_bridges
             .insert(authority_work_unit.id.to_string());
+        let bridged_workstream = state
+            .collaboration
+            .workstreams
+            .get(&authority_workstream.id.to_string())
+            .cloned()
+            .expect("bridged workstream");
+        let bridged_work_units = state
+            .collaboration
+            .work_units
+            .values()
+            .filter(|work_unit| work_unit.workstream_id == authority_workstream.id.to_string())
+            .cloned()
+            .collect::<Vec<_>>();
+        let _ = state.collaboration.planning.bootstrap_workstream(
+            &bridged_workstream,
+            &bridged_work_units,
+            "daemon_bootstrap",
+            Utc::now(),
+        );
+        let _ = Self::ensure_plan_item_for_work_unit(
+            &mut state.collaboration,
+            work_unit_id,
+            Utc::now(),
+            "daemon_bootstrap",
+        );
         Ok(())
     }
 
@@ -10861,13 +11036,13 @@ mod tests {
         AssignmentStatus, CodexThreadAssignmentStatus, CodexThreadBootstrapState,
         CollaborationState, DecisionType, DraftAssignment, EventEnvelope, ImplementModeSpec,
         JsonSessionStore, OrcasError, OrcasEvent, OrcasResult, OrcasSessionStore,
-        ProposedDecision, Report, ReportConfidence, ReportDisposition,
-        ReportParseResult, SupervisorContextPack, SupervisorProposal, SupervisorProposalEdits,
-        SupervisorProposalFailureStage, SupervisorProposalStatus, SupervisorProposalTriggerKind,
-        SupervisorSummary, SupervisorTurnDecision, SupervisorTurnDecisionKind,
-        SupervisorTurnDecisionStatus, SupervisorTurnProposalKind, WorkUnit, WorkUnitStatus,
-        WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, Workstream,
-        WorkstreamStatus, ipc,
+        PlanExecutionKind, PlanRevisionProposalStatus, ProposedDecision, Report, ReportConfidence,
+        ReportDisposition, ReportParseResult, SupervisorContextPack, SupervisorProposal,
+        SupervisorProposalEdits, SupervisorProposalFailureStage, SupervisorProposalStatus,
+        SupervisorProposalTriggerKind, SupervisorSummary, SupervisorTurnDecision,
+        SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus, SupervisorTurnProposalKind,
+        WorkUnit, WorkUnitStatus, WorkerSessionAttachability, WorkerSessionRuntimeStatus,
+        WorkerStatus, Workstream, WorkstreamStatus, ipc,
     };
 
     #[derive(Debug)]
@@ -12233,6 +12408,18 @@ mod tests {
             let now = Utc::now();
             let worker_id = format!("worker-manual-{label}");
             let mut state = service.state.write().await;
+            let active_plan = state
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan");
+            let plan_item_id = active_plan
+                .plan_items
+                .iter()
+                .find(|item| item.linked_work_unit_id.as_deref() == Some(work_unit.id.as_str()))
+                .map(|item| item.item_id.clone())
+                .expect("plan item for work unit");
             let worker_session_id = OrcasDaemonService::select_worker_session_for_assignment(
                 &mut state.collaboration,
                 &worker_id,
@@ -12241,11 +12428,14 @@ mod tests {
             let assignment = Assignment {
                 id: OrcasDaemonService::new_object_id("assignment"),
                 work_unit_id: work_unit.id.clone(),
-                plan_id: None,
-                plan_version: None,
-                plan_item_id: None,
+                plan_id: Some(active_plan.plan_id.clone()),
+                plan_version: Some(active_plan.version),
+                plan_item_id: Some(plan_item_id),
                 execution_kind: orcas_core::PlanExecutionKind::DirectExecution,
-                alignment_rationale: None,
+                alignment_rationale: Some(format!(
+                    "linked to workstream plan `{}` item for `{}`",
+                    active_plan.plan_id, work_unit.id
+                )),
                 worker_id: worker_id.clone(),
                 worker_session_id: worker_session_id.clone(),
                 instructions: "Review the current result and report back.".to_string(),
@@ -12662,14 +12852,39 @@ ORCAS_REPORT_END"#
             created_at: now,
             updated_at: now,
         };
+        let mut collaboration = CollaborationState::default();
+        collaboration
+            .workstreams
+            .insert(workstream.id.clone(), workstream.clone());
+        collaboration
+            .work_units
+            .insert(work_unit.id.clone(), work_unit.clone());
+        collaboration
+            .planning
+            .bootstrap_workstream(&workstream, &[work_unit.clone()], "tester", now)
+            .expect("bootstrap plan");
+        let active_plan = collaboration
+            .planning
+            .active_plan(&workstream.id)
+            .cloned()
+            .expect("active plan");
+        let plan_item_id = active_plan
+            .plan_items
+            .iter()
+            .find(|item| item.linked_work_unit_id.as_deref() == Some(work_unit.id.as_str()))
+            .map(|item| item.item_id.clone())
+            .expect("plan item");
         let assignment = Assignment {
             id: "assignment-parse".to_string(),
             work_unit_id: work_unit.id.clone(),
-            plan_id: None,
-            plan_version: None,
-            plan_item_id: None,
+            plan_id: Some(active_plan.plan_id.clone()),
+            plan_version: Some(active_plan.version),
+            plan_item_id: Some(plan_item_id),
             execution_kind: orcas_core::PlanExecutionKind::DirectExecution,
-            alignment_rationale: None,
+            alignment_rationale: Some(format!(
+                "linked to workstream plan `{}` item for `{}`",
+                active_plan.plan_id, work_unit.id
+            )),
             worker_id: "worker-parse".to_string(),
             worker_session_id: "session-parse".to_string(),
             instructions: "Implement the bounded task and report honestly.".to_string(),
@@ -12683,13 +12898,6 @@ ORCAS_REPORT_END"#
             created_at: now,
             updated_at: now,
         };
-        let mut collaboration = CollaborationState::default();
-        collaboration
-            .workstreams
-            .insert(workstream.id.clone(), workstream);
-        collaboration
-            .work_units
-            .insert(work_unit.id.clone(), work_unit);
         collaboration
             .assignments
             .insert(assignment.id.clone(), assignment.clone());
@@ -13644,11 +13852,11 @@ ORCAS_REPORT_END"#
             let successor = Assignment {
                 id: format!("assignment-{}", Uuid::new_v4().simple()),
                 work_unit_id: work_unit.id.clone(),
-                plan_id: None,
-                plan_version: None,
-                plan_item_id: None,
+                plan_id: assignment.plan_id.clone(),
+                plan_version: assignment.plan_version,
+                plan_item_id: assignment.plan_item_id.clone(),
                 execution_kind: orcas_core::PlanExecutionKind::DirectExecution,
-                alignment_rationale: None,
+                alignment_rationale: assignment.alignment_rationale.clone(),
                 worker_id: assignment.worker_id.clone(),
                 worker_session_id: assignment.worker_session_id.clone(),
                 instructions: "manual replacement".to_string(),
@@ -14119,6 +14327,506 @@ ORCAS_REPORT_END"#
             reject_after_approve
                 .to_string()
                 .contains("is not open and cannot be rejected")
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_approve_applies_plan_revision_in_second_phase() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "revision-apply").await;
+        let active_plan = service
+            .state
+            .read()
+            .await
+            .collaboration
+            .planning
+            .active_plan(&workstream.id)
+            .cloned()
+            .expect("active plan");
+        let mut proposal = sample_proposal_for_decision(
+            DecisionType::Continue,
+            &work_unit.id,
+            &report.id,
+            &assignment.id,
+            &assignment.worker_id,
+        );
+        proposal.plan_revision_proposal = Some(orcas_core::planning::PlanRevisionProposal {
+            proposal_id: orcas_core::planning::PlanRevisionProposalId::parse(
+                "proposal-revision-apply",
+            )
+            .expect("proposal id"),
+            workstream_id: workstream.id.clone(),
+            base_plan_id: active_plan.plan_id.clone(),
+            base_plan_version: active_plan.version,
+            rationale: "Tighten the canonical constraints.".to_string(),
+            urgency: "medium".to_string(),
+            expected_benefit: "Make the approved boundary explicit.".to_string(),
+            tradeoffs: vec!["minor churn".to_string()],
+            ops: vec![orcas_core::planning::PlanRevisionOp::UpdateConstraints {
+                constraints: vec!["keep the follow-up bounded".to_string()],
+            }],
+            status: PlanRevisionProposalStatus::Pending,
+            created_at: Utc::now(),
+            created_by: "tester".to_string(),
+            reviewed_at: None,
+            reviewed_by: None,
+            review_note: None,
+            apply_started_at: None,
+            apply_finished_at: None,
+            apply_error: None,
+            applied_plan_id: None,
+            applied_plan_version: None,
+            source_supervisor_proposal_id: None,
+        });
+        reasoner.set_proposal(proposal).await;
+
+        let created = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect("proposal create")
+            .proposal;
+        let _ = approve_proposal(&service, &created.id, SupervisorProposalEdits::default()).await;
+
+        let state = service.state.read().await;
+        let revision = state
+            .collaboration
+            .planning
+            .revision_proposals
+            .get("proposal-revision-apply")
+            .expect("persisted revision");
+        assert_eq!(revision.status, PlanRevisionProposalStatus::Applied);
+        assert!(revision.apply_started_at.is_some());
+        assert!(revision.apply_finished_at.is_some());
+        let updated_plan = state
+            .collaboration
+            .planning
+            .active_plan(&workstream.id)
+            .expect("updated plan");
+        assert_eq!(updated_plan.version, active_plan.version + 1);
+        assert_eq!(
+            updated_plan.constraints,
+            vec!["keep the follow-up bounded".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_approve_marks_revision_apply_failed_when_decision_apply_fails() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "revision-fail").await;
+        let active_plan = service
+            .state
+            .read()
+            .await
+            .collaboration
+            .planning
+            .active_plan(&workstream.id)
+            .cloned()
+            .expect("active plan");
+        let mut proposal = sample_proposal_for_decision(
+            DecisionType::Continue,
+            &work_unit.id,
+            &report.id,
+            &assignment.id,
+            &assignment.worker_id,
+        );
+        proposal.plan_revision_proposal = Some(orcas_core::planning::PlanRevisionProposal {
+            proposal_id: orcas_core::planning::PlanRevisionProposalId::parse(
+                "proposal-revision-fail",
+            )
+            .expect("proposal id"),
+            workstream_id: workstream.id.clone(),
+            base_plan_id: active_plan.plan_id.clone(),
+            base_plan_version: active_plan.version,
+            rationale: "Tighten the canonical constraints.".to_string(),
+            urgency: "medium".to_string(),
+            expected_benefit: "Make the approved boundary explicit.".to_string(),
+            tradeoffs: vec!["minor churn".to_string()],
+            ops: vec![orcas_core::planning::PlanRevisionOp::UpdateConstraints {
+                constraints: vec!["keep the follow-up bounded".to_string()],
+            }],
+            status: PlanRevisionProposalStatus::Pending,
+            created_at: Utc::now(),
+            created_by: "tester".to_string(),
+            reviewed_at: None,
+            reviewed_by: None,
+            review_note: None,
+            apply_started_at: None,
+            apply_finished_at: None,
+            apply_error: None,
+            applied_plan_id: None,
+            applied_plan_version: None,
+            source_supervisor_proposal_id: None,
+        });
+        reasoner.set_proposal(proposal).await;
+
+        let created = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect("proposal create")
+            .proposal;
+        {
+            let mut state = service.state.write().await;
+            state.collaboration.assignments.remove(&assignment.id);
+        }
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist broken state");
+
+        let error = service
+            .proposal_approve(ipc::ProposalApproveRequest {
+                proposal_id: created.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("approved".to_string()),
+                edits: SupervisorProposalEdits::default(),
+            })
+            .await
+            .expect_err("approval should fail when decision apply fails");
+        assert!(
+            error
+                .to_string()
+                .contains("continue/redirect requires an existing assignment")
+        );
+
+        let state = service.state.read().await;
+        let revision = state
+            .collaboration
+            .planning
+            .revision_proposals
+            .get("proposal-revision-fail")
+            .expect("persisted failed revision");
+        assert_eq!(revision.status, PlanRevisionProposalStatus::ApplyFailed);
+        assert!(
+            revision
+                .apply_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Downstream decision application failed")
+        );
+        assert_eq!(
+            state
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .map(|plan| plan.version),
+            Some(active_plan.version)
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_approve_rejects_stale_plan_revision_base() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "revision-stale").await;
+        let active_plan = service
+            .state
+            .read()
+            .await
+            .collaboration
+            .planning
+            .active_plan(&workstream.id)
+            .cloned()
+            .expect("active plan");
+        let mut proposal = sample_proposal_for_decision(
+            DecisionType::Continue,
+            &work_unit.id,
+            &report.id,
+            &assignment.id,
+            &assignment.worker_id,
+        );
+        proposal.plan_revision_proposal = Some(orcas_core::planning::PlanRevisionProposal {
+            proposal_id: orcas_core::planning::PlanRevisionProposalId::parse(
+                "proposal-revision-stale",
+            )
+            .expect("proposal id"),
+            workstream_id: workstream.id.clone(),
+            base_plan_id: active_plan.plan_id.clone(),
+            base_plan_version: active_plan.version,
+            rationale: "Tighten the canonical constraints.".to_string(),
+            urgency: "medium".to_string(),
+            expected_benefit: "Make the approved boundary explicit.".to_string(),
+            tradeoffs: vec!["minor churn".to_string()],
+            ops: vec![orcas_core::planning::PlanRevisionOp::UpdateConstraints {
+                constraints: vec!["keep the follow-up bounded".to_string()],
+            }],
+            status: PlanRevisionProposalStatus::Pending,
+            created_at: Utc::now(),
+            created_by: "tester".to_string(),
+            reviewed_at: None,
+            reviewed_by: None,
+            review_note: None,
+            apply_started_at: None,
+            apply_finished_at: None,
+            apply_error: None,
+            applied_plan_id: None,
+            applied_plan_version: None,
+            source_supervisor_proposal_id: None,
+        });
+        reasoner.set_proposal(proposal).await;
+
+        let created = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect("proposal create")
+            .proposal;
+        {
+            let now = Utc::now();
+            let mut state = service.state.write().await;
+            let plans = state
+                .collaboration
+                .planning
+                .workstream_plans
+                .get_mut(&workstream.id)
+                .expect("plan series");
+            let previous = plans.last_mut().expect("active plan");
+            previous.status = orcas_core::planning::PlanStatus::Superseded;
+            previous.superseded_by_plan_id =
+                Some(orcas_core::PlanId::parse("plan-stale-next").expect("plan id"));
+            let mut next = previous.clone();
+            next.plan_id = orcas_core::PlanId::parse("plan-stale-next").expect("plan id");
+            next.version += 1;
+            next.status = orcas_core::planning::PlanStatus::Active;
+            next.updated_at = now;
+            next.updated_by = "tester".to_string();
+            next.superseded_by_plan_id = None;
+            plans.push(next);
+        }
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist stale base");
+
+        let error = service
+            .proposal_approve(ipc::ProposalApproveRequest {
+                proposal_id: created.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("approved".to_string()),
+                edits: SupervisorProposalEdits::default(),
+            })
+            .await
+            .expect_err("stale base should fail approval");
+        assert!(error.to_string().contains("is stale"));
+
+        let state = service.state.read().await;
+        let revision = state
+            .collaboration
+            .planning
+            .revision_proposals
+            .get("proposal-revision-stale")
+            .expect("persisted revision");
+        assert_eq!(revision.status, PlanRevisionProposalStatus::Superseded);
+    }
+
+    #[tokio::test]
+    async fn prepare_assignment_rejects_direct_execution_without_resolved_plan_item() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner).await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Direct execution invariant".to_string(),
+                objective: "Reject orphaned direct execution assignments".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: "Work unit".to_string(),
+                task_statement: "Do one bounded thing.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        {
+            let mut state = service.state.write().await;
+            let plan = state
+                .collaboration
+                .planning
+                .active_plan_mut(&workstream.id)
+                .expect("active plan");
+            plan.plan_items.clear();
+            plan.current_focus_item_id = None;
+        }
+
+        let error = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-invariant".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Keep this bounded".to_string()),
+                model: None,
+                cwd: None,
+                ..Default::default()
+            })
+            .await
+            .expect_err("direct execution should require a plan item");
+        assert!(error.to_string().contains("must resolve to a plan item"));
+    }
+
+    #[tokio::test]
+    async fn prepare_assignment_allows_special_execution_without_plan_item() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner).await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Special execution invariant".to_string(),
+                objective: "Allow non-direct execution without a plan item".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: "Work unit".to_string(),
+                task_statement: "Review the plan.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        {
+            let mut state = service.state.write().await;
+            let plan = state
+                .collaboration
+                .planning
+                .active_plan_mut(&workstream.id)
+                .expect("active plan");
+            plan.plan_items.clear();
+            plan.current_focus_item_id = None;
+        }
+
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-special".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Review only the canonical plan".to_string()),
+                model: None,
+                cwd: None,
+                execution_kind: PlanExecutionKind::PlanReview,
+                ..Default::default()
+            })
+            .await
+            .expect("plan review assignment");
+        assert_eq!(
+            prepared.assignment.execution_kind,
+            PlanExecutionKind::PlanReview
+        );
+        assert!(prepared.assignment.plan_id.is_some());
+        assert!(prepared.assignment.plan_version.is_some());
+        assert!(prepared.assignment.plan_item_id.is_none());
+    }
+
+    #[test]
+    fn runtime_plan_sync_only_updates_status_and_focus() {
+        let now = Utc::now();
+        let mut collaboration = CollaborationState::default();
+        let workstream = Workstream {
+            id: "ws-sync".to_string(),
+            title: "Sync".to_string(),
+            objective: "Check runtime sync boundaries.".to_string(),
+            status: WorkstreamStatus::Active,
+            priority: "normal".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let work_unit = WorkUnit {
+            id: "wu-sync".to_string(),
+            workstream_id: workstream.id.clone(),
+            title: "Bounded task".to_string(),
+            task_statement: "Keep status in sync only.".to_string(),
+            status: WorkUnitStatus::Ready,
+            dependencies: Vec::new(),
+            latest_report_id: None,
+            current_assignment_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        collaboration
+            .workstreams
+            .insert(workstream.id.clone(), workstream.clone());
+        collaboration
+            .work_units
+            .insert(work_unit.id.clone(), work_unit.clone());
+        collaboration
+            .planning
+            .bootstrap_workstream(&workstream, &[work_unit], "tester", now)
+            .expect("bootstrap plan");
+        let plan = collaboration
+            .planning
+            .active_plan_mut(&workstream.id)
+            .expect("active plan");
+        plan.constraints = vec!["do not change".to_string()];
+        plan.exploration_policy.mode = orcas_core::planning::ExplorationMode::Strict;
+        let work_unit = collaboration
+            .work_units
+            .get_mut("wu-sync")
+            .expect("work unit");
+        work_unit.status = WorkUnitStatus::Running;
+        work_unit.latest_report_id = Some("report-sync".to_string());
+        work_unit.current_assignment_id = Some("assignment-sync".to_string());
+
+        let changed = OrcasDaemonService::sync_plan_item_statuses_for_work_unit(
+            &mut collaboration,
+            "wu-sync",
+            now,
+        );
+        assert!(changed);
+        let plan = collaboration
+            .planning
+            .active_plan(&workstream.id)
+            .expect("active plan");
+        assert_eq!(plan.constraints, vec!["do not change".to_string()]);
+        assert_eq!(
+            plan.exploration_policy.mode,
+            orcas_core::planning::ExplorationMode::Strict
+        );
+        let item = plan
+            .plan_items
+            .iter()
+            .find(|item| item.linked_work_unit_id.as_deref() == Some("wu-sync"))
+            .expect("linked plan item");
+        assert_eq!(
+            item.status,
+            orcas_core::planning::PlanItemStatus::InProgress
+        );
+        assert!(
+            item.evidence_refs
+                .iter()
+                .any(|report_id| report_id == "report-sync")
+        );
+        assert!(
+            item.linked_assignment_ids
+                .iter()
+                .any(|assignment_id| assignment_id == "assignment-sync")
         );
     }
 
@@ -19965,11 +20673,13 @@ ORCAS_REPORT_END"#
         let assignment = Assignment {
             id: "assignment-legacy".to_string(),
             work_unit_id: work_unit.id.clone(),
-            plan_id: None,
-            plan_version: None,
-            plan_item_id: None,
+            plan_id: Some(orcas_core::PlanId::parse("plan-legacy").expect("plan id")),
+            plan_version: Some(1),
+            plan_item_id: Some(orcas_core::PlanItemId::parse("item-legacy").expect("plan item")),
             execution_kind: orcas_core::PlanExecutionKind::DirectExecution,
-            alignment_rationale: None,
+            alignment_rationale: Some(
+                "linked to workstream plan `plan-legacy` item `item-legacy`".to_string(),
+            ),
             worker_id: "worker-legacy".to_string(),
             worker_session_id: "session-legacy".to_string(),
             instructions: r#"Objective: Legacy objective
@@ -19993,10 +20703,56 @@ Boundedness note: Stay within the legacy compatibility boundary."#
         let mut collaboration = CollaborationState::default();
         collaboration
             .workstreams
-            .insert(workstream.id.clone(), workstream);
+            .insert(workstream.id.clone(), workstream.clone());
         collaboration
             .work_units
-            .insert(work_unit.id.clone(), work_unit);
+            .insert(work_unit.id.clone(), work_unit.clone());
+        collaboration.planning.workstream_plans.insert(
+            workstream.id.clone(),
+            vec![orcas_core::planning::WorkstreamPlan {
+                plan_id: orcas_core::PlanId::parse("plan-legacy").expect("plan id"),
+                workstream_id: workstream.id.clone(),
+                version: 1,
+                status: orcas_core::planning::PlanStatus::Active,
+                title: workstream.title.clone(),
+                overview: Some(workstream.objective.clone()),
+                goals: vec![orcas_core::planning::PlanGoal {
+                    goal_id: orcas_core::planning::PlanGoalId::parse("goal-legacy")
+                        .expect("goal id"),
+                    title: workstream.title.clone(),
+                    description: Some(workstream.objective.clone()),
+                    priority: workstream.priority.clone(),
+                    status: orcas_core::planning::PlanGoalStatus::InProgress,
+                }],
+                plan_items: vec![orcas_core::planning::PlanItem {
+                    item_id: orcas_core::PlanItemId::parse("item-legacy").expect("item id"),
+                    goal_id: orcas_core::planning::PlanGoalId::parse("goal-legacy")
+                        .expect("goal id"),
+                    title: work_unit.title.clone(),
+                    purpose: Some(work_unit.task_statement.clone()),
+                    priority: "normal".to_string(),
+                    status: orcas_core::planning::PlanItemStatus::Pending,
+                    acceptance_criteria: Vec::new(),
+                    dependency_item_ids: Vec::new(),
+                    notes: None,
+                    linked_work_unit_id: Some(work_unit.id.clone()),
+                    linked_assignment_ids: vec![assignment.id.clone()],
+                    evidence_refs: Vec::new(),
+                }],
+                success_criteria: Vec::new(),
+                constraints: Vec::new(),
+                exploration_policy: orcas_core::planning::ExplorationPolicy::default(),
+                current_focus_item_id: Some(
+                    orcas_core::PlanItemId::parse("item-legacy").expect("focus item"),
+                ),
+                created_at: now,
+                updated_at: now,
+                created_by: "tester".to_string(),
+                updated_by: "tester".to_string(),
+                superseded_by_plan_id: None,
+                source_revision_proposal_id: None,
+            }],
+        );
         collaboration
             .assignments
             .insert(assignment.id.clone(), assignment.clone());
@@ -20931,11 +21687,11 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             let duplicate_assignment = Assignment {
                 id: "assignment-dup".to_string(),
                 work_unit_id: work_unit.id.clone(),
-                plan_id: None,
-                plan_version: None,
-                plan_item_id: None,
+                plan_id: first.assignment.plan_id.clone(),
+                plan_version: first.assignment.plan_version,
+                plan_item_id: first.assignment.plan_item_id.clone(),
                 execution_kind: orcas_core::PlanExecutionKind::DirectExecution,
-                alignment_rationale: None,
+                alignment_rationale: first.assignment.alignment_rationale.clone(),
                 worker_id: "worker-a".to_string(),
                 worker_session_id: first.assignment.worker_session_id.clone(),
                 instructions: "duplicate".to_string(),
