@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use chrono::{TimeZone, Utc};
 use serde::de::DeserializeOwned;
@@ -2269,6 +2270,16 @@ impl OrcasDaemonService {
         turn_state: ipc::TurnStateView,
         raw_output: String,
     ) -> OrcasResult<(Report, Assignment, WorkUnit, Vec<SupervisorProposalRecord>)> {
+        let started_at = Instant::now();
+        info!(
+            assignment_id,
+            worker_id,
+            worker_session_id,
+            lifecycle = ?turn_state.lifecycle,
+            attachable = turn_state.attachable,
+            raw_output_len = raw_output.len(),
+            "recording assignment turn outcome"
+        );
         self.ensure_assignment_communication_record(assignment_id, None, None)
             .await?;
         let (assignment_for_parse, communication_record) = {
@@ -2392,6 +2403,19 @@ impl OrcasDaemonService {
             .get(&work_unit_id)
             .cloned()
             .ok_or_else(|| OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`")))?;
+        info!(
+            assignment_id,
+            worker_id,
+            worker_session_id,
+            work_unit_id = %work_unit_after_report.id,
+            report_id = %report.id,
+            parse_result = ?report.parse_result,
+            needs_supervisor_review = report.needs_supervisor_review,
+            disposition = ?report.disposition,
+            stale_proposal_count = stale_proposals.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "recorded assignment turn outcome"
+        );
         Ok((
             report,
             assignment_after_report,
@@ -4318,6 +4342,23 @@ impl OrcasDaemonService {
         request: ProposalGenerationRequest,
         duplicate_policy: ProposalDuplicatePolicy,
     ) -> OrcasResult<ProposalGenerationOutcome> {
+        let started_at = Instant::now();
+        let duplicate_policy_label = match duplicate_policy {
+            ProposalDuplicatePolicy::Manual {
+                supersede_open: false,
+            } => "manual_reject_duplicate",
+            ProposalDuplicatePolicy::Manual {
+                supersede_open: true,
+            } => "manual_supersede_open",
+            ProposalDuplicatePolicy::Auto => "auto",
+        };
+        info!(
+            work_unit_id = %request.work_unit_id,
+            source_report_id = request.source_report_id.as_deref().unwrap_or("latest"),
+            trigger_kind = ?request.trigger_kind,
+            duplicate_policy = duplicate_policy_label,
+            "starting supervisor proposal workflow"
+        );
         let prepared = self
             .prepare_proposal_generation(
                 &request.work_unit_id,
@@ -4328,6 +4369,15 @@ impl OrcasDaemonService {
         let prepared = match prepared {
             PreparedProposalGenerationOutcome::Ready(prepared) => prepared,
             PreparedProposalGenerationOutcome::Suppressed { reason } => {
+                info!(
+                    work_unit_id = %request.work_unit_id,
+                    source_report_id = request.source_report_id.as_deref().unwrap_or("latest"),
+                    trigger_kind = ?request.trigger_kind,
+                    result = "suppressed",
+                    %reason,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    "supervisor proposal workflow suppressed before generation"
+                );
                 return Ok(ProposalGenerationOutcome::Suppressed { reason });
             }
         };
@@ -4360,6 +4410,15 @@ impl OrcasDaemonService {
                 .next()
                 .is_some()
                 {
+                    info!(
+                        work_unit_id = %request.work_unit_id,
+                        source_report_id = %prepared.source_report_id,
+                        trigger_kind = ?request.trigger_kind,
+                        result = "suppressed",
+                        reason = "proposal generation already exists for source report",
+                        duration_ms = started_at.elapsed().as_millis() as u64,
+                        "supervisor proposal workflow suppressed"
+                    );
                     return Ok(ProposalGenerationOutcome::Suppressed {
                         reason: format!(
                             "proposal generation already exists for work unit `{}` and source report `{}`",
@@ -4382,6 +4441,17 @@ impl OrcasDaemonService {
         let result = match self.supervisor_reasoner.propose(context_pack.clone()).await {
             Ok(result) => result,
             Err(failure) => {
+                warn!(
+                    work_unit_id = %request.work_unit_id,
+                    source_report_id = %prepared.source_report_id,
+                    trigger_kind = ?request.trigger_kind,
+                    stage = ?failure.stage,
+                    backend_kind = %failure.backend_kind,
+                    model = %failure.model,
+                    reason = %failure.message,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    "supervisor proposal generation failed"
+                );
                 let record = self
                     .persist_failed_proposal_record(
                         proposal_id.clone(),
@@ -4409,6 +4479,15 @@ impl OrcasDaemonService {
         if let Err(error) =
             validate_proposal(&result.proposal, &context_pack, &prepared.collaboration)
         {
+            warn!(
+                work_unit_id = %request.work_unit_id,
+                source_report_id = %prepared.source_report_id,
+                trigger_kind = ?request.trigger_kind,
+                stage = "validate_proposal",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "supervisor proposal validation failed"
+            );
             let record = self
                 .persist_failed_proposal_record(
                     proposal_id.clone(),
@@ -4519,6 +4598,15 @@ impl OrcasDaemonService {
                         .next()
                         .is_some()
                         {
+                            info!(
+                                work_unit_id = %proposal.primary_work_unit_id,
+                                source_report_id = %proposal.source_report_id,
+                                trigger_kind = ?request.trigger_kind,
+                                result = "suppressed",
+                                reason = "proposal generation raced with existing proposal",
+                                duration_ms = started_at.elapsed().as_millis() as u64,
+                                "supervisor proposal workflow suppressed"
+                            );
                             return Ok(ProposalGenerationOutcome::Suppressed {
                                 reason: format!(
                                     "proposal generation raced with an existing proposal for work unit `{}` and source report `{}`",
@@ -4550,6 +4638,21 @@ impl OrcasDaemonService {
             &proposal,
         )
         .await;
+        info!(
+            proposal_id = %proposal.id,
+            work_unit_id = %proposal.primary_work_unit_id,
+            source_report_id = %proposal.source_report_id,
+            trigger_kind = ?request.trigger_kind,
+            status = ?proposal.status,
+            decision_type = proposal
+                .proposal
+                .as_ref()
+                .map(|proposal| format!("{:?}", proposal.proposed_decision.decision_type))
+                .unwrap_or_else(|| "unknown".to_string()),
+            superseded_count = superseded_proposals.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "supervisor proposal persisted"
+        );
 
         Ok(ProposalGenerationOutcome::Created(proposal))
     }
@@ -5541,6 +5644,7 @@ impl OrcasDaemonService {
         requested_model: Option<String>,
         requested_cwd: Option<String>,
     ) -> OrcasResult<()> {
+        let started_at = Instant::now();
         if self
             .state
             .read()
@@ -5549,6 +5653,11 @@ impl OrcasDaemonService {
             .assignment_communications
             .contains_key(assignment_id)
         {
+            debug!(
+                assignment_id,
+                result = "already_present",
+                "assignment communication record available"
+            );
             return Ok(());
         }
 
@@ -5560,6 +5669,11 @@ impl OrcasDaemonService {
                 .assignment_communications
                 .contains_key(assignment_id)
             {
+                debug!(
+                    assignment_id,
+                    result = "already_present",
+                    "assignment communication record available"
+                );
                 return Ok(());
             }
             let assignment = state
@@ -5568,26 +5682,63 @@ impl OrcasDaemonService {
                 .get(assignment_id)
                 .cloned()
                 .ok_or_else(|| {
+                    warn!(
+                        assignment_id,
+                        stage = "resolve_assignment",
+                        "assignment communication record generation failed"
+                    );
                     OrcasError::Protocol(format!(
                         "unknown assignment `{assignment_id}` for communication record"
                     ))
                 })?;
-            let record = build_assignment_communication_record(
+            let record = match build_assignment_communication_record(
                 &state.collaboration,
                 &assignment,
                 requested_model,
                 requested_cwd,
                 self.config.defaults.cwd.as_ref(),
                 now,
-            )?;
-            validate_assignment_packet(&record.packet)?;
+            ) {
+                Ok(record) => record,
+                Err(error) => {
+                    warn!(
+                        assignment_id,
+                        work_unit_id = %assignment.work_unit_id,
+                        stage = "build_assignment_communication_record",
+                        duration_ms = started_at.elapsed().as_millis() as u64,
+                        error = %error,
+                        "assignment communication record generation failed"
+                    );
+                    return Err(error);
+                }
+            };
+            if let Err(error) = validate_assignment_packet(&record.packet) {
+                warn!(
+                    assignment_id,
+                    work_unit_id = %assignment.work_unit_id,
+                    packet_id = %record.packet.packet_id,
+                    stage = "validate_assignment_packet",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "assignment communication record generation failed"
+                );
+                return Err(error);
+            }
             state
                 .collaboration
                 .assignment_communications
                 .insert(assignment_id.to_string(), record.clone());
             record
         };
-        let _ = record;
+        info!(
+            assignment_id,
+            work_unit_id = %record.work_unit_id,
+            workstream_id = %record.workstream_id,
+            packet_id = %record.packet.packet_id,
+            prompt_bytes = record.prompt_render.prompt_text.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "assignment communication record persisted"
+        );
         self.persist_collaboration_state().await?;
         Ok(())
     }

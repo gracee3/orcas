@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{Value, json};
+use tracing::{debug, info, warn};
 
 use orcas_core::supervisor::{
     DecisionPolicy, DraftAssignment, PriorDecisionContext, PriorReportContext,
@@ -146,7 +148,24 @@ impl SupervisorReasoner for ResponsesApiReasoner {
         &self,
         pack: SupervisorContextPack,
     ) -> Result<SupervisorReasonerResult, SupervisorReasonerFailure> {
+        let started_at = Instant::now();
+        info!(
+            work_unit_id = %pack.primary_work_unit.id,
+            source_report_id = %pack.source_report.id,
+            trigger_kind = ?pack.trigger.kind,
+            backend_kind = "responses_api",
+            model = %self.config.supervisor.model,
+            "starting supervisor proposal generation"
+        );
         let api_key = self.api_key().map_err(|error| {
+            warn!(
+                work_unit_id = %pack.primary_work_unit.id,
+                source_report_id = %pack.source_report.id,
+                stage = "resolve_api_key",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "supervisor proposal generation failed"
+            );
             self.failure(
                 SupervisorProposalFailureStage::Backend,
                 error.to_string(),
@@ -155,6 +174,14 @@ impl SupervisorReasoner for ResponsesApiReasoner {
             )
         })?;
         let body = self.request_body(&pack).map_err(|error| {
+            warn!(
+                work_unit_id = %pack.primary_work_unit.id,
+                source_report_id = %pack.source_report.id,
+                stage = "build_request",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "supervisor proposal generation failed"
+            );
             self.failure(
                 SupervisorProposalFailureStage::Backend,
                 error.to_string(),
@@ -170,6 +197,14 @@ impl SupervisorReasoner for ResponsesApiReasoner {
             .send()
             .await
             .map_err(|error| {
+                warn!(
+                    work_unit_id = %pack.primary_work_unit.id,
+                    source_report_id = %pack.source_report.id,
+                    stage = "send_request",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "supervisor proposal generation failed"
+                );
                 self.failure(
                     SupervisorProposalFailureStage::Backend,
                     format!("supervisor Responses API request failed: {error}"),
@@ -180,6 +215,14 @@ impl SupervisorReasoner for ResponsesApiReasoner {
 
         let status = response.status();
         let raw = response.text().await.map_err(|error| {
+            warn!(
+                work_unit_id = %pack.primary_work_unit.id,
+                source_report_id = %pack.source_report.id,
+                stage = "read_response",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "supervisor proposal generation failed"
+            );
             self.failure(
                 SupervisorProposalFailureStage::Backend,
                 format!("failed to read supervisor Responses API response body: {error}"),
@@ -189,6 +232,14 @@ impl SupervisorReasoner for ResponsesApiReasoner {
         })?;
 
         if !status.is_success() {
+            warn!(
+                work_unit_id = %pack.primary_work_unit.id,
+                source_report_id = %pack.source_report.id,
+                stage = "responses_api_status",
+                status = %status,
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                "supervisor proposal generation failed"
+            );
             return Err(self.failure(
                 SupervisorProposalFailureStage::Backend,
                 format!(
@@ -201,6 +252,14 @@ impl SupervisorReasoner for ResponsesApiReasoner {
         }
 
         let value: Value = serde_json::from_str(&raw).map_err(|error| {
+            warn!(
+                work_unit_id = %pack.primary_work_unit.id,
+                source_report_id = %pack.source_report.id,
+                stage = "decode_response_json",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "supervisor proposal generation failed"
+            );
             self.failure(
                 SupervisorProposalFailureStage::ResponseMalformed,
                 format!("failed to decode supervisor Responses API response JSON: {error}"),
@@ -210,6 +269,17 @@ impl SupervisorReasoner for ResponsesApiReasoner {
         })?;
         if let Some(error) = value.get("error") {
             if !error.is_null() {
+                warn!(
+                    work_unit_id = %pack.primary_work_unit.id,
+                    source_report_id = %pack.source_report.id,
+                    stage = "response_error_payload",
+                    response_id = value
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown"),
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    "supervisor Responses API returned error payload"
+                );
                 return Err(self.failure(
                     SupervisorProposalFailureStage::Backend,
                     format!("supervisor Responses API returned an error payload: {error}"),
@@ -223,6 +293,17 @@ impl SupervisorReasoner for ResponsesApiReasoner {
         }
 
         let Some(output_text) = extract_output_text(&value) else {
+            warn!(
+                work_unit_id = %pack.primary_work_unit.id,
+                source_report_id = %pack.source_report.id,
+                stage = "extract_output_text",
+                response_id = value
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown"),
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                "supervisor proposal generation failed"
+            );
             return Err(self.failure(
                 SupervisorProposalFailureStage::ResponseMalformed,
                 "supervisor Responses API response did not contain assistant output_text",
@@ -234,6 +315,18 @@ impl SupervisorReasoner for ResponsesApiReasoner {
             ));
         };
         let proposal: SupervisorProposal = serde_json::from_str(&output_text).map_err(|error| {
+            warn!(
+                work_unit_id = %pack.primary_work_unit.id,
+                source_report_id = %pack.source_report.id,
+                stage = "decode_proposal_json",
+                response_id = value
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown"),
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "supervisor proposal generation failed"
+            );
             self.failure(
                 SupervisorProposalFailureStage::ProposalMalformed,
                 format!("failed to decode supervisor proposal JSON: {error}"),
@@ -245,6 +338,24 @@ impl SupervisorReasoner for ResponsesApiReasoner {
             )
         })?;
         let usage = value.get("usage").map(extract_usage);
+        info!(
+            work_unit_id = %pack.primary_work_unit.id,
+            source_report_id = %pack.source_report.id,
+            trigger_kind = ?pack.trigger.kind,
+            backend_kind = "responses_api",
+            model = value
+                .get("model")
+                .and_then(|value| value.as_str())
+                .unwrap_or(self.config.supervisor.model.as_str()),
+            response_id = value
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown"),
+            decision_type = snake_label(proposal.proposed_decision.decision_type),
+            requires_assignment = proposal.proposed_decision.requires_assignment,
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "supervisor proposal generated"
+        );
 
         Ok(SupervisorReasonerResult {
             proposal,
@@ -272,6 +383,13 @@ pub fn build_context_pack(
     note: Option<String>,
     trigger_kind: SupervisorProposalTriggerKind,
 ) -> OrcasResult<SupervisorContextPack> {
+    let started_at = Instant::now();
+    info!(
+        work_unit_id = %work_unit_id,
+        source_report_id = source_report_id.unwrap_or("latest"),
+        trigger_kind = ?trigger_kind,
+        "building supervisor context pack"
+    );
     let generated_at = Utc::now();
     let limits = SupervisorPackLimits {
         max_related_work_units: 8,
@@ -320,7 +438,7 @@ pub fn build_context_pack(
     let (recent_primary_history, reports_truncated, decisions_truncated) =
         build_recent_primary_history(collaboration, &work_unit, &limits);
 
-    Ok(SupervisorContextPack {
+    let pack = SupervisorContextPack {
         schema_version: CONTEXT_SCHEMA_VERSION.to_string(),
         generated_at,
         trigger: SupervisorProposalTrigger {
@@ -410,7 +528,18 @@ pub fn build_context_pack(
             focus: None,
             constraints: Vec::new(),
         }),
-    })
+    };
+    debug!(
+        work_unit_id = %pack.primary_work_unit.id,
+        source_report_id = %pack.source_report.id,
+        related_work_unit_count = pack.related_work_units.len(),
+        recent_report_count = pack.recent_primary_history.prior_reports.len(),
+        recent_decision_count = pack.recent_primary_history.prior_decisions.len(),
+        raw_report_truncated = pack.truncation.raw_report_truncated,
+        duration_ms = started_at.elapsed().as_millis() as u64,
+        "supervisor context pack built"
+    );
+    Ok(pack)
 }
 
 pub fn validate_proposal(
@@ -418,60 +547,109 @@ pub fn validate_proposal(
     pack: &SupervisorContextPack,
     collaboration: &CollaborationState,
 ) -> OrcasResult<()> {
+    let started_at = Instant::now();
+    debug!(
+        work_unit_id = %pack.primary_work_unit.id,
+        source_report_id = %pack.source_report.id,
+        decision_type = snake_label(proposal.proposed_decision.decision_type),
+        stage = "validate_proposal",
+        "validating supervisor proposal"
+    );
+
+    let fail = |stage: &'static str, error: OrcasError| -> OrcasResult<()> {
+        warn!(
+            work_unit_id = %pack.primary_work_unit.id,
+            source_report_id = %pack.source_report.id,
+            decision_type = snake_label(proposal.proposed_decision.decision_type),
+            stage,
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            error = %error,
+            "supervisor proposal validation failed"
+        );
+        Err(error)
+    };
+
     if proposal.schema_version != PROPOSAL_SCHEMA_VERSION {
-        return Err(OrcasError::Protocol(format!(
-            "proposal schema version `{}` did not match `{PROPOSAL_SCHEMA_VERSION}`",
-            proposal.schema_version
-        )));
+        return fail(
+            "schema_version",
+            OrcasError::Protocol(format!(
+                "proposal schema version `{}` did not match `{PROPOSAL_SCHEMA_VERSION}`",
+                proposal.schema_version
+            )),
+        );
     }
 
     let decision = proposal.proposed_decision.decision_type;
     if !pack.decision_policy.allowed_decisions.contains(&decision) {
-        return Err(OrcasError::Protocol(format!(
-            "proposal decision `{}` is not allowed for this decision point",
-            label(&decision)?
-        )));
+        return fail(
+            "allowed_decisions",
+            OrcasError::Protocol(format!(
+                "proposal decision `{}` is not allowed for this decision point",
+                label(&decision)?
+            )),
+        );
     }
     if proposal.proposed_decision.target_work_unit_id != pack.primary_work_unit.id {
-        return Err(OrcasError::Protocol(
-            "proposal targeted a different work unit".to_string(),
-        ));
+        return fail(
+            "target_work_unit",
+            OrcasError::Protocol("proposal targeted a different work unit".to_string()),
+        );
     }
     if proposal.proposed_decision.source_report_id != pack.source_report.id {
-        return Err(OrcasError::Protocol(
-            "proposal targeted a different source report".to_string(),
-        ));
+        return fail(
+            "source_report",
+            OrcasError::Protocol("proposal targeted a different source report".to_string()),
+        );
     }
 
     let requires_assignment = decision_requires_assignment(decision);
     if proposal.proposed_decision.requires_assignment != requires_assignment {
-        return Err(OrcasError::Protocol(
-            "proposal requires_assignment did not match Orcas policy".to_string(),
-        ));
+        return fail(
+            "requires_assignment",
+            OrcasError::Protocol(
+                "proposal requires_assignment did not match Orcas policy".to_string(),
+            ),
+        );
     }
     let expected_status = expected_work_unit_status(decision);
     if proposal.proposed_decision.expected_work_unit_status != expected_status {
-        return Err(OrcasError::Protocol(format!(
-            "proposal expected work-unit status `{}` did not match `{expected_status}`",
-            proposal.proposed_decision.expected_work_unit_status
-        )));
+        return fail(
+            "expected_work_unit_status",
+            OrcasError::Protocol(format!(
+                "proposal expected work-unit status `{}` did not match `{expected_status}`",
+                proposal.proposed_decision.expected_work_unit_status
+            )),
+        );
     }
 
     match (&proposal.draft_next_assignment, requires_assignment) {
         (Some(_), false) => {
-            return Err(OrcasError::Protocol(
-                "proposal included a draft assignment for a decision that forbids one".to_string(),
-            ));
+            return fail(
+                "draft_assignment_forbidden",
+                OrcasError::Protocol(
+                    "proposal included a draft assignment for a decision that forbids one"
+                        .to_string(),
+                ),
+            );
         }
         (None, true) => {
-            return Err(OrcasError::Protocol(
-                "proposal omitted the required draft assignment".to_string(),
-            ));
+            return fail(
+                "draft_assignment_required",
+                OrcasError::Protocol("proposal omitted the required draft assignment".to_string()),
+            );
         }
         (None, false) => {}
         (Some(draft), true) => validate_draft_assignment(draft, decision, pack, collaboration)?,
     }
 
+    debug!(
+        work_unit_id = %pack.primary_work_unit.id,
+        source_report_id = %pack.source_report.id,
+        decision_type = snake_label(decision),
+        requires_assignment,
+        duration_ms = started_at.elapsed().as_millis() as u64,
+        "supervisor proposal validated"
+    );
     Ok(())
 }
 
@@ -526,6 +704,16 @@ pub fn apply_edits(
 }
 
 pub fn compile_assignment_instructions(draft: &DraftAssignment, source_report_id: &str) -> String {
+    debug!(
+        predecessor_assignment_id = %draft.predecessor_assignment_id,
+        source_report_id,
+        decision_type = snake_label(draft.derived_from_decision_type),
+        instruction_count = draft.instructions.len(),
+        acceptance_count = draft.acceptance_criteria.len(),
+        stop_condition_count = draft.stop_conditions.len(),
+        expected_report_field_count = draft.expected_report_fields.len(),
+        "compiling assignment instructions from supervisor draft"
+    );
     let mut lines = vec![
         format!("Objective: {}", draft.objective),
         format!(

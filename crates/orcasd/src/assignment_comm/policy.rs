@@ -1,8 +1,11 @@
+use std::time::Instant;
+
 use orcas_core::{
     Assignment, AssignmentCommunicationPacket, AssignmentCommunicationRecord, AssignmentTaskMode,
     OrcasError, OrcasResult, ReportConfidence, ReportDisposition, ReportParseResult,
     WorkerReportEnvelope,
 };
+use tracing::{debug, warn};
 
 use crate::assignment_comm::{
     ASSIGNMENT_COMMUNICATION_PACKET_SCHEMA_VERSION, EnvelopeValidationResult, REPORT_MARKER_BEGIN,
@@ -11,57 +14,112 @@ use crate::assignment_comm::{
 };
 
 pub fn validate_assignment_packet(packet: &AssignmentCommunicationPacket) -> OrcasResult<()> {
+    let started_at = Instant::now();
+    debug!(
+        assignment_id = %packet.assignment_id,
+        packet_id = %packet.packet_id,
+        task_mode = ?packet.task_mode,
+        "validating assignment communication packet"
+    );
+
+    let fail = |stage: &'static str, error: OrcasError| -> Result<(), OrcasError> {
+        warn!(
+            assignment_id = %packet.assignment_id,
+            packet_id = %packet.packet_id,
+            stage,
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            error = %error,
+            "assignment communication packet validation failed"
+        );
+        Err(error)
+    };
+
     if packet.schema_version != ASSIGNMENT_COMMUNICATION_PACKET_SCHEMA_VERSION {
-        return Err(OrcasError::Protocol(format!(
-            "unsupported assignment communication packet schema `{}`",
-            packet.schema_version
-        )));
+        return fail(
+            "schema_version",
+            OrcasError::Protocol(format!(
+                "unsupported assignment communication packet schema `{}`",
+                packet.schema_version
+            )),
+        );
     }
     if packet.assignment_id.trim().is_empty() || packet.packet_id.trim().is_empty() {
-        return Err(OrcasError::Protocol(
-            "assignment communication packet requires assignment_id and packet_id".to_string(),
-        ));
+        return fail(
+            "identity",
+            OrcasError::Protocol(
+                "assignment communication packet requires assignment_id and packet_id".to_string(),
+            ),
+        );
     }
     if packet.task_mode != AssignmentTaskMode::Implement {
-        return Err(OrcasError::Protocol(format!(
-            "unsupported assignment task mode `{:?}` in v1 implement-mode slice",
-            packet.task_mode
-        )));
+        return fail(
+            "task_mode",
+            OrcasError::Protocol(format!(
+                "unsupported assignment task mode `{:?}` in v1 implement-mode slice",
+                packet.task_mode
+            )),
+        );
     }
     if packet.mode_spec.task_mode() != packet.task_mode {
-        return Err(OrcasError::Protocol(
-            "assignment communication packet mode_spec does not match task_mode".to_string(),
-        ));
+        return fail(
+            "mode_spec",
+            OrcasError::Protocol(
+                "assignment communication packet mode_spec does not match task_mode".to_string(),
+            ),
+        );
     }
     if packet.acceptance_criteria.is_empty() {
-        return Err(OrcasError::Protocol(
-            "assignment communication packet requires at least one acceptance criterion"
-                .to_string(),
-        ));
+        return fail(
+            "acceptance_criteria",
+            OrcasError::Protocol(
+                "assignment communication packet requires at least one acceptance criterion"
+                    .to_string(),
+            ),
+        );
     }
     if packet.stop_conditions.is_empty() {
-        return Err(OrcasError::Protocol(
-            "assignment communication packet requires at least one stop condition".to_string(),
-        ));
+        return fail(
+            "stop_conditions",
+            OrcasError::Protocol(
+                "assignment communication packet requires at least one stop condition".to_string(),
+            ),
+        );
     }
     if packet.response_contract.schema_version != WORKER_REPORT_CONTRACT_SCHEMA_VERSION {
-        return Err(OrcasError::Protocol(format!(
-            "unsupported worker report contract schema `{}`",
-            packet.response_contract.schema_version
-        )));
+        return fail(
+            "response_contract_schema",
+            OrcasError::Protocol(format!(
+                "unsupported worker report contract schema `{}`",
+                packet.response_contract.schema_version
+            )),
+        );
     }
     if packet.response_contract.task_mode != packet.task_mode {
-        return Err(OrcasError::Protocol(
-            "worker report contract task_mode does not match packet task_mode".to_string(),
-        ));
+        return fail(
+            "response_contract_mode",
+            OrcasError::Protocol(
+                "worker report contract task_mode does not match packet task_mode".to_string(),
+            ),
+        );
     }
     if packet.response_contract.marker_begin != REPORT_MARKER_BEGIN
         || packet.response_contract.marker_end != REPORT_MARKER_END
     {
-        return Err(OrcasError::Protocol(
-            "worker report contract markers do not match Orcas v1 markers".to_string(),
-        ));
+        return fail(
+            "response_contract_markers",
+            OrcasError::Protocol(
+                "worker report contract markers do not match Orcas v1 markers".to_string(),
+            ),
+        );
     }
+    debug!(
+        assignment_id = %packet.assignment_id,
+        packet_id = %packet.packet_id,
+        acceptance_count = packet.acceptance_criteria.len(),
+        stop_condition_count = packet.stop_conditions.len(),
+        duration_ms = started_at.elapsed().as_millis() as u64,
+        "assignment communication packet validated"
+    );
     Ok(())
 }
 
@@ -71,6 +129,13 @@ pub fn validate_worker_report_envelope(
     record: &AssignmentCommunicationRecord,
     surrounding_text: bool,
 ) -> EnvelopeValidationResult {
+    let started_at = Instant::now();
+    debug!(
+        assignment_id = %assignment.id,
+        packet_id = %record.packet.packet_id,
+        surrounding_text,
+        "validating worker report envelope"
+    );
     let mut structural_issues = Vec::new();
     let mut semantic_issues = Vec::new();
     let mut policy_violations = Vec::new();
@@ -183,11 +248,322 @@ pub fn validate_worker_report_envelope(
         parse_result = ReportParseResult::Ambiguous;
     }
 
-    EnvelopeValidationResult {
+    let result = EnvelopeValidationResult {
         needs_supervisor_review: parse_result != ReportParseResult::Parsed,
         parse_result,
         structural_issues,
         semantic_issues,
         policy_violations,
+    };
+    let duration_ms = started_at.elapsed().as_millis() as u64;
+    if result.parse_result == ReportParseResult::Parsed {
+        debug!(
+            assignment_id = %assignment.id,
+            packet_id = %record.packet.packet_id,
+            parse_result = ?result.parse_result,
+            duration_ms,
+            "worker report envelope validated"
+        );
+    } else {
+        warn!(
+            assignment_id = %assignment.id,
+            packet_id = %record.packet.packet_id,
+            parse_result = ?result.parse_result,
+            structural_issue_count = result.structural_issues.len(),
+            semantic_issue_count = result.semantic_issues.len(),
+            policy_violation_count = result.policy_violations.len(),
+            needs_supervisor_review = result.needs_supervisor_review,
+            duration_ms,
+            "worker report envelope validation degraded"
+        );
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use orcas_core::{
+        AcceptanceCriterionStatus, Assignment, AssignmentCommunicationSeed, AssignmentModeSpec,
+        AssignmentTaskMode, CollaborationState, FileChangeKind, ImplementModePayload,
+        ImplementModeSpec, ReportConfidence, ReportDisposition, ReportParseResult, ReviewSignal,
+        ReviewSignalLevel, TouchedFile, WorkUnit, WorkUnitStatus, WorkerReportModePayload,
+        Workstream, WorkstreamStatus,
+    };
+
+    use super::{validate_assignment_packet, validate_worker_report_envelope};
+    use crate::assignment_comm::render::build_assignment_communication_record;
+
+    fn fixed_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 3, 4, 5, 6, 7)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    fn sample_assignment() -> Assignment {
+        Assignment {
+            id: "assignment-1".to_string(),
+            work_unit_id: "work-unit-1".to_string(),
+            worker_id: "worker-1".to_string(),
+            worker_session_id: "session-1".to_string(),
+            instructions: "legacy fallback text".to_string(),
+            communication_seed: Some(AssignmentCommunicationSeed {
+                source_decision_id: None,
+                source_report_id: None,
+                source_proposal_id: None,
+                predecessor_assignment_id: None,
+                objective: "Implement one bounded policy change.".to_string(),
+                instructions: vec!["Stay inside assignment_comm.".to_string()],
+                acceptance_criteria: vec!["Return a valid worker report.".to_string()],
+                stop_conditions: vec!["Stop when blocked.".to_string()],
+                required_context_refs: Vec::new(),
+                expected_report_fields: Vec::new(),
+                boundedness_note: Some("Do not broaden scope.".to_string()),
+                mode_spec: AssignmentModeSpec::Implement(ImplementModeSpec {
+                    expected_verification_commands: vec![
+                        "cargo test -p orcasd assignment_comm".to_string(),
+                    ],
+                }),
+            }),
+            status: Default::default(),
+            attempt_number: 1,
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_workstream() -> Workstream {
+        Workstream {
+            id: "workstream-1".to_string(),
+            title: "Workstream".to_string(),
+            objective: "Policy objective".to_string(),
+            status: WorkstreamStatus::Active,
+            priority: "high".to_string(),
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_work_unit() -> WorkUnit {
+        WorkUnit {
+            id: "work-unit-1".to_string(),
+            workstream_id: "workstream-1".to_string(),
+            title: "Work Unit".to_string(),
+            task_statement: "Implement bounded validation.".to_string(),
+            status: WorkUnitStatus::Ready,
+            dependencies: Vec::new(),
+            latest_report_id: None,
+            current_assignment_id: None,
+            created_at: fixed_now(),
+            updated_at: fixed_now(),
+        }
+    }
+
+    fn sample_record(assignment: &Assignment) -> orcas_core::AssignmentCommunicationRecord {
+        let mut collaboration = CollaborationState::default();
+        collaboration
+            .workstreams
+            .insert("workstream-1".to_string(), sample_workstream());
+        collaboration
+            .work_units
+            .insert("work-unit-1".to_string(), sample_work_unit());
+        build_assignment_communication_record(
+            &collaboration,
+            assignment,
+            Some("gpt-test".to_string()),
+            Some("/repo".to_string()),
+            None,
+            fixed_now(),
+        )
+        .expect("build communication record")
+    }
+
+    fn sample_envelope(
+        assignment: &Assignment,
+        packet_id: &str,
+    ) -> orcas_core::WorkerReportEnvelope {
+        orcas_core::WorkerReportEnvelope {
+            schema_version: "worker_report_envelope.v1".to_string(),
+            assignment_id: assignment.id.clone(),
+            packet_id: packet_id.to_string(),
+            task_mode: AssignmentTaskMode::Implement,
+            disposition: ReportDisposition::Completed,
+            summary: "Completed the bounded change.".to_string(),
+            confidence: ReportConfidence::High,
+            acceptance_results: vec![orcas_core::AcceptanceResult {
+                criterion_id: "acceptance_1".to_string(),
+                status: AcceptanceCriterionStatus::Met,
+                note: None,
+            }],
+            triggered_stop_condition_ids: vec!["stop_1".to_string()],
+            touched_files: vec![TouchedFile {
+                path: "/repo/src/lib.rs".to_string(),
+                change_kind: FileChangeKind::Modified,
+                summary: "Tightened the policy boundary.".to_string(),
+            }],
+            commands_run: vec!["cargo test -p orcasd assignment_comm".to_string()],
+            artifacts: Vec::new(),
+            blockers: Vec::new(),
+            questions: Vec::new(),
+            recommended_next_actions: Vec::new(),
+            uncertainties: Vec::new(),
+            review_signal: ReviewSignal {
+                level: ReviewSignalLevel::Normal,
+                reasons: Vec::new(),
+                focus: Vec::new(),
+            },
+            mode_payload: WorkerReportModePayload::Implement(ImplementModePayload {
+                semantic_changes: vec!["Adjusted validation semantics.".to_string()],
+                tests_run: vec!["cargo test -p orcasd assignment_comm".to_string()],
+                rough_edges: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn validate_assignment_packet_accepts_rendered_packet() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+
+        validate_assignment_packet(&record.packet).expect("packet should validate");
+    }
+
+    #[test]
+    fn validate_assignment_packet_rejects_marker_mismatch() {
+        let assignment = sample_assignment();
+        let mut record = sample_record(&assignment);
+        record.packet.response_contract.marker_begin = "WRONG_BEGIN".to_string();
+        record.packet.response_contract.marker_end = "WRONG_END".to_string();
+
+        let error = validate_assignment_packet(&record.packet).expect_err("packet should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("worker report contract markers do not match Orcas v1 markers")
+        );
+    }
+
+    #[test]
+    fn validate_assignment_packet_rejects_mode_spec_task_mode_mismatch() {
+        let assignment = sample_assignment();
+        let mut record = sample_record(&assignment);
+        record.packet.task_mode = AssignmentTaskMode::Debug;
+
+        let error = validate_assignment_packet(&record.packet).expect_err("packet should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported assignment task mode `Debug`")
+        );
+    }
+
+    #[test]
+    fn validate_worker_report_envelope_accepts_clean_valid_report() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+        let envelope = sample_envelope(&assignment, &record.packet.packet_id);
+
+        let validation = validate_worker_report_envelope(&envelope, &assignment, &record, false);
+
+        assert_eq!(validation.parse_result, ReportParseResult::Parsed);
+        assert!(!validation.needs_supervisor_review);
+        assert!(validation.structural_issues.is_empty());
+        assert!(validation.semantic_issues.is_empty());
+        assert!(validation.policy_violations.is_empty());
+    }
+
+    #[test]
+    fn validate_worker_report_envelope_downgrades_surrounding_noise_to_ambiguous() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+        let envelope = sample_envelope(&assignment, &record.packet.packet_id);
+
+        let validation = validate_worker_report_envelope(&envelope, &assignment, &record, true);
+
+        assert_eq!(validation.parse_result, ReportParseResult::Ambiguous);
+        assert!(validation.needs_supervisor_review);
+        assert!(
+            validation
+                .structural_issues
+                .iter()
+                .any(|issue| issue.contains("extra text outside the Orcas report envelope"))
+        );
+    }
+
+    #[test]
+    fn validate_worker_report_envelope_marks_required_review_without_reasons_ambiguous() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+        let mut envelope = sample_envelope(&assignment, &record.packet.packet_id);
+        envelope.review_signal.level = ReviewSignalLevel::Required;
+
+        let validation = validate_worker_report_envelope(&envelope, &assignment, &record, false);
+
+        assert_eq!(validation.parse_result, ReportParseResult::Ambiguous);
+        assert!(validation.needs_supervisor_review);
+        assert!(
+            validation
+                .semantic_issues
+                .iter()
+                .any(|issue| issue.contains("review_signal.level=required"))
+        );
+    }
+
+    #[test]
+    fn validate_worker_report_envelope_rejects_unknown_acceptance_criterion() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+        let mut envelope = sample_envelope(&assignment, &record.packet.packet_id);
+        envelope.acceptance_results[0].criterion_id = "acceptance_unknown".to_string();
+
+        let validation = validate_worker_report_envelope(&envelope, &assignment, &record, false);
+
+        assert_eq!(validation.parse_result, ReportParseResult::Invalid);
+        assert!(validation.needs_supervisor_review);
+        assert!(
+            validation
+                .semantic_issues
+                .iter()
+                .any(|issue| issue.contains("unknown acceptance criterion"))
+        );
+    }
+
+    #[test]
+    fn validate_worker_report_envelope_treats_out_of_scope_file_touches_as_ambiguous() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+        let mut envelope = sample_envelope(&assignment, &record.packet.packet_id);
+        envelope.touched_files = vec![TouchedFile {
+            path: "/outside/src/lib.rs".to_string(),
+            change_kind: FileChangeKind::Modified,
+            summary: "Outside the allowed repo root.".to_string(),
+        }];
+
+        let validation = validate_worker_report_envelope(&envelope, &assignment, &record, false);
+
+        assert_eq!(validation.parse_result, ReportParseResult::Ambiguous);
+        assert!(validation.needs_supervisor_review);
+        assert_eq!(validation.policy_violations.len(), 1);
+        assert!(validation.policy_violations[0].contains("outside allowed_write_paths"));
+    }
+
+    #[test]
+    fn validate_worker_report_envelope_rejects_identity_mismatch_even_with_noise() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+        let mut envelope = sample_envelope(&assignment, &record.packet.packet_id);
+        envelope.assignment_id = "assignment-other".to_string();
+
+        let validation = validate_worker_report_envelope(&envelope, &assignment, &record, true);
+
+        assert_eq!(validation.parse_result, ReportParseResult::Invalid);
+        assert!(validation.needs_supervisor_review);
+        assert!(
+            validation
+                .structural_issues
+                .iter()
+                .any(|issue| issue.contains("does not match assignment"))
+        );
     }
 }

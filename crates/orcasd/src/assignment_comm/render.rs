@@ -1,6 +1,8 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use tracing::{debug, info, warn};
 
 use orcas_core::{
     Assignment, AssignmentChangePolicy, AssignmentChecklistItem, AssignmentCommunicationPacket,
@@ -52,10 +54,29 @@ pub fn build_assignment_communication_record(
     default_cwd: Option<&PathBuf>,
     now: DateTime<Utc>,
 ) -> OrcasResult<AssignmentCommunicationRecord> {
+    let started_at = Instant::now();
+    let mode = if assignment.communication_seed.is_some() {
+        "structured_seed"
+    } else {
+        "legacy_instructions"
+    };
+    info!(
+        assignment_id = %assignment.id,
+        work_unit_id = %assignment.work_unit_id,
+        mode,
+        requested_model = requested_model.as_deref().unwrap_or("default"),
+        "building assignment communication record"
+    );
     let work_unit = collaboration
         .work_units
         .get(&assignment.work_unit_id)
         .ok_or_else(|| {
+            warn!(
+                assignment_id = %assignment.id,
+                work_unit_id = %assignment.work_unit_id,
+                stage = "resolve_work_unit",
+                "assignment communication build failed"
+            );
             OrcasError::Protocol(format!(
                 "unknown work unit `{}` for assignment communication packet",
                 assignment.work_unit_id
@@ -65,6 +86,13 @@ pub fn build_assignment_communication_record(
         .workstreams
         .get(&work_unit.workstream_id)
         .ok_or_else(|| {
+            warn!(
+                assignment_id = %assignment.id,
+                work_unit_id = %assignment.work_unit_id,
+                workstream_id = %work_unit.workstream_id,
+                stage = "resolve_workstream",
+                "assignment communication build failed"
+            );
             OrcasError::Protocol(format!(
                 "unknown workstream `{}` for assignment communication packet",
                 work_unit.workstream_id
@@ -108,8 +136,42 @@ pub fn build_assignment_communication_record(
         )
     };
 
+    debug!(
+        assignment_id = %assignment.id,
+        packet_id = %packet.packet_id,
+        workstream_id = %workstream.id,
+        work_unit_id = %work_unit.id,
+        instruction_count = packet.instructions.len(),
+        acceptance_count = packet.acceptance_criteria.len(),
+        stop_condition_count = packet.stop_conditions.len(),
+        context_block_count = packet.included_context.len(),
+        "assignment communication packet built"
+    );
+
     let packet_hash = json_fingerprint(&packet)?;
-    let prompt_render = render_prompt(&packet, &packet_hash, now)?;
+    let prompt_render = match render_prompt(&packet, &packet_hash, now) {
+        Ok(prompt_render) => prompt_render,
+        Err(error) => {
+            warn!(
+                assignment_id = %assignment.id,
+                packet_id = %packet.packet_id,
+                stage = "render_prompt",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "assignment communication build failed"
+            );
+            return Err(error);
+        }
+    };
+    info!(
+        assignment_id = %assignment.id,
+        packet_id = %packet.packet_id,
+        workstream_id = %workstream.id,
+        work_unit_id = %work_unit.id,
+        prompt_bytes = prompt_render.prompt_text.len(),
+        duration_ms = started_at.elapsed().as_millis() as u64,
+        "assignment communication record built"
+    );
     Ok(AssignmentCommunicationRecord {
         assignment_id: assignment.id.clone(),
         work_unit_id: work_unit.id.clone(),
@@ -278,6 +340,14 @@ pub fn render_prompt(
     packet_hash: &str,
     rendered_at: DateTime<Utc>,
 ) -> OrcasResult<PromptRenderArtifact> {
+    let started_at = Instant::now();
+    debug!(
+        assignment_id = %packet.assignment_id,
+        packet_id = %packet.packet_id,
+        section_count = SECTION_ORDER.len(),
+        context_block_count = packet.included_context.len(),
+        "rendering assignment prompt"
+    );
     let render_spec = PromptRenderSpec {
         template_version: ASSIGNMENT_PROMPT_TEMPLATE_VERSION.to_string(),
         section_order: SECTION_ORDER
@@ -384,7 +454,27 @@ pub fn render_prompt(
     prompt.push_str(REPORT_MARKER_END);
     prompt.push('\n');
 
-    let prompt_hash = json_fingerprint(&prompt)?;
+    let prompt_hash = match json_fingerprint(&prompt) {
+        Ok(prompt_hash) => prompt_hash,
+        Err(error) => {
+            warn!(
+                assignment_id = %packet.assignment_id,
+                packet_id = %packet.packet_id,
+                stage = "fingerprint_prompt",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "assignment prompt render failed"
+            );
+            return Err(error);
+        }
+    };
+    debug!(
+        assignment_id = %packet.assignment_id,
+        packet_id = %packet.packet_id,
+        prompt_bytes = prompt.len(),
+        duration_ms = started_at.elapsed().as_millis() as u64,
+        "assignment prompt rendered"
+    );
     Ok(PromptRenderArtifact {
         render_spec,
         rendered_at,
@@ -1207,6 +1297,62 @@ Repo root: /legacy/repo",
                 .iter()
                 .any(|block| block.id == "required_context_refs"
                     && block.lines == vec!["alpha.rs".to_string(), "beta.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn build_assignment_record_legacy_without_bulleted_sections_falls_back_to_defaults() {
+        let collaboration = sample_collaboration();
+        let assignment = sample_assignment(
+            None,
+            "Objective: Recover a partial legacy packet\n\
+Instructions:\n\
+Preserve the parser contract without a bullet\n\
+Acceptance criteria:\n\
+not a checklist bullet\n\
+Stop conditions:\n\
+still not a checklist bullet",
+        );
+
+        let record = build_assignment_communication_record(
+            &collaboration,
+            &assignment,
+            None,
+            None,
+            None,
+            fixed_now(),
+        )
+        .expect("build legacy communication record");
+
+        assert_eq!(record.packet.objective, "Recover a partial legacy packet");
+        assert_eq!(
+            record.packet.instructions,
+            vec!["Objective: Recover a partial legacy packet\nInstructions:\nPreserve the parser contract without a bullet\nAcceptance criteria:\nnot a checklist bullet\nStop conditions:\nstill not a checklist bullet".to_string()]
+        );
+        assert_eq!(
+            record
+                .packet
+                .acceptance_criteria
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Complete the bounded implement task described in the objective and instructions.",
+                "Return a valid Orcas worker report envelope with honest implementation details."
+            ]
+        );
+        assert_eq!(
+            record
+                .packet
+                .stop_conditions
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Stop when the bounded implement task is complete.",
+                "Stop when blocked or when supervisor or human input is required.",
+                "Stop rather than broadening scope beyond the assignment boundary."
+            ]
         );
     }
 }

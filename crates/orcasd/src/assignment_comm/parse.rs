@@ -1,4 +1,7 @@
+use std::time::Instant;
+
 use chrono::Utc;
+use tracing::{debug, warn};
 
 use orcas_core::{
     Assignment, AssignmentCommunicationRecord, ImplementModePayload, ReportConfidence,
@@ -30,6 +33,14 @@ pub fn parse_worker_report_for_turn(
     assignment: &Assignment,
     record: &AssignmentCommunicationRecord,
 ) -> ParsedWorkerReport {
+    let started_at = Instant::now();
+    debug!(
+        assignment_id = %assignment.id,
+        packet_id = %record.packet.packet_id,
+        lifecycle = ?lifecycle,
+        raw_output_len = raw_output.len(),
+        "parsing worker report for turn outcome"
+    );
     let mut parsed = parse_worker_report(raw_output, assignment, record);
     match lifecycle {
         ipc::TurnLifecycleState::Interrupted => {
@@ -53,6 +64,15 @@ pub fn parse_worker_report_for_turn(
             parsed.validation.semantic_issues.push(
                 "runtime interrupted the turn before Orcas could trust the report as authoritative"
                     .to_string(),
+            );
+            warn!(
+                assignment_id = %assignment.id,
+                packet_id = %record.packet.packet_id,
+                lifecycle = ?lifecycle,
+                parse_result = ?parsed.validation.parse_result,
+                needs_supervisor_review = parsed.validation.needs_supervisor_review,
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                "worker report downgraded due to interrupted turn lifecycle"
             );
             parsed
         }
@@ -78,9 +98,28 @@ pub fn parse_worker_report_for_turn(
                 "runtime continuity was lost before Orcas could trust the report as authoritative"
                     .to_string(),
             );
+            warn!(
+                assignment_id = %assignment.id,
+                packet_id = %record.packet.packet_id,
+                lifecycle = ?lifecycle,
+                parse_result = ?parsed.validation.parse_result,
+                needs_supervisor_review = parsed.validation.needs_supervisor_review,
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                "worker report downgraded due to lost turn lifecycle"
+            );
             parsed
         }
-        _ => parsed,
+        _ => {
+            debug!(
+                assignment_id = %assignment.id,
+                packet_id = %record.packet.packet_id,
+                parse_result = ?parsed.validation.parse_result,
+                needs_supervisor_review = parsed.validation.needs_supervisor_review,
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                "worker report parsed for turn outcome"
+            );
+            parsed
+        }
     }
 }
 
@@ -89,6 +128,13 @@ pub fn parse_worker_report(
     assignment: &Assignment,
     record: &AssignmentCommunicationRecord,
 ) -> ParsedWorkerReport {
+    let started_at = Instant::now();
+    debug!(
+        assignment_id = %assignment.id,
+        packet_id = %record.packet.packet_id,
+        raw_output_len = raw_output.len(),
+        "parsing worker report envelope"
+    );
     let fallback = |structural_issue: Option<String>| {
         let mut structural_issues = Vec::new();
         if let Some(issue) = structural_issue {
@@ -118,14 +164,37 @@ pub fn parse_worker_report(
 
     let extraction = extract_envelope(raw_output);
     let Some(json_payload) = extraction.json_payload else {
+        warn!(
+            assignment_id = %assignment.id,
+            packet_id = %record.packet.packet_id,
+            stage = "extract_envelope",
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "worker report envelope extraction failed"
+        );
         return fallback(Some(
             "worker output did not contain exactly one Orcas report envelope".to_string(),
         ));
     };
+    debug!(
+        assignment_id = %assignment.id,
+        packet_id = %record.packet.packet_id,
+        stage = "extract_envelope",
+        surrounding_text = extraction.surrounding_text,
+        envelope_bytes = json_payload.len(),
+        "worker report envelope extracted"
+    );
 
     let envelope: WorkerReportEnvelope = match serde_json::from_str(json_payload.trim()) {
         Ok(envelope) => envelope,
         Err(error) => {
+            warn!(
+                assignment_id = %assignment.id,
+                packet_id = %record.packet.packet_id,
+                stage = "decode_envelope",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "worker report envelope decode failed"
+            );
             return fallback(Some(format!(
                 "worker report envelope JSON could not be decoded: {error}"
             )));
@@ -144,6 +213,17 @@ pub fn parse_worker_report(
     };
 
     if report_validation.parse_result == ReportParseResult::Invalid {
+        warn!(
+            assignment_id = %assignment.id,
+            packet_id = %record.packet.packet_id,
+            stage = "validate_envelope",
+            parse_result = ?report_validation.parse_result,
+            structural_issue_count = report_validation.structural_issues.len(),
+            semantic_issue_count = report_validation.semantic_issues.len(),
+            policy_violation_count = report_validation.policy_violations.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "worker report validation failed"
+        );
         return ParsedWorkerReport {
             envelope: Some(envelope),
             validation: report_validation,
@@ -165,7 +245,7 @@ pub fn parse_worker_report(
         }) => semantic_changes.clone(),
     };
 
-    ParsedWorkerReport {
+    let parsed = ParsedWorkerReport {
         disposition: envelope.disposition,
         summary: envelope.summary.clone(),
         findings,
@@ -175,7 +255,35 @@ pub fn parse_worker_report(
         confidence: envelope.confidence,
         envelope: Some(envelope),
         validation: report_validation,
+    };
+    if parsed.validation.needs_supervisor_review {
+        warn!(
+            assignment_id = %assignment.id,
+            packet_id = %record.packet.packet_id,
+            stage = "finalize_report",
+            parse_result = ?parsed.validation.parse_result,
+            disposition = ?parsed.disposition,
+            finding_count = parsed.findings.len(),
+            blocker_count = parsed.blockers.len(),
+            question_count = parsed.questions.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "worker report parsed with supervisor review required"
+        );
+    } else {
+        debug!(
+            assignment_id = %assignment.id,
+            packet_id = %record.packet.packet_id,
+            stage = "finalize_report",
+            parse_result = ?parsed.validation.parse_result,
+            disposition = ?parsed.disposition,
+            finding_count = parsed.findings.len(),
+            blocker_count = parsed.blockers.len(),
+            question_count = parsed.questions.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "worker report parsed successfully"
+        );
     }
+    parsed
 }
 
 fn extract_envelope(raw_output: &str) -> EnvelopeExtraction {
