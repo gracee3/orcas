@@ -589,7 +589,7 @@ impl SupervisorService {
     }
 
     pub async fn assignment_get(&self, assignment_id: &str) -> Result<()> {
-        let client = self.ready_client().await?;
+        let client = self.daemon_state_client().await?;
         let response = client
             .assignment_get(&ipc::AssignmentGetRequest {
                 assignment_id: assignment_id.to_string(),
@@ -613,7 +613,7 @@ impl SupervisorService {
     }
 
     pub async fn assignment_communication_get(&self, assignment_id: &str) -> Result<()> {
-        let client = self.ready_client().await?;
+        let client = self.daemon_state_client().await?;
         let response = client
             .assignment_communication_get(&ipc::AssignmentCommunicationGetRequest {
                 assignment_id: assignment_id.to_string(),
@@ -624,7 +624,7 @@ impl SupervisorService {
     }
 
     pub async fn report_get(&self, report_id: &str) -> Result<()> {
-        let client = self.ready_client().await?;
+        let client = self.daemon_state_client().await?;
         let response = client
             .report_get(&ipc::ReportGetRequest {
                 report_id: report_id.to_string(),
@@ -652,7 +652,7 @@ impl SupervisorService {
     }
 
     pub async fn report_list_for_workunit(&self, work_unit_id: &str) -> Result<()> {
-        let client = self.ready_client().await?;
+        let client = self.daemon_state_client().await?;
         let response = client
             .report_list_for_workunit(&ipc::ReportListForWorkunitRequest {
                 work_unit_id: work_unit_id.to_string(),
@@ -1664,6 +1664,15 @@ impl SupervisorService {
         }
 
         Err(last_error.unwrap_or_else(|| Error::msg("connect Orcas daemon to Codex")))
+    }
+
+    async fn daemon_state_client(&self) -> Result<Arc<OrcasIpcClient>> {
+        let launch = if self.overrides.force_spawn {
+            OrcasDaemonLaunch::Always
+        } else {
+            OrcasDaemonLaunch::IfNeeded
+        };
+        self.connect_client(launch).await
     }
 
     async fn connect_client(&self, launch: OrcasDaemonLaunch) -> Result<Arc<OrcasIpcClient>> {
