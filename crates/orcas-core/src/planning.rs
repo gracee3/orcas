@@ -448,6 +448,86 @@ pub enum PlanRevisionProposalStatus {
     Superseded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanRevisionApplyPhase {
+    #[default]
+    NotStarted,
+    DownstreamApplying,
+    AwaitingFinalization,
+    Applied,
+    FailedBeforeDownstream,
+    FailedDuringDownstream,
+    FailedAfterDownstream,
+    Rejected,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanRevisionApplyFailureKind {
+    #[default]
+    RetryableInfrastructure,
+    ValidationFailure,
+    StaleBasePlan,
+    DownstreamUnknown,
+    FinalizationFailure,
+    OperatorRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanRevisionRecoveryState {
+    #[serde(default)]
+    pub phase: PlanRevisionApplyPhase,
+    #[serde(default)]
+    pub failure_kind: Option<PlanRevisionApplyFailureKind>,
+    #[serde(default)]
+    pub downstream_apply_started: bool,
+    #[serde(default)]
+    pub downstream_apply_completed: bool,
+    #[serde(default)]
+    pub retry_safe: bool,
+    #[serde(default)]
+    pub reconcile_available: bool,
+    #[serde(default)]
+    pub operator_intervention_required: bool,
+    #[serde(default)]
+    pub failure_message: Option<String>,
+    #[serde(default)]
+    pub downstream_decision_id: Option<String>,
+    #[serde(default)]
+    pub downstream_assignment_id: Option<String>,
+}
+
+impl Default for PlanRevisionRecoveryState {
+    fn default() -> Self {
+        Self {
+            phase: PlanRevisionApplyPhase::NotStarted,
+            failure_kind: None,
+            downstream_apply_started: false,
+            downstream_apply_completed: false,
+            retry_safe: false,
+            reconcile_available: false,
+            operator_intervention_required: false,
+            failure_message: None,
+            downstream_decision_id: None,
+            downstream_assignment_id: None,
+        }
+    }
+}
+
+impl PlanRevisionRecoveryState {
+    #[must_use]
+    pub fn can_retry(&self) -> bool {
+        self.retry_safe && !self.reconcile_available && !self.operator_intervention_required
+    }
+
+    #[must_use]
+    pub fn can_reconcile(&self) -> bool {
+        self.reconcile_available && self.downstream_apply_completed
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanRevisionOp {
@@ -563,6 +643,8 @@ pub struct PlanRevisionProposal {
     pub apply_finished_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub apply_error: Option<String>,
+    #[serde(default)]
+    pub recovery: PlanRevisionRecoveryState,
     #[serde(default)]
     pub applied_plan_id: Option<PlanId>,
     #[serde(default)]
@@ -709,6 +791,57 @@ impl PlanningState {
         Ok(proposal)
     }
 
+    fn revision_proposal_mut(
+        &mut self,
+        proposal_id: &PlanRevisionProposalId,
+    ) -> OrcasResult<&mut PlanRevisionProposal> {
+        self.revision_proposals
+            .get_mut(proposal_id.as_str())
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown plan revision proposal `{}`", proposal_id))
+            })
+    }
+
+    fn revision_proposal_snapshot(
+        &self,
+        proposal_id: &PlanRevisionProposalId,
+    ) -> OrcasResult<PlanRevisionProposal> {
+        self.revision_proposals
+            .get(proposal_id.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown plan revision proposal `{}`", proposal_id))
+            })
+    }
+
+    fn mark_revision_retrying(
+        proposal: &mut PlanRevisionProposal,
+        now: DateTime<Utc>,
+        reviewed_by: impl Into<String>,
+        review_note: Option<String>,
+    ) {
+        let reviewed_by = reviewed_by.into();
+        proposal.status = PlanRevisionProposalStatus::Applying;
+        proposal.reviewed_at = Some(now);
+        proposal.reviewed_by = Some(reviewed_by);
+        proposal.review_note = review_note;
+        proposal.apply_started_at = Some(now);
+        proposal.apply_finished_at = None;
+        proposal.apply_error = None;
+        proposal.recovery.phase = PlanRevisionApplyPhase::DownstreamApplying;
+        proposal.recovery.failure_kind = None;
+        proposal.recovery.retry_safe = false;
+        proposal.recovery.reconcile_available = false;
+        proposal.recovery.operator_intervention_required = false;
+        proposal.recovery.failure_message = None;
+        proposal.recovery.downstream_apply_started = true;
+        proposal.recovery.downstream_apply_completed = false;
+        proposal.recovery.downstream_decision_id = None;
+        proposal.recovery.downstream_assignment_id = None;
+        proposal.applied_plan_id = None;
+        proposal.applied_plan_version = None;
+    }
+
     pub fn begin_apply_revision(
         &mut self,
         proposal_id: &PlanRevisionProposalId,
@@ -717,13 +850,7 @@ impl PlanningState {
         now: DateTime<Utc>,
     ) -> OrcasResult<PlanRevisionProposal> {
         let reviewed_by = reviewed_by.into();
-        let proposal_snapshot = self
-            .revision_proposals
-            .get(proposal_id.as_str())
-            .cloned()
-            .ok_or_else(|| {
-                OrcasError::Protocol(format!("unknown plan revision proposal `{}`", proposal_id))
-            })?;
+        let proposal_snapshot = self.revision_proposal_snapshot(proposal_id)?;
         if !matches!(
             proposal_snapshot.status,
             PlanRevisionProposalStatus::Pending | PlanRevisionProposalStatus::ApplyFailed
@@ -754,6 +881,14 @@ impl PlanningState {
                 proposal.apply_finished_at = Some(now);
                 proposal.apply_error =
                     Some("Base plan changed before revision application.".to_string());
+                proposal.recovery.phase = PlanRevisionApplyPhase::Superseded;
+                proposal.recovery.failure_kind = Some(PlanRevisionApplyFailureKind::StaleBasePlan);
+                proposal.recovery.retry_safe = false;
+                proposal.recovery.reconcile_available = false;
+                proposal.recovery.operator_intervention_required = false;
+                proposal.recovery.failure_message = proposal.apply_error.clone();
+                proposal.recovery.downstream_apply_started = false;
+                proposal.recovery.downstream_apply_completed = false;
             }
             return Err(OrcasError::Protocol(format!(
                 "plan revision proposal `{}` is stale",
@@ -761,21 +896,36 @@ impl PlanningState {
             )));
         }
         validate_plan_revision_ops(&active_plan, &proposal_snapshot.ops)?;
-        let proposal = self
-            .revision_proposals
-            .get_mut(proposal_id.as_str())
-            .ok_or_else(|| {
-                OrcasError::Protocol(format!("unknown plan revision proposal `{}`", proposal_id))
-            })?;
-        proposal.status = PlanRevisionProposalStatus::Applying;
-        proposal.reviewed_at = Some(now);
-        proposal.reviewed_by = Some(reviewed_by);
-        proposal.review_note = review_note;
-        proposal.apply_started_at = Some(now);
-        proposal.apply_finished_at = None;
-        proposal.apply_error = None;
-        proposal.applied_plan_id = None;
-        proposal.applied_plan_version = None;
+        let proposal = self.revision_proposal_mut(proposal_id)?;
+        if matches!(proposal.status, PlanRevisionProposalStatus::ApplyFailed) {
+            if !proposal.recovery.can_retry() {
+                return Err(OrcasError::Protocol(format!(
+                    "plan revision proposal `{}` is not safely retryable",
+                    proposal_id
+                )));
+            }
+            Self::mark_revision_retrying(proposal, now, reviewed_by, review_note);
+        } else {
+            proposal.status = PlanRevisionProposalStatus::Applying;
+            proposal.reviewed_at = Some(now);
+            proposal.reviewed_by = Some(reviewed_by);
+            proposal.review_note = review_note;
+            proposal.apply_started_at = Some(now);
+            proposal.apply_finished_at = None;
+            proposal.apply_error = None;
+            proposal.recovery.phase = PlanRevisionApplyPhase::DownstreamApplying;
+            proposal.recovery.failure_kind = None;
+            proposal.recovery.retry_safe = false;
+            proposal.recovery.reconcile_available = false;
+            proposal.recovery.operator_intervention_required = false;
+            proposal.recovery.failure_message = None;
+            proposal.recovery.downstream_apply_started = true;
+            proposal.recovery.downstream_apply_completed = false;
+            proposal.recovery.downstream_decision_id = None;
+            proposal.recovery.downstream_assignment_id = None;
+            proposal.applied_plan_id = None;
+            proposal.applied_plan_version = None;
+        }
         Ok(proposal.clone())
     }
 
@@ -787,16 +937,15 @@ impl PlanningState {
         now: DateTime<Utc>,
     ) -> OrcasResult<WorkstreamPlan> {
         let reviewed_by = reviewed_by.into();
-        let proposal_snapshot = self
-            .revision_proposals
-            .get(proposal_id.as_str())
-            .cloned()
-            .ok_or_else(|| {
-                OrcasError::Protocol(format!("unknown plan revision proposal `{}`", proposal_id))
-            })?;
-        if proposal_snapshot.status != PlanRevisionProposalStatus::Applying {
+        let proposal_snapshot = self.revision_proposal_snapshot(proposal_id)?;
+        if !matches!(
+            proposal_snapshot.status,
+            PlanRevisionProposalStatus::Applying
+                | PlanRevisionProposalStatus::ApplyFailed
+                | PlanRevisionProposalStatus::Applied
+        ) {
             return Err(OrcasError::Protocol(format!(
-                "plan revision proposal `{}` is not applying",
+                "plan revision proposal `{}` is not applying or reconcilable",
                 proposal_id
             )));
         }
@@ -809,6 +958,38 @@ impl PlanningState {
                     proposal_snapshot.workstream_id
                 ))
             })?;
+        if let Some(applied_plan) = self
+            .workstream_plans
+            .get(&proposal_snapshot.workstream_id)
+            .and_then(|series| {
+                series
+                    .iter()
+                    .rev()
+                    .find(|plan| plan.source_revision_proposal_id.as_ref() == Some(proposal_id))
+            })
+            .cloned()
+        {
+            if let Some(proposal) = self.revision_proposals.get_mut(proposal_id.as_str()) {
+                proposal.status = PlanRevisionProposalStatus::Applied;
+                proposal.reviewed_at = Some(now);
+                proposal.reviewed_by = Some(reviewed_by.clone());
+                proposal.review_note = review_note;
+                proposal.apply_finished_at = Some(now);
+                proposal.apply_error = None;
+                proposal.recovery.phase = PlanRevisionApplyPhase::Applied;
+                proposal.recovery.failure_kind = None;
+                proposal.recovery.retry_safe = false;
+                proposal.recovery.reconcile_available = false;
+                proposal.recovery.operator_intervention_required = false;
+                proposal.recovery.failure_message = None;
+                proposal.recovery.downstream_apply_started = true;
+                proposal.recovery.downstream_apply_completed = true;
+                proposal.applied_plan_id = Some(applied_plan.plan_id.clone());
+                proposal.applied_plan_version = Some(applied_plan.version);
+            }
+            return Ok(applied_plan);
+        }
+
         if active_plan.plan_id != proposal_snapshot.base_plan_id
             || active_plan.version != proposal_snapshot.base_plan_version
         {
@@ -821,9 +1002,26 @@ impl PlanningState {
                 proposal.apply_finished_at = Some(now);
                 proposal.apply_error =
                     Some("Base plan changed before revision application.".to_string());
+                proposal.recovery.phase = PlanRevisionApplyPhase::Superseded;
+                proposal.recovery.failure_kind = Some(PlanRevisionApplyFailureKind::StaleBasePlan);
+                proposal.recovery.retry_safe = false;
+                proposal.recovery.reconcile_available = false;
+                proposal.recovery.operator_intervention_required = false;
+                proposal.recovery.failure_message = proposal.apply_error.clone();
+                proposal.recovery.downstream_apply_started = false;
+                proposal.recovery.downstream_apply_completed = false;
             }
             return Err(OrcasError::Protocol(format!(
                 "plan revision proposal `{}` is stale",
+                proposal_id
+            )));
+        }
+
+        if proposal_snapshot.status == PlanRevisionProposalStatus::ApplyFailed
+            && !proposal_snapshot.recovery.reconcile_available
+        {
+            return Err(OrcasError::Protocol(format!(
+                "plan revision proposal `{}` is not reconcilable",
                 proposal_id
             )));
         }
@@ -863,10 +1061,50 @@ impl PlanningState {
             proposal.review_note = review_note;
             proposal.apply_finished_at = Some(now);
             proposal.apply_error = None;
+            proposal.recovery.phase = PlanRevisionApplyPhase::Applied;
+            proposal.recovery.failure_kind = None;
+            proposal.recovery.retry_safe = false;
+            proposal.recovery.reconcile_available = false;
+            proposal.recovery.operator_intervention_required = false;
+            proposal.recovery.failure_message = None;
+            proposal.recovery.downstream_apply_started = true;
+            proposal.recovery.downstream_apply_completed = true;
             proposal.applied_plan_id = Some(updated.plan_id.clone());
             proposal.applied_plan_version = Some(updated.version);
         }
         Ok(updated)
+    }
+
+    pub fn record_downstream_completion(
+        &mut self,
+        proposal_id: &PlanRevisionProposalId,
+        decision_id: impl Into<String>,
+        assignment_id: Option<String>,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<PlanRevisionProposal> {
+        let proposal = self.revision_proposal_mut(proposal_id)?;
+        if !matches!(
+            proposal.status,
+            PlanRevisionProposalStatus::Applying | PlanRevisionProposalStatus::ApplyFailed
+        ) {
+            return Err(OrcasError::Protocol(format!(
+                "plan revision proposal `{}` is not applying or recoverable",
+                proposal_id
+            )));
+        }
+        proposal.recovery.phase = PlanRevisionApplyPhase::AwaitingFinalization;
+        proposal.recovery.downstream_apply_started = true;
+        proposal.recovery.downstream_apply_completed = true;
+        proposal.recovery.downstream_decision_id = Some(decision_id.into());
+        proposal.recovery.downstream_assignment_id = assignment_id;
+        proposal.recovery.failure_kind = None;
+        proposal.recovery.retry_safe = false;
+        proposal.recovery.reconcile_available = true;
+        proposal.recovery.operator_intervention_required = false;
+        proposal.recovery.failure_message = None;
+        proposal.apply_started_at.get_or_insert(now);
+        proposal.apply_error = None;
+        Ok(proposal.clone())
     }
 
     pub fn fail_apply_revision(
@@ -874,19 +1112,24 @@ impl PlanningState {
         proposal_id: &PlanRevisionProposalId,
         reviewed_by: impl Into<String>,
         review_note: Option<String>,
+        phase: PlanRevisionApplyPhase,
+        failure_kind: PlanRevisionApplyFailureKind,
+        retry_safe: bool,
+        reconcile_available: bool,
+        operator_intervention_required: bool,
         apply_error: impl Into<String>,
         now: DateTime<Utc>,
     ) -> OrcasResult<PlanRevisionProposal> {
         let reviewed_by = reviewed_by.into();
-        let proposal = self
-            .revision_proposals
-            .get_mut(proposal_id.as_str())
-            .ok_or_else(|| {
-                OrcasError::Protocol(format!("unknown plan revision proposal `{}`", proposal_id))
-            })?;
-        if proposal.status != PlanRevisionProposalStatus::Applying {
+        let proposal = self.revision_proposal_mut(proposal_id)?;
+        if !matches!(
+            proposal.status,
+            PlanRevisionProposalStatus::Applying
+                | PlanRevisionProposalStatus::ApplyFailed
+                | PlanRevisionProposalStatus::Applied
+        ) {
             return Err(OrcasError::Protocol(format!(
-                "plan revision proposal `{}` is not applying",
+                "plan revision proposal `{}` is not applying or recoverable",
                 proposal_id
             )));
         }
@@ -896,6 +1139,26 @@ impl PlanningState {
         proposal.review_note = review_note;
         proposal.apply_finished_at = Some(now);
         proposal.apply_error = Some(apply_error.into());
+        proposal.recovery.phase = phase;
+        proposal.recovery.failure_kind = Some(failure_kind);
+        proposal.recovery.retry_safe = retry_safe;
+        proposal.recovery.reconcile_available = reconcile_available;
+        proposal.recovery.operator_intervention_required = operator_intervention_required;
+        proposal.recovery.failure_message = proposal.apply_error.clone();
+        proposal.recovery.downstream_apply_started = matches!(
+            phase,
+            PlanRevisionApplyPhase::DownstreamApplying
+                | PlanRevisionApplyPhase::AwaitingFinalization
+                | PlanRevisionApplyPhase::Applied
+                | PlanRevisionApplyPhase::FailedDuringDownstream
+                | PlanRevisionApplyPhase::FailedAfterDownstream
+        );
+        proposal.recovery.downstream_apply_completed = matches!(
+            phase,
+            PlanRevisionApplyPhase::AwaitingFinalization
+                | PlanRevisionApplyPhase::Applied
+                | PlanRevisionApplyPhase::FailedAfterDownstream
+        );
         Ok(proposal.clone())
     }
 
@@ -1329,6 +1592,7 @@ mod tests {
             apply_started_at: None,
             apply_finished_at: None,
             apply_error: None,
+            recovery: PlanRevisionRecoveryState::default(),
             applied_plan_id: None,
             applied_plan_version: None,
             source_supervisor_proposal_id: None,
@@ -1426,6 +1690,11 @@ mod tests {
                 &proposal.proposal_id,
                 "reviewer",
                 Some("apply failed".to_string()),
+                PlanRevisionApplyPhase::FailedDuringDownstream,
+                PlanRevisionApplyFailureKind::DownstreamUnknown,
+                false,
+                false,
+                true,
                 "downstream decision application failed",
                 Utc::now(),
             )
@@ -1435,5 +1704,150 @@ mod tests {
             failed.apply_error.as_deref(),
             Some("downstream decision application failed")
         );
+    }
+
+    #[test]
+    fn retry_safe_failure_can_restart_before_downstream_apply() {
+        let mut state = sample_planning_state();
+        let proposal = sample_revision(vec![PlanRevisionOp::UpdateConstraints {
+            constraints: vec!["retry".to_string()],
+        }]);
+        state.propose_revision(proposal.clone()).expect("proposal");
+        state
+            .begin_apply_revision(&proposal.proposal_id, "reviewer", None, Utc::now())
+            .expect("begin apply");
+        let failed = state
+            .fail_apply_revision(
+                &proposal.proposal_id,
+                "reviewer",
+                Some("checkpoint write failed".to_string()),
+                PlanRevisionApplyPhase::FailedBeforeDownstream,
+                PlanRevisionApplyFailureKind::RetryableInfrastructure,
+                true,
+                false,
+                false,
+                "checkpoint write failed",
+                Utc::now(),
+            )
+            .expect("mark retryable failure");
+        assert!(failed.recovery.retry_safe);
+        assert_eq!(
+            failed.recovery.phase,
+            PlanRevisionApplyPhase::FailedBeforeDownstream
+        );
+
+        let retrying = state
+            .begin_apply_revision(&proposal.proposal_id, "reviewer", None, Utc::now())
+            .expect("retry begin");
+        assert_eq!(retrying.status, PlanRevisionProposalStatus::Applying);
+        assert_eq!(
+            retrying.recovery.phase,
+            PlanRevisionApplyPhase::DownstreamApplying
+        );
+        let completed = state
+            .record_downstream_completion(
+                &proposal.proposal_id,
+                "decision-1",
+                Some("assignment-1".to_string()),
+                Utc::now(),
+            )
+            .expect("record downstream completion");
+        assert!(completed.recovery.reconcile_available);
+        let applied = state
+            .complete_apply_revision(&proposal.proposal_id, "reviewer", None, Utc::now())
+            .expect("complete after retry");
+        assert_eq!(applied.version, 2);
+        assert_eq!(
+            state.revision_proposals[proposal.proposal_id.as_str()].status,
+            PlanRevisionProposalStatus::Applied
+        );
+    }
+
+    #[test]
+    fn reconcile_after_downstream_completion_is_idempotent() {
+        let mut state = sample_planning_state();
+        let proposal = sample_revision(vec![PlanRevisionOp::UpdateConstraints {
+            constraints: vec!["reconcile".to_string()],
+        }]);
+        state.propose_revision(proposal.clone()).expect("proposal");
+        state
+            .begin_apply_revision(&proposal.proposal_id, "reviewer", None, Utc::now())
+            .expect("begin apply");
+        state
+            .record_downstream_completion(
+                &proposal.proposal_id,
+                "decision-1",
+                Some("assignment-1".to_string()),
+                Utc::now(),
+            )
+            .expect("record downstream completion");
+        state
+            .fail_apply_revision(
+                &proposal.proposal_id,
+                "reviewer",
+                Some("finalization persist failed".to_string()),
+                PlanRevisionApplyPhase::FailedAfterDownstream,
+                PlanRevisionApplyFailureKind::FinalizationFailure,
+                false,
+                true,
+                false,
+                "finalization persist failed",
+                Utc::now(),
+            )
+            .expect("mark finalization failure");
+
+        let applied = state
+            .complete_apply_revision(&proposal.proposal_id, "reviewer", None, Utc::now())
+            .expect("reconcile finalization");
+        assert_eq!(applied.version, 2);
+        let applied_again = state
+            .complete_apply_revision(&proposal.proposal_id, "reviewer", None, Utc::now())
+            .expect("idempotent reconcile");
+        assert_eq!(applied_again.plan_id, applied.plan_id);
+        assert_eq!(
+            state.revision_proposals[proposal.proposal_id.as_str()]
+                .recovery
+                .phase,
+            PlanRevisionApplyPhase::Applied
+        );
+    }
+
+    #[test]
+    fn unsafe_retry_is_blocked_when_reconcile_is_required() {
+        let mut state = sample_planning_state();
+        let proposal = sample_revision(vec![PlanRevisionOp::UpdateConstraints {
+            constraints: vec!["blocked".to_string()],
+        }]);
+        state.propose_revision(proposal.clone()).expect("proposal");
+        state
+            .begin_apply_revision(&proposal.proposal_id, "reviewer", None, Utc::now())
+            .expect("begin apply");
+        state
+            .record_downstream_completion(
+                &proposal.proposal_id,
+                "decision-1",
+                Some("assignment-1".to_string()),
+                Utc::now(),
+            )
+            .expect("record downstream completion");
+        state
+            .fail_apply_revision(
+                &proposal.proposal_id,
+                "reviewer",
+                Some("ambiguous downstream failure".to_string()),
+                PlanRevisionApplyPhase::FailedDuringDownstream,
+                PlanRevisionApplyFailureKind::DownstreamUnknown,
+                false,
+                false,
+                true,
+                "ambiguous downstream failure",
+                Utc::now(),
+            )
+            .expect("mark unsafe failure");
+
+        let error = state
+            .begin_apply_revision(&proposal.proposal_id, "reviewer", None, Utc::now())
+            .expect_err("unsafe retry should fail");
+        assert!(error.to_string().contains("not safely retryable"));
     }
 }

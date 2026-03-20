@@ -71,6 +71,14 @@ Structural plan changes require operator approval before they become canonical. 
 
 When a supervisor proposes a revision, the daemon stores the proposal against the active plan version, validates it semantically against the current canonical plan, and preserves the prior version for historical inspection. Revision application now uses an explicit lifecycle: `pending`, `applying`, `applied`, `apply_failed`, `rejected`, or `superseded`. Orcas does not silently advance the canonical plan before downstream approval effects complete. If downstream apply fails, the revision remains inspectable with structured failure state instead of disappearing into logs.
 
+`ApplyFailed` is now split into explicit recovery classes so operators can tell what kind of recovery is safe:
+
+- `FailedBeforeDownstream` with `retry_safe = true` means the revision can be re-approved without duplicating downstream work.
+- `FailedDuringDownstream` means downstream completion is uncertain; retry is blocked and the operator must inspect or intervene.
+- `FailedAfterDownstream` with `reconcile_available = true` means downstream effects are believed complete, but plan finalization failed. The daemon can reconcile and finalize without re-running downstream work.
+
+The daemon records whether downstream apply started, whether it completed, whether retry is safe, and whether operator intervention is required. Retry and reconcile are both explicit and state-gated; stale or superseded proposals still cannot be revived unsafely.
+
 Assignment start and supervisor prompt generation both include plan linkage so tactical work stays anchored to the workstream plan rather than drifting into free-form local context. Direct execution assignments must resolve to a concrete `plan_item_id`. Narrow special execution kinds such as plan review or blocker investigation may omit a plan item, but they still attach to the active workstream plan version.
 
 Runtime execution may only synchronize a narrow subset of canonical plan fields automatically:

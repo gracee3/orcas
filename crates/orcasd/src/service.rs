@@ -46,13 +46,14 @@ use orcas_core::{
     CodexThreadBootstrapState, CollaborationState, ConnectionState, Decision, DecisionType,
     DraftAssignment, EventEnvelope, ImplementModeSpec, JsonSessionStore, OrcasError, OrcasEvent,
     OrcasResult, OrcasSessionStore, PlanAssessment, PlanAssessmentId, PlanExecutionKind, PlanId,
-    PlanItemId, PlanRevisionProposalStatus, Report, ReportParseResult, SupervisorContextPack,
-    SupervisorProposal, SupervisorProposalFailure, SupervisorProposalFailureStage,
-    SupervisorProposalRecord, SupervisorProposalStatus, SupervisorProposalTriggerKind,
-    SupervisorReasonerUsage, SupervisorTurnDecision, SupervisorTurnDecisionKind,
-    SupervisorTurnDecisionStatus, SupervisorTurnProposalKind, ThreadMetadata, WorkUnit,
-    WorkUnitStatus, Worker, WorkerSession, WorkerSessionAttachability, WorkerSessionRuntimeStatus,
-    WorkerStatus, Workstream, WorkstreamStatus,
+    PlanItemId, PlanRevisionApplyFailureKind, PlanRevisionApplyPhase, PlanRevisionProposalStatus,
+    Report, ReportParseResult, SupervisorContextPack, SupervisorProposal,
+    SupervisorProposalFailure, SupervisorProposalFailureStage, SupervisorProposalRecord,
+    SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorReasonerUsage,
+    SupervisorTurnDecision, SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus,
+    SupervisorTurnProposalKind, ThreadMetadata, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
+    WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, Workstream,
+    WorkstreamStatus,
 };
 
 use crate::assignment_comm::parse::parse_worker_report_for_turn;
@@ -1094,6 +1095,11 @@ impl OrcasDaemonService {
                 let params: ipc::ProposalApproveRequest =
                     Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.proposal_approve(params).await?)?
+            }
+            ipc::methods::PROPOSAL_RECONCILE => {
+                let params: ipc::ProposalReconcileRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.proposal_reconcile(params).await?)?
             }
             ipc::methods::PROPOSAL_REJECT => {
                 let params: ipc::ProposalRejectRequest =
@@ -6418,6 +6424,22 @@ impl OrcasDaemonService {
         if let Some(revision_proposal) = approved_plan_revision.as_ref() {
             let now = Utc::now();
             let mut state = self.state.write().await;
+            let existing_revision = state
+                .collaboration
+                .planning
+                .revision_proposals
+                .get(revision_proposal.proposal_id.as_str())
+                .cloned();
+            if let Some(existing_revision) = existing_revision {
+                if existing_revision.status == PlanRevisionProposalStatus::ApplyFailed {
+                    if !existing_revision.recovery.can_retry() {
+                        return Err(OrcasError::Protocol(format!(
+                            "plan revision proposal `{}` is not safely retryable",
+                            revision_proposal.proposal_id
+                        )));
+                    }
+                }
+            }
             if !state
                 .collaboration
                 .planning
@@ -6439,7 +6461,25 @@ impl OrcasDaemonService {
                 now,
             )?;
             drop(state);
-            self.persist_collaboration_state().await?;
+            if let Err(error) = self.persist_collaboration_state().await {
+                let now = Utc::now();
+                let mut state = self.state.write().await;
+                let _ = state.collaboration.planning.fail_apply_revision(
+                    &revision_proposal.proposal_id,
+                    reviewed_by.clone(),
+                    params.review_note.clone(),
+                    PlanRevisionApplyPhase::FailedBeforeDownstream,
+                    PlanRevisionApplyFailureKind::RetryableInfrastructure,
+                    true,
+                    false,
+                    false,
+                    format!("Persisting planning state before downstream apply failed: {error}"),
+                    now,
+                );
+                drop(state);
+                let _ = self.persist_collaboration_state().await;
+                return Err(error);
+            }
         }
 
         let (instructions, worker_id, worker_kind, communication_seed) =
@@ -6493,6 +6533,11 @@ impl OrcasDaemonService {
                         &revision.proposal_id,
                         reviewed_by.clone(),
                         params.review_note.clone(),
+                        PlanRevisionApplyPhase::FailedDuringDownstream,
+                        PlanRevisionApplyFailureKind::DownstreamUnknown,
+                        false,
+                        false,
+                        true,
                         format!("Downstream decision application failed: {error}"),
                         now,
                     );
@@ -6502,6 +6547,42 @@ impl OrcasDaemonService {
                 return Err(error);
             }
         };
+
+        if let Some(revision) = approved_plan_revision.as_ref() {
+            let now = Utc::now();
+            let mut state = self.state.write().await;
+            let _ = state.collaboration.planning.record_downstream_completion(
+                &revision.proposal_id,
+                decision_response.decision.id.clone(),
+                decision_response
+                    .next_assignment
+                    .as_ref()
+                    .map(|assignment| assignment.id.clone()),
+                now,
+            )?;
+            drop(state);
+            if let Err(error) = self.persist_collaboration_state().await {
+                let now = Utc::now();
+                let mut state = self.state.write().await;
+                let _ = state.collaboration.planning.fail_apply_revision(
+                    &revision.proposal_id,
+                    reviewed_by.clone(),
+                    params.review_note.clone(),
+                    PlanRevisionApplyPhase::FailedAfterDownstream,
+                    PlanRevisionApplyFailureKind::FinalizationFailure,
+                    false,
+                    true,
+                    false,
+                    format!(
+                        "Persisting downstream completion marker failed before finalization: {error}"
+                    ),
+                    now,
+                );
+                drop(state);
+                let _ = self.persist_collaboration_state().await;
+                return Err(error);
+            }
+        }
 
         let mut plan_revision_finalize_error = None;
         let persisted_plan_revision = if let Some(revision) = approved_plan_revision.as_ref() {
@@ -6534,6 +6615,11 @@ impl OrcasDaemonService {
                             &revision.proposal_id,
                             reviewed_by.clone(),
                             params.review_note.clone(),
+                            PlanRevisionApplyPhase::FailedAfterDownstream,
+                            PlanRevisionApplyFailureKind::FinalizationFailure,
+                            false,
+                            true,
+                            false,
                             error_text.clone(),
                             now,
                         );
@@ -6551,7 +6637,29 @@ impl OrcasDaemonService {
             None
         };
         if approved_plan_revision.is_some() {
-            self.persist_collaboration_state().await?;
+            if let Err(error) = self.persist_collaboration_state().await {
+                if let Some(revision) = approved_plan_revision.as_ref() {
+                    let now = Utc::now();
+                    let mut state = self.state.write().await;
+                    let _ = state.collaboration.planning.fail_apply_revision(
+                        &revision.proposal_id,
+                        reviewed_by.clone(),
+                        params.review_note.clone(),
+                        PlanRevisionApplyPhase::FailedAfterDownstream,
+                        PlanRevisionApplyFailureKind::FinalizationFailure,
+                        false,
+                        true,
+                        false,
+                        format!(
+                            "Persisting planning state after downstream completion failed: {error}"
+                        ),
+                        now,
+                    );
+                    drop(state);
+                    let _ = self.persist_collaboration_state().await;
+                }
+                return Err(error);
+            }
         }
         if let Some(revision) = approved_proposal.plan_revision_proposal.as_mut()
             && let Some(persisted_revision) = persisted_plan_revision
@@ -6747,6 +6855,171 @@ impl OrcasDaemonService {
             "review action persisted"
         );
         Ok(ipc::ProposalRejectResponse { proposal })
+    }
+
+    async fn proposal_reconcile(
+        &self,
+        params: ipc::ProposalReconcileRequest,
+    ) -> OrcasResult<ipc::ProposalReconcileResponse> {
+        let started_at = Instant::now();
+        let reviewed_by = params
+            .reviewed_by
+            .clone()
+            .unwrap_or_else(|| "supervisor_cli".to_string());
+        info!(
+            proposal_id = %params.proposal_id,
+            action = "reconcile_proposal",
+            reviewed_by = %reviewed_by,
+            "starting plan revision reconciliation"
+        );
+
+        let stale_proposals = {
+            let mut state = self.state.write().await;
+            let work_unit_id = state
+                .collaboration
+                .supervisor_proposals
+                .get(&params.proposal_id)
+                .map(|proposal| proposal.primary_work_unit_id.clone())
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
+                })?;
+            Self::refresh_stale_proposals_for_work_unit(&mut state.collaboration, &work_unit_id)
+        };
+        if !stale_proposals.is_empty() {
+            self.persist_collaboration_state().await?;
+            for proposal in &stale_proposals {
+                self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                    .await;
+            }
+        }
+
+        let (proposal_payload, revision_proposal, current_revision) = {
+            let state = self.state.read().await;
+            let proposal_record = state
+                .collaboration
+                .supervisor_proposals
+                .get(&params.proposal_id)
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
+                })?;
+            let proposal_payload = proposal_record.proposal.as_ref().ok_or_else(|| {
+                OrcasError::Protocol(format!(
+                    "proposal `{}` does not contain a model-generated proposal payload",
+                    proposal_record.id
+                ))
+            })?;
+            let revision_proposal = proposal_payload
+                .plan_revision_proposal
+                .as_ref()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "proposal `{}` does not include a plan revision proposal",
+                        proposal_record.id
+                    ))
+                })?;
+            let current_revision = state
+                .collaboration
+                .planning
+                .revision_proposals
+                .get(revision_proposal.proposal_id.as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "unknown plan revision proposal `{}`",
+                        revision_proposal.proposal_id
+                    ))
+                })?;
+            (
+                proposal_payload.clone(),
+                revision_proposal.clone(),
+                current_revision,
+            )
+        };
+        if !matches!(
+            current_revision.status,
+            PlanRevisionProposalStatus::Applied | PlanRevisionProposalStatus::ApplyFailed
+        ) {
+            return Err(OrcasError::Protocol(format!(
+                "plan revision proposal `{}` is not in a reconcilable state",
+                revision_proposal.proposal_id
+            )));
+        }
+        if current_revision.status == PlanRevisionProposalStatus::ApplyFailed
+            && !current_revision.recovery.can_reconcile()
+        {
+            return Err(OrcasError::Protocol(format!(
+                "plan revision proposal `{}` does not allow reconcile",
+                revision_proposal.proposal_id
+            )));
+        }
+
+        let applied_plan = {
+            let mut state = self.state.write().await;
+            state.collaboration.planning.complete_apply_revision(
+                &revision_proposal.proposal_id,
+                reviewed_by.clone(),
+                params.review_note.clone(),
+                Utc::now(),
+            )?
+        };
+        let persisted_revision = {
+            let state = self.state.read().await;
+            state
+                .collaboration
+                .planning
+                .revision_proposals
+                .get(revision_proposal.proposal_id.as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "unknown plan revision proposal `{}` after reconciliation",
+                        revision_proposal.proposal_id
+                    ))
+                })?
+        };
+        let proposal = {
+            let mut state = self.state.write().await;
+            let proposal_record = state
+                .collaboration
+                .supervisor_proposals
+                .get_mut(&params.proposal_id)
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown proposal `{}`", params.proposal_id))
+                })?;
+            proposal_record.status = SupervisorProposalStatus::Approved;
+            proposal_record.reviewed_at = Some(Utc::now());
+            proposal_record.reviewed_by = Some(reviewed_by.clone());
+            proposal_record.review_note = params.review_note.clone();
+            proposal_record.approved_proposal = Some({
+                let mut approved = proposal_payload;
+                approved.plan_revision_proposal = Some(persisted_revision.clone());
+                approved
+            });
+            proposal_record.approved_decision_id =
+                current_revision.recovery.downstream_decision_id.clone();
+            proposal_record.approved_assignment_id =
+                current_revision.recovery.downstream_assignment_id.clone();
+            proposal_record.clone()
+        };
+
+        self.persist_collaboration_state().await?;
+        self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Approved, &proposal)
+            .await;
+        info!(
+            proposal_id = %proposal.id,
+            work_unit_id = %proposal.primary_work_unit_id,
+            action = "reconcile_proposal",
+            result = "reconciled",
+            plan_id = %persisted_revision.applied_plan_id.as_ref().map(ToString::to_string).unwrap_or_else(|| applied_plan.plan_id.to_string()),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "plan revision reconciliation persisted"
+        );
+
+        Ok(ipc::ProposalReconcileResponse {
+            proposal,
+            plan_revision: persisted_revision,
+            applied_plan,
+        })
     }
 
     async fn decision_apply(
@@ -14376,6 +14649,7 @@ ORCAS_REPORT_END"#
             apply_started_at: None,
             apply_finished_at: None,
             apply_error: None,
+            recovery: orcas_core::planning::PlanRevisionRecoveryState::default(),
             applied_plan_id: None,
             applied_plan_version: None,
             source_supervisor_proposal_id: None,
@@ -14463,6 +14737,7 @@ ORCAS_REPORT_END"#
             apply_started_at: None,
             apply_finished_at: None,
             apply_error: None,
+            recovery: orcas_core::planning::PlanRevisionRecoveryState::default(),
             applied_plan_id: None,
             applied_plan_version: None,
             source_supervisor_proposal_id: None,
@@ -14530,6 +14805,368 @@ ORCAS_REPORT_END"#
     }
 
     #[tokio::test]
+    async fn proposal_approve_retries_retryable_failed_revision_without_duplicate_downstream_apply()
+    {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "revision-retry").await;
+        let active_plan = service
+            .state
+            .read()
+            .await
+            .collaboration
+            .planning
+            .active_plan(&workstream.id)
+            .cloned()
+            .expect("active plan");
+        let mut proposal = sample_proposal_for_decision(
+            DecisionType::Continue,
+            &work_unit.id,
+            &report.id,
+            &assignment.id,
+            &assignment.worker_id,
+        );
+        proposal.plan_revision_proposal = Some(orcas_core::planning::PlanRevisionProposal {
+            proposal_id: orcas_core::planning::PlanRevisionProposalId::parse(
+                "proposal-revision-retry",
+            )
+            .expect("proposal id"),
+            workstream_id: workstream.id.clone(),
+            base_plan_id: active_plan.plan_id.clone(),
+            base_plan_version: active_plan.version,
+            rationale: "Tighten the canonical constraints.".to_string(),
+            urgency: "medium".to_string(),
+            expected_benefit: "Make the approved boundary explicit.".to_string(),
+            tradeoffs: vec!["minor churn".to_string()],
+            ops: vec![orcas_core::planning::PlanRevisionOp::UpdateConstraints {
+                constraints: vec!["keep the follow-up bounded".to_string()],
+            }],
+            status: PlanRevisionProposalStatus::Pending,
+            created_at: Utc::now(),
+            created_by: "tester".to_string(),
+            reviewed_at: None,
+            reviewed_by: None,
+            review_note: None,
+            apply_started_at: None,
+            apply_finished_at: None,
+            apply_error: None,
+            recovery: orcas_core::planning::PlanRevisionRecoveryState::default(),
+            applied_plan_id: None,
+            applied_plan_version: None,
+            source_supervisor_proposal_id: None,
+        });
+        reasoner.set_proposal(proposal).await;
+
+        let created = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect("proposal create")
+            .proposal;
+        {
+            let mut state = service.state.write().await;
+            let revision = state
+                .collaboration
+                .planning
+                .revision_proposals
+                .get_mut("proposal-revision-retry")
+                .expect("revision");
+            revision.status = PlanRevisionProposalStatus::ApplyFailed;
+            revision.apply_started_at = Some(Utc::now());
+            revision.apply_finished_at = Some(Utc::now());
+            revision.apply_error = Some("checkpoint write failed".to_string());
+            revision.recovery.phase =
+                orcas_core::planning::PlanRevisionApplyPhase::FailedBeforeDownstream;
+            revision.recovery.failure_kind =
+                Some(orcas_core::planning::PlanRevisionApplyFailureKind::RetryableInfrastructure);
+            revision.recovery.downstream_apply_started = false;
+            revision.recovery.downstream_apply_completed = false;
+            revision.recovery.retry_safe = true;
+            revision.recovery.reconcile_available = false;
+            revision.recovery.operator_intervention_required = false;
+            revision.recovery.failure_message = revision.apply_error.clone();
+            revision.applied_plan_id = None;
+            revision.applied_plan_version = None;
+        }
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist retryable failure");
+
+        let approved =
+            approve_proposal(&service, &created.id, SupervisorProposalEdits::default()).await;
+
+        assert_eq!(approved.proposal.status, SupervisorProposalStatus::Approved);
+        let state = service.state.read().await;
+        let revision = state
+            .collaboration
+            .planning
+            .revision_proposals
+            .get("proposal-revision-retry")
+            .expect("persisted revision");
+        assert_eq!(revision.status, PlanRevisionProposalStatus::Applied);
+        assert_eq!(
+            revision.recovery.phase,
+            orcas_core::planning::PlanRevisionApplyPhase::Applied
+        );
+        assert_eq!(
+            state
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .map(|plan| plan.version),
+            Some(active_plan.version + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_reconcile_finalizes_failed_revision_after_downstream_apply() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "revision-reconcile").await;
+        let active_plan = service
+            .state
+            .read()
+            .await
+            .collaboration
+            .planning
+            .active_plan(&workstream.id)
+            .cloned()
+            .expect("active plan");
+        let mut proposal = sample_proposal_for_decision(
+            DecisionType::Continue,
+            &work_unit.id,
+            &report.id,
+            &assignment.id,
+            &assignment.worker_id,
+        );
+        proposal.plan_revision_proposal = Some(orcas_core::planning::PlanRevisionProposal {
+            proposal_id: orcas_core::planning::PlanRevisionProposalId::parse(
+                "proposal-revision-reconcile",
+            )
+            .expect("proposal id"),
+            workstream_id: workstream.id.clone(),
+            base_plan_id: active_plan.plan_id.clone(),
+            base_plan_version: active_plan.version,
+            rationale: "Tighten the canonical constraints.".to_string(),
+            urgency: "medium".to_string(),
+            expected_benefit: "Make the approved boundary explicit.".to_string(),
+            tradeoffs: vec!["minor churn".to_string()],
+            ops: vec![orcas_core::planning::PlanRevisionOp::UpdateConstraints {
+                constraints: vec!["keep the follow-up bounded".to_string()],
+            }],
+            status: PlanRevisionProposalStatus::Pending,
+            created_at: Utc::now(),
+            created_by: "tester".to_string(),
+            reviewed_at: None,
+            reviewed_by: None,
+            review_note: None,
+            apply_started_at: None,
+            apply_finished_at: None,
+            apply_error: None,
+            recovery: orcas_core::planning::PlanRevisionRecoveryState::default(),
+            applied_plan_id: None,
+            applied_plan_version: None,
+            source_supervisor_proposal_id: None,
+        });
+        reasoner.set_proposal(proposal).await;
+
+        let created = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect("proposal create")
+            .proposal;
+        {
+            let mut state = service.state.write().await;
+            let revision = state
+                .collaboration
+                .planning
+                .revision_proposals
+                .get_mut("proposal-revision-reconcile")
+                .expect("revision");
+            revision.status = PlanRevisionProposalStatus::ApplyFailed;
+            revision.apply_started_at = Some(Utc::now());
+            revision.apply_finished_at = Some(Utc::now());
+            revision.apply_error = Some("finalization persist failed".to_string());
+            revision.recovery.phase =
+                orcas_core::planning::PlanRevisionApplyPhase::FailedAfterDownstream;
+            revision.recovery.failure_kind =
+                Some(orcas_core::planning::PlanRevisionApplyFailureKind::FinalizationFailure);
+            revision.recovery.downstream_apply_started = true;
+            revision.recovery.downstream_apply_completed = true;
+            revision.recovery.downstream_decision_id = Some("decision-42".to_string());
+            revision.recovery.downstream_assignment_id = Some("assignment-42".to_string());
+            revision.recovery.retry_safe = false;
+            revision.recovery.reconcile_available = true;
+            revision.recovery.operator_intervention_required = false;
+            revision.recovery.failure_message = revision.apply_error.clone();
+            revision.applied_plan_id = None;
+            revision.applied_plan_version = None;
+        }
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist reconciliation failure");
+
+        let response = service
+            .proposal_reconcile(ipc::ProposalReconcileRequest {
+                proposal_id: created.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("finalize after downstream completion".to_string()),
+            })
+            .await
+            .expect("reconcile");
+
+        assert_eq!(response.proposal.status, SupervisorProposalStatus::Approved);
+        assert_eq!(
+            response.plan_revision.status,
+            PlanRevisionProposalStatus::Applied
+        );
+        assert_eq!(
+            response.plan_revision.recovery.phase,
+            orcas_core::planning::PlanRevisionApplyPhase::Applied
+        );
+        assert_eq!(
+            response
+                .plan_revision
+                .recovery
+                .downstream_decision_id
+                .as_deref(),
+            Some("decision-42")
+        );
+        assert_eq!(
+            response
+                .plan_revision
+                .recovery
+                .downstream_assignment_id
+                .as_deref(),
+            Some("assignment-42")
+        );
+        assert_eq!(response.applied_plan.version, active_plan.version + 1);
+    }
+
+    #[tokio::test]
+    async fn proposal_reconcile_rejects_ambiguous_in_progress_failures() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "revision-ambiguous").await;
+        let active_plan = service
+            .state
+            .read()
+            .await
+            .collaboration
+            .planning
+            .active_plan(&workstream.id)
+            .cloned()
+            .expect("active plan");
+        let mut proposal = sample_proposal_for_decision(
+            DecisionType::Continue,
+            &work_unit.id,
+            &report.id,
+            &assignment.id,
+            &assignment.worker_id,
+        );
+        proposal.plan_revision_proposal = Some(orcas_core::planning::PlanRevisionProposal {
+            proposal_id: orcas_core::planning::PlanRevisionProposalId::parse(
+                "proposal-revision-ambiguous",
+            )
+            .expect("proposal id"),
+            workstream_id: workstream.id.clone(),
+            base_plan_id: active_plan.plan_id.clone(),
+            base_plan_version: active_plan.version,
+            rationale: "Tighten the canonical constraints.".to_string(),
+            urgency: "medium".to_string(),
+            expected_benefit: "Make the approved boundary explicit.".to_string(),
+            tradeoffs: vec!["minor churn".to_string()],
+            ops: vec![orcas_core::planning::PlanRevisionOp::UpdateConstraints {
+                constraints: vec!["keep the follow-up bounded".to_string()],
+            }],
+            status: PlanRevisionProposalStatus::Pending,
+            created_at: Utc::now(),
+            created_by: "tester".to_string(),
+            reviewed_at: None,
+            reviewed_by: None,
+            review_note: None,
+            apply_started_at: None,
+            apply_finished_at: None,
+            apply_error: None,
+            recovery: orcas_core::planning::PlanRevisionRecoveryState::default(),
+            applied_plan_id: None,
+            applied_plan_version: None,
+            source_supervisor_proposal_id: None,
+        });
+        reasoner.set_proposal(proposal).await;
+
+        let created = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect("proposal create")
+            .proposal;
+        {
+            let mut state = service.state.write().await;
+            let revision = state
+                .collaboration
+                .planning
+                .revision_proposals
+                .get_mut("proposal-revision-ambiguous")
+                .expect("revision");
+            revision.status = PlanRevisionProposalStatus::ApplyFailed;
+            revision.apply_started_at = Some(Utc::now());
+            revision.apply_finished_at = Some(Utc::now());
+            revision.apply_error = Some("downstream state uncertain".to_string());
+            revision.recovery.phase =
+                orcas_core::planning::PlanRevisionApplyPhase::FailedDuringDownstream;
+            revision.recovery.failure_kind =
+                Some(orcas_core::planning::PlanRevisionApplyFailureKind::DownstreamUnknown);
+            revision.recovery.downstream_apply_started = true;
+            revision.recovery.downstream_apply_completed = false;
+            revision.recovery.retry_safe = false;
+            revision.recovery.reconcile_available = false;
+            revision.recovery.operator_intervention_required = true;
+            revision.recovery.failure_message = revision.apply_error.clone();
+            revision.applied_plan_id = None;
+            revision.applied_plan_version = None;
+        }
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist ambiguous failure");
+
+        let error = service
+            .proposal_reconcile(ipc::ProposalReconcileRequest {
+                proposal_id: created.id.clone(),
+                reviewed_by: Some("reviewer".to_string()),
+                review_note: Some("attempt reconcile".to_string()),
+            })
+            .await
+            .expect_err("ambiguous failures should not reconcile");
+        assert!(
+            error.to_string().contains("does not allow reconcile")
+                || error.to_string().contains("not in a reconcilable state")
+        );
+    }
+
+    #[tokio::test]
     async fn proposal_approve_rejects_stale_plan_revision_base() {
         let reasoner = Arc::new(StaticSupervisorReasoner::default());
         let service = test_service_with_reasoner(reasoner.clone()).await;
@@ -14575,6 +15212,7 @@ ORCAS_REPORT_END"#
             apply_started_at: None,
             apply_finished_at: None,
             apply_error: None,
+            recovery: orcas_core::planning::PlanRevisionRecoveryState::default(),
             applied_plan_id: None,
             applied_plan_version: None,
             source_supervisor_proposal_id: None,

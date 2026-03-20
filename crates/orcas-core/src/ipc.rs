@@ -119,6 +119,7 @@ pub mod methods {
         "proposal/artifact_summary/list_for_workunit";
     pub const PROPOSAL_LIST_FOR_WORKUNIT: &str = "proposal/list_for_workunit";
     pub const PROPOSAL_APPROVE: &str = "proposal/approve";
+    pub const PROPOSAL_RECONCILE: &str = "proposal/reconcile";
     pub const PROPOSAL_REJECT: &str = "proposal/reject";
     pub const EVENTS_SUBSCRIBE: &str = "events/subscribe";
     pub const EVENTS_NOTIFICATION: &str = "events/notification";
@@ -1833,6 +1834,20 @@ pub struct ProposalApproveResponse {
     pub proposal: SupervisorProposalRecord,
     pub decision: Decision,
     pub next_assignment: Option<Assignment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalReconcileRequest {
+    pub proposal_id: String,
+    pub reviewed_by: Option<String>,
+    pub review_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalReconcileResponse {
+    pub proposal: SupervisorProposalRecord,
+    pub plan_revision: PlanRevisionProposal,
+    pub applied_plan: WorkstreamPlan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
