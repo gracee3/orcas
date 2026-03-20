@@ -166,6 +166,39 @@ async fn spawn_proposal_ready_daemon(
     (fake_codex, fake_supervisor, daemon, started)
 }
 
+fn create_proposal_via_cli(daemon: &TestDaemon, started: &ipc::AssignmentStartResponse) -> String {
+    let create_output = run_orcas(
+        daemon,
+        &[
+            "proposals",
+            "create",
+            "--workunit",
+            &started.report.work_unit_id,
+            "--report",
+            &started.report.id,
+            "--requested-by",
+            "cli_operator",
+            "--note",
+            "Bounded CLI proposal workflow",
+        ],
+    );
+    assert!(
+        create_output.status.success(),
+        "stderr: {}",
+        stderr(&create_output)
+    );
+    let create_stdout = stdout(&create_output);
+    let proposal_id = field_value(&create_stdout, "proposal_id")
+        .expect("proposal create should print proposal_id")
+        .to_string();
+    assert!(create_stdout.contains(&format!("work_unit_id: {}", started.report.work_unit_id)));
+    assert!(create_stdout.contains(&format!("source_report_id: {}", started.report.id)));
+    assert!(create_stdout.contains("status: Open"));
+    assert!(create_stdout.contains("reasoner_model: fake-supervisor-model"));
+    assert!(create_stdout.contains("model_proposed_decision_type:"));
+    proposal_id
+}
+
 #[tokio::test]
 async fn real_cli_can_connect_to_daemon_and_read_basic_state() {
     let mut daemon = TestDaemon::spawn("cli-daemon-status").await;
@@ -525,35 +558,7 @@ async fn real_cli_can_create_list_and_approve_proposal_after_real_assignment_set
     let (_fake_codex, _fake_supervisor, mut daemon, started) =
         spawn_proposal_ready_daemon("cli-proposal-workflow").await;
 
-    let create_output = run_orcas(
-        &daemon,
-        &[
-            "proposals",
-            "create",
-            "--workunit",
-            &started.report.work_unit_id,
-            "--report",
-            &started.report.id,
-            "--requested-by",
-            "cli_operator",
-            "--note",
-            "Bounded CLI proposal workflow",
-        ],
-    );
-    assert!(
-        create_output.status.success(),
-        "stderr: {}",
-        stderr(&create_output)
-    );
-    let create_stdout = stdout(&create_output);
-    let proposal_id = field_value(&create_stdout, "proposal_id")
-        .expect("proposal create should print proposal_id")
-        .to_string();
-    assert!(create_stdout.contains(&format!("work_unit_id: {}", started.report.work_unit_id)));
-    assert!(create_stdout.contains(&format!("source_report_id: {}", started.report.id)));
-    assert!(create_stdout.contains("status: Open"));
-    assert!(create_stdout.contains("reasoner_model: fake-supervisor-model"));
-    assert!(create_stdout.contains("model_proposed_decision_type:"));
+    let proposal_id = create_proposal_via_cli(&daemon, &started);
 
     let list_output = run_orcas(
         &daemon,
@@ -611,6 +616,119 @@ async fn real_cli_can_create_list_and_approve_proposal_after_real_assignment_set
     assert!(get_stdout.contains("status: Approved"));
     assert!(get_stdout.contains("reviewed_by: cli_operator"));
     assert!(get_stdout.contains("approved_decision_id:"));
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_cli_can_create_list_and_reject_proposal_after_real_assignment_setup() {
+    let (_fake_codex, _fake_supervisor, mut daemon, started) =
+        spawn_proposal_ready_daemon("cli-proposal-reject").await;
+
+    let proposal_id = create_proposal_via_cli(&daemon, &started);
+
+    let list_output = run_orcas(
+        &daemon,
+        &[
+            "proposals",
+            "list-for-workunit",
+            "--workunit",
+            &started.report.work_unit_id,
+        ],
+    );
+    assert!(
+        list_output.status.success(),
+        "stderr: {}",
+        stderr(&list_output)
+    );
+    let list_stdout = stdout(&list_output);
+    assert!(list_stdout.contains(&proposal_id));
+    assert!(list_stdout.contains("Open"));
+
+    let reject_output = run_orcas(
+        &daemon,
+        &[
+            "proposals",
+            "reject",
+            "--proposal",
+            &proposal_id,
+            "--reviewed-by",
+            "cli_operator",
+            "--review-note",
+            "Reject the bounded fake supervisor proposal",
+        ],
+    );
+    assert!(
+        reject_output.status.success(),
+        "stderr: {}",
+        stderr(&reject_output)
+    );
+    let reject_stdout = stdout(&reject_output);
+    assert!(reject_stdout.contains(&format!("proposal_id: {proposal_id}")));
+    assert!(reject_stdout.contains("status: Rejected"));
+    assert!(reject_stdout.contains("reviewed_by: cli_operator"));
+    assert!(reject_stdout.contains("review_note: Reject the bounded fake supervisor proposal"));
+
+    let get_output = run_orcas(&daemon, &["proposals", "get", "--proposal", &proposal_id]);
+    assert!(
+        get_output.status.success(),
+        "stderr: {}",
+        stderr(&get_output)
+    );
+    let get_stdout = stdout(&get_output);
+    assert!(get_stdout.contains(&format!("proposal_id: {proposal_id}")));
+    assert!(get_stdout.contains("status: Rejected"));
+    assert!(get_stdout.contains("reviewed_by: cli_operator"));
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_cli_rejects_approving_non_open_proposal_with_nonzero_exit() {
+    let (_fake_codex, _fake_supervisor, mut daemon, started) =
+        spawn_proposal_ready_daemon("cli-proposal-closed").await;
+
+    let proposal_id = create_proposal_via_cli(&daemon, &started);
+
+    let reject_output = run_orcas(
+        &daemon,
+        &[
+            "proposals",
+            "reject",
+            "--proposal",
+            &proposal_id,
+            "--reviewed-by",
+            "cli_operator",
+            "--review-note",
+            "Close the proposal before the negative case",
+        ],
+    );
+    assert!(
+        reject_output.status.success(),
+        "stderr: {}",
+        stderr(&reject_output)
+    );
+
+    let approve_output = run_orcas(
+        &daemon,
+        &[
+            "proposals",
+            "approve",
+            "--proposal",
+            &proposal_id,
+            "--reviewed-by",
+            "cli_operator",
+            "--review-note",
+            "This should fail because the proposal is already closed",
+        ],
+    );
+    assert!(!approve_output.status.success());
+    assert!(stdout(&approve_output).is_empty());
+    assert!(
+        stderr(&approve_output).contains("is not open and cannot be approved"),
+        "stderr: {}",
+        stderr(&approve_output)
+    );
 
     daemon.stop().await;
 }
