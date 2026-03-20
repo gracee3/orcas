@@ -14,7 +14,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, trace, warn};
 
 use orcas_core::{AppPaths, init_file_logger};
 use orcas_tui::app::{Action, MainFooterState, ProgramView, TopLevelView, UserAction};
@@ -200,7 +200,7 @@ async fn handle_key(
     key: KeyEvent,
 ) -> Result<bool> {
     sync_codex_sessions(runtime, codex_sessions)?;
-    debug!(
+    trace!(
         key = ?key,
         current_view = ?runtime.state().current_view,
         "received key in tui"
@@ -243,11 +243,74 @@ async fn handle_key(
                 }
             }
         } else {
-            info!(?action, "dispatching tui action");
+            trace!(
+                action = user_action_label(&action),
+                "dispatching tui action"
+            );
             runtime.dispatch(Action::User(action));
         }
     }
     Ok(false)
+}
+
+fn user_action_label(action: &UserAction) -> &'static str {
+    match action {
+        UserAction::Refresh => "refresh",
+        UserAction::LoadModels => "load_models",
+        UserAction::StartDaemon => "start_daemon",
+        UserAction::RestartDaemon => "restart_daemon",
+        UserAction::StopDaemon => "stop_daemon",
+        UserAction::ToggleHelp => "toggle_help",
+        UserAction::CycleView => "cycle_view",
+        UserAction::ShowView(_) => "show_view",
+        UserAction::CycleProgramView => "cycle_program_view",
+        UserAction::ShowProgramView(_) => "show_program_view",
+        UserAction::CycleCollaborationFocus => "cycle_collaboration_focus",
+        UserAction::SelectNextInView => "select_next_in_view",
+        UserAction::SelectPreviousInView => "select_previous_in_view",
+        UserAction::ExpandSelectedInView => "expand_selected_in_view",
+        UserAction::CollapseSelectedInView => "collapse_selected_in_view",
+        UserAction::SelectNextThread => "select_next_thread",
+        UserAction::SelectPreviousThread => "select_previous_thread",
+        UserAction::SelectThread(_) => "select_thread",
+        UserAction::CreateWorkstream => "create_workstream",
+        UserAction::CreateWorkUnitForSelection => "create_work_unit_for_selection",
+        UserAction::CreateTrackedThreadForSelection => "create_tracked_thread_for_selection",
+        UserAction::EditSelectedMainEntity => "edit_selected_main_entity",
+        UserAction::DeleteSelectedMainEntity => "delete_selected_main_entity",
+        UserAction::MainFooterAppend(_) => "main_footer_append",
+        UserAction::MainFooterBackspace => "main_footer_backspace",
+        UserAction::MainFooterDelete => "main_footer_delete",
+        UserAction::MainFooterMoveLeft => "main_footer_move_left",
+        UserAction::MainFooterMoveRight => "main_footer_move_right",
+        UserAction::MainFooterNextField => "main_footer_next_field",
+        UserAction::MainFooterPreviousField => "main_footer_previous_field",
+        UserAction::SubmitMainFooter => "submit_main_footer",
+        UserAction::CancelMainFooter => "cancel_main_footer",
+        UserAction::EnterPromptMode => "enter_prompt_mode",
+        UserAction::ExitPromptMode => "exit_prompt_mode",
+        UserAction::PromptAppend(_) => "prompt_append",
+        UserAction::PromptBackspace => "prompt_backspace",
+        UserAction::SubmitPrompt => "submit_prompt",
+        UserAction::ResumeSelectedThreadInCodex => "resume_selected_thread_in_codex",
+        UserAction::ProposeSteerForSelectedThread => "propose_steer_for_selected_thread",
+        UserAction::EditPendingSteerForSelectedThread => "edit_pending_steer_for_selected_thread",
+        UserAction::SteerComposeAppend(_) => "steer_compose_append",
+        UserAction::SteerComposeInsertNewline => "steer_compose_insert_newline",
+        UserAction::SteerComposeBackspace => "steer_compose_backspace",
+        UserAction::SteerComposeDelete => "steer_compose_delete",
+        UserAction::SteerComposeMoveLeft => "steer_compose_move_left",
+        UserAction::SteerComposeMoveRight => "steer_compose_move_right",
+        UserAction::SteerComposeMoveUp => "steer_compose_move_up",
+        UserAction::SteerComposeMoveDown => "steer_compose_move_down",
+        UserAction::SubmitSteerCompose => "submit_steer_compose",
+        UserAction::CancelSteerCompose => "cancel_steer_compose",
+        UserAction::ProposeInterruptForSelectedThread => "propose_interrupt_for_selected_thread",
+        UserAction::RecordNoActionForSelectedThread => "record_no_action_for_selected_thread",
+        UserAction::ManualRefreshForSelectedThread => "manual_refresh_for_selected_thread",
+        UserAction::ApproveSelectedSupervisorDecision => "approve_selected_supervisor_decision",
+        UserAction::RejectSelectedSupervisorDecision => "reject_selected_supervisor_decision",
+    }
 }
 
 fn sync_codex_sessions(

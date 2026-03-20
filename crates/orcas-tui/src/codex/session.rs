@@ -19,7 +19,7 @@ use portable_pty::{
     Child, ChildKiller, CommandBuilder, ExitStatus as PtyExitStatus, MasterPty, PtySize,
     native_pty_system,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::app::AppState;
 
@@ -592,6 +592,13 @@ impl CodexSessionManager {
         self.session_mut(session_id)?
             .mark_attached(pid)
             .map_err(|error| anyhow!(error))?;
+        info!(
+            session_id = %session_id,
+            thread_id = %descriptor.thread_id,
+            pid,
+            state = "attached",
+            "Codex PTY session attached"
+        );
         self.hosts.insert(
             session_id,
             CodexSessionHost {
@@ -630,9 +637,26 @@ impl CodexSessionManager {
                 control_rx.try_recv(),
                 Ok(InputRelayControl::DetachRequested)
             ) {
+                let thread_id = self
+                    .sessions
+                    .get(&session_id)
+                    .map(|session| session.thread_id.clone())
+                    .unwrap_or_default();
+                let pid = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| session.state.pid())
+                    .unwrap_or_default();
                 self.session_mut(session_id)?
                     .mark_detached()
                     .map_err(|error| anyhow!(error))?;
+                info!(
+                    session_id = %session_id,
+                    thread_id = %thread_id,
+                    pid,
+                    state = "detached",
+                    "Codex PTY session detached"
+                );
                 break;
             }
             if !self
@@ -701,12 +725,36 @@ impl CodexSessionManager {
             }
             BackgroundEvent::Exited { session_id, result } => {
                 if let Some(session) = self.sessions.get_mut(&session_id) {
+                    let thread_id = session.thread_id.clone();
                     let _ = session.mark_exited(result);
+                    let exit_code = match &session.state {
+                        CodexSessionState::Exited { result } => result.code,
+                        _ => None,
+                    };
+                    info!(
+                        session_id = %session_id,
+                        thread_id = %thread_id,
+                        exit_code,
+                        state = "exited",
+                        "Codex PTY session exited"
+                    );
                 }
                 self.hosts.remove(&session_id);
                 Ok(true)
             }
             BackgroundEvent::Failed { session_id, error } => {
+                let thread_id = self
+                    .sessions
+                    .get(&session_id)
+                    .map(|session| session.thread_id.clone())
+                    .unwrap_or_default();
+                warn!(
+                    session_id = %session_id,
+                    thread_id = %thread_id,
+                    state = "failed",
+                    error = %error,
+                    "Codex PTY session failed"
+                );
                 self.mark_session_failed(session_id, error);
                 self.terminate_host(session_id);
                 self.hosts.remove(&session_id);

@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::{Mutex, mpsc};
+use tracing::{debug, info, warn};
 
 use orcas_core::{
     AppPaths, Assignment, Decision, Report, SupervisorTurnDecision, WorkUnit, authority, ipc,
@@ -139,10 +141,13 @@ pub struct OrcasDaemonBackend {
 
 impl OrcasDaemonBackend {
     pub async fn discover() -> Result<Self> {
+        Self::discover_with_overrides(OrcasRuntimeOverrides::default()).await
+    }
+
+    pub async fn discover_with_overrides(overrides: OrcasRuntimeOverrides) -> Result<Self> {
         let paths = AppPaths::discover()?;
         paths.ensure().await?;
-        let daemon =
-            OrcasDaemonProcessManager::new(paths.clone(), OrcasRuntimeOverrides::default());
+        let daemon = OrcasDaemonProcessManager::new(paths.clone(), overrides);
         Ok(Self {
             paths,
             daemon,
@@ -155,21 +160,41 @@ impl OrcasDaemonBackend {
             return Ok(client);
         }
 
+        debug!(
+            launch = launch_label(launch),
+            "TUI backend establishing daemon client"
+        );
         self.connect_client(launch).await
     }
 
     async fn connect_client(&self, launch: OrcasDaemonLaunch) -> Result<Arc<OrcasIpcClient>> {
+        let start = Instant::now();
+        let socket = self.paths.socket_file.display().to_string();
+        info!(
+            socket,
+            launch = launch_label(launch),
+            "TUI backend connecting to daemon"
+        );
         self.daemon.ensure_running(launch).await?;
         let client = OrcasIpcClient::connect(&self.paths).await?;
         client.daemon_connect().await?;
         let mut guard = self.client.lock().await;
         *guard = Some(Arc::clone(&client));
+        info!(
+            socket,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "TUI backend connected to daemon"
+        );
         Ok(client)
     }
 
     async fn invalidate_client(&self) {
         let mut guard = self.client.lock().await;
         *guard = None;
+        debug!(
+            socket = %self.paths.socket_file.display(),
+            "TUI backend invalidated cached daemon client"
+        );
     }
 }
 
@@ -180,6 +205,10 @@ impl TuiBackend for OrcasDaemonBackend {
         match client.state_get().await {
             Ok(response) => Ok(response.snapshot),
             Err(_) => {
+                warn!(
+                    socket = %self.paths.socket_file.display(),
+                    "TUI backend lost daemon snapshot connection; reconnecting"
+                );
                 self.invalidate_client().await;
                 let client = self.connect_client(OrcasDaemonLaunch::Never).await?;
                 Ok(client.state_get().await?.snapshot)
@@ -192,6 +221,10 @@ impl TuiBackend for OrcasDaemonBackend {
         let (events, _) = match client.subscribe_events(false).await {
             Ok(response) => response,
             Err(_) => {
+                warn!(
+                    socket = %self.paths.socket_file.display(),
+                    "TUI backend event subscription dropped; reconnecting"
+                );
                 self.invalidate_client().await;
                 let client = self.connect_client(OrcasDaemonLaunch::Never).await?;
                 client.subscribe_events(false).await?
@@ -225,16 +258,88 @@ impl TuiBackend for OrcasDaemonBackend {
             Ok(result) => Ok(result),
             Err(error) => {
                 let retry_launch = if Self::should_restart_for_error(&command, &error) {
+                    warn!(
+                        command = backend_command_label(&command),
+                        error = %error,
+                        "TUI backend restarting daemon after authority method mismatch"
+                    );
                     self.daemon.restart().await?;
+                    info!(
+                        command = backend_command_label(&command),
+                        "TUI backend daemon restart completed"
+                    );
                     OrcasDaemonLaunch::Never
                 } else {
+                    warn!(
+                        command = backend_command_label(&command),
+                        error = %error,
+                        "TUI backend retrying command after daemon client failure"
+                    );
                     launch
                 };
                 self.invalidate_client().await;
                 let client = self.connect_client(retry_launch).await?;
-                Self::execute_with_client(&client, command).await
+                let retried = Self::execute_with_client(&client, command).await;
+                match &retried {
+                    Ok(_) => info!("TUI backend reconnect succeeded"),
+                    Err(error) => warn!(error = %error, "TUI backend reconnect retry failed"),
+                }
+                retried
             }
         }
+    }
+}
+
+fn launch_label(launch: OrcasDaemonLaunch) -> &'static str {
+    match launch {
+        OrcasDaemonLaunch::Never => "never",
+        OrcasDaemonLaunch::IfNeeded => "if_needed",
+        OrcasDaemonLaunch::Always => "always",
+    }
+}
+
+fn backend_command_label(command: &BackendCommand) -> &'static str {
+    match command {
+        BackendCommand::GetAuthorityHierarchy { .. } => "get_authority_hierarchy",
+        BackendCommand::GetAuthorityDeletePlan { .. } => "get_authority_delete_plan",
+        BackendCommand::GetAuthorityWorkstream { .. } => "get_authority_workstream",
+        BackendCommand::GetAuthorityWorkUnit { .. } => "get_authority_work_unit",
+        BackendCommand::GetAuthorityTrackedThread { .. } => "get_authority_tracked_thread",
+        BackendCommand::CreateAuthorityWorkstream { .. } => "create_authority_workstream",
+        BackendCommand::EditAuthorityWorkstream { .. } => "edit_authority_workstream",
+        BackendCommand::DeleteAuthorityWorkstream { .. } => "delete_authority_workstream",
+        BackendCommand::CreateAuthorityWorkUnit { .. } => "create_authority_work_unit",
+        BackendCommand::EditAuthorityWorkUnit { .. } => "edit_authority_work_unit",
+        BackendCommand::DeleteAuthorityWorkUnit { .. } => "delete_authority_work_unit",
+        BackendCommand::CreateAuthorityTrackedThread { .. } => "create_authority_tracked_thread",
+        BackendCommand::EditAuthorityTrackedThread { .. } => "edit_authority_tracked_thread",
+        BackendCommand::DeleteAuthorityTrackedThread { .. } => "delete_authority_tracked_thread",
+        BackendCommand::GetThread { .. } => "get_thread",
+        BackendCommand::AttachThread { .. } => "attach_thread",
+        BackendCommand::GetTurn { .. } => "get_turn",
+        BackendCommand::GetWorkUnit { .. } => "get_work_unit",
+        BackendCommand::GetActiveTurns => "get_active_turns",
+        BackendCommand::LoadModels => "load_models",
+        BackendCommand::StartDaemon => "start_daemon",
+        BackendCommand::StopDaemon => "stop_daemon",
+        BackendCommand::SubmitPrompt { .. } => "submit_prompt",
+        BackendCommand::ProposeSteerSupervisorDecision { .. } => {
+            "propose_steer_supervisor_decision"
+        }
+        BackendCommand::ReplacePendingSteerSupervisorDecision { .. } => {
+            "replace_pending_steer_supervisor_decision"
+        }
+        BackendCommand::ProposeInterruptSupervisorDecision { .. } => {
+            "propose_interrupt_supervisor_decision"
+        }
+        BackendCommand::RecordNoActionSupervisorDecision { .. } => {
+            "record_no_action_supervisor_decision"
+        }
+        BackendCommand::ManualRefreshSupervisorDecision { .. } => {
+            "manual_refresh_supervisor_decision"
+        }
+        BackendCommand::ApproveSupervisorDecision { .. } => "approve_supervisor_decision",
+        BackendCommand::RejectSupervisorDecision { .. } => "reject_supervisor_decision",
     }
 }
 

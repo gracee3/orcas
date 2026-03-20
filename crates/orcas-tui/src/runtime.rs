@@ -5,11 +5,11 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep};
+use tracing::{info, trace, warn};
 
 use crate::app::{Action, AppState, Effect, UiEvent, UserAction, reduce};
 use crate::backend::{BackendCommand, BackendCommandResult, TuiBackend};
 use orcas_core::logging::runtime_cycle_enabled;
-use tracing::debug;
 
 const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(250);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
@@ -90,9 +90,9 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
     }
 
     pub fn dispatch(&mut self, action: Action) {
-        debug!(?action, "dispatching app action");
+        trace!(action = action_label(&action), "dispatching app action");
         let effects = reduce(&mut self.state, action);
-        debug!(?effects, "action reduced to effects");
+        trace!(effect_count = effects.len(), "action reduced to effects");
         for effect in effects {
             self.enqueue_effect(effect);
         }
@@ -105,7 +105,7 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
 
     pub async fn process_all(&mut self) {
         if runtime_cycle_enabled() {
-            debug!(
+            trace!(
                 pending = self.pending_effects.len(),
                 running = self.running_effects.len(),
                 "processing runtime cycle"
@@ -138,7 +138,7 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
     }
 
     fn enqueue_effect(&mut self, effect: Effect) {
-        debug!(?effect, "enqueueing effect");
+        trace!(effect_kind = effect_label(&effect), "enqueueing effect");
         if self.running_effects.contains(&effect) {
             return;
         }
@@ -149,7 +149,7 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
     }
 
     fn start_effect(&mut self, effect: Effect) {
-        debug!(?effect, "starting effect");
+        trace!(effect_kind = effect_label(&effect), "starting effect");
         self.running_effects.insert(effect.clone());
 
         let backend = Arc::clone(&self.backend);
@@ -163,8 +163,8 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
 
     fn apply_completion(&mut self, completion: EffectCompletion) {
         self.running_effects.remove(&completion.effect);
-        debug!(
-            ?completion.effect,
+        trace!(
+            effect_kind = effect_label(&completion.effect),
             actions = completion.actions.len(),
             follow_ups = completion.follow_up_effects.len(),
             "completing effect"
@@ -205,7 +205,7 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
             completion_count += 1;
         }
         if completion_count > 0 {
-            debug!(completion_count, "drained effect completions");
+            trace!(completion_count, "drained effect completions");
         }
     }
 
@@ -923,7 +923,7 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                 .await
             }
             effect @ Effect::StartDaemon => {
-                debug!(?effect, "starting start-daemon effect");
+                info!("starting daemon from TUI");
                 Self::run_backend_effect(
                     backend,
                     effect,
@@ -951,7 +951,7 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                 .await
             }
             effect @ Effect::StopDaemon => {
-                debug!(?effect, "starting stop-daemon effect");
+                info!("stopping daemon from TUI");
                 Self::run_backend_effect(
                     backend,
                     effect,
@@ -979,7 +979,7 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                 .await
             }
             effect @ Effect::RestartDaemon => {
-                debug!(?effect, "starting restart-daemon effect");
+                info!("restarting daemon from TUI");
                 let mut actions = Vec::new();
                 let stop_completion = Self::run_backend_effect(
                     Arc::clone(&backend),
@@ -1347,23 +1347,70 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
         G: FnOnce(anyhow::Error) -> Action,
     {
         let started = Instant::now();
-        debug!(?effect, ?command, "running backend effect");
+        trace!(
+            effect_kind = effect_label(&effect),
+            command = backend_command_label(&command),
+            "running backend effect"
+        );
         match backend.execute(command).await {
             Ok(result) => {
-                debug!(
-                    ?effect,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "backend effect succeeded"
-                );
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                match effect {
+                    Effect::RefreshSnapshot => {
+                        info!(duration_ms = elapsed_ms, "TUI backend snapshot loaded")
+                    }
+                    Effect::SubscribeEvents => info!(
+                        duration_ms = elapsed_ms,
+                        "TUI backend event subscription established"
+                    ),
+                    Effect::StartDaemon => {
+                        info!(duration_ms = elapsed_ms, "TUI daemon start completed")
+                    }
+                    Effect::StopDaemon => {
+                        info!(duration_ms = elapsed_ms, "TUI daemon stop completed")
+                    }
+                    Effect::RestartDaemon => {
+                        info!(duration_ms = elapsed_ms, "TUI daemon restart completed")
+                    }
+                    _ => trace!(
+                        effect_kind = effect_label(&effect),
+                        duration_ms = elapsed_ms,
+                        "backend effect succeeded"
+                    ),
+                }
                 EffectCompletion::success(effect, on_success(result))
             }
             Err(error) => {
-                debug!(
-                    ?effect,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    %error,
-                    "backend effect failed"
-                );
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                match effect {
+                    Effect::RefreshSnapshot => warn!(
+                        duration_ms = elapsed_ms,
+                        error = %error,
+                        "TUI backend snapshot load failed"
+                    ),
+                    Effect::SubscribeEvents => warn!(
+                        duration_ms = elapsed_ms,
+                        error = %error,
+                        "TUI backend event subscription failed"
+                    ),
+                    Effect::StartDaemon => {
+                        warn!(duration_ms = elapsed_ms, error = %error, "TUI daemon start failed")
+                    }
+                    Effect::StopDaemon => {
+                        warn!(duration_ms = elapsed_ms, error = %error, "TUI daemon stop failed")
+                    }
+                    Effect::RestartDaemon => warn!(
+                        duration_ms = elapsed_ms,
+                        error = %error,
+                        "TUI daemon restart failed"
+                    ),
+                    _ => trace!(
+                        effect_kind = effect_label(&effect),
+                        duration_ms = elapsed_ms,
+                        error = %error,
+                        "backend effect failed"
+                    ),
+                }
                 EffectCompletion::failure(effect, on_error(error))
             }
         }
@@ -1383,6 +1430,158 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
         ]
         .iter()
         .any(|needle| message.contains(needle))
+    }
+}
+
+fn effect_label(effect: &Effect) -> &'static str {
+    match effect {
+        Effect::RefreshSnapshot => "refresh_snapshot",
+        Effect::LoadAuthorityHierarchy => "load_authority_hierarchy",
+        Effect::LoadAuthorityWorkstreamDetail { .. } => "load_authority_workstream_detail",
+        Effect::LoadAuthorityWorkUnitDetail { .. } => "load_authority_work_unit_detail",
+        Effect::LoadAuthorityTrackedThreadDetail { .. } => "load_authority_tracked_thread_detail",
+        Effect::LoadAuthorityDeletePlan { .. } => "load_authority_delete_plan",
+        Effect::CreateAuthorityWorkstream { .. } => "create_authority_workstream",
+        Effect::EditAuthorityWorkstream { .. } => "edit_authority_workstream",
+        Effect::DeleteAuthorityWorkstream { .. } => "delete_authority_workstream",
+        Effect::CreateAuthorityWorkUnit { .. } => "create_authority_work_unit",
+        Effect::EditAuthorityWorkUnit { .. } => "edit_authority_work_unit",
+        Effect::DeleteAuthorityWorkUnit { .. } => "delete_authority_work_unit",
+        Effect::CreateAuthorityTrackedThread { .. } => "create_authority_tracked_thread",
+        Effect::EditAuthorityTrackedThread { .. } => "edit_authority_tracked_thread",
+        Effect::DeleteAuthorityTrackedThread { .. } => "delete_authority_tracked_thread",
+        Effect::SubscribeEvents => "subscribe_events",
+        Effect::ScheduleReconnect => "schedule_reconnect",
+        Effect::LoadActiveTurns => "load_active_turns",
+        Effect::LoadThread { .. } => "load_thread",
+        Effect::AttachThread { .. } => "attach_thread",
+        Effect::LoadTurnState { .. } => "load_turn_state",
+        Effect::LoadWorkUnitDetail { .. } => "load_work_unit_detail",
+        Effect::SubmitPrompt { .. } => "submit_prompt",
+        Effect::ProposeSteerDecision { .. } => "propose_steer_decision",
+        Effect::ReplacePendingSteerDecision { .. } => "replace_pending_steer_decision",
+        Effect::ProposeInterruptDecision { .. } => "propose_interrupt_decision",
+        Effect::RecordNoActionDecision { .. } => "record_no_action_decision",
+        Effect::ManualRefreshDecision { .. } => "manual_refresh_decision",
+        Effect::ApproveSupervisorDecision { .. } => "approve_supervisor_decision",
+        Effect::RejectSupervisorDecision { .. } => "reject_supervisor_decision",
+        Effect::LoadModels => "load_models",
+        Effect::StartDaemon => "start_daemon",
+        Effect::RestartDaemon => "restart_daemon",
+        Effect::StopDaemon => "stop_daemon",
+    }
+}
+
+fn backend_command_label(command: &BackendCommand) -> &'static str {
+    match command {
+        BackendCommand::GetAuthorityHierarchy { .. } => "get_authority_hierarchy",
+        BackendCommand::GetAuthorityDeletePlan { .. } => "get_authority_delete_plan",
+        BackendCommand::GetAuthorityWorkstream { .. } => "get_authority_workstream",
+        BackendCommand::GetAuthorityWorkUnit { .. } => "get_authority_work_unit",
+        BackendCommand::GetAuthorityTrackedThread { .. } => "get_authority_tracked_thread",
+        BackendCommand::CreateAuthorityWorkstream { .. } => "create_authority_workstream",
+        BackendCommand::EditAuthorityWorkstream { .. } => "edit_authority_workstream",
+        BackendCommand::DeleteAuthorityWorkstream { .. } => "delete_authority_workstream",
+        BackendCommand::CreateAuthorityWorkUnit { .. } => "create_authority_work_unit",
+        BackendCommand::EditAuthorityWorkUnit { .. } => "edit_authority_work_unit",
+        BackendCommand::DeleteAuthorityWorkUnit { .. } => "delete_authority_work_unit",
+        BackendCommand::CreateAuthorityTrackedThread { .. } => "create_authority_tracked_thread",
+        BackendCommand::EditAuthorityTrackedThread { .. } => "edit_authority_tracked_thread",
+        BackendCommand::DeleteAuthorityTrackedThread { .. } => "delete_authority_tracked_thread",
+        BackendCommand::GetThread { .. } => "get_thread",
+        BackendCommand::AttachThread { .. } => "attach_thread",
+        BackendCommand::GetTurn { .. } => "get_turn",
+        BackendCommand::GetWorkUnit { .. } => "get_work_unit",
+        BackendCommand::GetActiveTurns => "get_active_turns",
+        BackendCommand::LoadModels => "load_models",
+        BackendCommand::StartDaemon => "start_daemon",
+        BackendCommand::StopDaemon => "stop_daemon",
+        BackendCommand::SubmitPrompt { .. } => "submit_prompt",
+        BackendCommand::ProposeSteerSupervisorDecision { .. } => {
+            "propose_steer_supervisor_decision"
+        }
+        BackendCommand::ReplacePendingSteerSupervisorDecision { .. } => {
+            "replace_pending_steer_supervisor_decision"
+        }
+        BackendCommand::ProposeInterruptSupervisorDecision { .. } => {
+            "propose_interrupt_supervisor_decision"
+        }
+        BackendCommand::RecordNoActionSupervisorDecision { .. } => {
+            "record_no_action_supervisor_decision"
+        }
+        BackendCommand::ManualRefreshSupervisorDecision { .. } => {
+            "manual_refresh_supervisor_decision"
+        }
+        BackendCommand::ApproveSupervisorDecision { .. } => "approve_supervisor_decision",
+        BackendCommand::RejectSupervisorDecision { .. } => "reject_supervisor_decision",
+    }
+}
+
+fn action_label(action: &Action) -> &'static str {
+    match action {
+        Action::Start => "start",
+        Action::User(user_action) => user_action_label(user_action),
+        Action::Event(_) => "event",
+    }
+}
+
+fn user_action_label(action: &UserAction) -> &'static str {
+    match action {
+        UserAction::Refresh => "refresh",
+        UserAction::LoadModels => "load_models",
+        UserAction::StartDaemon => "start_daemon",
+        UserAction::RestartDaemon => "restart_daemon",
+        UserAction::StopDaemon => "stop_daemon",
+        UserAction::ToggleHelp => "toggle_help",
+        UserAction::CycleView => "cycle_view",
+        UserAction::ShowView(_) => "show_view",
+        UserAction::CycleProgramView => "cycle_program_view",
+        UserAction::ShowProgramView(_) => "show_program_view",
+        UserAction::CycleCollaborationFocus => "cycle_collaboration_focus",
+        UserAction::SelectNextInView => "select_next_in_view",
+        UserAction::SelectPreviousInView => "select_previous_in_view",
+        UserAction::ExpandSelectedInView => "expand_selected_in_view",
+        UserAction::CollapseSelectedInView => "collapse_selected_in_view",
+        UserAction::SelectNextThread => "select_next_thread",
+        UserAction::SelectPreviousThread => "select_previous_thread",
+        UserAction::SelectThread(_) => "select_thread",
+        UserAction::CreateWorkstream => "create_workstream",
+        UserAction::CreateWorkUnitForSelection => "create_work_unit_for_selection",
+        UserAction::CreateTrackedThreadForSelection => "create_tracked_thread_for_selection",
+        UserAction::EditSelectedMainEntity => "edit_selected_main_entity",
+        UserAction::DeleteSelectedMainEntity => "delete_selected_main_entity",
+        UserAction::MainFooterAppend(_) => "main_footer_append",
+        UserAction::MainFooterBackspace => "main_footer_backspace",
+        UserAction::MainFooterDelete => "main_footer_delete",
+        UserAction::MainFooterMoveLeft => "main_footer_move_left",
+        UserAction::MainFooterMoveRight => "main_footer_move_right",
+        UserAction::MainFooterNextField => "main_footer_next_field",
+        UserAction::MainFooterPreviousField => "main_footer_previous_field",
+        UserAction::SubmitMainFooter => "submit_main_footer",
+        UserAction::CancelMainFooter => "cancel_main_footer",
+        UserAction::EnterPromptMode => "enter_prompt_mode",
+        UserAction::ExitPromptMode => "exit_prompt_mode",
+        UserAction::PromptAppend(_) => "prompt_append",
+        UserAction::PromptBackspace => "prompt_backspace",
+        UserAction::SubmitPrompt => "submit_prompt",
+        UserAction::ResumeSelectedThreadInCodex => "resume_selected_thread_in_codex",
+        UserAction::ProposeSteerForSelectedThread => "propose_steer_for_selected_thread",
+        UserAction::EditPendingSteerForSelectedThread => "edit_pending_steer_for_selected_thread",
+        UserAction::SteerComposeAppend(_) => "steer_compose_append",
+        UserAction::SteerComposeInsertNewline => "steer_compose_insert_newline",
+        UserAction::SteerComposeBackspace => "steer_compose_backspace",
+        UserAction::SteerComposeDelete => "steer_compose_delete",
+        UserAction::SteerComposeMoveLeft => "steer_compose_move_left",
+        UserAction::SteerComposeMoveRight => "steer_compose_move_right",
+        UserAction::SteerComposeMoveUp => "steer_compose_move_up",
+        UserAction::SteerComposeMoveDown => "steer_compose_move_down",
+        UserAction::SubmitSteerCompose => "submit_steer_compose",
+        UserAction::CancelSteerCompose => "cancel_steer_compose",
+        UserAction::ProposeInterruptForSelectedThread => "propose_interrupt_for_selected_thread",
+        UserAction::RecordNoActionForSelectedThread => "record_no_action_for_selected_thread",
+        UserAction::ManualRefreshForSelectedThread => "manual_refresh_for_selected_thread",
+        UserAction::ApproveSelectedSupervisorDecision => "approve_selected_supervisor_decision",
+        UserAction::RejectSelectedSupervisorDecision => "reject_selected_supervisor_decision",
     }
 }
 
