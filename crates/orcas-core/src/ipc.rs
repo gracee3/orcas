@@ -1370,6 +1370,59 @@ pub struct AuthorityTrackedThreadGetRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorityTrackedThreadGetResponse {
     pub tracked_thread: authority::TrackedThreadRecord,
+    #[serde(default)]
+    pub workspace_inspection: Option<TrackedThreadWorkspaceInspection>,
+}
+
+/// Read-only daemon-side inspection of a tracked-thread workspace.
+///
+/// This is an observed-state payload only. It does not replace the canonical
+/// workspace intent stored on the tracked-thread record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackedThreadWorkspaceInspection {
+    pub inspected_at: DateTime<Utc>,
+    pub repository_root: String,
+    pub worktree_path: String,
+    pub exists: bool,
+    pub is_git_worktree: bool,
+    #[serde(default)]
+    pub current_branch: Option<String>,
+    #[serde(default)]
+    pub current_head_commit: Option<String>,
+    #[serde(default)]
+    pub dirty: Option<bool>,
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    #[serde(default)]
+    pub base_commit: Option<String>,
+    #[serde(default)]
+    pub landing_target: Option<String>,
+    #[serde(default)]
+    pub base_commit_comparison: Option<TrackedThreadWorkspaceRefComparison>,
+    #[serde(default)]
+    pub landing_target_comparison: Option<TrackedThreadWorkspaceRefComparison>,
+    #[serde(default)]
+    pub warnings: Vec<TrackedThreadWorkspaceInspectionWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackedThreadWorkspaceRefComparison {
+    pub reference: String,
+    pub ahead_by: u64,
+    pub behind_by: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackedThreadWorkspaceInspectionWarning {
+    MissingWorktree,
+    InvalidWorktree,
+    DetachedHead,
+    DirtyWorkspace,
+    BaseCommitMismatch,
+    BehindLandingTarget,
+    DivergedFromLandingTarget,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

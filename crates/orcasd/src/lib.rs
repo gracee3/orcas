@@ -6,6 +6,7 @@ pub mod client;
 pub mod process;
 pub mod service;
 pub mod supervisor;
+pub(crate) mod workspace_inspection;
 
 pub use client::{EventSubscription, OrcasIpcClient};
 pub use process::{

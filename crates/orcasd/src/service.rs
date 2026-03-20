@@ -2073,7 +2073,15 @@ impl OrcasDaemonService {
                     params.tracked_thread_id
                 ))
             })?;
-        Ok(ipc::AuthorityTrackedThreadGetResponse { tracked_thread })
+        let workspace_inspection = if let Some(workspace) = tracked_thread.workspace.as_ref() {
+            Some(crate::workspace_inspection::inspect_tracked_thread_workspace(workspace).await)
+        } else {
+            None
+        };
+        Ok(ipc::AuthorityTrackedThreadGetResponse {
+            tracked_thread,
+            workspace_inspection,
+        })
     }
 
     async fn assignment_start(

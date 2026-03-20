@@ -889,10 +889,15 @@ impl SupervisorService {
             println!("preferred_model: {preferred_model}");
         }
         if let Some(workspace) = response.tracked_thread.workspace.as_ref() {
+            println!("workspace_scope: supervisor_intent");
             println!("workspace_repository_root: {}", workspace.repository_root);
             println!("workspace_worktree_path: {}", workspace.worktree_path);
             println!("workspace_branch_name: {}", workspace.branch_name);
             println!("workspace_base_ref: {}", workspace.base_ref);
+            println!(
+                "workspace_base_commit: {}",
+                workspace.base_commit.as_deref().unwrap_or("unset")
+            );
             println!("workspace_landing_target: {}", workspace.landing_target);
             println!("workspace_status: {:?}", workspace.status);
             println!(
@@ -902,6 +907,72 @@ impl SupervisorService {
                     .as_deref()
                     .unwrap_or("unset")
             );
+        }
+        if let Some(inspection) = response.workspace_inspection.as_ref() {
+            println!("workspace_scope: daemon_inspection");
+            println!(
+                "workspace_inspected_at: {}",
+                inspection.inspected_at.to_rfc3339()
+            );
+            println!(
+                "workspace_local_repository_root: {}",
+                inspection.repository_root
+            );
+            println!(
+                "workspace_local_worktree_path: {}",
+                inspection.worktree_path
+            );
+            println!("workspace_local_exists: {}", inspection.exists);
+            println!(
+                "workspace_local_is_git_worktree: {}",
+                inspection.is_git_worktree
+            );
+            println!(
+                "workspace_local_branch_name: {}",
+                inspection.current_branch.as_deref().unwrap_or("unset")
+            );
+            println!(
+                "workspace_local_head_commit: {}",
+                inspection.current_head_commit.as_deref().unwrap_or("unset")
+            );
+            println!(
+                "workspace_local_dirty: {}",
+                inspection
+                    .dirty
+                    .map(|dirty| dirty.to_string())
+                    .unwrap_or_else(|| "unset".to_string())
+            );
+            println!(
+                "workspace_local_base_ref: {}",
+                inspection.base_ref.as_deref().unwrap_or("unset")
+            );
+            println!(
+                "workspace_local_base_commit: {}",
+                inspection.base_commit.as_deref().unwrap_or("unset")
+            );
+            println!(
+                "workspace_local_landing_target: {}",
+                inspection.landing_target.as_deref().unwrap_or("unset")
+            );
+            if let Some(comparison) = inspection.base_commit_comparison.as_ref() {
+                println!(
+                    "workspace_local_base_commit_comparison: reference={} ahead={} behind={}",
+                    comparison.reference, comparison.ahead_by, comparison.behind_by
+                );
+            }
+            if let Some(comparison) = inspection.landing_target_comparison.as_ref() {
+                println!(
+                    "workspace_local_landing_target_comparison: reference={} ahead={} behind={}",
+                    comparison.reference, comparison.ahead_by, comparison.behind_by
+                );
+            }
+            if inspection.warnings.is_empty() {
+                println!("workspace_local_warnings: none");
+            } else {
+                for warning in &inspection.warnings {
+                    println!("workspace_local_warning: {:?}", warning);
+                }
+            }
         }
         Ok(())
     }
