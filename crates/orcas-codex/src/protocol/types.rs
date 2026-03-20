@@ -525,9 +525,54 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ClientInfo, InitializeParams, InitializeResponse, SandboxPolicy, TextElement,
-        ThreadStartParams, ThreadStatus, TurnStatus, UserInput,
+        AskForApproval, ClientInfo, GranularApproval, InitializeParams, InitializeResponse,
+        ItemCompletedNotification, ModelListResponse, SandboxPolicy, TextElement, Thread,
+        ThreadItem, ThreadListParams, ThreadReadResponse, ThreadResumeParams, ThreadStartParams,
+        ThreadStartedNotification, ThreadStatus, ThreadStatusChangedNotification, Turn,
+        TurnCompletedNotification, TurnError, TurnStatus, UserInput,
     };
+
+    fn sample_thread() -> Thread {
+        Thread {
+            id: "thread-1".to_string(),
+            preview: "Preview".to_string(),
+            ephemeral: true,
+            model_provider: "openai".to_string(),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_100,
+            status: ThreadStatus::Active {
+                active_flags: vec!["turn_running".to_string()],
+            },
+            path: Some("/repo/session.json".to_string()),
+            cwd: "/repo".to_string(),
+            cli_version: "0.1.0".to_string(),
+            source: Some(json!({"kind":"cli"})),
+            name: Some("Thread".to_string()),
+            turns: vec![Turn {
+                id: "turn-1".to_string(),
+                items: vec![ThreadItem {
+                    id: "item-1".to_string(),
+                    item_type: "message".to_string(),
+                    extra: serde_json::from_value(json!({
+                        "text": "hello",
+                        "role": "assistant"
+                    }))
+                    .expect("thread item extra map"),
+                }],
+                status: TurnStatus::Completed,
+                error: Some(TurnError {
+                    message: "done".to_string(),
+                    additional_details: Some("details".to_string()),
+                    codex_error_info: Some(json!({"code":"done"})),
+                }),
+            }],
+            extra: serde_json::from_value(json!({
+                "serviceName": "orcas",
+                "custom": true
+            }))
+            .expect("thread extra map"),
+        }
+    }
 
     #[test]
     fn initialize_params_omits_optional_capabilities_when_absent() {
@@ -664,5 +709,228 @@ mod tests {
         let round_trip: TurnStatus =
             serde_json::from_value(value).expect("deserialize turn status");
         assert!(matches!(round_trip, TurnStatus::InProgress));
+    }
+
+    #[test]
+    fn ask_for_approval_granular_uses_untagged_granular_shape() {
+        let approval = AskForApproval::Granular {
+            granular: GranularApproval {
+                sandbox_approval: true,
+                rules: false,
+                skill_approval: true,
+                request_permissions: false,
+                mcp_elicitations: true,
+            },
+        };
+
+        let value = serde_json::to_value(&approval).expect("serialize approval");
+        assert_eq!(
+            value,
+            json!({
+                "granular": {
+                    "sandbox_approval": true,
+                    "rules": false,
+                    "skill_approval": true,
+                    "request_permissions": false,
+                    "mcp_elicitations": true
+                }
+            })
+        );
+
+        let round_trip: AskForApproval =
+            serde_json::from_value(value).expect("deserialize approval");
+        match round_trip {
+            AskForApproval::Granular { granular } => {
+                assert!(granular.sandbox_approval);
+                assert!(granular.skill_approval);
+                assert!(granular.mcp_elicitations);
+                assert!(!granular.rules);
+                assert!(!granular.request_permissions);
+            }
+            other => panic!("unexpected approval shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thread_resume_params_omit_absent_fields_but_preserve_history_default() {
+        let params = ThreadResumeParams {
+            thread_id: "thread-1".to_string(),
+            model: None,
+            cwd: None,
+            approval_policy: None,
+            approvals_reviewer: None,
+            sandbox: None,
+            config: None,
+            base_instructions: None,
+            developer_instructions: None,
+            persist_extended_history: true,
+        };
+
+        let value = serde_json::to_value(&params).expect("serialize resume params");
+        assert_eq!(value["threadId"], "thread-1");
+        assert_eq!(value["persistExtendedHistory"], true);
+        assert!(value.get("model").is_none());
+        assert!(value.get("config").is_none());
+
+        let round_trip: ThreadResumeParams = serde_json::from_value(json!({"threadId":"thread-1"}))
+            .expect("deserialize sparse resume params");
+        assert_eq!(round_trip.thread_id, "thread-1");
+        assert!(round_trip.persist_extended_history);
+        assert!(round_trip.model.is_none());
+        assert!(round_trip.approval_policy.is_none());
+    }
+
+    #[test]
+    fn thread_list_params_round_trip_sparse_filter_vectors_and_flags() {
+        let params = ThreadListParams {
+            cursor: Some("cursor-1".to_string()),
+            limit: Some(25),
+            sort_key: Some("updated_at".to_string()),
+            model_providers: Some(vec!["openai".to_string()]),
+            source_kinds: Some(vec!["cli".to_string(), "daemon".to_string()]),
+            archived: Some(false),
+            cwd: Some("/repo".to_string()),
+            search_term: Some("bugfix".to_string()),
+        };
+
+        let value = serde_json::to_value(&params).expect("serialize list params");
+        assert_eq!(value["modelProviders"][0], "openai");
+        assert_eq!(value["sourceKinds"][1], "daemon");
+        assert_eq!(value["archived"], false);
+
+        let round_trip: ThreadListParams =
+            serde_json::from_value(value).expect("deserialize list params");
+        assert_eq!(round_trip.limit, Some(25));
+        assert_eq!(round_trip.cwd.as_deref(), Some("/repo"));
+        assert_eq!(round_trip.search_term.as_deref(), Some("bugfix"));
+    }
+
+    #[test]
+    fn thread_started_notification_defaults_sparse_thread_fields_and_preserves_extras() {
+        let notification = serde_json::from_value::<ThreadStartedNotification>(json!({
+            "thread": {
+                "id": "thread-1",
+                "status": {"type":"idle"},
+                "serviceName": "orcas",
+                "custom": true
+            }
+        }))
+        .expect("deserialize started notification");
+
+        assert_eq!(notification.thread.id, "thread-1");
+        assert_eq!(notification.thread.preview, "");
+        assert!(!notification.thread.ephemeral);
+        assert_eq!(notification.thread.cwd, "");
+        assert!(notification.thread.turns.is_empty());
+        assert_eq!(
+            notification.thread.extra.get("serviceName"),
+            Some(&json!("orcas"))
+        );
+        assert_eq!(notification.thread.extra.get("custom"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn thread_status_changed_notification_preserves_tagged_active_status() {
+        let notification = serde_json::from_value::<ThreadStatusChangedNotification>(json!({
+            "threadId": "thread-1",
+            "status": {
+                "type": "active",
+                "active_flags": ["turn_running", "streaming"]
+            }
+        }))
+        .expect("deserialize status changed notification");
+
+        assert_eq!(notification.thread_id, "thread-1");
+        match notification.status {
+            ThreadStatus::Active { active_flags } => {
+                assert_eq!(
+                    active_flags,
+                    vec!["turn_running".to_string(), "streaming".to_string()]
+                );
+            }
+            other => panic!("unexpected thread status: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_completed_notification_defaults_sparse_turn_fields() {
+        let notification = serde_json::from_value::<TurnCompletedNotification>(json!({
+            "threadId": "thread-1",
+            "turn": {
+                "id": "turn-1",
+                "status": "completed"
+            }
+        }))
+        .expect("deserialize completed notification");
+
+        assert_eq!(notification.thread_id, "thread-1");
+        assert_eq!(notification.turn.id, "turn-1");
+        assert!(notification.turn.items.is_empty());
+        assert!(notification.turn.error.is_none());
+    }
+
+    #[test]
+    fn item_completed_notification_preserves_flattened_thread_item_payload() {
+        let notification = serde_json::from_value::<ItemCompletedNotification>(json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "id": "item-1",
+                "type": "message",
+                "text": "hello",
+                "role": "assistant"
+            }
+        }))
+        .expect("deserialize item notification");
+
+        assert_eq!(notification.thread_id, "thread-1");
+        assert_eq!(notification.turn_id, "turn-1");
+        assert_eq!(notification.item.text(), Some("hello"));
+        assert_eq!(
+            notification.item.extra.get("role"),
+            Some(&json!("assistant"))
+        );
+    }
+
+    #[test]
+    fn thread_read_response_round_trips_nested_turns_and_extra_fields() {
+        let response = ThreadReadResponse {
+            thread: sample_thread(),
+        };
+
+        let value = serde_json::to_value(&response).expect("serialize read response");
+        assert_eq!(value["thread"]["status"]["type"], "active");
+        assert_eq!(value["thread"]["turns"][0]["items"][0]["type"], "message");
+        assert_eq!(value["thread"]["serviceName"], "orcas");
+
+        let round_trip: ThreadReadResponse =
+            serde_json::from_value(value).expect("deserialize read response");
+        assert_eq!(round_trip.thread.id, "thread-1");
+        assert_eq!(round_trip.thread.turns.len(), 1);
+        assert_eq!(round_trip.thread.turns[0].items[0].text(), Some("hello"));
+        assert_eq!(round_trip.thread.extra.get("custom"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn model_list_response_defaults_display_and_visibility_fields_when_sparse() {
+        let response = serde_json::from_value::<ModelListResponse>(json!({
+            "data": [
+                {
+                    "id": "model-1",
+                    "model": "gpt-5.4"
+                }
+            ],
+            "nextCursor": null
+        }))
+        .expect("deserialize model list response");
+
+        assert_eq!(response.data.len(), 1);
+        let model = &response.data[0];
+        assert_eq!(model.id, "model-1");
+        assert_eq!(model.model, "gpt-5.4");
+        assert_eq!(model.display_name, "");
+        assert_eq!(model.description, "");
+        assert!(!model.hidden);
+        assert!(!model.is_default);
     }
 }
