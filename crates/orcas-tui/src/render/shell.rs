@@ -229,7 +229,9 @@ fn key_bindings_hint(state: &AppState) -> Vec<Span<'static>> {
             spans.push(Span::styled("  ", metadata_style()));
             spans.extend(action_hint("left/right", "move cursor"));
             spans.push(Span::styled("  ", metadata_style()));
-            spans.extend(action_hint("enter", "export json"));
+            spans.extend(action_hint("tab", "toggle format"));
+            spans.push(Span::styled("  ", metadata_style()));
+            spans.extend(action_hint("enter", "export"));
             spans.push(Span::styled("  ", metadata_style()));
             spans.extend(action_hint("esc", "cancel"));
             spans
@@ -252,7 +254,7 @@ fn key_bindings_hint(state: &AppState) -> Vec<Span<'static>> {
             spans.push(Span::styled("  ", metadata_style()));
             spans.extend(action_hint("v", "artifact detail"));
             spans.push(Span::styled("  ", metadata_style()));
-            spans.extend(action_hint("x", "export json"));
+            spans.extend(action_hint("x", "export"));
             spans.push(Span::styled("  ", metadata_style()));
             spans.extend(action_hint("a/d", "approve/reject decision"));
             spans.push(Span::styled("  ", metadata_style()));

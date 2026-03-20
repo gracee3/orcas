@@ -226,9 +226,41 @@ pub struct ReviewArtifactDetailState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewArtifactExportState {
     pub proposal_id: String,
+    pub format: ReviewArtifactExportFormat,
     pub destination: FooterFieldState,
+    pub auto_destination: String,
+    pub destination_is_auto: bool,
     pub in_flight: bool,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReviewArtifactExportFormat {
+    Json,
+    Markdown,
+}
+
+impl ReviewArtifactExportFormat {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Json => Self::Markdown,
+            Self::Markdown => Self::Json,
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Markdown => "md",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Markdown => "md",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -385,6 +417,7 @@ pub enum UserAction {
     OpenSelectedProposalArtifactExport,
     CloseReviewArtifactExport,
     SubmitReviewArtifactExport,
+    ReviewArtifactExportToggleFormat,
     ReviewArtifactExportAppend(char),
     ReviewArtifactExportBackspace,
     ReviewArtifactExportDelete,
@@ -486,10 +519,12 @@ pub enum UiEvent {
     ProposalArtifactExported {
         proposal_id: String,
         destination: String,
+        format: ReviewArtifactExportFormat,
     },
     ProposalArtifactExportFailed {
         proposal_id: String,
         message: String,
+        format: ReviewArtifactExportFormat,
     },
     WorkUnitDetailLoaded(ipc::WorkunitGetResponse),
     TurnUpdated {
@@ -653,6 +688,7 @@ pub enum Effect {
     ExportProposalArtifact {
         proposal_id: String,
         destination: String,
+        format: ReviewArtifactExportFormat,
     },
     SubmitPrompt {
         thread_id: String,
@@ -1277,11 +1313,15 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
                 return Vec::new();
             };
             state.review_view.artifact_detail = None;
+            let format = ReviewArtifactExportFormat::Json;
+            let auto_destination =
+                default_review_artifact_export_path(proposal_id.as_str(), format);
             state.review_view.artifact_export = Some(ReviewArtifactExportState {
                 proposal_id: proposal_id.clone(),
-                destination: FooterFieldState::new(default_review_artifact_export_path(
-                    proposal_id.as_str(),
-                )),
+                format,
+                destination: FooterFieldState::new(auto_destination.clone()),
+                auto_destination,
+                destination_is_auto: true,
                 in_flight: false,
                 error: None,
             });
@@ -1325,16 +1365,40 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
             export.error = None;
             state.banner = Some(StatusBanner {
                 level: BannerLevel::Info,
-                message: format!("Exporting proposal artifact to {}...", destination),
+                message: format!(
+                    "Exporting proposal artifact as {} to {}...",
+                    export.format.label(),
+                    destination
+                ),
             });
             vec![Effect::ExportProposalArtifact {
                 proposal_id: export.proposal_id.clone(),
                 destination,
+                format: export.format,
             }]
+        }
+        UserAction::ReviewArtifactExportToggleFormat => {
+            let Some(export) = state.review_view.artifact_export.as_mut() else {
+                return Vec::new();
+            };
+            export.format = export.format.toggle();
+            export.error = None;
+            let next_auto =
+                default_review_artifact_export_path(export.proposal_id.as_str(), export.format);
+            if export.destination_is_auto && export.destination.value == export.auto_destination {
+                export.destination = FooterFieldState::new(next_auto.clone());
+            }
+            export.auto_destination = next_auto;
+            if export.destination.value == export.auto_destination {
+                export.destination_is_auto = true;
+            }
+            state.banner = None;
+            Vec::new()
         }
         UserAction::ReviewArtifactExportAppend(ch) => {
             if let Some(export) = state.review_view.artifact_export.as_mut() {
                 footer_field_insert(&mut export.destination, ch);
+                export.destination_is_auto = false;
                 export.error = None;
                 state.banner = None;
             }
@@ -1343,6 +1407,7 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
         UserAction::ReviewArtifactExportBackspace => {
             if let Some(export) = state.review_view.artifact_export.as_mut() {
                 footer_field_backspace(&mut export.destination);
+                export.destination_is_auto = false;
                 export.error = None;
                 state.banner = None;
             }
@@ -1351,6 +1416,7 @@ fn reduce_user_action(state: &mut AppState, action: UserAction) -> Vec<Effect> {
         UserAction::ReviewArtifactExportDelete => {
             if let Some(export) = state.review_view.artifact_export.as_mut() {
                 footer_field_delete(&mut export.destination);
+                export.destination_is_auto = false;
                 export.error = None;
                 state.banner = None;
             }
@@ -2100,6 +2166,7 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
         UiEvent::ProposalArtifactExported {
             proposal_id,
             destination,
+            format,
         } => {
             if state
                 .review_view
@@ -2111,12 +2178,16 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             }
             state.banner = Some(StatusBanner {
                 level: BannerLevel::Info,
-                message: format!("Exported proposal artifact {proposal_id} to {destination}."),
+                message: format!(
+                    "Exported proposal artifact {proposal_id} as {} to {destination}.",
+                    format.label()
+                ),
             });
         }
         UiEvent::ProposalArtifactExportFailed {
             proposal_id,
             message,
+            format,
         } => {
             if let Some(export) = state.review_view.artifact_export.as_mut() {
                 if export.proposal_id == proposal_id {
@@ -2126,7 +2197,10 @@ fn reduce_event(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             }
             state.banner = Some(StatusBanner {
                 level: BannerLevel::Error,
-                message: format!("Proposal artifact export failed for {proposal_id}: {message}"),
+                message: format!(
+                    "Proposal artifact export failed for {proposal_id} as {}: {message}",
+                    format.label()
+                ),
             });
         }
         UiEvent::WorkUnitDetailLoaded(detail) => {
@@ -2940,10 +3014,13 @@ fn selected_review_proposal_id(state: &AppState) -> Option<&str> {
         .and_then(review_selection_proposal_id)
 }
 
-fn default_review_artifact_export_path(proposal_id: &str) -> String {
+fn default_review_artifact_export_path(
+    proposal_id: &str,
+    format: ReviewArtifactExportFormat,
+) -> String {
     std::env::temp_dir()
         .join("orcas-proposal-exports")
-        .join(format!("{proposal_id}.json"))
+        .join(format!("{proposal_id}.{}", format.extension()))
         .display()
         .to_string()
 }

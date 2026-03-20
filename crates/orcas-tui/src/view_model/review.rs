@@ -769,19 +769,22 @@ fn review_artifact_export_overlay(
     let export_state = state.review_view.artifact_export.as_ref()?;
     let mut lines = vec![
         format!("proposal_id: {}", export_state.proposal_id),
-        "format: json".to_string(),
+        format!("format: {}", export_state.format.label()),
         "destination:".to_string(),
         format!("  {}", export_state.destination.value),
     ];
     if export_state.in_flight {
-        lines.push("status: exporting canonical proposal artifact bundle".to_string());
+        lines.push(format!(
+            "status: exporting canonical proposal artifact bundle as {}",
+            export_state.format.label()
+        ));
     } else if let Some(error) = export_state.error.as_ref() {
         lines.push("status: export failed".to_string());
         lines.push(format!("error: {}", abbreviate(&compact_line(error), 140)));
     } else {
         lines.push("status: ready to export".to_string());
         lines.push(
-            "edit the destination path if needed, then press enter to write the JSON bundle."
+            "tab toggles json/md; edit the destination path if needed, then press enter to write the bundle."
                 .to_string(),
         );
     }
@@ -1225,15 +1228,27 @@ fn review_footer(state: &AppState) -> ReviewFooterViewModel {
         return ReviewFooterViewModel {
             title: "Artifact Export".to_string(),
             lines: vec![
-                "Export writes the canonical supervisor evidence bundle for the selected proposal as JSON."
+                "Export writes the canonical supervisor evidence bundle for the selected proposal."
                     .to_string(),
-                "The destination path is explicit and editable here; export uses the daemon's canonical artifact-export path, not snapshot state."
+                "The destination path is explicit and editable here; tab toggles json/md; export uses the daemon's canonical artifact-export path, not snapshot state."
                     .to_string(),
             ],
             actions: vec![
                 ReviewActionViewModel {
                     key: "enter".to_string(),
-                    label: "export json".to_string(),
+                    label: format!(
+                        "export {}",
+                        state
+                            .review_view
+                            .artifact_export
+                            .as_ref()
+                            .map(|export| export.format.label())
+                            .unwrap_or("json")
+                    ),
+                },
+                ReviewActionViewModel {
+                    key: "tab".to_string(),
+                    label: "toggle format".to_string(),
                 },
                 ReviewActionViewModel {
                     key: "esc".to_string(),
@@ -1241,7 +1256,7 @@ fn review_footer(state: &AppState) -> ReviewFooterViewModel {
                 },
             ],
             hint_line:
-                "type edit path  left/right move cursor  backspace/delete edit  enter export  esc cancel"
+                "type edit path  left/right move cursor  backspace/delete edit  tab toggle format  enter export  esc cancel"
                     .to_string(),
         };
     }
@@ -1314,10 +1329,10 @@ fn review_footer(state: &AppState) -> ReviewFooterViewModel {
                 },
                 ReviewActionViewModel {
                     key: "x".to_string(),
-                    label: "export json".to_string(),
+                    label: "export".to_string(),
                 },
             ],
-            "up/down move  v view artifacts  x export json  tab switch tabs  r refresh  ? help"
+            "up/down move  v view artifacts  x export  tab switch tabs  r refresh  ? help"
                 .to_string(),
         ),
         Some(ReviewSelection::Failure { .. }) => (
@@ -1333,10 +1348,10 @@ fn review_footer(state: &AppState) -> ReviewFooterViewModel {
                 },
                 ReviewActionViewModel {
                     key: "x".to_string(),
-                    label: "export json".to_string(),
+                    label: "export".to_string(),
                 },
             ],
-            "up/down move  v view artifacts  x export json  tab switch tabs  r refresh  ? help"
+            "up/down move  v view artifacts  x export  tab switch tabs  r refresh  ? help"
                 .to_string(),
         ),
         Some(ReviewSelection::ReviewRequired { .. }) => (

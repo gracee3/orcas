@@ -318,6 +318,7 @@ fn user_action_label(action: &UserAction) -> &'static str {
         UserAction::OpenSelectedProposalArtifactExport => "open_selected_proposal_artifact_export",
         UserAction::CloseReviewArtifactExport => "close_review_artifact_export",
         UserAction::SubmitReviewArtifactExport => "submit_review_artifact_export",
+        UserAction::ReviewArtifactExportToggleFormat => "review_artifact_export_toggle_format",
         UserAction::ReviewArtifactExportAppend(_) => "review_artifact_export_append",
         UserAction::ReviewArtifactExportBackspace => "review_artifact_export_backspace",
         UserAction::ReviewArtifactExportDelete => "review_artifact_export_delete",
@@ -418,6 +419,9 @@ fn action_for_key(state: &orcas_tui::app::AppState, key: KeyEvent) -> Option<Use
         return match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => Some(UserAction::CloseReviewArtifactExport),
             (KeyCode::Enter, _) => Some(UserAction::SubmitReviewArtifactExport),
+            (KeyCode::Tab, KeyModifiers::NONE) => {
+                Some(UserAction::ReviewArtifactExportToggleFormat)
+            }
             (KeyCode::Backspace, _) => Some(UserAction::ReviewArtifactExportBackspace),
             (KeyCode::Delete, _) => Some(UserAction::ReviewArtifactExportDelete),
             (KeyCode::Left, _) => Some(UserAction::ReviewArtifactExportMoveLeft),
@@ -819,7 +823,10 @@ mod tests {
         let mut state = state_for_overview_program(ProgramView::Review);
         state.review_view.artifact_export = Some(orcas_tui::app::ReviewArtifactExportState {
             proposal_id: "proposal-1".to_string(),
+            format: orcas_tui::app::ReviewArtifactExportFormat::Json,
             destination: orcas_tui::app::FooterFieldState::new("/tmp/proposal-1.json"),
+            auto_destination: "/tmp/proposal-1.json".to_string(),
+            destination_is_auto: true,
             in_flight: false,
             error: None,
         });
@@ -831,6 +838,10 @@ mod tests {
         assert_eq!(
             action_for_key(&state, key(KeyCode::Enter)),
             Some(UserAction::SubmitReviewArtifactExport)
+        );
+        assert_eq!(
+            action_for_key(&state, key(KeyCode::Tab)),
+            Some(UserAction::ReviewArtifactExportToggleFormat)
         );
         assert_eq!(
             action_for_key(&state, key(KeyCode::Backspace)),

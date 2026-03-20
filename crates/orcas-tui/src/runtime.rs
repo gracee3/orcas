@@ -983,14 +983,17 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
             Effect::ExportProposalArtifact {
                 proposal_id,
                 destination,
+                format,
             } => {
                 let effect = Effect::ExportProposalArtifact {
                     proposal_id: proposal_id.clone(),
                     destination: destination.clone(),
+                    format,
                 };
                 let success_proposal_id = proposal_id.clone();
                 let success_destination = destination.clone();
                 let failure_proposal_id = proposal_id.clone();
+                let success_format = format;
                 Self::run_backend_effect(
                     backend,
                     effect,
@@ -1000,15 +1003,20 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                     move |response| match response {
                         BackendCommandResult::ProposalArtifactExport(export) => {
                             vec![Action::Event(
-                                match write_proposal_artifact_export(&success_destination, &export)
-                                {
+                                match write_proposal_artifact_export(
+                                    &success_destination,
+                                    success_format,
+                                    &export,
+                                ) {
                                     Ok(()) => UiEvent::ProposalArtifactExported {
                                         proposal_id: success_proposal_id.clone(),
                                         destination: success_destination.clone(),
+                                        format: success_format,
                                     },
                                     Err(error) => UiEvent::ProposalArtifactExportFailed {
                                         proposal_id: success_proposal_id.clone(),
                                         message: error.to_string(),
+                                        format: success_format,
                                     },
                                 },
                             )]
@@ -1021,6 +1029,7 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
                         Action::Event(UiEvent::ProposalArtifactExportFailed {
                             proposal_id: failure_proposal_id.clone(),
                             message: error.to_string(),
+                            format,
                         })
                     },
                 )
@@ -1566,15 +1575,136 @@ impl<B: TuiBackend + Send + Sync + 'static> AppRuntime<B> {
 
 fn write_proposal_artifact_export(
     destination: &str,
+    format: crate::app::ReviewArtifactExportFormat,
     export: &orcas_core::ipc::SupervisorProposalArtifactExport,
 ) -> Result<()> {
     let path = std::path::Path::new(destination);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let serialized = serde_json::to_string_pretty(export)?;
+    let serialized = match format {
+        crate::app::ReviewArtifactExportFormat::Json => {
+            format!("{}\n", serde_json::to_string_pretty(export)?)
+        }
+        crate::app::ReviewArtifactExportFormat::Markdown => {
+            render_proposal_artifact_export_markdown(export)?
+        }
+    };
     std::fs::write(path, serialized)?;
     Ok(())
+}
+
+fn render_proposal_artifact_export_markdown(
+    export: &orcas_core::ipc::SupervisorProposalArtifactExport,
+) -> Result<String> {
+    let mut out = String::new();
+    out.push_str("# Supervisor Proposal Artifact Export\n\n");
+    out.push_str("## Proposal Metadata\n");
+    out.push_str(&format!("- Proposal ID: `{}`\n", export.proposal_id));
+    out.push_str(&format!(
+        "- Work Unit ID: `{}`\n",
+        export.primary_work_unit_id
+    ));
+    out.push_str(&format!(
+        "- Source Report ID: `{}`\n",
+        export.source_report_id
+    ));
+    out.push_str(&format!("- Status: `{:?}`\n", export.proposal_status));
+    out.push_str(&format!("- Created At: `{}`\n", export.created_at));
+    out.push_str(&format!(
+        "- Validated At: `{}`\n",
+        export
+            .validated_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    out.push_str(&format!(
+        "- Reviewed At: `{}`\n",
+        export
+            .reviewed_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    out.push_str(&format!(
+        "- Reviewed By: `{}`\n",
+        export.reviewed_by.as_deref().unwrap_or("-")
+    ));
+    out.push_str(&format!(
+        "- Review Note: `{}`\n",
+        export.review_note.as_deref().unwrap_or("-")
+    ));
+    out.push_str(&format!(
+        "- Approved Decision ID: `{}`\n",
+        export.approved_decision_id.as_deref().unwrap_or("-")
+    ));
+    out.push_str(&format!(
+        "- Approved Assignment ID: `{}`\n\n",
+        export.approved_assignment_id.as_deref().unwrap_or("-")
+    ));
+
+    push_markdown_json_section(
+        &mut out,
+        "Artifact Summary",
+        serde_json::to_value(&export.artifact_summary)?,
+    )?;
+    push_markdown_json_section(
+        &mut out,
+        "Prompt Artifact",
+        serde_json::to_value(&export.artifact_detail.prompt_render)?,
+    )?;
+    push_markdown_json_section(
+        &mut out,
+        "Response Artifact",
+        serde_json::to_value(&export.artifact_detail.response_artifact)?,
+    )?;
+    push_markdown_text_section(
+        &mut out,
+        "Extracted Output Text",
+        export.artifact_detail.reasoner_output_text.as_deref(),
+    );
+    push_markdown_json_section(
+        &mut out,
+        "Parsed Proposal",
+        serde_json::to_value(&export.artifact_detail.parsed_proposal)?,
+    )?;
+    push_markdown_json_section(
+        &mut out,
+        "Approved Proposal",
+        serde_json::to_value(&export.artifact_detail.approved_proposal)?,
+    )?;
+    push_markdown_json_section(
+        &mut out,
+        "Failure Metadata",
+        serde_json::to_value(&export.artifact_detail.generation_failure)?,
+    )?;
+    Ok(out)
+}
+
+fn push_markdown_json_section(
+    out: &mut String,
+    title: &str,
+    value: serde_json::Value,
+) -> Result<()> {
+    out.push_str(&format!("## {title}\n"));
+    out.push_str("```json\n");
+    out.push_str(&serde_json::to_string_pretty(&value)?);
+    out.push_str("\n```\n\n");
+    Ok(())
+}
+
+fn push_markdown_text_section(out: &mut String, title: &str, value: Option<&str>) {
+    out.push_str(&format!("## {title}\n"));
+    match value {
+        Some(value) => {
+            out.push_str("```text\n");
+            out.push_str(value);
+            if !value.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("```\n\n");
+        }
+        None => out.push_str("_none_\n\n"),
+    }
 }
 
 fn effect_label(effect: &Effect) -> &'static str {
@@ -1744,6 +1874,7 @@ fn user_action_label(action: &UserAction) -> &'static str {
         UserAction::OpenSelectedProposalArtifactExport => "open_selected_proposal_artifact_export",
         UserAction::CloseReviewArtifactExport => "close_review_artifact_export",
         UserAction::SubmitReviewArtifactExport => "submit_review_artifact_export",
+        UserAction::ReviewArtifactExportToggleFormat => "review_artifact_export_toggle_format",
         UserAction::ReviewArtifactExportAppend(_) => "review_artifact_export_append",
         UserAction::ReviewArtifactExportBackspace => "review_artifact_export_backspace",
         UserAction::ReviewArtifactExportDelete => "review_artifact_export_delete",
