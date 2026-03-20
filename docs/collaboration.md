@@ -192,7 +192,8 @@ This read model is the current source for:
 
 ### Which Clients Rely On Which Read Models
 
-- The CLI primarily relies on `state/get` and the legacy `workstream/*` and `workunit/*` RPC family.
+- The CLI uses authority-backed planning CRUD for `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...`, while still using `state/get` and focused RPCs for collaboration and runtime state.
+- The CLI retains `orcas legacy-workstreams ...` and `orcas legacy-workunits ...` as explicit create/list/get compatibility commands over the legacy `workstream/*` and `workunit/*` RPC family.
 - The TUI bootstraps from both `state/get` and `authority/hierarchy/get`.
 - The TUI uses authority detail RPCs such as `authority/workstream/get`, `authority/workunit/get`, and `authority/tracked_thread/get` for focused editing surfaces.
 - Existing subscribers should treat events as incremental hints layered on top of snapshot reloads, not as a complete replayable truth source for authority state.
@@ -285,8 +286,10 @@ The one intentional exception is the TUI's local PTY-backed `codex resume` helpe
 
 ## Operator And Client Surfaces
 
-- The CLI currently uses the legacy `workstream/*` and `workunit/*` workflow CRUD surface.
-- The TUI currently uses the authority CRUD and hierarchy surface for workstreams, work units, and tracked threads.
+- The canonical operator CRUD surface for planning hierarchy objects is now authority-backed in both clients:
+  - CLI: `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...`
+  - TUI: authority CRUD plus `authority/hierarchy/get` and authority detail RPCs
+- The CLI still exposes `orcas legacy-workstreams ...` and `orcas legacy-workunits ...`, but those are explicit create/list/get compatibility commands for legacy collaboration records rather than peer canonical paths.
 - Both clients still depend on daemon snapshots and focused daemon RPCs for thread, turn, assignment, report, decision, and proposal views.
 - The daemon event stream is shared and now carries post-commit create, update, and delete notifications for authority workstreams, work units, and tracked threads.
 - The TUI's PTY-backed `codex resume` path is local to the TUI process and should be understood as an operator convenience layer rather than a daemon-managed session model.
@@ -296,6 +299,6 @@ The one intentional exception is the TUI's local PTY-backed `codex resume` helpe
 - `state/get` still contains mixed-semantics workstream and work unit lists because collaboration-native rows and explicit compatibility bridge rows share summary types.
 - Authority deletes hide previously bridged rows from `state/get`, but do not currently scrub the underlying bridge copy from `state.json`.
 - Tracked-thread lifecycle events do not remove the need for authority query reloads when a client needs full record detail rather than an event summary.
-- The CLI and TUI currently operate different CRUD surfaces for workflow hierarchy objects.
+- The CLI still exposes legacy collaboration workflow commands for compatibility, so the operator surface is clearer than before but not yet fully collapsed to one naming family.
 
 These are current implementation truths, not guarantees that later hardening phases will preserve unchanged. Later phases can normalize the boundary, but this document intentionally describes the boundary as it exists today.

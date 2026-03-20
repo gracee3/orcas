@@ -6,7 +6,9 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use orcas_core::{AppPaths, DecisionType, init_file_logger};
+use orcas_core::{
+    AppPaths, DecisionType, WorkUnitStatus, WorkstreamStatus, authority, init_file_logger,
+};
 use tracing::info;
 
 use service::{RuntimeOverrides, SupervisorService};
@@ -64,6 +66,18 @@ enum TopCommand {
         #[command(subcommand)]
         command: WorkunitsCommand,
     },
+    TrackedThreads {
+        #[command(subcommand)]
+        command: TrackedThreadsCommand,
+    },
+    LegacyWorkstreams {
+        #[command(subcommand)]
+        command: LegacyWorkstreamsCommand,
+    },
+    LegacyWorkunits {
+        #[command(subcommand)]
+        command: LegacyWorkunitsCommand,
+    },
     Assignments {
         #[command(subcommand)]
         command: AssignmentsCommand,
@@ -117,14 +131,46 @@ enum TurnsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[command(about = "Canonical authority-backed CRUD for planning workstreams")]
 enum WorkstreamsCommand {
+    Create(WorkstreamCreateArgs),
+    Edit(WorkstreamEditArgs),
+    Delete(WorkstreamRefArgs),
+    List,
+    Get(WorkstreamRefArgs),
+}
+
+#[derive(Debug, Subcommand)]
+#[command(about = "Canonical authority-backed CRUD for planning work units")]
+enum WorkunitsCommand {
+    Create(WorkunitCreateArgs),
+    Edit(WorkunitEditArgs),
+    Delete(WorkunitRefArgs),
+    List(WorkunitListArgs),
+    Get(WorkunitRefArgs),
+}
+
+#[derive(Debug, Subcommand)]
+#[command(about = "Canonical authority-backed CRUD for tracked-thread planning records")]
+enum TrackedThreadsCommand {
+    Create(TrackedThreadCreateArgs),
+    Edit(TrackedThreadEditArgs),
+    Delete(TrackedThreadRefArgs),
+    List(TrackedThreadListArgs),
+    Get(TrackedThreadRefArgs),
+}
+
+#[derive(Debug, Subcommand)]
+#[command(about = "Compatibility create/list/get commands for legacy collaboration workstreams")]
+enum LegacyWorkstreamsCommand {
     Create(WorkstreamCreateArgs),
     List,
     Get(WorkstreamRefArgs),
 }
 
 #[derive(Debug, Subcommand)]
-enum WorkunitsCommand {
+#[command(about = "Compatibility create/list/get commands for legacy collaboration work units")]
+enum LegacyWorkunitsCommand {
     Create(WorkunitCreateArgs),
     List(WorkunitListArgs),
     Get(WorkunitRefArgs),
@@ -230,6 +276,20 @@ struct WorkstreamRefArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+struct WorkstreamEditArgs {
+    #[arg(long)]
+    workstream: String,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long)]
+    objective: Option<String>,
+    #[arg(long, value_enum)]
+    status: Option<WorkstreamStatusArg>,
+    #[arg(long)]
+    priority: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
 struct WorkunitCreateArgs {
     #[arg(long)]
     workstream: String,
@@ -251,6 +311,64 @@ struct WorkunitListArgs {
 struct WorkunitRefArgs {
     #[arg(long)]
     workunit: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct WorkunitEditArgs {
+    #[arg(long)]
+    workunit: String,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long)]
+    task: Option<String>,
+    #[arg(long, value_enum)]
+    status: Option<WorkUnitStatusArg>,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+struct TrackedThreadListArgs {
+    #[arg(long)]
+    workunit: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TrackedThreadRefArgs {
+    #[arg(long = "tracked-thread")]
+    tracked_thread: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TrackedThreadCreateArgs {
+    #[arg(long)]
+    workunit: String,
+    #[arg(long)]
+    title: String,
+    #[arg(long = "root-dir")]
+    root_dir: String,
+    #[arg(long)]
+    notes: Option<String>,
+    #[arg(long = "upstream-thread")]
+    upstream_thread: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TrackedThreadEditArgs {
+    #[arg(long = "tracked-thread")]
+    tracked_thread: String,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long = "root-dir")]
+    root_dir: Option<String>,
+    #[arg(long)]
+    notes: Option<String>,
+    #[arg(long = "upstream-thread")]
+    upstream_thread: Option<String>,
+    #[arg(long, value_enum)]
+    binding_state: Option<TrackedThreadBindingStateArg>,
+    #[arg(long)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -469,6 +587,69 @@ enum DecisionTypeArg {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+enum WorkstreamStatusArg {
+    Active,
+    Blocked,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WorkUnitStatusArg {
+    Ready,
+    Blocked,
+    Running,
+    AwaitingDecision,
+    Accepted,
+    NeedsHuman,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TrackedThreadBindingStateArg {
+    Unbound,
+    Bound,
+    Detached,
+    Missing,
+}
+
+impl From<WorkstreamStatusArg> for WorkstreamStatus {
+    fn from(value: WorkstreamStatusArg) -> Self {
+        match value {
+            WorkstreamStatusArg::Active => WorkstreamStatus::Active,
+            WorkstreamStatusArg::Blocked => WorkstreamStatus::Blocked,
+            WorkstreamStatusArg::Completed => WorkstreamStatus::Completed,
+        }
+    }
+}
+
+impl From<WorkUnitStatusArg> for WorkUnitStatus {
+    fn from(value: WorkUnitStatusArg) -> Self {
+        match value {
+            WorkUnitStatusArg::Ready => WorkUnitStatus::Ready,
+            WorkUnitStatusArg::Blocked => WorkUnitStatus::Blocked,
+            WorkUnitStatusArg::Running => WorkUnitStatus::Running,
+            WorkUnitStatusArg::AwaitingDecision => WorkUnitStatus::AwaitingDecision,
+            WorkUnitStatusArg::Accepted => WorkUnitStatus::Accepted,
+            WorkUnitStatusArg::NeedsHuman => WorkUnitStatus::NeedsHuman,
+            WorkUnitStatusArg::Completed => WorkUnitStatus::Completed,
+        }
+    }
+}
+
+impl From<TrackedThreadBindingStateArg> for authority::TrackedThreadBindingState {
+    fn from(value: TrackedThreadBindingStateArg) -> Self {
+        match value {
+            TrackedThreadBindingStateArg::Unbound => authority::TrackedThreadBindingState::Unbound,
+            TrackedThreadBindingStateArg::Bound => authority::TrackedThreadBindingState::Bound,
+            TrackedThreadBindingStateArg::Detached => {
+                authority::TrackedThreadBindingState::Detached
+            }
+            TrackedThreadBindingStateArg::Missing => authority::TrackedThreadBindingState::Missing,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum CodexDecisionStatusArg {
     ProposedToHuman,
     Recorded,
@@ -615,6 +796,20 @@ async fn main() -> Result<()> {
                         .workstream_create(args.title, args.objective, args.priority)
                         .await?;
                 }
+                WorkstreamsCommand::Edit(args) => {
+                    service
+                        .workstream_edit(
+                            &args.workstream,
+                            args.title,
+                            args.objective,
+                            args.status.map(Into::into),
+                            args.priority,
+                        )
+                        .await?;
+                }
+                WorkstreamsCommand::Delete(args) => {
+                    service.workstream_delete(&args.workstream).await?;
+                }
                 WorkstreamsCommand::List => service.workstream_list().await?,
                 WorkstreamsCommand::Get(args) => service.workstream_get(&args.workstream).await?,
             }
@@ -627,10 +822,99 @@ async fn main() -> Result<()> {
                         .workunit_create(&args.workstream, args.title, args.task, args.dependencies)
                         .await?;
                 }
+                WorkunitsCommand::Edit(args) => {
+                    service
+                        .workunit_edit(
+                            &args.workunit,
+                            args.title,
+                            args.task,
+                            args.status.map(Into::into),
+                        )
+                        .await?;
+                }
+                WorkunitsCommand::Delete(args) => {
+                    service.workunit_delete(&args.workunit).await?;
+                }
                 WorkunitsCommand::List(args) => {
                     service.workunit_list(args.workstream.as_deref()).await?;
                 }
                 WorkunitsCommand::Get(args) => service.workunit_get(&args.workunit).await?,
+            }
+        }
+        TopCommand::TrackedThreads { command } => {
+            let service = SupervisorService::load(&overrides).await?;
+            match command {
+                TrackedThreadsCommand::Create(args) => {
+                    service
+                        .tracked_thread_create(
+                            &args.workunit,
+                            args.title,
+                            args.root_dir,
+                            args.notes,
+                            args.upstream_thread,
+                            args.model,
+                        )
+                        .await?;
+                }
+                TrackedThreadsCommand::Edit(args) => {
+                    service
+                        .tracked_thread_edit(
+                            &args.tracked_thread,
+                            args.title,
+                            args.root_dir,
+                            args.notes,
+                            args.upstream_thread,
+                            args.binding_state.map(Into::into),
+                            args.model,
+                        )
+                        .await?;
+                }
+                TrackedThreadsCommand::Delete(args) => {
+                    service.tracked_thread_delete(&args.tracked_thread).await?;
+                }
+                TrackedThreadsCommand::List(args) => {
+                    service.tracked_thread_list(&args.workunit).await?;
+                }
+                TrackedThreadsCommand::Get(args) => {
+                    service.tracked_thread_get(&args.tracked_thread).await?;
+                }
+            }
+        }
+        TopCommand::LegacyWorkstreams { command } => {
+            let service = SupervisorService::load(&overrides).await?;
+            match command {
+                LegacyWorkstreamsCommand::Create(args) => {
+                    service
+                        .legacy_workstream_create(args.title, args.objective, args.priority)
+                        .await?;
+                }
+                LegacyWorkstreamsCommand::List => service.legacy_workstream_list().await?,
+                LegacyWorkstreamsCommand::Get(args) => {
+                    service.legacy_workstream_get(&args.workstream).await?
+                }
+            }
+        }
+        TopCommand::LegacyWorkunits { command } => {
+            let service = SupervisorService::load(&overrides).await?;
+            match command {
+                LegacyWorkunitsCommand::Create(args) => {
+                    service
+                        .legacy_workunit_create(
+                            &args.workstream,
+                            args.title,
+                            args.task,
+                            args.dependencies,
+                        )
+                        .await?;
+                }
+                LegacyWorkunitsCommand::List(args) => {
+                    service
+                        .legacy_workunit_list(args.workstream.as_deref())
+                        .await?;
+                }
+                LegacyWorkunitsCommand::Get(args) => {
+                    service.legacy_workunit_get(&args.workunit).await?
+                }
             }
         }
         TopCommand::Assignments { command } => {
@@ -932,6 +1216,43 @@ mod tests {
     }
 
     #[test]
+    fn top_level_help_mentions_canonical_and_compatibility_planning_commands() {
+        let help = Cli::command().render_help().to_string();
+
+        assert!(help.contains("workstreams"));
+        assert!(help.contains("workunits"));
+        assert!(help.contains("tracked-threads"));
+        assert!(help.contains("legacy-workstreams"));
+        assert!(help.contains("legacy-workunits"));
+    }
+
+    #[test]
+    fn workstreams_help_marks_authority_surface_as_canonical() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("workstreams")
+            .expect("workstreams subcommand")
+            .render_help()
+            .to_string();
+
+        assert!(help.contains("Canonical authority-backed CRUD for planning workstreams"));
+    }
+
+    #[test]
+    fn legacy_workstreams_help_marks_surface_as_compatibility() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("legacy-workstreams")
+            .expect("legacy-workstreams subcommand")
+            .render_help()
+            .to_string();
+
+        assert!(help.contains(
+            "Compatibility create/list/get commands for legacy collaboration workstreams"
+        ));
+    }
+
+    #[test]
     fn parses_top_level_daemon_status_command() {
         let cli = Cli::parse_from(["orcas", "daemon", "status"]);
 
@@ -959,6 +1280,88 @@ mod tests {
 
         match cli.command {
             TopCommand::Doctor => {}
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tracked_thread_create_command() {
+        let cli = Cli::parse_from([
+            "orcas",
+            "tracked-threads",
+            "create",
+            "--workunit",
+            "wu-1",
+            "--title",
+            "Thread record",
+            "--root-dir",
+            "/tmp/orcas",
+            "--model",
+            "gpt-5.4",
+        ]);
+
+        match cli.command {
+            TopCommand::TrackedThreads {
+                command: TrackedThreadsCommand::Create(args),
+            } => {
+                assert_eq!(args.workunit, "wu-1");
+                assert_eq!(args.title, "Thread record");
+                assert_eq!(args.root_dir, "/tmp/orcas");
+                assert_eq!(args.model.as_deref(), Some("gpt-5.4"));
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tracked_thread_edit_command() {
+        let cli = Cli::parse_from([
+            "orcas",
+            "tracked-threads",
+            "edit",
+            "--tracked-thread",
+            "tt-1",
+            "--binding-state",
+            "detached",
+            "--model",
+            "gpt-5.5",
+        ]);
+
+        match cli.command {
+            TopCommand::TrackedThreads {
+                command: TrackedThreadsCommand::Edit(args),
+            } => {
+                assert_eq!(args.tracked_thread, "tt-1");
+                assert!(matches!(
+                    args.binding_state,
+                    Some(TrackedThreadBindingStateArg::Detached)
+                ));
+                assert_eq!(args.model.as_deref(), Some("gpt-5.5"));
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_legacy_workstream_create_command() {
+        let cli = Cli::parse_from([
+            "orcas",
+            "legacy-workstreams",
+            "create",
+            "--title",
+            "Legacy root",
+            "--objective",
+            "Legacy objective",
+        ]);
+
+        match cli.command {
+            TopCommand::LegacyWorkstreams {
+                command: LegacyWorkstreamsCommand::Create(args),
+            } => {
+                assert_eq!(args.title, "Legacy root");
+                assert_eq!(args.objective, "Legacy objective");
+                assert_eq!(args.priority, None);
+            }
             other => panic!("unexpected command parse: {other:?}"),
         }
     }

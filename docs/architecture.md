@@ -8,7 +8,7 @@ The control plane stays local. Orcas owns the records that matter for supervisio
 
 ## Runtime Roles
 
-`orcas` is the operator-facing CLI. It is used for daemon lifecycle commands, status inspection, workflow review, and other supervisor actions that need to go through the daemon.
+`orcas` is the operator-facing CLI. It is used for daemon lifecycle commands, status inspection, workflow review, and other supervisor actions that need to go through the daemon. For planning hierarchy CRUD, the CLI now converges on the same authority surface the TUI already uses.
 
 `orcasd` is the long-lived service process. On startup it resolves configuration, ensures the runtime and data directories exist, writes runtime metadata, binds the local socket, and connects to the upstream Codex app-server. From that point on it serves local clients and owns the live in-memory view of Orcas state.
 
@@ -18,7 +18,7 @@ The control plane stays local. Orcas owns the records that matter for supervisio
 
 Orcas uses a local Unix domain socket for IPC. The wire format is structured JSON-RPC 2.0, exchanged as line-delimited JSON messages. Clients use requests for commands and queries, responses for returned data, and notifications for state-change events.
 
-The daemon provides both snapshots and events. A client can ask for a point-in-time snapshot to bootstrap its view, then subscribe to events to keep that view current. The CLI mostly relies on `state/get` plus focused RPCs. The TUI bootstraps from both `state/get` and `authority/hierarchy/get`, because `state/get` is now a collaboration-first snapshot plus any explicit assignment-compatibility bridge rows rather than a general authority planning read. Authority workstream, work unit, and tracked-thread CRUD mutations emit post-commit lifecycle notifications, but those notifications are still visibility signals layered on top of authority reloads rather than a replacement for canonical authority reads.
+The daemon provides both snapshots and events. A client can ask for a point-in-time snapshot to bootstrap its view, then subscribe to events to keep that view current. The CLI relies on focused RPCs for authority-backed planning CRUD and on `state/get` plus focused RPCs for collaboration and runtime views. The TUI bootstraps from both `state/get` and `authority/hierarchy/get`, because `state/get` is now a collaboration-first snapshot plus any explicit assignment-compatibility bridge rows rather than a general authority planning read. Authority workstream, work unit, and tracked-thread CRUD mutations emit post-commit lifecycle notifications, but those notifications are still visibility signals layered on top of authority reloads rather than a replacement for canonical authority reads.
 
 The daemon’s state model is Orcas-native, but it currently has two live local persistence systems. Legacy collaboration and thread/turn mirror state are loaded from and persisted to `state.json`. Authority-owned workstreams, work units, and tracked threads are stored in `state.db` with explicit commands, revisions, and tombstones. `state/get` is therefore a merged derived snapshot rather than a single-store read, while `authority/hierarchy/get` and authority detail RPCs remain the canonical planning hierarchy surfaces.
 

@@ -11,7 +11,8 @@ use tracing::{info, warn};
 use orcas_core::{
     AppConfig, AppPaths, CodexThreadAssignmentStatus, DecisionType, SupervisorProposalEdits,
     SupervisorProposalRecord, SupervisorTurnDecision, SupervisorTurnDecisionKind,
-    SupervisorTurnDecisionStatus, ThreadReadRequest, ThreadResumeRequest, ThreadStartRequest, ipc,
+    SupervisorTurnDecisionStatus, ThreadReadRequest, ThreadResumeRequest, ThreadStartRequest,
+    WorkUnitStatus, WorkstreamStatus, authority, ipc,
 };
 use orcasd::{
     OrcasDaemonLaunch, OrcasDaemonProcessManager, OrcasIpcClient, OrcasRuntimeOverrides,
@@ -26,6 +27,7 @@ use crate::streaming::{
 pub use orcasd::OrcasRuntimeOverrides as RuntimeOverrides;
 
 const SUPERVISOR_CLI_OPERATOR: &str = "supervisor_cli_operator";
+const ORCAS_CLI_NODE_ID: &str = "orcas-cli";
 
 #[async_trait]
 trait SupervisorCodexBackend {
@@ -429,6 +431,461 @@ impl SupervisorService {
         objective: String,
         priority: Option<String>,
     ) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .authority_workstream_create(&ipc::AuthorityWorkstreamCreateRequest {
+                command: authority::CreateWorkstream {
+                    metadata: Self::authority_command_metadata(),
+                    workstream_id: authority::WorkstreamId::new(),
+                    title,
+                    objective,
+                    status: WorkstreamStatus::Active,
+                    priority: priority.unwrap_or_else(|| "medium".to_string()),
+                },
+            })
+            .await?;
+        println!("surface: authority");
+        println!("workstream_id: {}", response.workstream.id);
+        println!("revision: {}", response.workstream.revision.get());
+        println!("status: {:?}", response.workstream.status);
+        Ok(())
+    }
+
+    pub async fn workstream_edit(
+        &self,
+        workstream_id: &str,
+        title: Option<String>,
+        objective: Option<String>,
+        status: Option<WorkstreamStatus>,
+        priority: Option<String>,
+    ) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let existing = client
+            .authority_workstream_get(&ipc::AuthorityWorkstreamGetRequest {
+                workstream_id: authority::WorkstreamId::parse(workstream_id.to_string())?,
+            })
+            .await?;
+        let patch = authority::WorkstreamPatch {
+            title,
+            objective,
+            status,
+            priority,
+        };
+        if patch.is_empty() {
+            bail!("supply at least one workstream field to edit");
+        }
+        let response = client
+            .authority_workstream_edit(&ipc::AuthorityWorkstreamEditRequest {
+                command: authority::EditWorkstream {
+                    metadata: Self::authority_command_metadata(),
+                    workstream_id: existing.workstream.id,
+                    expected_revision: existing.workstream.revision,
+                    changes: patch,
+                },
+            })
+            .await?;
+        println!("surface: authority");
+        println!("workstream_id: {}", response.workstream.id);
+        println!("revision: {}", response.workstream.revision.get());
+        println!("status: {:?}", response.workstream.status);
+        Ok(())
+    }
+
+    pub async fn workstream_delete(&self, workstream_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let workstream_id = authority::WorkstreamId::parse(workstream_id.to_string())?;
+        let delete_plan = client
+            .authority_delete_plan(&ipc::AuthorityDeletePlanRequest {
+                target: authority::DeleteTarget::Workstream {
+                    workstream_id: workstream_id.clone(),
+                },
+            })
+            .await?
+            .delete_plan;
+        let response = client
+            .authority_workstream_delete(&ipc::AuthorityWorkstreamDeleteRequest {
+                command: authority::DeleteWorkstream {
+                    metadata: Self::authority_command_metadata(),
+                    workstream_id,
+                    expected_revision: delete_plan.expected_revision,
+                    delete_token: delete_plan.confirmation_token,
+                },
+            })
+            .await?;
+        println!("surface: authority");
+        println!("workstream_id: {}", response.workstream.id);
+        println!("revision: {}", response.workstream.revision.get());
+        println!("deleted: {}", response.workstream.deleted_at.is_some());
+        Ok(())
+    }
+
+    pub async fn workstream_list(&self) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .authority_workstream_list(&ipc::AuthorityWorkstreamListRequest::default())
+            .await?;
+        for workstream in response.workstreams {
+            println!(
+                "{}\trev={}\t{:?}\t{}\t{}",
+                workstream.id,
+                workstream.revision.get(),
+                workstream.status,
+                workstream.priority,
+                workstream.title
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn workstream_get(&self, workstream_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .authority_workstream_get(&ipc::AuthorityWorkstreamGetRequest {
+                workstream_id: authority::WorkstreamId::parse(workstream_id.to_string())?,
+            })
+            .await?;
+        println!("surface: authority");
+        println!("workstream_id: {}", response.workstream.id);
+        println!("title: {}", response.workstream.title);
+        println!("objective: {}", response.workstream.objective);
+        println!("status: {:?}", response.workstream.status);
+        println!("priority: {}", response.workstream.priority);
+        println!("revision: {}", response.workstream.revision.get());
+        println!("origin_node_id: {}", response.workstream.origin_node_id);
+        println!("work_units: {}", response.work_units.len());
+        for work_unit in response.work_units {
+            println!(
+                "work_unit\t{}\trev={}\t{:?}\t{}",
+                work_unit.id,
+                work_unit.revision.get(),
+                work_unit.status,
+                work_unit.title
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn workunit_create(
+        &self,
+        workstream_id: &str,
+        title: String,
+        task_statement: String,
+        dependencies: Vec<String>,
+    ) -> Result<()> {
+        if !dependencies.is_empty() {
+            bail!(
+                "authority-backed workunit create does not accept legacy collaboration dependencies"
+            );
+        }
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .authority_workunit_create(&ipc::AuthorityWorkunitCreateRequest {
+                command: authority::CreateWorkUnit {
+                    metadata: Self::authority_command_metadata(),
+                    work_unit_id: authority::WorkUnitId::new(),
+                    workstream_id: authority::WorkstreamId::parse(workstream_id.to_string())?,
+                    title,
+                    task_statement,
+                    status: WorkUnitStatus::Ready,
+                },
+            })
+            .await?;
+        println!("surface: authority");
+        println!("work_unit_id: {}", response.work_unit.id);
+        println!("revision: {}", response.work_unit.revision.get());
+        println!("status: {:?}", response.work_unit.status);
+        Ok(())
+    }
+
+    pub async fn workunit_edit(
+        &self,
+        work_unit_id: &str,
+        title: Option<String>,
+        task_statement: Option<String>,
+        status: Option<WorkUnitStatus>,
+    ) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let existing = client
+            .authority_workunit_get(&ipc::AuthorityWorkunitGetRequest {
+                work_unit_id: authority::WorkUnitId::parse(work_unit_id.to_string())?,
+            })
+            .await?;
+        let patch = authority::WorkUnitPatch {
+            title,
+            task_statement,
+            status,
+        };
+        if patch.is_empty() {
+            bail!("supply at least one work unit field to edit");
+        }
+        let response = client
+            .authority_workunit_edit(&ipc::AuthorityWorkunitEditRequest {
+                command: authority::EditWorkUnit {
+                    metadata: Self::authority_command_metadata(),
+                    work_unit_id: existing.work_unit.id,
+                    expected_revision: existing.work_unit.revision,
+                    changes: patch,
+                },
+            })
+            .await?;
+        println!("surface: authority");
+        println!("work_unit_id: {}", response.work_unit.id);
+        println!("revision: {}", response.work_unit.revision.get());
+        println!("status: {:?}", response.work_unit.status);
+        Ok(())
+    }
+
+    pub async fn workunit_delete(&self, work_unit_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let work_unit_id = authority::WorkUnitId::parse(work_unit_id.to_string())?;
+        let delete_plan = client
+            .authority_delete_plan(&ipc::AuthorityDeletePlanRequest {
+                target: authority::DeleteTarget::WorkUnit {
+                    work_unit_id: work_unit_id.clone(),
+                },
+            })
+            .await?
+            .delete_plan;
+        let response = client
+            .authority_workunit_delete(&ipc::AuthorityWorkunitDeleteRequest {
+                command: authority::DeleteWorkUnit {
+                    metadata: Self::authority_command_metadata(),
+                    work_unit_id,
+                    expected_revision: delete_plan.expected_revision,
+                    delete_token: delete_plan.confirmation_token,
+                },
+            })
+            .await?;
+        println!("surface: authority");
+        println!("work_unit_id: {}", response.work_unit.id);
+        println!("revision: {}", response.work_unit.revision.get());
+        println!("deleted: {}", response.work_unit.deleted_at.is_some());
+        Ok(())
+    }
+
+    pub async fn workunit_list(&self, workstream_id: Option<&str>) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .authority_workunit_list(&ipc::AuthorityWorkunitListRequest {
+                workstream_id: match workstream_id {
+                    Some(workstream_id) => {
+                        Some(authority::WorkstreamId::parse(workstream_id.to_string())?)
+                    }
+                    None => None,
+                },
+                include_deleted: false,
+            })
+            .await?;
+        for work_unit in response.work_units {
+            println!(
+                "{}\trev={}\t{:?}\tworkstream={}\t{}",
+                work_unit.id,
+                work_unit.revision.get(),
+                work_unit.status,
+                work_unit.workstream_id,
+                work_unit.title
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn workunit_get(&self, work_unit_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .authority_workunit_get(&ipc::AuthorityWorkunitGetRequest {
+                work_unit_id: authority::WorkUnitId::parse(work_unit_id.to_string())?,
+            })
+            .await?;
+        println!("surface: authority");
+        println!("work_unit_id: {}", response.work_unit.id);
+        println!("workstream_id: {}", response.work_unit.workstream_id);
+        println!("title: {}", response.work_unit.title);
+        println!("task_statement: {}", response.work_unit.task_statement);
+        println!("status: {:?}", response.work_unit.status);
+        println!("revision: {}", response.work_unit.revision.get());
+        println!("origin_node_id: {}", response.work_unit.origin_node_id);
+        println!("tracked_threads: {}", response.tracked_threads.len());
+        for tracked_thread in response.tracked_threads {
+            println!(
+                "tracked_thread\t{}\trev={}\t{:?}\t{:?}\t{}",
+                tracked_thread.id,
+                tracked_thread.revision.get(),
+                tracked_thread.backend_kind,
+                tracked_thread.binding_state,
+                tracked_thread.title
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn tracked_thread_create(
+        &self,
+        work_unit_id: &str,
+        title: String,
+        root_dir: String,
+        notes: Option<String>,
+        upstream_thread_id: Option<String>,
+        preferred_model: Option<String>,
+    ) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .authority_tracked_thread_create(&ipc::AuthorityTrackedThreadCreateRequest {
+                command: authority::CreateTrackedThread {
+                    metadata: Self::authority_command_metadata(),
+                    tracked_thread_id: authority::TrackedThreadId::new(),
+                    work_unit_id: authority::WorkUnitId::parse(work_unit_id.to_string())?,
+                    title,
+                    notes,
+                    backend_kind: authority::TrackedThreadBackendKind::Codex,
+                    upstream_thread_id,
+                    preferred_cwd: Some(root_dir),
+                    preferred_model,
+                },
+            })
+            .await?;
+        println!("surface: authority");
+        println!("tracked_thread_id: {}", response.tracked_thread.id);
+        println!("revision: {}", response.tracked_thread.revision.get());
+        println!("binding_state: {:?}", response.tracked_thread.binding_state);
+        Ok(())
+    }
+
+    pub async fn tracked_thread_edit(
+        &self,
+        tracked_thread_id: &str,
+        title: Option<String>,
+        root_dir: Option<String>,
+        notes: Option<String>,
+        upstream_thread_id: Option<String>,
+        binding_state: Option<authority::TrackedThreadBindingState>,
+        preferred_model: Option<String>,
+    ) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let existing = client
+            .authority_tracked_thread_get(&ipc::AuthorityTrackedThreadGetRequest {
+                tracked_thread_id: authority::TrackedThreadId::parse(
+                    tracked_thread_id.to_string(),
+                )?,
+            })
+            .await?;
+        let patch = authority::TrackedThreadPatch {
+            title,
+            notes: notes.map(Some),
+            backend_kind: None,
+            upstream_thread_id: upstream_thread_id.map(Some),
+            binding_state,
+            preferred_cwd: root_dir.map(Some),
+            preferred_model: preferred_model.map(Some),
+            last_seen_turn_id: None,
+        };
+        if patch.is_empty() {
+            bail!("supply at least one tracked-thread field to edit");
+        }
+        let response = client
+            .authority_tracked_thread_edit(&ipc::AuthorityTrackedThreadEditRequest {
+                command: authority::EditTrackedThread {
+                    metadata: Self::authority_command_metadata(),
+                    tracked_thread_id: existing.tracked_thread.id,
+                    expected_revision: existing.tracked_thread.revision,
+                    changes: patch,
+                },
+            })
+            .await?;
+        println!("surface: authority");
+        println!("tracked_thread_id: {}", response.tracked_thread.id);
+        println!("revision: {}", response.tracked_thread.revision.get());
+        println!("binding_state: {:?}", response.tracked_thread.binding_state);
+        Ok(())
+    }
+
+    pub async fn tracked_thread_delete(&self, tracked_thread_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let tracked_thread_id = authority::TrackedThreadId::parse(tracked_thread_id.to_string())?;
+        let delete_plan = client
+            .authority_delete_plan(&ipc::AuthorityDeletePlanRequest {
+                target: authority::DeleteTarget::TrackedThread {
+                    tracked_thread_id: tracked_thread_id.clone(),
+                },
+            })
+            .await?
+            .delete_plan;
+        let response = client
+            .authority_tracked_thread_delete(&ipc::AuthorityTrackedThreadDeleteRequest {
+                command: authority::DeleteTrackedThread {
+                    metadata: Self::authority_command_metadata(),
+                    tracked_thread_id,
+                    expected_revision: delete_plan.expected_revision,
+                    delete_token: delete_plan.confirmation_token,
+                },
+            })
+            .await?;
+        println!("surface: authority");
+        println!("tracked_thread_id: {}", response.tracked_thread.id);
+        println!("revision: {}", response.tracked_thread.revision.get());
+        println!("deleted: {}", response.tracked_thread.deleted_at.is_some());
+        Ok(())
+    }
+
+    pub async fn tracked_thread_list(&self, work_unit_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .authority_tracked_thread_list(&ipc::AuthorityTrackedThreadListRequest {
+                work_unit_id: authority::WorkUnitId::parse(work_unit_id.to_string())?,
+                include_deleted: false,
+            })
+            .await?;
+        for tracked_thread in response.tracked_threads {
+            println!(
+                "{}\trev={}\t{:?}\t{:?}\t{}",
+                tracked_thread.id,
+                tracked_thread.revision.get(),
+                tracked_thread.backend_kind,
+                tracked_thread.binding_state,
+                tracked_thread.title
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn tracked_thread_get(&self, tracked_thread_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .authority_tracked_thread_get(&ipc::AuthorityTrackedThreadGetRequest {
+                tracked_thread_id: authority::TrackedThreadId::parse(
+                    tracked_thread_id.to_string(),
+                )?,
+            })
+            .await?;
+        println!("surface: authority");
+        println!("tracked_thread_id: {}", response.tracked_thread.id);
+        println!("work_unit_id: {}", response.tracked_thread.work_unit_id);
+        println!("title: {}", response.tracked_thread.title);
+        println!("backend_kind: {:?}", response.tracked_thread.backend_kind);
+        println!("binding_state: {:?}", response.tracked_thread.binding_state);
+        println!("revision: {}", response.tracked_thread.revision.get());
+        println!("origin_node_id: {}", response.tracked_thread.origin_node_id);
+        if let Some(root_dir) = response.tracked_thread.preferred_cwd.as_ref() {
+            println!("preferred_cwd: {root_dir}");
+        }
+        if let Some(upstream_thread_id) = response.tracked_thread.upstream_thread_id.as_ref() {
+            println!("upstream_thread_id: {upstream_thread_id}");
+        }
+        if let Some(notes) = response.tracked_thread.notes.as_ref() {
+            println!("notes: {notes}");
+        }
+        if let Some(preferred_model) = response.tracked_thread.preferred_model.as_ref() {
+            println!("preferred_model: {preferred_model}");
+        }
+        Ok(())
+    }
+
+    pub async fn legacy_workstream_create(
+        &self,
+        title: String,
+        objective: String,
+        priority: Option<String>,
+    ) -> Result<()> {
+        Self::print_legacy_workflow_notice("workstreams");
         let client = self.ready_client().await?;
         let response = client
             .workstream_create(&ipc::WorkstreamCreateRequest {
@@ -442,7 +899,8 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn workstream_list(&self) -> Result<()> {
+    pub async fn legacy_workstream_list(&self) -> Result<()> {
+        Self::print_legacy_workflow_notice("workstreams");
         let client = self.daemon_state_client().await?;
         let response = client.workstream_list().await?;
         for workstream in response.workstreams {
@@ -454,7 +912,8 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn workstream_get(&self, workstream_id: &str) -> Result<()> {
+    pub async fn legacy_workstream_get(&self, workstream_id: &str) -> Result<()> {
+        Self::print_legacy_workflow_notice("workstreams");
         let client = self.daemon_state_client().await?;
         let response = client
             .workstream_get(&ipc::WorkstreamGetRequest {
@@ -479,13 +938,14 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn workunit_create(
+    pub async fn legacy_workunit_create(
         &self,
         workstream_id: &str,
         title: String,
         task_statement: String,
         dependencies: Vec<String>,
     ) -> Result<()> {
+        Self::print_legacy_workflow_notice("workunits");
         let client = self.ready_client().await?;
         let response = client
             .workunit_create(&ipc::WorkunitCreateRequest {
@@ -500,7 +960,8 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn workunit_list(&self, workstream_id: Option<&str>) -> Result<()> {
+    pub async fn legacy_workunit_list(&self, workstream_id: Option<&str>) -> Result<()> {
+        Self::print_legacy_workflow_notice("workunits");
         let client = self.daemon_state_client().await?;
         let response = client
             .workunit_list(&ipc::WorkunitListRequest {
@@ -520,7 +981,8 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn workunit_get(&self, work_unit_id: &str) -> Result<()> {
+    pub async fn legacy_workunit_get(&self, work_unit_id: &str) -> Result<()> {
+        Self::print_legacy_workflow_notice("workunits");
         let client = self.daemon_state_client().await?;
         let response = client
             .workunit_get(&ipc::WorkunitGetRequest {
@@ -1868,6 +2330,20 @@ impl SupervisorService {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| fallback.to_string())
+    }
+
+    fn authority_command_metadata() -> authority::CommandMetadata {
+        authority::CommandMetadata::new(
+            authority::OriginNodeId::parse(ORCAS_CLI_NODE_ID).expect("static cli origin node id"),
+            authority::CommandActor::parse(SUPERVISOR_CLI_OPERATOR).expect("static cli actor"),
+        )
+    }
+
+    fn print_legacy_workflow_notice(noun: &str) {
+        println!("surface: legacy_collaboration_compatibility");
+        println!(
+            "note: `{noun}` here uses the legacy collaboration compatibility path; canonical planning hierarchy create/edit/delete uses the authority-backed `orcas {noun}` commands."
+        );
     }
 
     fn print_supervisor_turn_decision(

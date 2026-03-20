@@ -21,7 +21,17 @@ The current workflow boundary is mixed. Legacy collaboration state remains in
 \fIstate.json\fR, while authority workstreams, authority work units, and tracked
 threads live in \fIstate.db\fR. The
 .B orcas
-CLI currently uses the legacy workflow CRUD surface.
+CLI now uses authority-backed planning hierarchy CRUD as the canonical operator
+surface via
+.B workstreams ,
+.B workunits ,
+and
+.B tracked-threads .
+The retained
+.B legacy-workstreams
+and
+.B legacy-workunits
+commands are explicit create/list/get compatibility paths for legacy collaboration records.
 .SH QUICK START
 Check the local Orcas environment:
 
