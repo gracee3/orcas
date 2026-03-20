@@ -3,9 +3,8 @@
 # Orcas
 
 _Open Reasoning Context & Agent Supervisor_  
-Tracking Codex `v0.115.0`. Reference upstream: [openai/codex](https://github.com/openai/codex)
 
-Orcas is a local Rust supervisor layer built around Codex [`app-server`](https://developers.openai.com/codex/app-server/).
+Orcas is a local Rust supervisor layer built around [`codex`](https://github.com/openai/codex) [`app-server`](https://developers.openai.com/codex/app-server/).
 
 Orcas is for the point where one agent thread is no longer enough. It keeps the control plane close: local, durable, inspectable, and calm. `orcasd` owns workflow state, lifecycle, local IPC, snapshots, and event streams. The CLI (`orcas`) and TUI (`orcas-tui`, also available as `orcas tui`) are clients of that daemon rather than direct Codex clients.
 
