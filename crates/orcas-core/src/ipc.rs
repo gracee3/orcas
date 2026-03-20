@@ -87,6 +87,7 @@ pub mod methods {
         "authority/tracked_thread/prepare_workspace";
     pub const AUTHORITY_TRACKED_THREAD_REFRESH_WORKSPACE: &str =
         "authority/tracked_thread/refresh_workspace";
+    pub const AUTHORITY_TRACKED_THREAD_MERGE_PREP: &str = "authority/tracked_thread/merge_prep";
     pub const ASSIGNMENT_START: &str = "assignment/start";
     pub const ASSIGNMENT_GET: &str = "assignment/get";
     pub const ASSIGNMENT_COMMUNICATION_GET: &str = "assignment_communication/get";
@@ -1378,6 +1379,8 @@ pub struct AuthorityTrackedThreadGetResponse {
     pub workspace_inspection: Option<TrackedThreadWorkspaceInspection>,
     #[serde(default)]
     pub workspace_operation: Option<WorkspaceOperationRecord>,
+    #[serde(default)]
+    pub merge_prep_assessment: Option<TrackedThreadMergePrepAssessment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1418,6 +1421,30 @@ pub struct AuthorityTrackedThreadRefreshWorkspaceRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorityTrackedThreadRefreshWorkspaceResponse {
     pub workspace_operation: WorkspaceOperationRecord,
+    pub assignment: Assignment,
+    pub worker: Worker,
+    pub worker_session: WorkerSession,
+    pub report: Report,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityTrackedThreadMergePrepRequest {
+    pub tracked_thread_id: authority::TrackedThreadId,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    #[serde(default)]
+    pub request_note: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityTrackedThreadMergePrepResponse {
+    pub workspace_operation: WorkspaceOperationRecord,
+    #[serde(default)]
+    pub merge_prep_assessment: Option<TrackedThreadMergePrepAssessment>,
     pub assignment: Assignment,
     pub worker: Worker,
     pub worker_session: WorkerSession,
@@ -1473,6 +1500,47 @@ pub enum TrackedThreadWorkspaceInspectionWarning {
     BehindLandingTarget,
     DivergedFromLandingTarget,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackedThreadMergePrepReadiness {
+    Ready,
+    NotReady,
+    Blocked,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackedThreadMergePrepReason {
+    MissingSuccessfulReport,
+    MissingWorkerReportedHead,
+    MissingWorktree,
+    InvalidWorktree,
+    DirtyWorkspace,
+    DetachedHead,
+    BaseCommitMismatch,
+    BehindLandingTarget,
+    DivergedFromLandingTarget,
+    HeadMismatch,
+    UnknownInspectionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackedThreadMergePrepAssessment {
+    pub assessed_at: DateTime<Utc>,
+    pub readiness: TrackedThreadMergePrepReadiness,
+    #[serde(default)]
+    pub reasons: Vec<TrackedThreadMergePrepReason>,
+    #[serde(default)]
+    pub local_head_commit: Option<String>,
+    #[serde(default)]
+    pub worker_reported_head_commit: Option<String>,
+    #[serde(default)]
+    pub report_id: Option<String>,
+    #[serde(default)]
+    pub report_disposition: Option<ReportDisposition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

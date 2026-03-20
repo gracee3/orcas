@@ -258,6 +258,11 @@ fn hierarchy_rows(state: &AppState) -> Vec<MainHierarchyRowViewModel> {
                 {
                     badges.push(tracked_thread_workspace_operation_label(operation));
                 }
+                if let Some(assessment) =
+                    detail.and_then(|detail| detail.merge_prep_assessment.as_ref())
+                {
+                    badges.push(tracked_thread_merge_prep_assessment_label(assessment));
+                }
                 rows.push(MainHierarchyRowViewModel {
                     kind: HierarchyRowKind::Thread,
                     selection: MainHierarchySelection::Thread {
@@ -484,6 +489,45 @@ fn main_detail_panel(state: &AppState) -> PanelViewModel {
                     }
                 } else {
                     lines.push("workspace operation: none".to_string());
+                }
+                if let Some(assessment) = detail.merge_prep_assessment.as_ref() {
+                    lines.push("merge prep assessment:".to_string());
+                    lines.push(format!(
+                        "  readiness: {}",
+                        tracked_thread_merge_prep_readiness_label(assessment.readiness)
+                    ));
+                    lines.push(format!(
+                        "  assessed at: {}",
+                        assessment.assessed_at.to_rfc3339()
+                    ));
+                    lines.push(format!(
+                        "  local head: {}  worker head: {}",
+                        assessment.local_head_commit.as_deref().unwrap_or("unset"),
+                        assessment
+                            .worker_reported_head_commit
+                            .as_deref()
+                            .unwrap_or("unset")
+                    ));
+                    lines.push(format!(
+                        "  report id: {}  disposition: {}",
+                        assessment.report_id.as_deref().unwrap_or("unset"),
+                        assessment
+                            .report_disposition
+                            .map(|value| format!("{value:?}"))
+                            .unwrap_or_else(|| "unset".to_string())
+                    ));
+                    if assessment.reasons.is_empty() {
+                        lines.push("  reasons: none".to_string());
+                    } else {
+                        for reason in &assessment.reasons {
+                            lines.push(format!(
+                                "  reason: {}",
+                                tracked_thread_merge_prep_reason_label(*reason)
+                            ));
+                        }
+                    }
+                } else {
+                    lines.push("merge prep assessment: none".to_string());
                 }
                 lines.push("delete semantics: local only".to_string());
                 PanelViewModel {
@@ -848,6 +892,7 @@ fn tracked_thread_workspace_operation_kind_label(
     match kind {
         orcas_core::TrackedThreadWorkspaceOperationKind::PrepareWorkspace => "prepare",
         orcas_core::TrackedThreadWorkspaceOperationKind::RefreshWorkspace => "refresh",
+        orcas_core::TrackedThreadWorkspaceOperationKind::MergePrep => "merge_prep",
     }
 }
 
@@ -880,6 +925,48 @@ fn tracked_thread_workspace_operation_label_parts(
         "{}:{}",
         tracked_thread_workspace_operation_kind_label(kind),
         tracked_thread_workspace_operation_status_label(status)
+    )
+}
+
+fn tracked_thread_merge_prep_readiness_label(
+    readiness: ipc::TrackedThreadMergePrepReadiness,
+) -> &'static str {
+    match readiness {
+        ipc::TrackedThreadMergePrepReadiness::Ready => "ready",
+        ipc::TrackedThreadMergePrepReadiness::NotReady => "not_ready",
+        ipc::TrackedThreadMergePrepReadiness::Blocked => "blocked",
+        ipc::TrackedThreadMergePrepReadiness::Unknown => "unknown",
+    }
+}
+
+fn tracked_thread_merge_prep_reason_label(
+    reason: ipc::TrackedThreadMergePrepReason,
+) -> &'static str {
+    match reason {
+        ipc::TrackedThreadMergePrepReason::MissingSuccessfulReport => "missing_successful_report",
+        ipc::TrackedThreadMergePrepReason::MissingWorkerReportedHead => {
+            "missing_worker_reported_head"
+        }
+        ipc::TrackedThreadMergePrepReason::MissingWorktree => "missing_worktree",
+        ipc::TrackedThreadMergePrepReason::InvalidWorktree => "invalid_worktree",
+        ipc::TrackedThreadMergePrepReason::DirtyWorkspace => "dirty_workspace",
+        ipc::TrackedThreadMergePrepReason::DetachedHead => "detached_head",
+        ipc::TrackedThreadMergePrepReason::BaseCommitMismatch => "base_commit_mismatch",
+        ipc::TrackedThreadMergePrepReason::BehindLandingTarget => "behind_landing_target",
+        ipc::TrackedThreadMergePrepReason::DivergedFromLandingTarget => {
+            "diverged_from_landing_target"
+        }
+        ipc::TrackedThreadMergePrepReason::HeadMismatch => "head_mismatch",
+        ipc::TrackedThreadMergePrepReason::UnknownInspectionState => "unknown_inspection_state",
+    }
+}
+
+fn tracked_thread_merge_prep_assessment_label(
+    assessment: &ipc::TrackedThreadMergePrepAssessment,
+) -> String {
+    format!(
+        "merge={}",
+        tracked_thread_merge_prep_readiness_label(assessment.readiness)
     )
 }
 

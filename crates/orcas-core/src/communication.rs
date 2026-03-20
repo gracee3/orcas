@@ -29,6 +29,7 @@ pub enum TrackedThreadWorkspaceOperationKind {
     #[default]
     PrepareWorkspace,
     RefreshWorkspace,
+    MergePrep,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

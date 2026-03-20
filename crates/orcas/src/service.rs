@@ -31,6 +31,44 @@ pub use orcasd::OrcasRuntimeOverrides as RuntimeOverrides;
 const SUPERVISOR_CLI_OPERATOR: &str = "supervisor_cli_operator";
 const ORCAS_CLI_NODE_ID: &str = "orcas-cli";
 
+fn print_merge_prep_assessment(assessment: &ipc::TrackedThreadMergePrepAssessment) {
+    println!("workspace_scope: merge_prep_assessment");
+    println!(
+        "merge_prep_assessed_at: {}",
+        assessment.assessed_at.to_rfc3339()
+    );
+    println!("merge_prep_readiness: {:?}", assessment.readiness);
+    println!(
+        "merge_prep_local_head_commit: {}",
+        assessment.local_head_commit.as_deref().unwrap_or("unset")
+    );
+    println!(
+        "merge_prep_worker_reported_head_commit: {}",
+        assessment
+            .worker_reported_head_commit
+            .as_deref()
+            .unwrap_or("unset")
+    );
+    println!(
+        "merge_prep_report_id: {}",
+        assessment.report_id.as_deref().unwrap_or("unset")
+    );
+    println!(
+        "merge_prep_report_disposition: {}",
+        assessment
+            .report_disposition
+            .map(|value| format!("{value:?}"))
+            .unwrap_or_else(|| "unset".to_string())
+    );
+    if assessment.reasons.is_empty() {
+        println!("merge_prep_reasons: none");
+    } else {
+        for reason in &assessment.reasons {
+            println!("merge_prep_reason: {:?}", reason);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProposalArtifactExportFormat {
     Json,
@@ -1020,6 +1058,9 @@ impl SupervisorService {
                 println!("workspace_operation_outcome_summary: {summary}");
             }
         }
+        if let Some(assessment) = response.merge_prep_assessment.as_ref() {
+            print_merge_prep_assessment(assessment);
+        }
         Ok(())
     }
 
@@ -1138,6 +1179,66 @@ impl SupervisorService {
             "workspace_operation_report_summary: {}",
             response.report.summary
         );
+        Ok(())
+    }
+
+    pub async fn tracked_thread_merge_prep(&self, tracked_thread_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let tracked_thread = client
+            .authority_tracked_thread_get(&ipc::AuthorityTrackedThreadGetRequest {
+                tracked_thread_id: authority::TrackedThreadId::parse(
+                    tracked_thread_id.to_string(),
+                )?,
+            })
+            .await?
+            .tracked_thread;
+        let workspace = tracked_thread
+            .workspace
+            .clone()
+            .ok_or_else(|| anyhow!("tracked thread `{tracked_thread_id}` has no workspace"))?;
+        let response = client
+            .authority_tracked_thread_merge_prep(&ipc::AuthorityTrackedThreadMergePrepRequest {
+                tracked_thread_id: tracked_thread.id.clone(),
+                requested_by: Some(SUPERVISOR_CLI_OPERATOR.to_string()),
+                request_note: None,
+                model: tracked_thread.preferred_model.clone(),
+                cwd: Some(workspace.repository_root.clone()),
+            })
+            .await?;
+        println!("surface: workspace_operation");
+        println!(
+            "workspace_operation_kind: {:?}",
+            response.workspace_operation.kind
+        );
+        println!(
+            "workspace_operation_status: {:?}",
+            response.workspace_operation.status
+        );
+        println!(
+            "workspace_operation_tracked_thread_id: {}",
+            response.workspace_operation.tracked_thread_id
+        );
+        println!(
+            "workspace_operation_assignment_id: {}",
+            response.assignment.id
+        );
+        println!("workspace_operation_worker_id: {}", response.worker.id);
+        println!(
+            "workspace_operation_worker_session_id: {}",
+            response.worker_session.id
+        );
+        println!("workspace_operation_report_id: {}", response.report.id);
+        println!(
+            "workspace_operation_report_disposition: {:?}",
+            response.report.disposition
+        );
+        println!(
+            "workspace_operation_report_summary: {}",
+            response.report.summary
+        );
+        if let Some(assessment) = response.merge_prep_assessment.as_ref() {
+            print_merge_prep_assessment(assessment);
+        }
         Ok(())
     }
 

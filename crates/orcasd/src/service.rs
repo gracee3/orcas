@@ -62,6 +62,7 @@ use crate::assignment_comm::policy::validate_assignment_packet;
 use crate::assignment_comm::render::build_assignment_communication_record;
 use crate::assignment_comm::stable_fingerprint;
 use crate::authority_store::{AuthorityMutationResult, AuthoritySqliteStore};
+use crate::merge_prep::assess_merge_prep;
 use crate::process::{OrcasDaemonProcessManager, OrcasRuntimeOverrides, apply_runtime_overrides};
 use crate::supervisor::{
     ResponsesApiReasoner, SupervisorReasoner, apply_edits, build_context_pack,
@@ -740,6 +741,11 @@ impl OrcasDaemonService {
                     self.authority_tracked_thread_refresh_workspace(params)
                         .await?,
                 )?
+            }
+            ipc::methods::AUTHORITY_TRACKED_THREAD_MERGE_PREP => {
+                let params: ipc::AuthorityTrackedThreadMergePrepRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.authority_tracked_thread_merge_prep(params).await?)?
             }
             ipc::methods::ASSIGNMENT_START => {
                 let params: ipc::AssignmentStartRequest =
@@ -2097,12 +2103,21 @@ impl OrcasDaemonService {
         } else {
             None
         };
+        let workspace_operation = self
+            .latest_workspace_operation_for_tracked_thread(&params.tracked_thread_id)
+            .await?;
+        let merge_prep_assessment = self
+            .tracked_thread_merge_prep_assessment(
+                &tracked_thread,
+                workspace_inspection.as_ref(),
+                workspace_operation.as_ref(),
+            )
+            .await?;
         Ok(ipc::AuthorityTrackedThreadGetResponse {
             tracked_thread,
             workspace_inspection,
-            workspace_operation: self
-                .latest_workspace_operation_for_tracked_thread(&params.tracked_thread_id)
-                .await?,
+            workspace_operation,
+            merge_prep_assessment,
         })
     }
 
@@ -2137,6 +2152,52 @@ impl OrcasDaemonService {
             .await?;
         Ok(ipc::AuthorityTrackedThreadRefreshWorkspaceResponse {
             workspace_operation: response.workspace_operation,
+            assignment: response.assignment,
+            worker: response.worker,
+            worker_session: response.worker_session,
+            report: response.report,
+        })
+    }
+
+    async fn authority_tracked_thread_merge_prep(
+        &self,
+        params: ipc::AuthorityTrackedThreadMergePrepRequest,
+    ) -> OrcasResult<ipc::AuthorityTrackedThreadMergePrepResponse> {
+        let response = self
+            .start_tracked_thread_workspace_operation(
+                params.tracked_thread_id,
+                params.requested_by,
+                params.request_note,
+                params.model,
+                params.cwd,
+                TrackedThreadWorkspaceOperationKind::MergePrep,
+            )
+            .await?;
+        let tracked_thread = self
+            .authority_store
+            .get_tracked_thread(&response.workspace_operation.tracked_thread_id)
+            .await?
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!(
+                    "unknown authority tracked thread `{}`",
+                    response.workspace_operation.tracked_thread_id
+                ))
+            })?;
+        let workspace_inspection = if let Some(workspace) = tracked_thread.workspace.as_ref() {
+            Some(crate::workspace_inspection::inspect_tracked_thread_workspace(workspace).await)
+        } else {
+            None
+        };
+        let merge_prep_assessment = self
+            .tracked_thread_merge_prep_assessment(
+                &tracked_thread,
+                workspace_inspection.as_ref(),
+                Some(&response.workspace_operation),
+            )
+            .await?;
+        Ok(ipc::AuthorityTrackedThreadMergePrepResponse {
+            workspace_operation: response.workspace_operation,
+            merge_prep_assessment,
             assignment: response.assignment,
             worker: response.worker,
             worker_session: response.worker_session,
@@ -2588,6 +2649,22 @@ impl OrcasDaemonService {
                     .then_with(|| left.id.cmp(&right.id))
             })
             .cloned())
+    }
+
+    async fn tracked_thread_merge_prep_assessment(
+        &self,
+        tracked_thread: &authority::TrackedThreadRecord,
+        workspace_inspection: Option<&ipc::TrackedThreadWorkspaceInspection>,
+        workspace_operation: Option<&WorkspaceOperationRecord>,
+    ) -> OrcasResult<Option<ipc::TrackedThreadMergePrepAssessment>> {
+        let Some(workspace) = tracked_thread.workspace.as_ref() else {
+            return Ok(None);
+        };
+        Ok(assess_merge_prep(
+            workspace,
+            workspace_inspection,
+            workspace_operation,
+        ))
     }
 
     fn workspace_operation_status_is_terminal(
@@ -6019,6 +6096,10 @@ impl OrcasDaemonService {
                 "Refresh the declared workspace for tracked thread `{}`.",
                 tracked_thread.id
             ),
+            TrackedThreadWorkspaceOperationKind::MergePrep => format!(
+                "Prepare the declared workspace for merge review on tracked thread `{}`.",
+                tracked_thread.id
+            ),
         };
         let mut instructions = vec![
             format!("Tracked thread: {}", tracked_thread.id),
@@ -6037,6 +6118,14 @@ impl OrcasDaemonService {
             TrackedThreadWorkspaceOperationKind::RefreshWorkspace => {
                 instructions.push(
                     "Inspect the declared lane, fetch and sync according to policy, and do not land or merge into the protected target.".to_string(),
+                );
+            }
+            TrackedThreadWorkspaceOperationKind::MergePrep => {
+                instructions.push(
+                    "Inspect and normalize the declared lane for supervisor landing review, surface readiness blockers clearly, and do not finalize the merge.".to_string(),
+                );
+                instructions.push(
+                    "Do not merge into the landing target, authorize landing, reset, or prune as part of merge_prep.".to_string(),
                 );
             }
         }

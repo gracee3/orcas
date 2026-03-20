@@ -1498,6 +1498,7 @@ impl TuiBackend for FakeBackend {
                             })?,
                         workspace_inspection: None,
                         workspace_operation: None,
+                        merge_prep_assessment: None,
                     },
                 ))
             }

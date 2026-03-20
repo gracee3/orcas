@@ -448,6 +448,12 @@ pub fn render_prompt(
                     "- Do not land, merge, reset, or prune from the daemon-side workflow.\n",
                 );
             }
+            TrackedThreadWorkspaceOperationKind::MergePrep => {
+                prompt.push_str("- merge_prep means prepare the declared lane for supervisor merge review, surface readiness blockers clearly, and report the observed lane state.\n");
+                prompt.push_str(
+                    "- Do not merge into the landing target, finalize landing, reset, or prune from this workflow.\n",
+                );
+            }
         }
         prompt.push_str(
             "- The worker performs any required git mutations inside the declared workspace.\n",
@@ -1275,6 +1281,53 @@ mod tests {
         assert!(prompt.contains("Workspace Operation:"));
         assert!(prompt.contains("\"kind\": \"prepare_workspace\""));
         assert!(prompt.contains("prepare_workspace means normalize the declared lane"));
+    }
+
+    #[test]
+    fn render_prompt_includes_merge_prep_contract_guidance() {
+        let collaboration = sample_collaboration();
+        let mut seed = sample_seed();
+        seed.workspace_operation = Some(TrackedThreadWorkspaceOperationContract {
+            kind: TrackedThreadWorkspaceOperationKind::MergePrep,
+            tracked_thread_id: TrackedThreadId::parse("tt-1").expect("tracked thread id"),
+            tracked_thread_title: "Tracked thread".to_string(),
+            workspace: TrackedThreadWorkspace {
+                repository_root: "/repo".to_string(),
+                owner_tracked_thread_id: TrackedThreadId::parse("tt-1").expect("tracked thread id"),
+                strategy: TrackedThreadWorkspaceStrategy::DedicatedThreadWorktree,
+                worktree_path: "/repo/worktree".to_string(),
+                branch_name: "orcas/tt-1".to_string(),
+                base_ref: "origin/main".to_string(),
+                base_commit: Some("base-123".to_string()),
+                landing_target: "origin/main".to_string(),
+                landing_policy: TrackedThreadWorkspaceLandingPolicy::MergeToMain,
+                sync_policy: TrackedThreadWorkspaceSyncPolicy::Manual,
+                cleanup_policy: TrackedThreadWorkspaceCleanupPolicy::KeepUntilCampaignClosed,
+                last_reported_head_commit: None,
+                status: TrackedThreadWorkspaceStatus::Requested,
+            },
+            requested_by: Some("supervisor_cli".to_string()),
+            request_note: Some("Assess lane readiness.".to_string()),
+        });
+        let assignment = sample_assignment(Some(seed), "unused legacy text");
+        let record = build_assignment_communication_record(
+            &collaboration,
+            &assignment,
+            Some("gpt-5".to_string()),
+            Some("/repo".to_string()),
+            None,
+            None,
+            fixed_now(),
+        )
+        .expect("build communication record");
+
+        let prompt = &record.prompt_render.prompt_text;
+        assert!(prompt.contains("\"kind\": \"merge_prep\""));
+        assert!(
+            prompt
+                .contains("merge_prep means prepare the declared lane for supervisor merge review")
+        );
+        assert!(prompt.contains("Do not merge into the landing target, finalize landing"));
     }
 
     #[test]
