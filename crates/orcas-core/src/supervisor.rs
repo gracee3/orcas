@@ -301,6 +301,30 @@ pub struct SupervisorReasonerUsage {
     pub total_tokens: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorPromptRenderSpec {
+    pub template_version: String,
+    pub context_schema_version: String,
+    pub proposal_schema_name: String,
+    pub proposal_schema_version: String,
+    pub response_format: String,
+    pub strict_schema: bool,
+    pub context_serialization: String,
+    pub style: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorPromptRenderArtifact {
+    pub render_spec: SupervisorPromptRenderSpec,
+    pub instructions_text: String,
+    pub user_content_text: String,
+    pub context_pack_text: String,
+    pub prompt_hash: String,
+    #[serde(default)]
+    pub request_body_hash: Option<String>,
+    pub rendered_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SupervisorProposalStatus {
@@ -345,6 +369,8 @@ pub struct SupervisorProposalRecord {
     #[serde(default)]
     pub reasoner_output_text: Option<String>,
     pub context_pack: SupervisorContextPack,
+    #[serde(default)]
+    pub prompt_render: Option<SupervisorPromptRenderArtifact>,
     #[serde(default)]
     pub proposal: Option<SupervisorProposal>,
     #[serde(default)]

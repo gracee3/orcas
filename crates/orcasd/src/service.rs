@@ -4840,6 +4840,7 @@ impl OrcasDaemonService {
                         failure.response_id.clone(),
                         None,
                         failure.output_text.clone(),
+                        failure.prompt_render.clone(),
                         None,
                         SupervisorProposalFailure {
                             stage: failure.stage,
@@ -4876,6 +4877,7 @@ impl OrcasDaemonService {
                     result.response_id.clone(),
                     result.usage.clone(),
                     result.output_text.clone(),
+                    Some(result.prompt_render.clone()),
                     Some(result.proposal.clone()),
                     SupervisorProposalFailure {
                         stage: SupervisorProposalFailureStage::ProposalValidation,
@@ -4902,6 +4904,7 @@ impl OrcasDaemonService {
             reasoner_usage: result.usage,
             reasoner_output_text: result.output_text,
             context_pack,
+            prompt_render: Some(result.prompt_render),
             proposal: Some(result.proposal),
             approval_edits: None,
             approved_proposal: None,
@@ -7713,6 +7716,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         reasoner_response_id: Option<String>,
         reasoner_usage: Option<SupervisorReasonerUsage>,
         reasoner_output_text: Option<String>,
+        prompt_render: Option<orcas_core::SupervisorPromptRenderArtifact>,
         proposal: Option<SupervisorProposal>,
         failure: SupervisorProposalFailure,
     ) -> OrcasResult<SupervisorProposalRecord> {
@@ -7730,6 +7734,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             reasoner_usage,
             reasoner_output_text,
             context_pack,
+            prompt_render,
             proposal,
             approval_edits: None,
             approved_proposal: None,
@@ -9451,7 +9456,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use async_trait::async_trait;
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
     use serde_json::{Map, Value};
     use tokio::sync::{Mutex, Notify, RwLock, broadcast};
     use tokio::time::Duration;
@@ -9464,6 +9469,7 @@ mod tests {
     use crate::authority_store::AuthoritySqliteStore;
     use crate::supervisor::{
         SupervisorReasoner, SupervisorReasonerFailure, SupervisorReasonerResult,
+        render_supervisor_prompt,
     };
     use orcas_codex::{
         CodexClient, CodexDaemonManager, CodexTransport, DaemonLaunch, DaemonStatus,
@@ -10085,32 +10091,40 @@ mod tests {
         }
     }
 
+    fn fixed_supervisor_prompt_rendered_at() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 4, 5, 6, 7, 8)
+            .single()
+            .expect("valid prompt render timestamp")
+    }
+
     #[derive(Clone)]
     enum StaticSupervisorReasonerOutcome {
-        Success(SupervisorReasonerResult),
-        Failure(SupervisorReasonerFailure),
+        Success {
+            proposal: SupervisorProposal,
+            output_text: Option<String>,
+        },
+        Failure {
+            stage: SupervisorProposalFailureStage,
+            message: String,
+            output_text: Option<String>,
+        },
     }
 
     #[derive(Default)]
     struct StaticSupervisorReasoner {
         outcome: Mutex<Option<StaticSupervisorReasonerOutcome>>,
         last_pack: Mutex<Option<SupervisorContextPack>>,
+        last_prompt_render: Mutex<Option<orcas_core::supervisor::SupervisorPromptRenderArtifact>>,
         propose_calls: AtomicUsize,
     }
 
     impl StaticSupervisorReasoner {
         async fn set_proposal(&self, proposal: SupervisorProposal) {
             let output_text = serde_json::to_string(&proposal).expect("serialize proposal");
-            *self.outcome.lock().await = Some(StaticSupervisorReasonerOutcome::Success(
-                SupervisorReasonerResult {
-                    proposal,
-                    backend_kind: "test".to_string(),
-                    model: "test-supervisor".to_string(),
-                    response_id: Some("resp-test".to_string()),
-                    usage: None,
-                    output_text: Some(output_text),
-                },
-            ));
+            *self.outcome.lock().await = Some(StaticSupervisorReasonerOutcome::Success {
+                proposal,
+                output_text: Some(output_text),
+            });
         }
 
         async fn set_failure(
@@ -10119,20 +10133,21 @@ mod tests {
             message: impl Into<String>,
             output_text: Option<String>,
         ) {
-            *self.outcome.lock().await = Some(StaticSupervisorReasonerOutcome::Failure(
-                SupervisorReasonerFailure {
-                    stage,
-                    message: message.into(),
-                    backend_kind: "test".to_string(),
-                    model: "test-supervisor".to_string(),
-                    response_id: Some("resp-test".to_string()),
-                    output_text,
-                },
-            ));
+            *self.outcome.lock().await = Some(StaticSupervisorReasonerOutcome::Failure {
+                stage,
+                message: message.into(),
+                output_text,
+            });
         }
 
         async fn last_pack(&self) -> Option<SupervisorContextPack> {
             self.last_pack.lock().await.clone()
+        }
+
+        async fn last_prompt_render(
+            &self,
+        ) -> Option<orcas_core::supervisor::SupervisorPromptRenderArtifact> {
+            self.last_prompt_render.lock().await.clone()
         }
 
         fn propose_call_count(&self) -> usize {
@@ -10148,10 +10163,37 @@ mod tests {
         ) -> Result<SupervisorReasonerResult, SupervisorReasonerFailure> {
             self.propose_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let prompt_render =
+                render_supervisor_prompt(&pack, fixed_supervisor_prompt_rendered_at())
+                    .expect("render test supervisor prompt");
+            *self.last_prompt_render.lock().await = Some(prompt_render.clone());
             *self.last_pack.lock().await = Some(pack);
             match self.outcome.lock().await.clone() {
-                Some(StaticSupervisorReasonerOutcome::Success(result)) => Ok(result),
-                Some(StaticSupervisorReasonerOutcome::Failure(failure)) => Err(failure),
+                Some(StaticSupervisorReasonerOutcome::Success {
+                    proposal,
+                    output_text,
+                }) => Ok(SupervisorReasonerResult {
+                    proposal,
+                    backend_kind: "test".to_string(),
+                    model: "test-supervisor".to_string(),
+                    response_id: Some("resp-test".to_string()),
+                    usage: None,
+                    output_text,
+                    prompt_render,
+                }),
+                Some(StaticSupervisorReasonerOutcome::Failure {
+                    stage,
+                    message,
+                    output_text,
+                }) => Err(SupervisorReasonerFailure {
+                    stage,
+                    message,
+                    backend_kind: "test".to_string(),
+                    model: "test-supervisor".to_string(),
+                    response_id: Some("resp-test".to_string()),
+                    output_text,
+                    prompt_render: Some(prompt_render),
+                }),
                 None => Err(SupervisorReasonerFailure {
                     stage: SupervisorProposalFailureStage::Backend,
                     message: "missing test supervisor reasoner outcome".to_string(),
@@ -10159,6 +10201,7 @@ mod tests {
                     model: "test-supervisor".to_string(),
                     response_id: Some("resp-test".to_string()),
                     output_text: None,
+                    prompt_render: Some(prompt_render),
                 }),
             }
         }
@@ -10195,6 +10238,9 @@ mod tests {
             *self.last_pack.lock().await = Some(pack.clone());
             let proposal = sample_proposal_for_pack(self.decision_type, &pack);
             let output_text = serde_json::to_string(&proposal).expect("serialize proposal");
+            let prompt_render =
+                render_supervisor_prompt(&pack, fixed_supervisor_prompt_rendered_at())
+                    .expect("render pack-driven supervisor prompt");
             Ok(SupervisorReasonerResult {
                 proposal,
                 backend_kind: "test".to_string(),
@@ -10202,6 +10248,7 @@ mod tests {
                 response_id: Some("resp-pack-driven".to_string()),
                 usage: None,
                 output_text: Some(output_text),
+                prompt_render,
             })
         }
     }
@@ -10673,6 +10720,109 @@ mod tests {
             .await
             .expect("persist fixture");
 
+        (workstream, work_unit, assignment, report)
+    }
+
+    async fn seed_manual_proposal_fixture(
+        service: &Arc<OrcasDaemonService>,
+        label: &str,
+    ) -> (Workstream, WorkUnit, Assignment, Report) {
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: format!("Manual proposal {label}"),
+                objective: "Exercise supervisor proposal persistence".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: format!("Manual work unit {label}"),
+                task_statement: "Inspect the report and propose one bounded next step.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+
+        let (assignment, report) = {
+            let now = Utc::now();
+            let worker_id = format!("worker-manual-{label}");
+            let mut state = service.state.write().await;
+            let worker_session_id = OrcasDaemonService::select_worker_session_for_assignment(
+                &mut state.collaboration,
+                &worker_id,
+                "codex".to_string(),
+            );
+            let assignment = Assignment {
+                id: OrcasDaemonService::new_object_id("assignment"),
+                work_unit_id: work_unit.id.clone(),
+                worker_id: worker_id.clone(),
+                worker_session_id: worker_session_id.clone(),
+                instructions: "Review the current result and report back.".to_string(),
+                communication_seed: None,
+                status: AssignmentStatus::AwaitingDecision,
+                attempt_number: 1,
+                created_at: now,
+                updated_at: now,
+            };
+            state
+                .collaboration
+                .assignments
+                .insert(assignment.id.clone(), assignment.clone());
+            let worker = state
+                .collaboration
+                .workers
+                .get_mut(&worker_id)
+                .expect("worker");
+            worker.current_assignment_id = Some(assignment.id.clone());
+            worker.status = WorkerStatus::Busy;
+            let worker_session = state
+                .collaboration
+                .worker_sessions
+                .get_mut(&worker_session_id)
+                .expect("worker session");
+            worker_session.runtime_status = WorkerSessionRuntimeStatus::Completed;
+            worker_session.attachability = WorkerSessionAttachability::NotAttachable;
+            worker_session.updated_at = now;
+            let report = Report {
+                id: format!("report-{}", Uuid::new_v4().simple()),
+                work_unit_id: work_unit.id.clone(),
+                assignment_id: assignment.id.clone(),
+                worker_id,
+                disposition: ReportDisposition::Completed,
+                summary: "Bounded work completed cleanly.".to_string(),
+                findings: vec!["Parser contract tightened.".to_string()],
+                blockers: Vec::new(),
+                questions: Vec::new(),
+                recommended_next_actions: vec!["Continue with one bounded follow-up.".to_string()],
+                confidence: ReportConfidence::High,
+                raw_output: "raw output".to_string(),
+                parse_result: ReportParseResult::Parsed,
+                needs_supervisor_review: false,
+                created_at: now,
+            };
+            state
+                .collaboration
+                .reports
+                .insert(report.id.clone(), report.clone());
+            let work_unit_entry = state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .expect("work unit");
+            work_unit_entry.status = WorkUnitStatus::AwaitingDecision;
+            work_unit_entry.current_assignment_id = Some(assignment.id.clone());
+            work_unit_entry.latest_report_id = Some(report.id.clone());
+            work_unit_entry.updated_at = now;
+            (assignment, report)
+        };
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist manual proposal fixture");
         (workstream, work_unit, assignment, report)
     }
 
@@ -11198,6 +11348,58 @@ ORCAS_REPORT_END"#
             .expect("stored proposal");
         assert_eq!(stored.status, SupervisorProposalStatus::Open);
         assert_eq!(stored.reasoner_backend, "test");
+        let expected_prompt_render = reasoner
+            .last_prompt_render()
+            .await
+            .expect("captured prompt render");
+        assert_eq!(stored.prompt_render.as_ref(), Some(&expected_prompt_render));
+        let prompt_render = stored.prompt_render.as_ref().expect("stored prompt render");
+        assert_eq!(
+            prompt_render.render_spec.template_version,
+            crate::supervisor::SUPERVISOR_PROMPT_TEMPLATE_VERSION
+        );
+        assert!(
+            prompt_render
+                .instructions_text
+                .contains("Orcas supervisor reasoner")
+        );
+        assert!(prompt_render.context_pack_text.contains(&work_unit.id));
+        assert_eq!(prompt_render.request_body_hash, None);
+    }
+
+    #[tokio::test]
+    async fn proposal_create_persists_prompt_render_artifact_on_open_record() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_manual_proposal_fixture(&service, "prompt-open").await;
+
+        let response =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report).await;
+        let stored = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        let expected_prompt_render = reasoner
+            .last_prompt_render()
+            .await
+            .expect("captured prompt render");
+
+        assert_eq!(response.proposal.id, stored.id);
+        assert_eq!(stored.prompt_render.as_ref(), Some(&expected_prompt_render));
+        let prompt_render = stored.prompt_render.as_ref().expect("stored prompt render");
+        assert_eq!(
+            prompt_render.render_spec.template_version,
+            crate::supervisor::SUPERVISOR_PROMPT_TEMPLATE_VERSION
+        );
+        assert_eq!(
+            prompt_render.render_spec.context_schema_version,
+            stored.context_pack.schema_version
+        );
+        assert!(prompt_render.context_pack_text.contains(&report.id));
+        assert!(
+            prompt_render
+                .user_content_text
+                .contains("SupervisorContextPack:")
+        );
+        assert!(!prompt_render.prompt_hash.is_empty());
     }
 
     #[tokio::test]
@@ -11286,6 +11488,27 @@ ORCAS_REPORT_END"#
             state.collaboration.assignments[&next_assignment.id].worker_id,
             assignment.worker_id
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_approve_continue_with_manual_fixture_creates_next_assignment() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_manual_proposal_fixture(&service, "approve-manual").await;
+        let proposal =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
+
+        let response =
+            approve_proposal(&service, &proposal.id, SupervisorProposalEdits::default()).await;
+
+        assert_eq!(response.decision.decision_type, DecisionType::Continue);
+        assert_eq!(response.proposal.status, SupervisorProposalStatus::Approved);
+        assert!(response.next_assignment.is_some());
+        let stored = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        assert!(stored.prompt_render.is_some());
     }
 
     #[tokio::test]
@@ -11788,6 +12011,45 @@ ORCAS_REPORT_END"#
             failed.reasoner_output_text.as_deref(),
             Some("provider timeout")
         );
+        let expected_prompt_render = reasoner
+            .last_prompt_render()
+            .await
+            .expect("captured failed prompt render");
+        assert_eq!(failed.prompt_render.as_ref(), Some(&expected_prompt_render));
+    }
+
+    #[tokio::test]
+    async fn backend_generation_failure_with_manual_fixture_persists_prompt_render() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, _assignment, report) =
+            seed_manual_proposal_fixture(&service, "backend-fail-manual").await;
+
+        reasoner
+            .set_failure(
+                SupervisorProposalFailureStage::Backend,
+                "timeout contacting provider",
+                Some("provider timeout".to_string()),
+            )
+            .await;
+        let _ = service
+            .proposal_create(ipc::ProposalCreateRequest {
+                work_unit_id: work_unit.id.clone(),
+                source_report_id: Some(report.id.clone()),
+                requested_by: Some("tester".to_string()),
+                note: None,
+                supersede_open: false,
+            })
+            .await
+            .expect_err("backend failure");
+
+        let failed = latest_proposal_record_for_workunit(&service, &work_unit.id).await;
+        let expected_prompt_render = reasoner
+            .last_prompt_render()
+            .await
+            .expect("captured failed prompt render");
+        assert_eq!(failed.status, SupervisorProposalStatus::GenerationFailed);
+        assert_eq!(failed.prompt_render.as_ref(), Some(&expected_prompt_render));
     }
 
     #[tokio::test]
@@ -12950,6 +13212,37 @@ ORCAS_REPORT_END"#
         let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot json");
         assert!(!snapshot_json.contains("reasoner_output_text"));
         assert!(!snapshot_json.contains("Objective:"));
+        assert!(!snapshot_json.contains("prompt_render"));
+        assert!(!snapshot_json.contains("You are the Orcas supervisor reasoner."));
+        assert!(!snapshot_json.contains("SupervisorContextPack:"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_manual_proposal_fixture_omits_prompt_render_artifact_text() {
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner(reasoner.clone()).await;
+        let (_workstream, work_unit, assignment, report) =
+            seed_manual_proposal_fixture(&service, "snapshot-manual").await;
+        let proposal =
+            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+                .await
+                .proposal;
+
+        let snapshot = service.snapshot().await.expect("snapshot");
+        let summary = snapshot
+            .collaboration
+            .work_units
+            .iter()
+            .find(|work_unit| work_unit.id == proposal.primary_work_unit_id)
+            .and_then(|work_unit| work_unit.proposal.as_ref())
+            .expect("proposal summary");
+        assert_eq!(summary.latest_proposal_id, proposal.id);
+        assert!(summary.has_open_proposal);
+
+        let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot json");
+        assert!(!snapshot_json.contains("prompt_render"));
+        assert!(!snapshot_json.contains("You are the Orcas supervisor reasoner."));
+        assert!(!snapshot_json.contains("SupervisorContextPack:"));
     }
 
     #[tokio::test]

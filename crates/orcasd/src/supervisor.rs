@@ -2,21 +2,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
+use crate::assignment_comm::json_fingerprint;
 use orcas_core::supervisor::{
     DecisionPolicy, DraftAssignment, PriorDecisionContext, PriorReportContext,
     RecentPrimaryHistory, RelatedWorkUnitContext, SupervisorArtifactRef,
     SupervisorAssignmentContext, SupervisorContextPack, SupervisorDependencyContext,
     SupervisorDependencyContextItem, SupervisorOperatorRequest, SupervisorPackLimits,
-    SupervisorPackTruncation, SupervisorProposal, SupervisorProposalEdits,
-    SupervisorProposalFailureStage, SupervisorProposalRecord, SupervisorSourceReportContext,
-    SupervisorStateAnchor, SupervisorWorkUnitContext, SupervisorWorkerSessionContext,
-    SupervisorWorkstreamContext,
+    SupervisorPackTruncation, SupervisorPromptRenderArtifact, SupervisorPromptRenderSpec,
+    SupervisorProposal, SupervisorProposalEdits, SupervisorProposalFailureStage,
+    SupervisorProposalRecord, SupervisorSourceReportContext, SupervisorStateAnchor,
+    SupervisorWorkUnitContext, SupervisorWorkerSessionContext, SupervisorWorkstreamContext,
 };
 use orcas_core::{
     AppConfig, Assignment, CollaborationState, Decision, DecisionType, OrcasError, OrcasResult,
@@ -27,6 +28,11 @@ use orcas_core::{
 
 const CONTEXT_SCHEMA_VERSION: &str = "supervisor_context_pack.v1";
 const PROPOSAL_SCHEMA_VERSION: &str = "supervisor_proposal.v1";
+pub const SUPERVISOR_PROMPT_TEMPLATE_VERSION: &str = "supervisor_prompt.v1";
+const SUPERVISOR_PROPOSAL_SCHEMA_NAME: &str = "supervisor_proposal";
+const SUPERVISOR_PROMPT_STYLE: &str = "instructions_plus_json_context";
+const SUPERVISOR_CONTEXT_SERIALIZATION: &str = "json_pretty";
+const SUPERVISOR_RESPONSE_FORMAT: &str = "json_schema";
 const EXPECTED_REPORT_FIELDS: &[&str] = &[
     "summary",
     "findings",
@@ -44,6 +50,7 @@ pub struct SupervisorReasonerResult {
     pub response_id: Option<String>,
     pub usage: Option<SupervisorReasonerUsage>,
     pub output_text: Option<String>,
+    pub prompt_render: SupervisorPromptRenderArtifact,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +61,7 @@ pub struct SupervisorReasonerFailure {
     pub model: String,
     pub response_id: Option<String>,
     pub output_text: Option<String>,
+    pub prompt_render: Option<SupervisorPromptRenderArtifact>,
 }
 
 #[async_trait]
@@ -94,34 +102,36 @@ impl ResponsesApiReasoner {
         )
     }
 
-    fn request_body(&self, pack: &SupervisorContextPack) -> OrcasResult<Value> {
-        let pack_json = serde_json::to_string_pretty(pack)?;
-        Ok(json!({
+    fn request_body(
+        &self,
+        prompt_render: &SupervisorPromptRenderArtifact,
+    ) -> OrcasResult<(Value, String)> {
+        let body = json!({
             "model": self.config.supervisor.model,
             "store": false,
             "max_output_tokens": self.config.supervisor.max_output_tokens,
             "reasoning": {
                 "effort": self.config.supervisor.reasoning_effort,
             },
-            "instructions": "You are the Orcas supervisor reasoner. Orcas state in the provided packet is the only source of truth. Choose exactly one allowed decision for the primary work unit. Never invent ids, hidden context, or extra work units. If the decision is continue or redirect, return one bounded draft next assignment. Return JSON only, matching the requested schema.",
+            "instructions": prompt_render.instructions_text,
             "input": [{
                 "role": "user",
                 "content": [{
                     "type": "input_text",
-                    "text": format!(
-                        "Return a supervisor proposal JSON object for this Orcas decision point.\nThe packet already contains the allowed decision set and the canonical workstream state.\n\nSupervisorContextPack:\n{pack_json}"
-                    ),
+                    "text": prompt_render.user_content_text,
                 }],
             }],
             "text": {
                 "format": {
-                    "type": "json_schema",
-                    "strict": true,
-                    "name": "supervisor_proposal",
+                    "type": prompt_render.render_spec.response_format,
+                    "strict": prompt_render.render_spec.strict_schema,
+                    "name": prompt_render.render_spec.proposal_schema_name,
                     "schema": proposal_json_schema(),
                 }
             }
-        }))
+        });
+        let request_body_hash = json_fingerprint(&body)?;
+        Ok((body, request_body_hash))
     }
 
     fn failure(
@@ -130,6 +140,7 @@ impl ResponsesApiReasoner {
         message: impl Into<String>,
         response_id: Option<String>,
         output_text: Option<String>,
+        prompt_render: Option<SupervisorPromptRenderArtifact>,
     ) -> SupervisorReasonerFailure {
         SupervisorReasonerFailure {
             stage,
@@ -138,6 +149,7 @@ impl ResponsesApiReasoner {
             model: self.config.supervisor.model.clone(),
             response_id,
             output_text,
+            prompt_render,
         }
     }
 }
@@ -157,6 +169,23 @@ impl SupervisorReasoner for ResponsesApiReasoner {
             model = %self.config.supervisor.model,
             "starting supervisor proposal generation"
         );
+        let prompt_render = render_supervisor_prompt(&pack, Utc::now()).map_err(|error| {
+            warn!(
+                work_unit_id = %pack.primary_work_unit.id,
+                source_report_id = %pack.source_report.id,
+                stage = "render_prompt",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "supervisor proposal generation failed"
+            );
+            self.failure(
+                SupervisorProposalFailureStage::Backend,
+                error.to_string(),
+                None,
+                None,
+                None,
+            )
+        })?;
         let api_key = self.api_key().map_err(|error| {
             warn!(
                 work_unit_id = %pack.primary_work_unit.id,
@@ -171,9 +200,10 @@ impl SupervisorReasoner for ResponsesApiReasoner {
                 error.to_string(),
                 None,
                 None,
+                Some(prompt_render.clone()),
             )
         })?;
-        let body = self.request_body(&pack).map_err(|error| {
+        let (body, request_body_hash) = self.request_body(&prompt_render).map_err(|error| {
             warn!(
                 work_unit_id = %pack.primary_work_unit.id,
                 source_report_id = %pack.source_report.id,
@@ -187,8 +217,13 @@ impl SupervisorReasoner for ResponsesApiReasoner {
                 error.to_string(),
                 None,
                 None,
+                Some(prompt_render.clone()),
             )
         })?;
+        let prompt_render = SupervisorPromptRenderArtifact {
+            request_body_hash: Some(request_body_hash),
+            ..prompt_render
+        };
         let response = self
             .client
             .post(self.endpoint())
@@ -210,6 +245,7 @@ impl SupervisorReasoner for ResponsesApiReasoner {
                     format!("supervisor Responses API request failed: {error}"),
                     None,
                     None,
+                    Some(prompt_render.clone()),
                 )
             })?;
 
@@ -228,6 +264,7 @@ impl SupervisorReasoner for ResponsesApiReasoner {
                 format!("failed to read supervisor Responses API response body: {error}"),
                 None,
                 None,
+                Some(prompt_render.clone()),
             )
         })?;
 
@@ -248,6 +285,7 @@ impl SupervisorReasoner for ResponsesApiReasoner {
                 ),
                 None,
                 Some(raw),
+                Some(prompt_render.clone()),
             ));
         }
 
@@ -265,6 +303,7 @@ impl SupervisorReasoner for ResponsesApiReasoner {
                 format!("failed to decode supervisor Responses API response JSON: {error}"),
                 None,
                 Some(raw.clone()),
+                Some(prompt_render.clone()),
             )
         })?;
         if let Some(error) = value.get("error") {
@@ -288,6 +327,7 @@ impl SupervisorReasoner for ResponsesApiReasoner {
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned),
                     Some(raw.clone()),
+                    Some(prompt_render.clone()),
                 ));
             }
         }
@@ -312,6 +352,7 @@ impl SupervisorReasoner for ResponsesApiReasoner {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 Some(raw),
+                Some(prompt_render.clone()),
             ));
         };
         let proposal: SupervisorProposal = serde_json::from_str(&output_text).map_err(|error| {
@@ -335,6 +376,7 @@ impl SupervisorReasoner for ResponsesApiReasoner {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 Some(output_text.clone()),
+                Some(prompt_render.clone()),
             )
         })?;
         let usage = value.get("usage").map(extract_usage);
@@ -371,8 +413,53 @@ impl SupervisorReasoner for ResponsesApiReasoner {
                 .map(ToOwned::to_owned),
             usage,
             output_text: Some(output_text),
+            prompt_render,
         })
     }
+}
+
+#[derive(Serialize)]
+struct SupervisorPromptFingerprint<'a> {
+    render_spec: &'a SupervisorPromptRenderSpec,
+    instructions_text: &'a str,
+    user_content_text: &'a str,
+    context_pack_text: &'a str,
+}
+
+pub fn render_supervisor_prompt(
+    pack: &SupervisorContextPack,
+    rendered_at: DateTime<Utc>,
+) -> OrcasResult<SupervisorPromptRenderArtifact> {
+    let context_pack_text = serde_json::to_string_pretty(pack)?;
+    let instructions_text = "You are the Orcas supervisor reasoner. Orcas state in the provided packet is the only source of truth. Choose exactly one allowed decision for the primary work unit. Never invent ids, hidden context, or extra work units. If the decision is continue or redirect, return one bounded draft next assignment. Return JSON only, matching the requested schema.".to_string();
+    let user_content_text = format!(
+        "Return a supervisor proposal JSON object for this Orcas decision point.\nThe packet already contains the allowed decision set and the canonical workstream state.\n\nSupervisorContextPack:\n{context_pack_text}"
+    );
+    let render_spec = SupervisorPromptRenderSpec {
+        template_version: SUPERVISOR_PROMPT_TEMPLATE_VERSION.to_string(),
+        context_schema_version: pack.schema_version.clone(),
+        proposal_schema_name: SUPERVISOR_PROPOSAL_SCHEMA_NAME.to_string(),
+        proposal_schema_version: PROPOSAL_SCHEMA_VERSION.to_string(),
+        response_format: SUPERVISOR_RESPONSE_FORMAT.to_string(),
+        strict_schema: true,
+        context_serialization: SUPERVISOR_CONTEXT_SERIALIZATION.to_string(),
+        style: SUPERVISOR_PROMPT_STYLE.to_string(),
+    };
+    let prompt_hash = json_fingerprint(&SupervisorPromptFingerprint {
+        render_spec: &render_spec,
+        instructions_text: &instructions_text,
+        user_content_text: &user_content_text,
+        context_pack_text: &context_pack_text,
+    })?;
+    Ok(SupervisorPromptRenderArtifact {
+        render_spec,
+        instructions_text,
+        user_content_text,
+        context_pack_text,
+        prompt_hash,
+        request_body_hash: None,
+        rendered_at,
+    })
 }
 
 pub fn build_context_pack(
@@ -1541,9 +1628,10 @@ mod tests {
     };
 
     use super::{
-        PROPOSAL_SCHEMA_VERSION, apply_edits, build_decision_policy,
-        compile_assignment_instructions, decision_requires_assignment, expected_work_unit_status,
-        state_anchor_freshness_error, validate_proposal,
+        PROPOSAL_SCHEMA_VERSION, SUPERVISOR_PROMPT_TEMPLATE_VERSION, apply_edits,
+        build_decision_policy, compile_assignment_instructions, decision_requires_assignment,
+        expected_work_unit_status, render_supervisor_prompt, state_anchor_freshness_error,
+        validate_proposal,
     };
 
     fn fixed_now() -> chrono::DateTime<Utc> {
@@ -1802,6 +1890,42 @@ mod tests {
             expected_report_fields: vec!["summary".to_string(), "findings".to_string()],
             boundedness_note: "Do not broaden beyond the follow-up work.".to_string(),
         }
+    }
+
+    #[test]
+    fn supervisor_prompt_render_is_deterministic_for_same_pack() {
+        let pack = sample_pack(vec![DecisionType::Continue, DecisionType::Accept]);
+        let first = render_supervisor_prompt(&pack, fixed_now()).expect("first render");
+        let second = render_supervisor_prompt(&pack, fixed_now()).expect("second render");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.render_spec.template_version,
+            SUPERVISOR_PROMPT_TEMPLATE_VERSION
+        );
+        assert_eq!(
+            first.render_spec.context_schema_version,
+            pack.schema_version
+        );
+        assert_eq!(
+            first.render_spec.proposal_schema_version,
+            PROPOSAL_SCHEMA_VERSION
+        );
+        assert_eq!(first.rendered_at, fixed_now());
+        assert!(first.request_body_hash.is_none());
+        assert!(
+            first
+                .instructions_text
+                .contains("You are the Orcas supervisor reasoner.")
+        );
+        assert!(
+            first
+                .user_content_text
+                .contains("Return a supervisor proposal JSON object")
+        );
+        assert!(first.user_content_text.contains(&first.context_pack_text));
+        assert!(first.context_pack_text.contains("\"schema_version\""));
+        assert!(!first.prompt_hash.is_empty());
     }
 
     fn sample_proposal(decision: DecisionType) -> SupervisorProposal {
