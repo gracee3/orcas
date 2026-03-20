@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+clap.workspace = true
 orcas-codex = { path = "../orcas-codex" }
 orcas-core = { path = "../orcas-core" }
 reqwest.workspace = true
@@ -24,6 +25,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+axum = "0.8.6"
 futures.workspace = true
 tokio-tungstenite.workspace = true
 
