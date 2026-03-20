@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -8,7 +7,6 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::sync::Mutex;
 use tokio::time::sleep;
 use url::Url;
 
@@ -124,23 +122,6 @@ impl CodexDaemonManager for LocalCodexDaemonManager {
             .append(true)
             .open(&self.log_path)
             .await?;
-        let aggregate_log = if orcas_core::logging::aggregate_enabled("app-server") {
-            let aggregate_path = self
-                .log_path
-                .parent()
-                .ok_or_else(|| OrcasError::Config("log path has no parent directory".to_string()))?
-                .join("orcas.log");
-            Some(Arc::new(Mutex::new(
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(aggregate_path)
-                    .await?,
-            )))
-        } else {
-            None
-        };
-        let stdout_log = Arc::new(Mutex::new(stdout_log));
 
         info!(
             binary_path = %self.config.binary_path.display(),
@@ -183,13 +164,8 @@ impl CodexDaemonManager for LocalCodexDaemonManager {
             OrcasError::Transport("failed to capture Codex app-server stderr".to_string())
         })?;
 
-        Self::spawn_output_mirror(
-            "stdout",
-            stdout,
-            Arc::clone(&stdout_log),
-            aggregate_log.clone(),
-        );
-        Self::spawn_output_mirror("stderr", stderr, stdout_log, aggregate_log);
+        Self::spawn_output_mirror("stdout", stdout, stdout_log.try_clone().await?);
+        Self::spawn_output_mirror("stderr", stderr, stdout_log);
 
         debug!(
             pid,
@@ -255,26 +231,18 @@ impl CodexDaemonManager for LocalCodexDaemonManager {
 }
 
 impl LocalCodexDaemonManager {
-    fn spawn_output_mirror<R>(
-        stream: &'static str,
-        reader: R,
-        log_file: Arc<Mutex<File>>,
-        aggregate_log: Option<Arc<Mutex<File>>>,
-    ) where
+    fn spawn_output_mirror<R>(stream: &'static str, reader: R, log_file: File)
+    where
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
     {
         tokio::spawn(async move {
-            if let Err(error) = Self::mirror_output(reader, log_file, aggregate_log).await {
+            if let Err(error) = Self::mirror_output(reader, log_file).await {
                 warn!(stream, error = %error, "failed to mirror Codex app-server output");
             }
         });
     }
 
-    async fn mirror_output<R>(
-        reader: R,
-        log_file: Arc<Mutex<File>>,
-        aggregate_log: Option<Arc<Mutex<File>>>,
-    ) -> OrcasResult<()>
+    async fn mirror_output<R>(reader: R, mut log_file: File) -> OrcasResult<()>
     where
         R: tokio::io::AsyncRead + Unpin,
     {
@@ -288,31 +256,10 @@ impl LocalCodexDaemonManager {
                 break;
             }
 
-            {
-                let mut file = log_file.lock().await;
-                file.write_all(&buffer).await?;
-                file.flush().await?;
-            }
-
-            if let Some(aggregate_log) = &aggregate_log {
-                let mut file = aggregate_log.lock().await;
-                Self::write_labeled_line(&mut file, &buffer, "app-server").await?;
-                file.flush().await?;
-            }
+            log_file.write_all(&buffer).await?;
+            log_file.flush().await?;
         }
 
-        Ok(())
-    }
-
-    async fn write_labeled_line(file: &mut File, buffer: &[u8], label: &str) -> OrcasResult<()> {
-        let line = buffer.strip_suffix(b"\n").unwrap_or(buffer);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        file.write_all(line).await?;
-        if !line.is_empty() {
-            file.write_all(b" ").await?;
-        }
-        file.write_all(label.as_bytes()).await?;
-        file.write_all(b"\n").await?;
         Ok(())
     }
 }

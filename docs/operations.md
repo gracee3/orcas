@@ -52,9 +52,10 @@ Use the file logs for the application’s own tracing output.
 ```bash
 tail -f ~/.local/share/orcas/logs/orcasd.log
 tail -f ~/.local/share/orcas/logs/orcas.log
+tail -f ~/.local/share/orcas/logs/orcas-tui.log
 ```
 
-Common log patterns include socket bind failures, stale runtime cleanup, upstream connection failures, and request validation errors. If a client cannot connect, check the daemon log first, then confirm the socket path exists and is responsive.
+Common log patterns include socket bind failures, stale runtime cleanup, upstream connection failures, and request validation errors. If a client cannot connect, check the daemon log first, then confirm the socket path exists and is responsive. Use `codex-app-server.log` only when you need raw upstream subprocess output.
 
 ## Restarting And Stopping
 

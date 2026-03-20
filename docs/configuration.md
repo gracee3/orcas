@@ -29,10 +29,6 @@ RUST_LOG=orcas=debug orcas doctor
 The logging layer also understands the following Orcas-specific flags:
 
 1. `ORCAS_LOG_RUNTIME_CYCLE` enables runtime-cycle logging when set to `1`, `true`, `yes`, or `on`.
-2. `ORCAS_LOG_AGGREGATE_DAEMON` controls the aggregate daemon log file.
-3. `ORCAS_LOG_AGGREGATE_SUPERVISOR` controls the aggregate supervisor log file.
-4. `ORCAS_LOG_AGGREGATE_TUI` controls the aggregate TUI log file.
-5. `ORCAS_LOG_AGGREGATE_APP_SERVER` controls aggregate logging for the Codex app-server stream.
 
 ### Daemon Runtime Overrides
 
@@ -69,7 +65,7 @@ The current source tree ships a development-oriented default for `codex.binary_p
 
 ## Logging Behavior
 
-Orcas binaries write structured tracing output to log files under the data directory rather than to stdout or stderr. For the daemon, the primary log is `orcasd.log` and the aggregate log is `orcas.log`, both under the logs directory derived from XDG data paths.
+Orcas binaries write structured tracing output to per-component log files under the data directory rather than to stdout or stderr.
 
 The current log directory is:
 
@@ -81,10 +77,8 @@ The current files are:
 
 1. `orcasd.log` for the daemon component log.
 2. `orcas-tui.log` for the TUI component log.
-3. `orcas.log` for the operator CLI log and the aggregate cross-component log.
+3. `orcas.log` for the operator CLI log.
 4. `codex-app-server.log` for raw Codex app-server stdout/stderr diagnostics.
-
-Aggregate logging is enabled by default for the daemon, TUI, and supervisor/CLI components. It is disabled by default for the raw app-server stream unless `ORCAS_LOG_AGGREGATE_APP_SERVER` is enabled.
 
 The log, config, data, and runtime directories are created automatically on startup.
 
