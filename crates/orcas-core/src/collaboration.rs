@@ -359,3 +359,62 @@ pub struct Decision {
     pub rationale: String,
     pub created_at: DateTime<Utc>,
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+
+    use super::{
+        CollaborationState, SupervisorTurnDecision, SupervisorTurnDecisionKind,
+        SupervisorTurnDecisionStatus, SupervisorTurnProposalKind,
+    };
+
+    fn fixed_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 8, 9, 10, 11, 12)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    #[test]
+    fn collaboration_state_defaults_missing_maps_to_empty() {
+        let state =
+            serde_json::from_value::<CollaborationState>(json!({})).expect("deserialize state");
+
+        assert!(state.workstreams.is_empty());
+        assert!(state.work_units.is_empty());
+        assert!(state.assignments.is_empty());
+        assert!(state.reports.is_empty());
+        assert!(state.supervisor_turn_decisions.is_empty());
+    }
+
+    #[test]
+    fn supervisor_turn_decision_defaults_optional_and_status_fields_when_missing() {
+        let decision = serde_json::from_value::<SupervisorTurnDecision>(json!({
+            "decision_id": "decision-1",
+            "assignment_id": "assignment-1",
+            "codex_thread_id": "thread-1",
+            "rationale_summary": "Bootstrap review required.",
+            "created_at": fixed_now()
+        }))
+        .expect("deserialize supervisor turn decision");
+
+        assert_eq!(decision.kind, SupervisorTurnDecisionKind::NextTurn);
+        assert_eq!(
+            decision.proposal_kind,
+            SupervisorTurnProposalKind::Bootstrap
+        );
+        assert_eq!(
+            decision.status,
+            SupervisorTurnDecisionStatus::ProposedToHuman
+        );
+        assert!(decision.basis_turn_id.is_none());
+        assert!(decision.proposed_text.is_none());
+        assert!(decision.approved_at.is_none());
+        assert!(decision.rejected_at.is_none());
+        assert!(decision.sent_at.is_none());
+        assert!(decision.superseded_by.is_none());
+        assert!(decision.sent_turn_id.is_none());
+        assert!(decision.notes.is_none());
+    }
+}

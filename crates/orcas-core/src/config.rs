@@ -146,3 +146,103 @@ pub struct SupervisorProposalConfig {
     #[serde(default)]
     pub auto_create_on_report_recorded: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use serde_json::json;
+
+    use super::{
+        AppConfig, CodexConnectionMode, DefaultsConfig, ReconnectPolicy, SupervisorConfig,
+        SupervisorProposalConfig,
+    };
+
+    #[test]
+    fn app_config_sparse_toml_uses_defaults_for_missing_sections() {
+        let config = toml::from_str::<AppConfig>(
+            r#"
+            [codex]
+            binary_path = "/tmp/codex"
+            listen_url = "ws://127.0.0.1:4500"
+            connection_mode = "connect_only"
+            config_overrides = []
+
+            [codex.reconnect]
+            initial_delay_ms = 150
+            max_delay_ms = 5000
+            multiplier = 2.0
+            "#,
+        )
+        .expect("deserialize sparse app config");
+
+        assert_eq!(config.codex.binary_path, PathBuf::from("/tmp/codex"));
+        assert_eq!(
+            config.codex.connection_mode,
+            CodexConnectionMode::ConnectOnly
+        );
+        assert_eq!(config.supervisor.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.supervisor.model, "gpt-5.4");
+        assert_eq!(config.defaults.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn reconnect_policy_round_trips_optional_attempt_limit() {
+        let policy = ReconnectPolicy {
+            initial_delay_ms: 250,
+            max_delay_ms: 9_000,
+            multiplier: 1.5,
+            max_attempts: Some(7),
+        };
+
+        let value = serde_json::to_value(&policy).expect("serialize reconnect policy");
+        assert_eq!(value["initial_delay_ms"], 250);
+        assert_eq!(value["max_attempts"], 7);
+
+        let round_trip =
+            serde_json::from_value::<ReconnectPolicy>(value).expect("deserialize reconnect policy");
+        assert_eq!(round_trip.initial_delay_ms, 250);
+        assert_eq!(round_trip.max_delay_ms, 9_000);
+        assert_eq!(round_trip.multiplier, 1.5);
+        assert_eq!(round_trip.max_attempts, Some(7));
+    }
+
+    #[test]
+    fn defaults_config_round_trips_optional_path_and_model() {
+        let defaults = DefaultsConfig {
+            cwd: Some(PathBuf::from("/repo")),
+            model: Some("gpt-5.4-mini".to_string()),
+        };
+
+        let value = serde_json::to_value(&defaults).expect("serialize defaults config");
+        assert_eq!(value["cwd"], "/repo");
+        assert_eq!(value["model"], "gpt-5.4-mini");
+
+        let round_trip =
+            serde_json::from_value::<DefaultsConfig>(value).expect("deserialize defaults config");
+        assert_eq!(round_trip.cwd, Some(PathBuf::from("/repo")));
+        assert_eq!(round_trip.model.as_deref(), Some("gpt-5.4-mini"));
+    }
+
+    #[test]
+    fn supervisor_config_defaults_nested_proposals_when_omitted() {
+        let config = serde_json::from_value::<SupervisorConfig>(json!({
+            "base_url": "https://example.invalid/v1",
+            "api_key_env": "EXAMPLE_API_KEY",
+            "model": "gpt-test",
+            "reasoning_effort": "medium",
+            "max_output_tokens": 512
+        }))
+        .expect("deserialize supervisor config");
+
+        assert_eq!(config.base_url, "https://example.invalid/v1");
+        assert_eq!(config.proposals.auto_create_on_report_recorded, false);
+    }
+
+    #[test]
+    fn supervisor_proposal_config_defaults_auto_create_to_false() {
+        let config = serde_json::from_value::<SupervisorProposalConfig>(json!({}))
+            .expect("deserialize proposal config");
+        assert!(!config.auto_create_on_report_recorded);
+    }
+}

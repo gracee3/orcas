@@ -327,3 +327,243 @@ pub struct AssignmentCommunicationRecord {
     #[serde(default)]
     pub raw_output_hash: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+
+    use super::{
+        AcceptanceCriterionStatus, AcceptanceResult, AssignmentChangePolicy,
+        AssignmentChecklistItem, AssignmentCommunicationPacket, AssignmentCommunicationPolicy,
+        AssignmentCommunicationRecord, AssignmentCommunicationSeed, AssignmentContextBlock,
+        AssignmentExecutionContext, AssignmentModeSpec, AssignmentScopeBoundary,
+        AssignmentTaskMode, ImplementModePayload, ImplementModeSpec, ReviewSignal,
+        ReviewSignalLevel, TouchedFile, WorkerReportContract, WorkerReportEnvelope,
+        WorkerReportModePayload,
+    };
+    use crate::{FileChangeKind, ReportConfidence, ReportDisposition};
+
+    fn fixed_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 7, 8, 9, 10, 11)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    fn sample_packet() -> AssignmentCommunicationPacket {
+        AssignmentCommunicationPacket {
+            schema_version: "assignment_communication_packet.v1".to_string(),
+            packet_id: "packet-1".to_string(),
+            assignment_id: "assignment-1".to_string(),
+            workstream_id: "ws-1".to_string(),
+            work_unit_id: "wu-1".to_string(),
+            worker_id: "worker-1".to_string(),
+            worker_session_id: "session-1".to_string(),
+            created_at: fixed_now(),
+            source_decision_id: Some("decision-1".to_string()),
+            source_report_id: Some("report-1".to_string()),
+            source_proposal_id: None,
+            predecessor_assignment_id: Some("assignment-0".to_string()),
+            task_mode: AssignmentTaskMode::Implement,
+            mode_spec: AssignmentModeSpec::Implement(ImplementModeSpec {
+                expected_verification_commands: vec!["cargo test".to_string()],
+            }),
+            execution_context: AssignmentExecutionContext {
+                runtime_kind: "codex_app_server".to_string(),
+                repo_root: Some("/repo".to_string()),
+                cwd: Some("/repo".to_string()),
+                related_repo_roots: vec!["/repo/submodule".to_string()],
+                requested_model: Some("gpt-5".to_string()),
+                shell: Some("/bin/bash".to_string()),
+            },
+            objective: "Complete a bounded task.".to_string(),
+            instructions: vec!["Stay in scope.".to_string()],
+            acceptance_criteria: vec![AssignmentChecklistItem {
+                id: "acceptance_1".to_string(),
+                text: "Return a valid report.".to_string(),
+            }],
+            stop_conditions: vec![AssignmentChecklistItem {
+                id: "stop_1".to_string(),
+                text: "Stop when blocked.".to_string(),
+            }],
+            allowed_scope: AssignmentScopeBoundary {
+                change_policy: AssignmentChangePolicy::CodeAllowed,
+                allowed_operations: vec!["edit_repo".to_string()],
+                allowed_write_paths: vec!["/repo".to_string()],
+                disallowed_paths: vec!["/repo/target".to_string()],
+            },
+            disallowed_scope: vec!["Do not broaden scope.".to_string()],
+            non_goals: vec!["No follow-on work.".to_string()],
+            included_context: vec![AssignmentContextBlock {
+                id: "ctx-1".to_string(),
+                kind: "report".to_string(),
+                source_ref: "report-1".to_string(),
+                title: "Source report".to_string(),
+                lines: vec!["Summary: previous report".to_string()],
+                required: true,
+                truncated: false,
+            }],
+            response_contract: WorkerReportContract {
+                schema_version: "worker_report_contract.v1".to_string(),
+                task_mode: AssignmentTaskMode::Implement,
+                marker_begin: "ORCAS_REPORT_BEGIN".to_string(),
+                marker_end: "ORCAS_REPORT_END".to_string(),
+                required_common_fields: vec!["summary".to_string()],
+                required_mode_fields: vec!["mode_payload.semantic_changes".to_string()],
+                allowed_dispositions: vec![ReportDisposition::Completed],
+                strict_single_envelope: true,
+            },
+            policy: AssignmentCommunicationPolicy {
+                stop_at_boundary: true,
+                single_report_required: true,
+                recommendations_are_non_authoritative: true,
+                enforce_scope_boundary: true,
+            },
+        }
+    }
+
+    #[test]
+    fn assignment_communication_seed_round_trips_optional_and_default_lists() {
+        let seed = AssignmentCommunicationSeed {
+            source_decision_id: Some("decision-1".to_string()),
+            source_report_id: None,
+            source_proposal_id: Some("proposal-1".to_string()),
+            predecessor_assignment_id: Some("assignment-0".to_string()),
+            objective: "Bounded objective".to_string(),
+            instructions: vec!["Inspect only the target module.".to_string()],
+            acceptance_criteria: vec!["Return a clean report.".to_string()],
+            stop_conditions: vec!["Stop on ambiguity.".to_string()],
+            required_context_refs: vec!["ctx-1".to_string()],
+            expected_report_fields: vec!["summary".to_string()],
+            boundedness_note: Some("Stay within the boundary.".to_string()),
+            mode_spec: AssignmentModeSpec::Implement(ImplementModeSpec {
+                expected_verification_commands: vec!["cargo test -p orcas-core".to_string()],
+            }),
+        };
+
+        let value = serde_json::to_value(&seed).expect("serialize seed");
+        assert_eq!(value["mode_spec"]["kind"], "implement");
+        assert_eq!(value["source_decision_id"], "decision-1");
+
+        let round_trip =
+            serde_json::from_value::<AssignmentCommunicationSeed>(value).expect("deserialize seed");
+        assert_eq!(round_trip.task_mode(), AssignmentTaskMode::Implement);
+        assert_eq!(round_trip.required_context_refs, vec!["ctx-1".to_string()]);
+        assert_eq!(
+            round_trip.boundedness_note.as_deref(),
+            Some("Stay within the boundary.")
+        );
+    }
+
+    #[test]
+    fn assignment_communication_packet_round_trips_nested_contract_fields() {
+        let packet = sample_packet();
+
+        let value = serde_json::to_value(&packet).expect("serialize packet");
+        assert_eq!(value["mode_spec"]["kind"], "implement");
+        assert_eq!(value["allowed_scope"]["change_policy"], "code_allowed");
+        assert_eq!(
+            value["response_contract"]["marker_begin"],
+            "ORCAS_REPORT_BEGIN"
+        );
+
+        let round_trip = serde_json::from_value::<AssignmentCommunicationPacket>(value)
+            .expect("deserialize packet");
+        assert_eq!(round_trip.task_mode, AssignmentTaskMode::Implement);
+        assert_eq!(
+            round_trip.allowed_scope.allowed_write_paths,
+            vec!["/repo".to_string()]
+        );
+        assert_eq!(round_trip.included_context.len(), 1);
+        assert!(round_trip.policy.stop_at_boundary);
+    }
+
+    #[test]
+    fn worker_report_envelope_round_trips_nested_payload_and_review_signal() {
+        let envelope = WorkerReportEnvelope {
+            schema_version: "worker_report_envelope.v1".to_string(),
+            assignment_id: "assignment-1".to_string(),
+            packet_id: "packet-1".to_string(),
+            task_mode: AssignmentTaskMode::Implement,
+            disposition: ReportDisposition::Partial,
+            summary: "Completed part of the bounded task.".to_string(),
+            confidence: ReportConfidence::Medium,
+            acceptance_results: vec![AcceptanceResult {
+                criterion_id: "acceptance_1".to_string(),
+                status: AcceptanceCriterionStatus::PartiallyMet,
+                note: Some("One edge remains.".to_string()),
+            }],
+            triggered_stop_condition_ids: vec!["stop_1".to_string()],
+            touched_files: vec![TouchedFile {
+                path: "/repo/src/lib.rs".to_string(),
+                change_kind: FileChangeKind::Modified,
+                summary: "Adjusted a parser branch.".to_string(),
+            }],
+            commands_run: vec!["cargo test -p orcas-core".to_string()],
+            artifacts: vec!["artifact.txt".to_string()],
+            blockers: vec!["missing fixture".to_string()],
+            questions: vec!["Should we add another contract test?".to_string()],
+            recommended_next_actions: vec!["Request review.".to_string()],
+            uncertainties: vec!["One edge may still exist.".to_string()],
+            review_signal: ReviewSignal {
+                level: ReviewSignalLevel::Elevated,
+                reasons: vec!["partial result".to_string()],
+                focus: vec!["review the remaining edge".to_string()],
+            },
+            mode_payload: WorkerReportModePayload::Implement(ImplementModePayload {
+                semantic_changes: vec!["Updated parser logic.".to_string()],
+                tests_run: vec!["cargo test -p orcas-core".to_string()],
+                rough_edges: vec!["No fixture for one edge case.".to_string()],
+            }),
+        };
+
+        let value = serde_json::to_value(&envelope).expect("serialize envelope");
+        assert_eq!(value["mode_payload"]["kind"], "implement");
+        assert_eq!(value["review_signal"]["level"], "elevated");
+        assert_eq!(value["touched_files"][0]["change_kind"], "modified");
+
+        let round_trip =
+            serde_json::from_value::<WorkerReportEnvelope>(value).expect("deserialize envelope");
+        assert_eq!(
+            round_trip.mode_payload.task_mode(),
+            AssignmentTaskMode::Implement
+        );
+        assert_eq!(round_trip.review_signal.level, ReviewSignalLevel::Elevated);
+        assert_eq!(
+            round_trip.acceptance_results[0].status,
+            AcceptanceCriterionStatus::PartiallyMet
+        );
+    }
+
+    #[test]
+    fn assignment_communication_record_defaults_optional_fields_when_missing() {
+        let packet = sample_packet();
+        let record = serde_json::from_value::<AssignmentCommunicationRecord>(json!({
+            "assignment_id": "assignment-1",
+            "work_unit_id": "wu-1",
+            "workstream_id": "ws-1",
+            "created_at": fixed_now(),
+            "packet": packet,
+            "prompt_render": {
+                "render_spec": {
+                    "template_version": "assignment_prompt.v1",
+                    "response_marker_begin": "ORCAS_REPORT_BEGIN",
+                    "response_marker_end": "ORCAS_REPORT_END",
+                    "style": "plain_text_markdown"
+                },
+                "rendered_at": fixed_now(),
+                "prompt_text": "prompt",
+                "packet_hash": "packet-hash",
+                "prompt_hash": "prompt-hash"
+            },
+            "packet_hash": "packet-hash",
+            "prompt_hash": "prompt-hash"
+        }))
+        .expect("deserialize record");
+
+        assert!(record.response_envelope.is_none());
+        assert!(record.validation.is_none());
+        assert!(record.raw_output_hash.is_none());
+        assert!(record.prompt_render.render_spec.section_order.is_empty());
+    }
+}
