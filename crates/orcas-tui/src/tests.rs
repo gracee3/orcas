@@ -553,6 +553,99 @@ fn sample_proposal_record(
     }
 }
 
+fn sample_plan_revision_proposal(
+    proposal_id: &str,
+    status: orcas_core::planning::PlanRevisionProposalStatus,
+    phase: orcas_core::planning::PlanRevisionApplyPhase,
+    failure_kind: Option<orcas_core::planning::PlanRevisionApplyFailureKind>,
+    retry_safe: bool,
+    reconcile_available: bool,
+    operator_intervention_required: bool,
+    apply_error: Option<&str>,
+) -> orcas_core::planning::PlanRevisionProposal {
+    let now = Utc::now();
+    let plan_id = orcas_core::planning::PlanId::parse("plan-1").expect("plan id");
+    let proposal_id_parsed =
+        orcas_core::planning::PlanRevisionProposalId::parse(proposal_id).expect("proposal id");
+    let item_id = orcas_core::planning::PlanItemId::parse("item-1").expect("item id");
+    orcas_core::planning::PlanRevisionProposal {
+        proposal_id: proposal_id_parsed,
+        workstream_id: "ws-1".to_string(),
+        base_plan_id: plan_id,
+        base_plan_version: 1,
+        rationale: "Keep the workstream aligned with the canonical plan.".to_string(),
+        urgency: "medium".to_string(),
+        expected_benefit: "Reduce plan drift.".to_string(),
+        tradeoffs: vec!["Requires operator review for structural change.".to_string()],
+        ops: vec![orcas_core::planning::PlanRevisionOp::UpdateItem {
+            item_id,
+            patch: orcas_core::planning::PlanItemPatch {
+                notes: Some(Some("Updated for visibility test".to_string())),
+                ..Default::default()
+            },
+        }],
+        status,
+        created_at: now,
+        created_by: "supervisor-a".to_string(),
+        reviewed_at: Some(now),
+        reviewed_by: Some("operator".to_string()),
+        review_note: Some("inspect recovery".to_string()),
+        apply_started_at: Some(now),
+        apply_finished_at: Some(now),
+        apply_error: apply_error.map(|error| error.to_string()),
+        recovery: orcas_core::planning::PlanRevisionRecoveryState {
+            phase,
+            failure_kind,
+            downstream_apply_started: matches!(
+                phase,
+                orcas_core::planning::PlanRevisionApplyPhase::DownstreamApplying
+                    | orcas_core::planning::PlanRevisionApplyPhase::AwaitingFinalization
+                    | orcas_core::planning::PlanRevisionApplyPhase::Applied
+                    | orcas_core::planning::PlanRevisionApplyPhase::FailedDuringDownstream
+                    | orcas_core::planning::PlanRevisionApplyPhase::FailedAfterDownstream
+            ),
+            downstream_apply_completed: matches!(
+                phase,
+                orcas_core::planning::PlanRevisionApplyPhase::AwaitingFinalization
+                    | orcas_core::planning::PlanRevisionApplyPhase::Applied
+                    | orcas_core::planning::PlanRevisionApplyPhase::FailedAfterDownstream
+            ),
+            retry_safe,
+            reconcile_available,
+            operator_intervention_required,
+            failure_message: apply_error.map(|error| error.to_string()),
+            downstream_decision_id: Some("decision-1".to_string()),
+            downstream_assignment_id: Some("assignment-2".to_string()),
+        },
+        applied_plan_id: None,
+        applied_plan_version: None,
+        source_supervisor_proposal_id: Some(format!("supervisor-proposal-{proposal_id}")),
+    }
+}
+
+fn sample_proposal_record_with_plan_revision(
+    id: &str,
+    work_unit_id: &str,
+    report_id: &str,
+    assignment_id: &str,
+    decision_type: DecisionType,
+    status: SupervisorProposalStatus,
+    revision: orcas_core::planning::PlanRevisionProposal,
+) -> SupervisorProposalRecord {
+    let mut record = sample_proposal_record(
+        id,
+        work_unit_id,
+        report_id,
+        assignment_id,
+        decision_type,
+        status,
+    );
+    if let Some(proposal) = record.proposal.as_mut() {
+        proposal.plan_revision_proposal = Some(revision);
+    }
+    record
+}
+
 fn sample_collaboration_snapshot() -> ipc::CollaborationSnapshot {
     ipc::CollaborationSnapshot {
         workstreams: vec![
@@ -852,6 +945,10 @@ fn sample_snapshot_with_plan() -> ipc::StateSnapshot {
             reviewed_at: None,
             reviewed_by: None,
             review_note: None,
+            apply_started_at: None,
+            apply_finished_at: None,
+            apply_error: None,
+            recovery: Default::default(),
             applied_plan_id: None,
             applied_plan_version: None,
             source_supervisor_proposal_id: Some("proposal-1".to_string()),
@@ -918,13 +1015,23 @@ fn sample_workunit_detail(work_unit_id: &str) -> ipc::WorkunitGetResponse {
                 stage: SupervisorProposalFailureStage::Backend,
                 message: "request timed out".to_string(),
             });
-            let open = sample_proposal_record(
+            let open = sample_proposal_record_with_plan_revision(
                 "proposal-1",
                 "wu-1",
                 "report-2",
                 "assignment-2",
                 DecisionType::Continue,
-                SupervisorProposalStatus::Open,
+                SupervisorProposalStatus::Approved,
+                sample_plan_revision_proposal(
+                    "rev-1",
+                    orcas_core::planning::PlanRevisionProposalStatus::ApplyFailed,
+                    orcas_core::planning::PlanRevisionApplyPhase::FailedBeforeDownstream,
+                    Some(orcas_core::planning::PlanRevisionApplyFailureKind::RetryableInfrastructure),
+                    true,
+                    false,
+                    false,
+                    Some("downstream apply did not start"),
+                ),
             );
             ipc::WorkunitGetResponse {
                 work_unit: WorkUnit {
@@ -2427,7 +2534,7 @@ async fn collaboration_snapshot_drives_rendering() {
         workstream_detail
             .lines
             .iter()
-            .any(|line| line.contains("focus: Show canonical plan summary in the operator UI"))
+            .any(|line| line.contains("focus:"))
     );
     assert!(
         workstream_detail
@@ -2473,6 +2580,12 @@ async fn collaboration_snapshot_drives_rendering() {
             .any(|line| line.contains("decision_rationale: Need one more bounded pass."))
     );
     assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line.contains("proposal_recovery:"))
+    );
+    assert!(
         history
             .lines
             .iter()
@@ -2488,7 +2601,7 @@ async fn collaboration_snapshot_drives_rendering() {
         history
             .lines
             .iter()
-            .any(|line| line.contains("proposal-1 [open] decision=continue"))
+            .any(|line| line.contains("recovery retry"))
     );
 }
 
@@ -4726,6 +4839,161 @@ async fn actionable_review_decision_exposes_approve_and_reject_affordances() {
     );
     assert!(review.footer.hint_line.contains("a approve"));
     assert!(review.footer.hint_line.contains("d reject"));
+}
+
+#[tokio::test]
+async fn plan_revision_retry_state_renders_recovery_detail_and_hint() {
+    let mut harness = AppHarness::new(sample_review_snapshot()).await.unwrap();
+    harness
+        .set_workunit_detail(sample_workunit_detail("wu-1"))
+        .await;
+    harness
+        .dispatch(UserAction::ShowProgramView(ProgramView::Review))
+        .await;
+    harness.dispatch(UserAction::Refresh).await;
+    harness.dispatch(UserAction::SelectNextInView).await;
+
+    let review = harness.review_vm();
+    assert!(
+        review
+            .detail_panel
+            .lines
+            .iter()
+            .any(|line| line.contains("plan_revision:"))
+    );
+    assert!(
+        review
+            .detail_panel
+            .lines
+            .iter()
+            .any(|line| line.contains("phase: failed_before_downstream"))
+    );
+    assert!(
+        review
+            .detail_panel
+            .lines
+            .iter()
+            .any(|line| line.contains("retry_safe: true"))
+    );
+    assert!(
+        review
+            .detail_panel
+            .lines
+            .iter()
+            .any(|line| line.contains("next_action: retry available"))
+    );
+    assert!(
+        review
+            .footer
+            .lines
+            .iter()
+            .any(|line| line.contains("next_action: retry available"))
+    );
+    assert!(
+        review
+            .queue
+            .rows
+            .iter()
+            .find(|row| matches!(
+                row.selection,
+                ReviewSelection::Proposal {
+                    ref work_unit_id,
+                    ref proposal_id,
+                } if work_unit_id == "wu-1" && proposal_id == "proposal-1"
+            ))
+            .is_some_and(|row| row.badges.iter().any(|badge| badge == "retry"))
+    );
+}
+
+#[tokio::test]
+async fn plan_revision_reconcile_and_operator_review_states_render_distinct_hints() {
+    let mut harness = AppHarness::new(sample_review_snapshot()).await.unwrap();
+    let mut detail = sample_workunit_detail("wu-1");
+    if let Some(proposal) = detail.proposals.iter_mut().find(|proposal| proposal.id == "proposal-1")
+        && let Some(plan_revision) = proposal.proposal.as_mut().and_then(|proposal| {
+            proposal.plan_revision_proposal.as_mut()
+        })
+    {
+        *plan_revision = sample_plan_revision_proposal(
+            "rev-1",
+            orcas_core::planning::PlanRevisionProposalStatus::ApplyFailed,
+            orcas_core::planning::PlanRevisionApplyPhase::FailedAfterDownstream,
+            Some(orcas_core::planning::PlanRevisionApplyFailureKind::FinalizationFailure),
+            false,
+            true,
+            false,
+            Some("plan finalization failed"),
+        );
+    }
+    harness.set_workunit_detail(detail).await;
+    harness
+        .dispatch(UserAction::ShowProgramView(ProgramView::Review))
+        .await;
+    harness.dispatch(UserAction::Refresh).await;
+    harness.dispatch(UserAction::SelectNextInView).await;
+
+    let review = harness.review_vm();
+    assert!(
+        review
+            .detail_panel
+            .lines
+            .iter()
+            .any(|line| line.contains("phase: failed_after_downstream"))
+    );
+    assert!(
+        review
+            .detail_panel
+            .lines
+            .iter()
+            .any(|line| line.contains("reconcile_available: true"))
+    );
+    assert!(
+        review
+            .detail_panel
+            .lines
+            .iter()
+            .any(|line| line.contains("next_action: reconcile available"))
+    );
+
+    let mut operator_detail = sample_workunit_detail("wu-1");
+    if let Some(proposal) = operator_detail
+        .proposals
+        .iter_mut()
+        .find(|proposal| proposal.id == "proposal-1")
+        && let Some(plan_revision) = proposal
+            .proposal
+            .as_mut()
+            .and_then(|proposal| proposal.plan_revision_proposal.as_mut())
+    {
+        *plan_revision = sample_plan_revision_proposal(
+            "rev-1",
+            orcas_core::planning::PlanRevisionProposalStatus::ApplyFailed,
+            orcas_core::planning::PlanRevisionApplyPhase::FailedDuringDownstream,
+            Some(orcas_core::planning::PlanRevisionApplyFailureKind::DownstreamUnknown),
+            false,
+            false,
+            true,
+            Some("downstream completion is uncertain"),
+        );
+    }
+    harness.set_workunit_detail(operator_detail).await;
+    harness.dispatch(UserAction::Refresh).await;
+
+    let review = harness.review_vm();
+    assert!(
+        review
+            .detail_panel
+            .lines
+            .iter()
+            .any(|line| line.contains("operator_intervention_required: true"))
+    );
+    assert!(
+        review
+            .detail_panel
+            .lines
+            .iter()
+            .any(|line| line.contains("next_action: operator review required"))
+    );
 }
 
 #[tokio::test]

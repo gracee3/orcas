@@ -1,4 +1,5 @@
 use crate::app::{AppState, ProgramView, ReviewSelection, review_queue_selections};
+use orcas_core::planning::PlanRevisionProposal;
 use orcas_core::{
     ReportConfidence, ReportDisposition, ReportParseResult, SupervisorProposalFailureStage,
     SupervisorProposalStatus, ipc,
@@ -8,7 +9,8 @@ use orcas_core::{SupervisorPromptRenderArtifact, SupervisorResponseArtifact};
 use super::main::{MainStatusSegmentViewModel, ProgramTabViewModel};
 use super::shared::{
     PanelViewModel, abbreviate, compact_line, connection_status, event_log, short_id,
-    status_banner, timestamp_label,
+    plan_revision_next_action_label, plan_revision_recovery_badge,
+    plan_revision_recovery_lines, proposal_plan_revision, status_banner, timestamp_label,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +241,8 @@ fn review_queue_row(state: &AppState, selection: ReviewSelection) -> ReviewQueue
                 .map(|work_unit| workstream_summary(state, &work_unit.workstream_id))
                 .flatten();
             let proposal = work_unit.and_then(|work_unit| work_unit.proposal.as_ref());
+            let proposal_record = proposal_record(state, &work_unit_id, &proposal_id);
+            let recovery_revision = proposal_record.and_then(proposal_plan_revision);
             let mut badges = vec![
                 "proposal".to_string(),
                 proposal
@@ -250,6 +254,10 @@ fn review_queue_row(state: &AppState, selection: ReviewSelection) -> ReviewQueue
                     .unwrap_or("-")
                     .to_string(),
             ];
+            if let Some(revision) = recovery_revision {
+                badges.push("plan_revision".to_string());
+                badges.push(plan_revision_recovery_badge(revision));
+            }
             badges.extend(proposal_artifact_queue_badges(
                 state,
                 &work_unit_id,
@@ -481,6 +489,14 @@ fn proposal_detail_panel(
                 .unwrap_or("none")
         ),
     ];
+    if let Some(revision) = proposal_plan_revision(record) {
+        lines.push("plan_revision:".to_string());
+        lines.extend(
+            plan_revision_recovery_lines(revision)
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+    }
     if !proposal.summary.key_evidence.is_empty() {
         lines.push("key_evidence:".to_string());
         lines.extend(
@@ -669,6 +685,14 @@ fn failure_detail_panel(state: &AppState, work_unit_id: &str, proposal_id: &str)
         "next_action: inspect failure context, then regenerate or adjust supervisor inputs."
             .to_string(),
     ];
+    if let Some(revision) = proposal_plan_revision(record) {
+        lines.push("plan_revision:".to_string());
+        lines.extend(
+            plan_revision_recovery_lines(revision)
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+    }
     if let Some(output) = record.reasoner_output_text.as_ref() {
         lines.push(format!(
             "reasoner_output: {}",
@@ -1317,11 +1341,20 @@ fn review_footer(state: &AppState) -> ReviewFooterViewModel {
             }
         }
         Some(ReviewSelection::Proposal { .. }) => (
-            vec![
-                "Selected item is an open supervisor proposal.".to_string(),
-                "Use the detail pane to review summary, timing, and decision type; press v to inspect persisted prompt/response evidence without leaving the review flow."
-                    .to_string(),
-            ],
+            {
+                let mut lines = vec![
+                    "Selected item is a supervisor proposal.".to_string(),
+                    "Use the detail pane to review summary, timing, and decision type; press v to inspect persisted prompt/response evidence without leaving the review flow."
+                        .to_string(),
+                ];
+                if let Some(revision) = selected_plan_revision_proposal(state) {
+                    lines.push(format!(
+                        "next_action: {}",
+                        plan_revision_next_action_label(revision)
+                    ));
+                }
+                lines
+            },
             vec![
                 ReviewActionViewModel {
                     key: "v".to_string(),
@@ -1379,6 +1412,17 @@ fn review_footer(state: &AppState) -> ReviewFooterViewModel {
         actions,
         hint_line,
     }
+}
+
+fn selected_plan_revision_proposal(state: &AppState) -> Option<&PlanRevisionProposal> {
+    let ReviewSelection::Proposal {
+        work_unit_id,
+        proposal_id,
+    } = state.review_view.selected.as_ref()?
+    else {
+        return None;
+    };
+    proposal_record(state, work_unit_id, proposal_id).and_then(proposal_plan_revision)
 }
 
 fn workstream_summary<'a>(

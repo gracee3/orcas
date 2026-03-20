@@ -6,7 +6,12 @@ use orcas_core::{
     WorkUnitStatus, WorkstreamStatus, ipc,
 };
 
-use super::shared::{PanelViewModel, abbreviate, compact_line, short_id, timestamp_label};
+use super::shared::{
+    PanelViewModel, abbreviate, compact_line, plan_revision_apply_phase_label,
+    plan_revision_failure_kind_label, plan_revision_next_action_label,
+    plan_revision_recovery_lines, plan_revision_recovery_badge, proposal_plan_revision, short_id,
+    timestamp_label,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollaborationStatusViewModel {
@@ -152,6 +157,46 @@ pub fn workstream_plan_panel(state: &AppState, workstream_id: &str) -> Option<Pa
 
     if let Some(threshold) = plan.exploration_policy.drift_alert_threshold.as_deref() {
         lines.push(format!("drift_alert: {threshold}"));
+    }
+
+    let failed_revisions = state
+        .collaboration
+        .planning
+        .revision_proposals
+        .values()
+        .filter(|proposal| {
+            proposal.workstream_id == workstream_id
+                && proposal.status == orcas_core::planning::PlanRevisionProposalStatus::ApplyFailed
+        })
+        .collect::<Vec<_>>();
+    if !failed_revisions.is_empty() {
+        lines.push(format!("recoveries: {}", failed_revisions.len()));
+        for revision in failed_revisions.into_iter().take(2) {
+            lines.push(format!(
+                "recovery: {} [{}] {}",
+                short_id(revision.proposal_id.as_str()),
+                plan_revision_recovery_badge(revision),
+                plan_revision_next_action_label(revision)
+            ));
+            lines.push(format!(
+                "  phase: {} failure_kind: {}",
+                plan_revision_apply_phase_label(revision.recovery.phase),
+                revision
+                    .recovery
+                    .failure_kind
+                    .map(plan_revision_failure_kind_label)
+                    .unwrap_or("-")
+            ));
+            lines.push(format!(
+                "  retry_safe: {} reconcile_available: {} operator_required: {}",
+                revision.recovery.can_retry(),
+                revision.recovery.can_reconcile(),
+                revision.recovery.operator_intervention_required
+            ));
+            if let Some(error) = revision.apply_error.as_deref() {
+                lines.push(format!("  error: {}", abbreviate(&compact_line(error), 88)));
+            }
+        }
     }
 
     let recent_assessments = state
@@ -609,6 +654,21 @@ pub fn collaboration_detail(state: &AppState) -> CollaborationDetailViewModel {
         lines.push("proposal: -".to_string());
     }
 
+    let latest_proposal_id = latest_proposal.as_ref().map(|proposal| proposal.latest_proposal_id.as_str());
+    if let Some(detail) = state.work_unit_details.get(work_unit_id)
+        && let Some(proposal_id) = latest_proposal_id
+        && let Some(proposal_record) = detail.proposals.iter().find(|proposal| proposal.id == proposal_id)
+        && let Some(revision) = proposal_plan_revision(proposal_record)
+    {
+        lines.push("proposal_recovery:".to_string());
+        lines.extend(
+            plan_revision_recovery_lines(revision)
+                .into_iter()
+                .take(8)
+                .map(|line| format!("  {line}")),
+        );
+    }
+
     CollaborationDetailViewModel {
         title: format!("Work Unit {}", work_unit.id),
         lines,
@@ -733,6 +793,24 @@ pub fn collaboration_history(state: &AppState) -> CollaborationHistoryViewModel 
                     "    {}",
                     abbreviate(&compact_line(&summary.headline), 88)
                 ));
+            }
+            if let Some(revision) = proposal
+                .approved_proposal
+                .as_ref()
+                .or(proposal.proposal.as_ref())
+                .and_then(|proposal| proposal.plan_revision_proposal.as_ref())
+            {
+                lines.push(format!(
+                    "    recovery {} {}",
+                    plan_revision_recovery_badge(revision),
+                    plan_revision_next_action_label(revision)
+                ));
+                lines.extend(
+                    plan_revision_recovery_lines(revision)
+                        .into_iter()
+                        .take(4)
+                        .map(|line| format!("    {}", line)),
+                );
             }
             if let Some(failure) = proposal.generation_failure.as_ref() {
                 lines.push(format!(

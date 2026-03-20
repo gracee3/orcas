@@ -89,6 +89,8 @@ Runtime execution may only synchronize a narrow subset of canonical plan fields 
 
 Runtime synchronization does not mutate plan structure, ordering, priorities, acceptance criteria, constraints, or exploration policy.
 
+The review and collaboration operator surfaces now render plan revision recovery state directly from the canonical plan/proposal records. Failed revisions show the recovery phase, failure kind, retry safety, reconcile availability, operator-intervention requirement, and a short next-action hint so the operator does not need to infer recovery state from logs alone.
+
 ## Source-Of-Truth Matrix
 
 ### Ownership And Read Paths

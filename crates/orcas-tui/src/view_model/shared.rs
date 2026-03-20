@@ -2,6 +2,11 @@ use crate::app::{
     AppState, BannerLevel, CollaborationFocus, DaemonConnectionPhase, DaemonLifecycleState,
 };
 use orcas_core::ipc;
+use orcas_core::planning::{
+    PlanRevisionApplyFailureKind, PlanRevisionApplyPhase, PlanRevisionProposal,
+    PlanRevisionProposalStatus,
+};
+use orcas_core::SupervisorProposalRecord;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelViewModel {
@@ -139,4 +144,177 @@ pub(crate) fn short_id(id: &str) -> String {
 
 pub(crate) fn timestamp_label(timestamp: chrono::DateTime<chrono::Utc>) -> String {
     timestamp.format("%H:%M:%S").to_string()
+}
+
+pub(crate) fn proposal_plan_revision(
+    proposal: &SupervisorProposalRecord,
+) -> Option<&PlanRevisionProposal> {
+    proposal
+        .approved_proposal
+        .as_ref()
+        .or(proposal.proposal.as_ref())
+        .and_then(|proposal| proposal.plan_revision_proposal.as_ref())
+}
+
+pub(crate) fn plan_revision_status_label(status: PlanRevisionProposalStatus) -> &'static str {
+    match status {
+        PlanRevisionProposalStatus::Pending => "pending",
+        PlanRevisionProposalStatus::Approved => "approved",
+        PlanRevisionProposalStatus::Applying => "applying",
+        PlanRevisionProposalStatus::ApplyFailed => "apply_failed",
+        PlanRevisionProposalStatus::Rejected => "rejected",
+        PlanRevisionProposalStatus::Applied => "applied",
+        PlanRevisionProposalStatus::Superseded => "superseded",
+    }
+}
+
+pub(crate) fn plan_revision_apply_phase_label(phase: PlanRevisionApplyPhase) -> &'static str {
+    match phase {
+        PlanRevisionApplyPhase::NotStarted => "not_started",
+        PlanRevisionApplyPhase::DownstreamApplying => "downstream_applying",
+        PlanRevisionApplyPhase::AwaitingFinalization => "awaiting_finalization",
+        PlanRevisionApplyPhase::Applied => "applied",
+        PlanRevisionApplyPhase::FailedBeforeDownstream => "failed_before_downstream",
+        PlanRevisionApplyPhase::FailedDuringDownstream => "failed_during_downstream",
+        PlanRevisionApplyPhase::FailedAfterDownstream => "failed_after_downstream",
+        PlanRevisionApplyPhase::Rejected => "rejected",
+        PlanRevisionApplyPhase::Superseded => "superseded",
+    }
+}
+
+pub(crate) fn plan_revision_failure_kind_label(
+    failure_kind: PlanRevisionApplyFailureKind,
+) -> &'static str {
+    match failure_kind {
+        PlanRevisionApplyFailureKind::RetryableInfrastructure => "retryable_infrastructure",
+        PlanRevisionApplyFailureKind::ValidationFailure => "validation_failure",
+        PlanRevisionApplyFailureKind::StaleBasePlan => "stale_base_plan",
+        PlanRevisionApplyFailureKind::DownstreamUnknown => "downstream_unknown",
+        PlanRevisionApplyFailureKind::FinalizationFailure => "finalization_failure",
+        PlanRevisionApplyFailureKind::OperatorRequired => "operator_required",
+    }
+}
+
+pub(crate) fn plan_revision_next_action_label(
+    revision: &PlanRevisionProposal,
+) -> &'static str {
+    use PlanRevisionProposalStatus::*;
+
+    match revision.status {
+        Pending => "operator approval required",
+        Approved => "ready to apply",
+        Applying => {
+            if revision.recovery.downstream_apply_completed {
+                "finalize canonical plan version"
+            } else if revision.recovery.downstream_apply_started {
+                "downstream apply in progress"
+            } else {
+                "apply in progress"
+            }
+        }
+        ApplyFailed => {
+            if revision.recovery.can_reconcile() {
+                "reconcile available"
+            } else if revision.recovery.can_retry() {
+                "retry available"
+            } else if revision.recovery.operator_intervention_required {
+                "operator review required"
+            } else if revision.recovery.downstream_apply_started {
+                "unsafe to retry"
+            } else {
+                "retry blocked"
+            }
+        }
+        Rejected => "rejected; no action",
+        Applied => "applied; no action",
+        Superseded => "superseded; no action",
+    }
+}
+
+pub(crate) fn plan_revision_recovery_badge(revision: &PlanRevisionProposal) -> String {
+    match revision.status {
+        PlanRevisionProposalStatus::ApplyFailed => {
+            if revision.recovery.can_reconcile() {
+                "reconcile".to_string()
+            } else if revision.recovery.can_retry() {
+                "retry".to_string()
+            } else if revision.recovery.operator_intervention_required {
+                "review".to_string()
+            } else if revision.recovery.downstream_apply_started {
+                "unsafe".to_string()
+            } else {
+                "blocked".to_string()
+            }
+        }
+        PlanRevisionProposalStatus::Applying => "applying".to_string(),
+        PlanRevisionProposalStatus::Applied => "applied".to_string(),
+        PlanRevisionProposalStatus::Rejected => "rejected".to_string(),
+        PlanRevisionProposalStatus::Superseded => "superseded".to_string(),
+        PlanRevisionProposalStatus::Approved => "approved".to_string(),
+        PlanRevisionProposalStatus::Pending => "pending".to_string(),
+    }
+}
+
+pub(crate) fn plan_revision_recovery_lines(revision: &PlanRevisionProposal) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "status: {}",
+            plan_revision_status_label(revision.status)
+        ),
+        format!(
+            "phase: {}",
+            plan_revision_apply_phase_label(revision.recovery.phase)
+        ),
+        format!(
+            "failure_kind: {}",
+            revision
+                .recovery
+                .failure_kind
+                .map(plan_revision_failure_kind_label)
+                .unwrap_or("-")
+        ),
+        format!(
+            "downstream_started: {}",
+            revision.recovery.downstream_apply_started
+        ),
+        format!(
+            "downstream_completed: {}",
+            revision.recovery.downstream_apply_completed
+        ),
+        format!("retry_safe: {}", revision.recovery.can_retry()),
+        format!(
+            "reconcile_available: {}",
+            revision.recovery.can_reconcile()
+        ),
+        format!(
+            "operator_intervention_required: {}",
+            revision.recovery.operator_intervention_required
+        ),
+        format!(
+            "next_action: {}",
+            plan_revision_next_action_label(revision)
+        ),
+    ];
+    if let Some(error) = revision.apply_error.as_deref() {
+        lines.push(format!("apply_error: {}", abbreviate(&compact_line(error), 96)));
+    }
+    if let Some(error) = revision.recovery.failure_message.as_deref()
+        && revision.apply_error.as_deref() != Some(error)
+    {
+        lines.push(format!(
+            "failure_message: {}",
+            abbreviate(&compact_line(error), 96)
+        ));
+    }
+    if let Some(plan_id) = revision.applied_plan_id.as_ref() {
+        lines.push(format!(
+            "applied_plan: {} v{}",
+            short_id(plan_id.as_str()),
+            revision
+                .applied_plan_version
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ));
+    }
+    lines
 }
