@@ -107,7 +107,7 @@ Recovery is snapshot-first rather than replay-based:
 The current operator mutation surface is also split, but no longer ambiguous:
 
 - `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...` are the canonical authority-backed planning hierarchy CRUD commands
-- `orcas legacy-workstreams ...` and `orcas legacy-workunits ...` remain available as explicit create/list/get compatibility paths for legacy collaboration records
+- `orcas legacy-workstreams ...` and `orcas legacy-workunits ...` remain available only as explicit list/get compatibility paths for pre-existing legacy collaboration records
 - assignment, report, decision, proposal, thread, and turn flows remain collaboration- or runtime-oriented daemon surfaces rather than authority planning CRUD
 
 `RUST_LOG` controls tracing verbosity. Orcas-specific overrides use `ORCAS_*` environment variables, including the Codex binary path and upstream listen URL.

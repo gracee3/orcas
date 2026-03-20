@@ -881,26 +881,6 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn legacy_workstream_create(
-        &self,
-        title: String,
-        objective: String,
-        priority: Option<String>,
-    ) -> Result<()> {
-        Self::print_legacy_workflow_notice("workstreams");
-        let client = self.ready_client().await?;
-        let response = client
-            .workstream_create(&ipc::WorkstreamCreateRequest {
-                title,
-                objective,
-                priority,
-            })
-            .await?;
-        println!("workstream_id: {}", response.workstream.id);
-        println!("status: {:?}", response.workstream.status);
-        Ok(())
-    }
-
     pub async fn legacy_workstream_list(&self) -> Result<()> {
         Self::print_legacy_workflow_notice("workstreams");
         let client = self.daemon_state_client().await?;
@@ -937,28 +917,6 @@ impl SupervisorService {
                 work_unit.title
             );
         }
-        Ok(())
-    }
-
-    pub async fn legacy_workunit_create(
-        &self,
-        workstream_id: &str,
-        title: String,
-        task_statement: String,
-        dependencies: Vec<String>,
-    ) -> Result<()> {
-        Self::print_legacy_workflow_notice("workunits");
-        let client = self.ready_client().await?;
-        let response = client
-            .workunit_create(&ipc::WorkunitCreateRequest {
-                workstream_id: workstream_id.to_string(),
-                title,
-                task_statement,
-                dependencies,
-            })
-            .await?;
-        println!("work_unit_id: {}", response.work_unit.id);
-        println!("status: {:?}", response.work_unit.status);
         Ok(())
     }
 
@@ -2344,7 +2302,7 @@ impl SupervisorService {
     fn print_legacy_workflow_notice(noun: &str) {
         println!("surface: legacy_collaboration_compatibility");
         println!(
-            "note: `{noun}` here uses the legacy collaboration compatibility path; canonical planning hierarchy create/edit/delete uses the authority-backed `orcas {noun}` commands."
+            "note: `{noun}` here uses a read-only legacy collaboration compatibility path; canonical planning hierarchy create/edit/delete uses the authority-backed `orcas {noun}` commands."
         );
     }
 

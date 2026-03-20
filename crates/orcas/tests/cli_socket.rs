@@ -932,58 +932,113 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
 }
 
 #[tokio::test]
-async fn real_cli_legacy_workstream_commands_are_explicit_compatibility_paths() {
+async fn real_cli_legacy_planning_commands_are_read_only_compatibility_paths() {
     let mut daemon = TestDaemon::spawn("cli-legacy-workstream-compat").await;
+    let client = daemon.connect().await;
 
-    let create_output = run_orcas(
+    let workstream = client
+        .workstream_create(&ipc::WorkstreamCreateRequest {
+            title: "Legacy CLI Root".to_string(),
+            objective: "Seed a legacy collaboration workstream explicitly.".to_string(),
+            priority: Some("low".to_string()),
+        })
+        .await
+        .expect("seed legacy workstream")
+        .workstream;
+    let work_unit = client
+        .workunit_create(&ipc::WorkunitCreateRequest {
+            workstream_id: workstream.id.clone(),
+            title: "Legacy CLI Unit".to_string(),
+            task_statement: "Inspect a retained collaboration-native work unit.".to_string(),
+            dependencies: Vec::new(),
+        })
+        .await
+        .expect("seed legacy workunit")
+        .work_unit;
+
+    let list_output = run_orcas(&daemon, &["legacy-workstreams", "list"]);
+    assert!(
+        list_output.status.success(),
+        "stderr: {}",
+        stderr(&list_output)
+    );
+    let list_stdout = stdout(&list_output);
+    assert!(list_stdout.contains("surface: legacy_collaboration_compatibility"));
+    assert!(list_stdout.contains("read-only legacy collaboration compatibility path"));
+    assert!(list_stdout.contains(&workstream.id));
+
+    let get_output = run_orcas(
         &daemon,
-        &[
-            "legacy-workstreams",
-            "create",
-            "--title",
-            "Legacy CLI Root",
-            "--objective",
-            "Create a legacy collaboration workstream explicitly.",
-            "--priority",
-            "low",
-        ],
+        &["legacy-workstreams", "get", "--workstream", &workstream.id],
     );
     assert!(
-        create_output.status.success(),
+        get_output.status.success(),
         "stderr: {}",
-        stderr(&create_output)
+        stderr(&get_output)
     );
-    let create_stdout = stdout(&create_output);
-    let workstream_id = field_value(&create_stdout, "workstream_id")
-        .expect("legacy workstream create should print workstream_id")
-        .to_string();
-    assert!(create_stdout.contains("surface: legacy_collaboration_compatibility"));
-    assert!(create_stdout.contains("legacy collaboration compatibility path"));
+    let get_stdout = stdout(&get_output);
+    assert!(get_stdout.contains("surface: legacy_collaboration_compatibility"));
+    assert!(get_stdout.contains(&format!("workstream_id: {}", workstream.id)));
+    assert!(get_stdout.contains("Legacy CLI Root"));
 
-    let client = daemon.connect().await;
+    let unit_list_output = run_orcas(
+        &daemon,
+        &["legacy-workunits", "list", "--workstream", &workstream.id],
+    );
+    assert!(
+        unit_list_output.status.success(),
+        "stderr: {}",
+        stderr(&unit_list_output)
+    );
+    let unit_list_stdout = stdout(&unit_list_output);
+    assert!(unit_list_stdout.contains("surface: legacy_collaboration_compatibility"));
+    assert!(unit_list_stdout.contains(&work_unit.id));
+
+    let unit_get_output = run_orcas(
+        &daemon,
+        &["legacy-workunits", "get", "--workunit", &work_unit.id],
+    );
+    assert!(
+        unit_get_output.status.success(),
+        "stderr: {}",
+        stderr(&unit_get_output)
+    );
+    let unit_get_stdout = stdout(&unit_get_output);
+    assert!(unit_get_stdout.contains("surface: legacy_collaboration_compatibility"));
+    assert!(unit_get_stdout.contains(&format!("work_unit_id: {}", work_unit.id)));
+    assert!(unit_get_stdout.contains("Legacy CLI Unit"));
+
     let snapshot = client
         .state_get()
         .await
-        .expect("state/get after legacy workstream create");
+        .expect("state/get after seeded legacy planning records");
     assert!(
         snapshot
             .snapshot
             .collaboration
             .workstreams
             .iter()
-            .any(|workstream| workstream.id == workstream_id)
+            .any(|entry| entry.id == workstream.id)
+    );
+    assert!(
+        snapshot
+            .snapshot
+            .collaboration
+            .work_units
+            .iter()
+            .any(|entry| entry.id == work_unit.id)
     );
 
     let hierarchy = client
         .authority_hierarchy_get(&ipc::AuthorityHierarchyGetRequest::default())
         .await
-        .expect("authority hierarchy after legacy workstream create");
+        .expect("authority hierarchy after seeded legacy planning records");
     assert!(
         hierarchy
             .hierarchy
             .workstreams
             .iter()
-            .all(|workstream| workstream.workstream.id.to_string() != workstream_id)
+            .all(|entry| entry.workstream.id.to_string() != workstream.id)
     );
 
     daemon.stop().await;

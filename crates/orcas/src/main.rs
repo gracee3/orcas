@@ -189,17 +189,15 @@ enum TrackedThreadsCommand {
 }
 
 #[derive(Debug, Subcommand)]
-#[command(about = "Compatibility create/list/get commands for legacy collaboration workstreams")]
+#[command(about = "Compatibility list/get commands for legacy collaboration workstreams")]
 enum LegacyWorkstreamsCommand {
-    Create(WorkstreamCreateArgs),
     List,
     Get(WorkstreamRefArgs),
 }
 
 #[derive(Debug, Subcommand)]
-#[command(about = "Compatibility create/list/get commands for legacy collaboration work units")]
+#[command(about = "Compatibility list/get commands for legacy collaboration work units")]
 enum LegacyWorkunitsCommand {
-    Create(WorkunitCreateArgs),
     List(WorkunitListArgs),
     Get(WorkunitRefArgs),
 }
@@ -911,11 +909,6 @@ async fn main() -> Result<()> {
         TopCommand::LegacyWorkstreams { command } => {
             let service = SupervisorService::load(&overrides).await?;
             match command {
-                LegacyWorkstreamsCommand::Create(args) => {
-                    service
-                        .legacy_workstream_create(args.title, args.objective, args.priority)
-                        .await?;
-                }
                 LegacyWorkstreamsCommand::List => service.legacy_workstream_list().await?,
                 LegacyWorkstreamsCommand::Get(args) => {
                     service.legacy_workstream_get(&args.workstream).await?
@@ -925,16 +918,6 @@ async fn main() -> Result<()> {
         TopCommand::LegacyWorkunits { command } => {
             let service = SupervisorService::load(&overrides).await?;
             match command {
-                LegacyWorkunitsCommand::Create(args) => {
-                    service
-                        .legacy_workunit_create(
-                            &args.workstream,
-                            args.title,
-                            args.task,
-                            args.dependencies,
-                        )
-                        .await?;
-                }
                 LegacyWorkunitsCommand::List(args) => {
                     service
                         .legacy_workunit_list(args.workstream.as_deref())
@@ -1285,9 +1268,9 @@ mod tests {
             .render_help()
             .to_string();
 
-        assert!(help.contains(
-            "Compatibility create/list/get commands for legacy collaboration workstreams"
-        ));
+        assert!(
+            help.contains("Compatibility list/get commands for legacy collaboration workstreams")
+        );
     }
 
     #[test]
@@ -1388,27 +1371,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_legacy_workstream_create_command() {
-        let cli = Cli::parse_from([
-            "orcas",
-            "legacy-workstreams",
-            "create",
-            "--title",
-            "Legacy root",
-            "--objective",
-            "Legacy objective",
-        ]);
+    fn legacy_workstream_create_is_not_exposed() {
+        assert!(Cli::try_parse_from(["orcas", "legacy-workstreams", "create"]).is_err());
+    }
 
-        match cli.command {
-            TopCommand::LegacyWorkstreams {
-                command: LegacyWorkstreamsCommand::Create(args),
-            } => {
-                assert_eq!(args.title, "Legacy root");
-                assert_eq!(args.objective, "Legacy objective");
-                assert_eq!(args.priority, None);
-            }
-            other => panic!("unexpected command parse: {other:?}"),
-        }
+    #[test]
+    fn legacy_workunit_create_is_not_exposed() {
+        assert!(Cli::try_parse_from(["orcas", "legacy-workunits", "create"]).is_err());
     }
 
     #[test]
