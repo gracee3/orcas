@@ -13,7 +13,7 @@ use tokio::time::sleep;
 use url::Url;
 
 use orcas_core::{AppPaths, CodexDaemonConfig, OrcasError, OrcasResult};
-use tracing::warn;
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Copy)]
 pub enum DaemonLaunch {
@@ -113,6 +113,7 @@ impl CodexDaemonManager for LocalCodexDaemonManager {
     }
 
     async fn spawn_background(&self) -> OrcasResult<DaemonStatus> {
+        let start = Instant::now();
         std::fs::create_dir_all(
             self.log_path.parent().ok_or_else(|| {
                 OrcasError::Config("log path has no parent directory".to_string())
@@ -141,6 +142,12 @@ impl CodexDaemonManager for LocalCodexDaemonManager {
         };
         let stdout_log = Arc::new(Mutex::new(stdout_log));
 
+        info!(
+            binary_path = %self.config.binary_path.display(),
+            listen_url = self.config.listen_url.as_str(),
+            cwd = self.cwd.as_ref().map(|cwd| cwd.display().to_string()),
+            "starting Codex app-server"
+        );
         let mut command = Command::new(&self.config.binary_path);
         command.kill_on_drop(false);
         for override_kv in &self.config.config_overrides {
@@ -163,6 +170,12 @@ impl CodexDaemonManager for LocalCodexDaemonManager {
                 self.config.binary_path.display()
             ))
         })?;
+        let pid = child.id();
+        info!(
+            pid,
+            listen_url = self.config.listen_url.as_str(),
+            "Codex app-server spawned"
+        );
         let stdout = child.stdout.take().ok_or_else(|| {
             OrcasError::Transport("failed to capture Codex app-server stdout".to_string())
         })?;
@@ -178,13 +191,31 @@ impl CodexDaemonManager for LocalCodexDaemonManager {
         );
         Self::spawn_output_mirror("stderr", stderr, stdout_log, aggregate_log);
 
+        debug!(
+            pid,
+            listen_url = self.config.listen_url.as_str(),
+            "waiting for Codex app-server readiness"
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if Self::endpoint_reachable(&self.config.listen_url).await? {
+                info!(
+                    pid,
+                    listen_url = self.config.listen_url.as_str(),
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "Codex app-server is ready"
+                );
                 std::mem::forget(child);
                 return self.status().await;
             }
             if let Some(status) = child.try_wait()? {
+                error!(
+                    pid,
+                    listen_url = self.config.listen_url.as_str(),
+                    exit_status = %status,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "Codex app-server exited before becoming ready"
+                );
                 return Err(OrcasError::Transport(format!(
                     "Codex app-server exited early with status {status}"
                 )));
@@ -192,7 +223,33 @@ impl CodexDaemonManager for LocalCodexDaemonManager {
             sleep(Duration::from_millis(100)).await;
         }
 
-        self.wait_for_endpoint(Duration::from_secs(1)).await?;
+        if let Err(error) = self.wait_for_endpoint(Duration::from_secs(1)).await {
+            if let Some(status) = child.try_wait()? {
+                error!(
+                    pid,
+                    listen_url = self.config.listen_url.as_str(),
+                    exit_status = %status,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    error = %error,
+                    "Codex app-server failed during readiness wait"
+                );
+            } else {
+                error!(
+                    pid,
+                    listen_url = self.config.listen_url.as_str(),
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    error = %error,
+                    "Codex app-server did not become ready in time"
+                );
+            }
+            return Err(error);
+        }
+        info!(
+            pid,
+            listen_url = self.config.listen_url.as_str(),
+            duration_ms = start.elapsed().as_millis() as u64,
+            "Codex app-server is ready"
+        );
         self.status().await
     }
 }

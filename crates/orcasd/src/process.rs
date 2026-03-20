@@ -32,6 +32,46 @@ pub struct OrcasRuntimeOverrides {
     pub force_spawn: bool,
 }
 
+impl OrcasRuntimeOverrides {
+    pub fn from_env() -> Self {
+        let codex_bin = std::env::var_os(ENV_CODEX_BIN).map(PathBuf::from);
+        let listen_url = std::env::var(ENV_CODEX_LISTEN_URL).ok();
+        let cwd = std::env::var_os(ENV_DEFAULT_CWD).map(PathBuf::from);
+        let model = std::env::var(ENV_DEFAULT_MODEL).ok();
+        let mode = std::env::var(ENV_CONNECTION_MODE).ok();
+        Self {
+            codex_bin,
+            listen_url,
+            cwd,
+            model,
+            connect_only: mode.as_deref() == Some("connect_only"),
+            force_spawn: mode.as_deref() == Some("spawn_always"),
+        }
+    }
+
+    pub fn overlay(mut self, overrides: &Self) -> Self {
+        if let Some(codex_bin) = &overrides.codex_bin {
+            self.codex_bin = Some(codex_bin.clone());
+        }
+        if let Some(listen_url) = &overrides.listen_url {
+            self.listen_url = Some(listen_url.clone());
+        }
+        if let Some(cwd) = &overrides.cwd {
+            self.cwd = Some(cwd.clone());
+        }
+        if let Some(model) = &overrides.model {
+            self.model = Some(model.clone());
+        }
+        if overrides.connect_only {
+            self.connect_only = true;
+        }
+        if overrides.force_spawn {
+            self.force_spawn = true;
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum OrcasDaemonLaunch {
     Never,
@@ -248,7 +288,7 @@ impl OrcasDaemonProcessManager {
         command.arg(&daemon_binary);
         info!(
             daemon_binary = %daemon_binary.display(),
-            env = ?self.overrides,
+            socket = %self.paths.socket_file.display(),
             "launching daemon process"
         );
         command
@@ -257,6 +297,7 @@ impl OrcasDaemonProcessManager {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         self.apply_spawn_env(&mut command, &binary_summary);
+        self.apply_spawn_args(&mut command);
 
         let mut child = command.spawn().map_err(|error| {
             OrcasError::Transport(format!("failed to spawn Orcas daemon: {error}"))
@@ -447,6 +488,27 @@ impl OrcasDaemonProcessManager {
             command.env(ENV_CONNECTION_MODE, "connect_only");
         } else if self.overrides.force_spawn {
             command.env(ENV_CONNECTION_MODE, "spawn_always");
+        }
+    }
+
+    fn apply_spawn_args(&self, command: &mut Command) {
+        if let Some(codex_bin) = &self.overrides.codex_bin {
+            command.arg("--codex-bin").arg(codex_bin);
+        }
+        if let Some(listen_url) = &self.overrides.listen_url {
+            command.arg("--listen-url").arg(listen_url);
+        }
+        if let Some(cwd) = &self.overrides.cwd {
+            command.arg("--cwd").arg(cwd);
+        }
+        if let Some(model) = &self.overrides.model {
+            command.arg("--model").arg(model);
+        }
+        if self.overrides.connect_only {
+            command.arg("--connect-only");
+        }
+        if self.overrides.force_spawn {
+            command.arg("--force-spawn");
         }
     }
 

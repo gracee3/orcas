@@ -44,10 +44,7 @@ use crate::assignment_comm::policy::validate_assignment_packet;
 use crate::assignment_comm::render::build_assignment_communication_record;
 use crate::assignment_comm::stable_fingerprint;
 use crate::authority_store::{AuthorityMutationResult, AuthoritySqliteStore};
-use crate::process::{
-    ENV_CODEX_BIN, ENV_CODEX_LISTEN_URL, ENV_CONNECTION_MODE, ENV_DEFAULT_CWD, ENV_DEFAULT_MODEL,
-    OrcasDaemonProcessManager, OrcasRuntimeOverrides, apply_runtime_overrides,
-};
+use crate::process::{OrcasDaemonProcessManager, OrcasRuntimeOverrides, apply_runtime_overrides};
 use crate::supervisor::{
     ResponsesApiReasoner, SupervisorReasoner, apply_edits, build_context_pack,
     compile_assignment_instructions, proposal_freshness_error, state_anchor_freshness_error,
@@ -171,10 +168,16 @@ pub struct OrcasDaemonService {
 impl OrcasDaemonService {
     pub async fn load_from_env() -> OrcasResult<Arc<Self>> {
         debug!("loading daemon service from environment");
+        Self::load_with_runtime_overrides(Self::overrides_from_env()).await
+    }
+
+    pub async fn load_with_runtime_overrides(
+        runtime_overrides: OrcasRuntimeOverrides,
+    ) -> OrcasResult<Arc<Self>> {
         let paths = AppPaths::discover()?;
         paths.ensure().await?;
         let mut config = AppConfig::write_default_if_missing(&paths).await?;
-        apply_runtime_overrides(&mut config, &Self::overrides_from_env());
+        apply_runtime_overrides(&mut config, &runtime_overrides);
         let runtime =
             OrcasDaemonProcessManager::runtime_metadata_for_current_process(&paths).await?;
 
@@ -248,12 +251,7 @@ impl OrcasDaemonService {
                         service.handle_client(stream).await;
                     });
                 }
-                signal = tokio::signal::ctrl_c() => {
-                    if let Err(error) = signal {
-                        warn!(%error, "failed to listen for shutdown signal");
-                    }
-                    break;
-                }
+                _ = Self::wait_for_shutdown_signal() => break,
                 _ = self.shutdown.notified() => {
                     break;
                 }
@@ -261,6 +259,38 @@ impl OrcasDaemonService {
         }
 
         Ok(())
+    }
+
+    async fn wait_for_shutdown_signal() {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    warn!(%error, "failed to listen for SIGTERM");
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
+
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => {
+                    if let Err(error) = signal {
+                        warn!(%error, "failed to listen for ctrl-c");
+                    }
+                }
+                _ = sigterm.recv() => {}
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                warn!(%error, "failed to listen for shutdown signal");
+            }
+        }
     }
 
     async fn bind_listener(&self) -> OrcasResult<UnixListener> {
@@ -397,24 +427,41 @@ impl OrcasDaemonService {
         let message: JsonRpcMessage = serde_json::from_str(raw)?;
         match message {
             JsonRpcMessage::Request(request) => {
+                let start = std::time::Instant::now();
                 debug!(
                     request_id = ?request.id,
                     method = request.method.as_str(),
                     "ipc request received"
                 );
-                if let Err(error) = self
+                match self
                     .handle_request(request.clone(), outbound.clone(), subscription_task)
                     .await
                 {
-                    warn!(%error, "ipc client message failed");
-                    let _ = Self::send_error(
-                        &outbound,
-                        Some(request.id),
-                        -32000,
-                        &error.to_string(),
-                        None,
-                    )
-                    .await;
+                    Ok(()) => {
+                        debug!(
+                            request_id = ?request.id,
+                            method = request.method.as_str(),
+                            duration_ms = start.elapsed().as_millis() as u64,
+                            "ipc request completed"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            request_id = ?request.id,
+                            method = request.method.as_str(),
+                            duration_ms = start.elapsed().as_millis() as u64,
+                            error = %error,
+                            "ipc request failed"
+                        );
+                        let _ = Self::send_error(
+                            &outbound,
+                            Some(request.id),
+                            -32000,
+                            &error.to_string(),
+                            None,
+                        )
+                        .await;
+                    }
                 }
             }
             JsonRpcMessage::Notification(_) => {}
@@ -8585,19 +8632,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
     }
 
     fn overrides_from_env() -> OrcasRuntimeOverrides {
-        let codex_bin = std::env::var_os(ENV_CODEX_BIN).map(PathBuf::from);
-        let listen_url = std::env::var(ENV_CODEX_LISTEN_URL).ok();
-        let cwd = std::env::var_os(ENV_DEFAULT_CWD).map(PathBuf::from);
-        let model = std::env::var(ENV_DEFAULT_MODEL).ok();
-        let mode = std::env::var(ENV_CONNECTION_MODE).ok();
-        OrcasRuntimeOverrides {
-            codex_bin,
-            listen_url,
-            cwd,
-            model,
-            connect_only: mode.as_deref() == Some("connect_only"),
-            force_spawn: mode.as_deref() == Some("spawn_always"),
-        }
+        OrcasRuntimeOverrides::from_env()
     }
 
     fn decode_params<T>(params: Option<Value>) -> OrcasResult<T>

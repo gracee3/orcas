@@ -33,7 +33,7 @@ pub fn init_file_logger(component: &str, log_path: &Path) -> OrcasResult<()> {
         .open(log_path)?;
 
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("{component}=debug,debug,tokio=info")));
+        .unwrap_or_else(|_| EnvFilter::new(format!("{component}=info,info,tokio=info")));
 
     let subscriber = tracing_subscriber::registry().with(
         fmt::layer()

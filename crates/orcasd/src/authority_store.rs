@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tracing::{debug, info, warn};
 
 use orcas_core::authority::{
     self, AggregateKey, AggregateType, AuthorityCommand, AuthorityCommandStore, AuthorityEvent,
@@ -138,8 +139,12 @@ pub struct AuthoritySqliteStore {
 
 impl AuthoritySqliteStore {
     pub fn open(paths: AppPaths) -> OrcasResult<Self> {
+        let start = std::time::Instant::now();
+        let db_path = paths.state_db_file.display().to_string();
+        info!(db_path, "opening authority store");
         let mut connection = Connection::open(&paths.state_db_file)
             .map_err(|error| store_error(format!("open authority db: {error}")))?;
+        debug!(db_path, "configuring authority sqlite pragmas");
         connection
             .execute_batch(
                 "pragma journal_mode = wal;
@@ -148,9 +153,19 @@ impl AuthoritySqliteStore {
                  pragma busy_timeout = 5000;",
             )
             .map_err(|error| store_error(format!("configure authority db: {error}")))?;
-        Self::migrate(&mut connection)?;
+        let migration = Self::migrate(&mut connection)?;
         let origin_node_id = Self::ensure_origin_node_id(&connection)?;
-        Self::bootstrap_from_json_if_needed(&paths, &mut connection, &origin_node_id)?;
+        let import_status =
+            Self::bootstrap_from_json_if_needed(&paths, &mut connection, &origin_node_id)?;
+        info!(
+            db_path,
+            schema_version = migration.schema_version,
+            migration_applied = migration.applied,
+            origin_node_id = origin_node_id.as_str(),
+            import_status,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "authority store ready"
+        );
         Ok(Self {
             #[cfg(test)]
             paths,
@@ -172,6 +187,15 @@ impl AuthoritySqliteStore {
         &self,
         command: AuthorityCommand,
     ) -> OrcasResult<AuthorityMutationResult> {
+        let start = std::time::Instant::now();
+        let command_summary = summarize_command(&command);
+        debug!(
+            command_id = command.metadata().command_id.as_str(),
+            command_kind = command.kind().as_ref(),
+            aggregate_type = command_summary.aggregate_type,
+            aggregate_id = command_summary.aggregate_id.as_str(),
+            "authority command started"
+        );
         self.with_connection(|connection| {
             let transaction = connection
                 .transaction()
@@ -190,10 +214,34 @@ impl AuthoritySqliteStore {
                 transaction.commit().map_err(|error| {
                     store_error(format!("commit duplicate authority transaction: {error}"))
                 })?;
+                let result_summary = summarize_mutation_result(&result);
+                debug!(
+                    command_id = command.metadata().command_id.as_str(),
+                    command_kind = command.kind().as_ref(),
+                    aggregate_type = result_summary.aggregate_type,
+                    aggregate_id = result_summary.aggregate_id,
+                    revision = result_summary.revision,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "authority command replayed stored receipt"
+                );
                 return Ok(result);
             }
 
-            let result = Self::execute_command_tx(&transaction, &command)?;
+            let result = match Self::execute_command_tx(&transaction, &command) {
+                Ok(result) => result,
+                Err(error) => {
+                    warn!(
+                        command_id = command.metadata().command_id.as_str(),
+                        command_kind = command.kind().as_ref(),
+                        aggregate_type = command_summary.aggregate_type,
+                        aggregate_id = command_summary.aggregate_id.as_str(),
+                        duration_ms = start.elapsed().as_millis() as u64,
+                        error = %error,
+                        "authority command failed"
+                    );
+                    return Err(error);
+                }
+            };
             let receipt = CommandReceipt {
                 command_id: command.metadata().command_id.clone(),
                 command_kind: command.kind(),
@@ -208,6 +256,33 @@ impl AuthoritySqliteStore {
             transaction
                 .commit()
                 .map_err(|error| store_error(format!("commit authority transaction: {error}")))?;
+            let result_summary = summarize_mutation_result(&result);
+            if matches!(
+                command.kind(),
+                authority::CommandKind::DeleteWorkstream
+                    | authority::CommandKind::DeleteWorkUnit
+                    | authority::CommandKind::DeleteTrackedThread
+            ) {
+                debug!(
+                    command_id = command.metadata().command_id.as_str(),
+                    command_kind = command.kind().as_ref(),
+                    aggregate_type = result_summary.aggregate_type,
+                    aggregate_id = result_summary.aggregate_id,
+                    revision = result_summary.revision,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "authority delete command completed"
+                );
+            } else {
+                debug!(
+                    command_id = command.metadata().command_id.as_str(),
+                    command_kind = command.kind().as_ref(),
+                    aggregate_type = result_summary.aggregate_type,
+                    aggregate_id = result_summary.aggregate_id,
+                    revision = result_summary.revision,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "authority command completed"
+                );
+            }
             Ok(result)
         })
     }
@@ -943,7 +1018,7 @@ impl AuthoritySqliteStore {
         Ok(())
     }
 
-    fn migrate(connection: &mut Connection) -> OrcasResult<()> {
+    fn migrate(connection: &mut Connection) -> OrcasResult<MigrationOutcome> {
         let user_version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|error| store_error(format!("read authority schema version: {error}")))?;
@@ -957,15 +1032,22 @@ impl AuthoritySqliteStore {
                     .map_err(|error| {
                         store_error(format!("set authority schema version: {error}"))
                     })?;
+                debug!(schema_version = 1_i64, "initialized authority schema");
+                Ok(MigrationOutcome {
+                    schema_version: 1,
+                    applied: true,
+                })
             }
-            1 => {}
+            1 => Ok(MigrationOutcome {
+                schema_version: 1,
+                applied: false,
+            }),
             other => {
                 return Err(OrcasError::Store(format!(
                     "unsupported authority schema version `{other}`"
                 )));
             }
         }
-        Ok(())
     }
 
     fn ensure_origin_node_id(connection: &Connection) -> OrcasResult<OriginNodeId> {
@@ -986,9 +1068,13 @@ impl AuthoritySqliteStore {
         paths: &AppPaths,
         connection: &mut Connection,
         origin_node_id: &OriginNodeId,
-    ) -> OrcasResult<()> {
-        if Self::meta_value(connection, META_JSON_IMPORT_STATUS)?.is_some() {
-            return Ok(());
+    ) -> OrcasResult<String> {
+        if let Some(status) = Self::meta_value(connection, META_JSON_IMPORT_STATUS)? {
+            debug!(
+                import_status = status,
+                "authority bootstrap already recorded"
+            );
+            return Ok(status);
         }
         if Self::has_existing_authority_data(connection)? {
             Self::set_meta(connection, META_JSON_IMPORT_STATUS, "existing_db")?;
@@ -997,7 +1083,12 @@ impl AuthoritySqliteStore {
                 META_JSON_IMPORT_COMPLETED_AT,
                 &Utc::now().to_rfc3339(),
             )?;
-            return Ok(());
+            info!(
+                state_file = %paths.state_file.display(),
+                import_status = "existing_db",
+                "authority bootstrap skipped because database already contains authority state"
+            );
+            return Ok("existing_db".to_string());
         }
         if !paths.state_file.exists() {
             Self::set_meta(connection, META_JSON_IMPORT_STATUS, "no_state_json")?;
@@ -1006,9 +1097,19 @@ impl AuthoritySqliteStore {
                 META_JSON_IMPORT_COMPLETED_AT,
                 &Utc::now().to_rfc3339(),
             )?;
-            return Ok(());
+            info!(
+                state_file = %paths.state_file.display(),
+                import_status = "no_state_json",
+                "authority bootstrap skipped because legacy state.json was not found"
+            );
+            return Ok("no_state_json".to_string());
         }
 
+        let start = std::time::Instant::now();
+        info!(
+            state_file = %paths.state_file.display(),
+            "bootstrapping authority store from legacy state.json"
+        );
         let raw = fs::read_to_string(&paths.state_file).map_err(OrcasError::Io)?;
         let stored: StoredState = serde_json::from_str(&raw)?;
         let transaction = connection
@@ -1112,7 +1213,13 @@ impl AuthoritySqliteStore {
             META_JSON_IMPORT_COMPLETED_AT,
             &Utc::now().to_rfc3339(),
         )?;
-        Ok(())
+        info!(
+            state_file = %paths.state_file.display(),
+            import_status = "imported_workstreams_work_units",
+            duration_ms = start.elapsed().as_millis() as u64,
+            "authority bootstrap completed"
+        );
+        Ok("imported_workstreams_work_units".to_string())
     }
 
     fn has_existing_authority_data(connection: &Connection) -> OrcasResult<bool> {
@@ -1834,6 +1941,8 @@ impl AuthorityQueryStore for AuthoritySqliteStore {
     }
 
     async fn delete_plan(&self, target: &DeleteTarget) -> OrcasResult<Option<DeletePlan>> {
+        let start = std::time::Instant::now();
+        let target_summary = summarize_delete_target(target);
         self.with_connection(|connection| {
             let transaction = connection
                 .transaction()
@@ -1932,8 +2041,116 @@ impl AuthorityQueryStore for AuthoritySqliteStore {
             transaction
                 .commit()
                 .map_err(|error| store_error(format!("commit delete plan transaction: {error}")))?;
+            match &plan {
+                Some(plan) => debug!(
+                    aggregate_type = target_summary.aggregate_type,
+                    aggregate_id = target_summary.aggregate_id.as_str(),
+                    affected_work_units = plan.affected_work_units,
+                    affected_tracked_threads = plan.affected_tracked_threads,
+                    has_upstream_bindings = plan.has_upstream_bindings,
+                    requires_typed_confirmation = plan.requires_typed_confirmation,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "authority delete plan computed"
+                ),
+                None => debug!(
+                    aggregate_type = target_summary.aggregate_type,
+                    aggregate_id = target_summary.aggregate_id.as_str(),
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    "authority delete plan not found"
+                ),
+            }
             Ok(plan)
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MigrationOutcome {
+    schema_version: i64,
+    applied: bool,
+}
+
+struct CommandLogSummary {
+    aggregate_type: &'static str,
+    aggregate_id: String,
+}
+
+struct MutationLogSummary<'a> {
+    aggregate_type: &'static str,
+    aggregate_id: &'a str,
+    revision: u64,
+}
+
+fn summarize_command(command: &AuthorityCommand) -> CommandLogSummary {
+    let key = command.aggregate_key();
+    CommandLogSummary {
+        aggregate_type: aggregate_type_label(key.aggregate_type),
+        aggregate_id: key.aggregate_id,
+    }
+}
+
+fn summarize_mutation_result(result: &AuthorityMutationResult) -> MutationLogSummary<'_> {
+    match result {
+        AuthorityMutationResult::Workstream(record) => MutationLogSummary {
+            aggregate_type: "workstream",
+            aggregate_id: record.id.as_str(),
+            revision: record.revision.get(),
+        },
+        AuthorityMutationResult::WorkUnit(record) => MutationLogSummary {
+            aggregate_type: "work_unit",
+            aggregate_id: record.id.as_str(),
+            revision: record.revision.get(),
+        },
+        AuthorityMutationResult::TrackedThread(record) => MutationLogSummary {
+            aggregate_type: "tracked_thread",
+            aggregate_id: record.id.as_str(),
+            revision: record.revision.get(),
+        },
+    }
+}
+
+fn summarize_delete_target(target: &DeleteTarget) -> CommandLogSummary {
+    match target {
+        DeleteTarget::Workstream { workstream_id } => CommandLogSummary {
+            aggregate_type: "workstream",
+            aggregate_id: workstream_id.as_str().to_string(),
+        },
+        DeleteTarget::WorkUnit { work_unit_id } => CommandLogSummary {
+            aggregate_type: "work_unit",
+            aggregate_id: work_unit_id.as_str().to_string(),
+        },
+        DeleteTarget::TrackedThread { tracked_thread_id } => CommandLogSummary {
+            aggregate_type: "tracked_thread",
+            aggregate_id: tracked_thread_id.as_str().to_string(),
+        },
+    }
+}
+
+fn aggregate_type_label(aggregate_type: AggregateType) -> &'static str {
+    match aggregate_type {
+        AggregateType::Workstream => "workstream",
+        AggregateType::WorkUnit => "work_unit",
+        AggregateType::TrackedThread => "tracked_thread",
+    }
+}
+
+trait CommandKindLabel {
+    fn as_ref(&self) -> &'static str;
+}
+
+impl CommandKindLabel for authority::CommandKind {
+    fn as_ref(&self) -> &'static str {
+        match self {
+            authority::CommandKind::CreateWorkstream => "create_workstream",
+            authority::CommandKind::EditWorkstream => "edit_workstream",
+            authority::CommandKind::DeleteWorkstream => "delete_workstream",
+            authority::CommandKind::CreateWorkUnit => "create_work_unit",
+            authority::CommandKind::EditWorkUnit => "edit_work_unit",
+            authority::CommandKind::DeleteWorkUnit => "delete_work_unit",
+            authority::CommandKind::CreateTrackedThread => "create_tracked_thread",
+            authority::CommandKind::EditTrackedThread => "edit_tracked_thread",
+            authority::CommandKind::DeleteTrackedThread => "delete_tracked_thread",
+        }
     }
 }
 
