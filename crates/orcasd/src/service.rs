@@ -21728,6 +21728,10 @@ ORCAS_REPORT_END"#
                 },
             ))
             .await;
+        service
+            .refresh_codex_supervisor_state_for_thread(&thread.summary.id)
+            .await
+            .expect("refresh supervisor state after idle");
 
         let decisions = service
             .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
@@ -24434,6 +24438,10 @@ ORCAS_REPORT_END"#
                 },
             ))
             .await;
+        service
+            .refresh_codex_supervisor_state_for_thread(&thread.summary.id)
+            .await
+            .expect("refresh supervisor state after interrupt proposal");
 
         let stored = service
             .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
@@ -24485,6 +24493,10 @@ ORCAS_REPORT_END"#
                 },
             ))
             .await;
+        service
+            .refresh_codex_supervisor_state_for_thread(&thread.summary.id)
+            .await
+            .expect("refresh supervisor state after steer proposal");
 
         let stored = service
             .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {

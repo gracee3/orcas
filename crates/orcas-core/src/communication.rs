@@ -654,6 +654,7 @@ mod tests {
             expected_report_fields: vec!["summary".to_string()],
             boundedness_note: Some("Stay within the boundary.".to_string()),
             workspace_operation: None,
+            prune_workspace: None,
             landing_execution: None,
             mode_spec: AssignmentModeSpec::Implement(ImplementModeSpec {
                 expected_verification_commands: vec!["cargo test -p orcas-core".to_string()],
