@@ -111,5 +111,6 @@ That removes `target/e2e/` and nothing else.
 - `phased-fibonacci`
 - `live-worker-direct-patch`
 - `live-supervisor-micro-proposal`
+- `live-reject-redirect`
 
-The current migration keeps the existing behavior first, then opens the path for a truly live worker-turn scenario next.
+The current migration keeps the existing behavior first, then grows the live lane through worker execution, supervisor approval, and governed redirect flows.
