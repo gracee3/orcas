@@ -1,3 +1,4 @@
+mod delivery;
 mod http;
 mod store;
 

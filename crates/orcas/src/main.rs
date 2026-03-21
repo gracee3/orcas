@@ -36,11 +36,7 @@ struct GlobalOptions {
         help = "Override the upstream Codex app-server WebSocket URL"
     )]
     listen_url: Option<String>,
-    #[arg(
-        long,
-        global = true,
-        help = "Enable inbox mirroring to a server URL"
-    )]
+    #[arg(long, global = true, help = "Enable inbox mirroring to a server URL")]
     inbox_mirror_server_url: Option<String>,
     #[arg(
         long,

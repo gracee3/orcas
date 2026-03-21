@@ -1509,8 +1509,8 @@ impl AuthoritySqliteStore {
                     })?,
                     encode_datetime(checkpoint.updated_at),
                 ],
-        )
-        .map_err(map_sql_error)?;
+            )
+            .map_err(map_sql_error)?;
         Ok(())
     }
 

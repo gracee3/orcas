@@ -104,6 +104,21 @@ pub mod methods {
     pub const OPERATOR_NOTIFICATION_GET: &str = "operator_notification/get";
     pub const OPERATOR_NOTIFICATION_ACK: &str = "operator_notification/ack";
     pub const OPERATOR_NOTIFICATION_SUPPRESS: &str = "operator_notification/suppress";
+    pub const OPERATOR_NOTIFICATION_RECIPIENT_UPSERT: &str =
+        "operator_notification/recipient/upsert";
+    pub const OPERATOR_NOTIFICATION_RECIPIENT_LIST: &str = "operator_notification/recipient/list";
+    pub const OPERATOR_NOTIFICATION_SUBSCRIPTION_UPSERT: &str =
+        "operator_notification/subscription/upsert";
+    pub const OPERATOR_NOTIFICATION_SUBSCRIPTION_LIST: &str =
+        "operator_notification/subscription/list";
+    pub const OPERATOR_NOTIFICATION_SUBSCRIPTION_SET_ENABLED: &str =
+        "operator_notification/subscription/set_enabled";
+    pub const OPERATOR_NOTIFICATION_DELIVERY_JOB_LIST: &str =
+        "operator_notification/delivery_job/list";
+    pub const OPERATOR_NOTIFICATION_DELIVERY_JOB_GET: &str =
+        "operator_notification/delivery_job/get";
+    pub const OPERATOR_NOTIFICATION_DELIVERY_RUN_PENDING: &str =
+        "operator_notification/delivery/run_pending";
     pub const WORKSTREAM_PLAN_GET: &str = "workstream_plan/get";
     pub const WORKSTREAM_PLAN_LIST: &str = "workstream_plan/list";
     pub const PLAN_ASSESSMENT_LIST: &str = "plan_assessment/list";
@@ -708,6 +723,193 @@ pub struct OperatorNotificationSuppressRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorNotificationSuppressResponse {
     pub candidate: OperatorNotificationCandidate,
+}
+
+/// Transport families available to notification delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationTransportKind {
+    #[default]
+    Log,
+    Mock,
+    Webhook,
+    Apns,
+    Fcm,
+    WebPush,
+}
+
+/// A durable recipient identity for notification delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationRecipient {
+    pub recipient_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationRecipientUpsertRequest {
+    pub recipient_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationRecipientUpsertResponse {
+    pub recipient: NotificationRecipient,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationRecipientListRequest {
+    #[serde(default)]
+    pub include_disabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationRecipientListResponse {
+    pub recipients: Vec<NotificationRecipient>,
+}
+
+/// A durable notification subscription bound to a recipient.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationSubscription {
+    pub subscription_id: String,
+    pub recipient_id: String,
+    pub transport_kind: NotificationTransportKind,
+    pub endpoint: Value,
+    #[serde(default)]
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationSubscriptionUpsertRequest {
+    pub subscription_id: String,
+    pub recipient_id: String,
+    pub transport_kind: NotificationTransportKind,
+    #[serde(default)]
+    pub endpoint: Value,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationSubscriptionUpsertResponse {
+    pub subscription: NotificationSubscription,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationSubscriptionListRequest {
+    #[serde(default)]
+    pub recipient_id: Option<String>,
+    #[serde(default)]
+    pub enabled_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationSubscriptionListResponse {
+    pub subscriptions: Vec<NotificationSubscription>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationSubscriptionSetEnabledRequest {
+    pub subscription_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationSubscriptionSetEnabledResponse {
+    pub subscription: NotificationSubscription,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeliveryJob {
+    pub job_id: String,
+    pub origin_node_id: String,
+    pub candidate_id: String,
+    pub trigger_sequence: u64,
+    pub recipient_id: String,
+    pub subscription_id: String,
+    pub transport_kind: NotificationTransportKind,
+    pub status: NotificationDeliveryJobStatus,
+    pub attempt_count: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub dispatched_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub delivered_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub failed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub suppressed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub skipped_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub obsolete_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub receipt: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDeliveryJobStatus {
+    #[default]
+    Pending,
+    Dispatched,
+    Delivered,
+    Failed,
+    Suppressed,
+    Skipped,
+    Obsolete,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationDeliveryJobListRequest {
+    #[serde(default)]
+    pub origin_node_id: Option<String>,
+    #[serde(default)]
+    pub candidate_id: Option<String>,
+    #[serde(default)]
+    pub subscription_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<NotificationDeliveryJobStatus>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeliveryJobListResponse {
+    pub jobs: Vec<NotificationDeliveryJob>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeliveryJobGetRequest {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeliveryJobGetResponse {
+    pub job: Option<NotificationDeliveryJob>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeliveryRunPendingRequest {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub transport_kind: Option<NotificationTransportKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeliveryRunPendingResponse {
+    pub jobs: Vec<NotificationDeliveryJob>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

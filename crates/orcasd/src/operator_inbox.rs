@@ -8,14 +8,16 @@ use orcas_core::collaboration::{
     CollaborationState, PlanningSession, PlanningSessionStatus, SupervisorTurnDecision,
     SupervisorTurnDecisionStatus,
 };
+use orcas_core::ipc;
 use orcas_core::planning::{PlanRevisionProposal, PlanRevisionProposalStatus};
 use orcas_core::supervisor::SupervisorProposalRecord;
-use orcas_core::ipc;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
 #[cfg(test)]
 use chrono::TimeZone;
+#[cfg(test)]
+use orcas_core::WorkUnit;
 #[cfg(test)]
 use orcas_core::collaboration::PlanningSessionStructuredSummary;
 #[cfg(test)]
@@ -31,11 +33,9 @@ use orcas_core::supervisor::{
 };
 #[cfg(test)]
 use orcas_core::{
-    DecisionType, ReportConfidence, ReportDisposition, ReportParseResult, SupervisorTurnDecisionKind,
-    Workstream, WorkUnitStatus,
+    DecisionType, ReportConfidence, ReportDisposition, ReportParseResult,
+    SupervisorTurnDecisionKind, WorkUnitStatus, Workstream,
 };
-#[cfg(test)]
-use orcas_core::WorkUnit;
 
 pub fn rebuild_operator_inbox_state(
     collaboration: &CollaborationState,
@@ -279,20 +279,22 @@ pub fn resolve_operator_inbox_action_route(
     }
 
     match (item.source_kind, action_kind) {
-        (ipc::OperatorInboxSourceKind::SupervisorProposal, ipc::OperatorInboxActionKind::Approve) => {
-            Ok(ipc::OperatorInboxActionRoute::Proposal {
-                item_id: item.id.clone(),
-                proposal_id: item.actionable_object_id.clone(),
-                method: ipc::methods::PROPOSAL_APPROVE.to_string(),
-            })
-        }
-        (ipc::OperatorInboxSourceKind::SupervisorProposal, ipc::OperatorInboxActionKind::Reject) => {
-            Ok(ipc::OperatorInboxActionRoute::Proposal {
-                item_id: item.id.clone(),
-                proposal_id: item.actionable_object_id.clone(),
-                method: ipc::methods::PROPOSAL_REJECT.to_string(),
-            })
-        }
+        (
+            ipc::OperatorInboxSourceKind::SupervisorProposal,
+            ipc::OperatorInboxActionKind::Approve,
+        ) => Ok(ipc::OperatorInboxActionRoute::Proposal {
+            item_id: item.id.clone(),
+            proposal_id: item.actionable_object_id.clone(),
+            method: ipc::methods::PROPOSAL_APPROVE.to_string(),
+        }),
+        (
+            ipc::OperatorInboxSourceKind::SupervisorProposal,
+            ipc::OperatorInboxActionKind::Reject,
+        ) => Ok(ipc::OperatorInboxActionRoute::Proposal {
+            item_id: item.id.clone(),
+            proposal_id: item.actionable_object_id.clone(),
+            method: ipc::methods::PROPOSAL_REJECT.to_string(),
+        }),
         (
             ipc::OperatorInboxSourceKind::SupervisorDecision,
             ipc::OperatorInboxActionKind::ApproveAndSend,
@@ -339,27 +341,30 @@ pub fn resolve_operator_inbox_action_route(
                 method: ipc::methods::PLANNING_SESSION_REJECT.to_string(),
             })
         }
-        (ipc::OperatorInboxSourceKind::PlanningSession, ipc::OperatorInboxActionKind::Supersede) => {
-            Ok(ipc::OperatorInboxActionRoute::PlanningSession {
-                item_id: item.id.clone(),
-                session_id: item.actionable_object_id.clone(),
-                method: ipc::methods::PLANNING_SESSION_SUPERSEDE.to_string(),
-            })
-        }
-        (ipc::OperatorInboxSourceKind::PlanRevisionProposal, ipc::OperatorInboxActionKind::Approve) => {
-            Ok(ipc::OperatorInboxActionRoute::PlanRevisionProposal {
-                item_id: item.id.clone(),
-                proposal_id: item.actionable_object_id.clone(),
-                method: ipc::methods::PROPOSAL_APPROVE.to_string(),
-            })
-        }
-        (ipc::OperatorInboxSourceKind::PlanRevisionProposal, ipc::OperatorInboxActionKind::Reject) => {
-            Ok(ipc::OperatorInboxActionRoute::PlanRevisionProposal {
-                item_id: item.id.clone(),
-                proposal_id: item.actionable_object_id.clone(),
-                method: ipc::methods::PROPOSAL_REJECT.to_string(),
-            })
-        }
+        (
+            ipc::OperatorInboxSourceKind::PlanningSession,
+            ipc::OperatorInboxActionKind::Supersede,
+        ) => Ok(ipc::OperatorInboxActionRoute::PlanningSession {
+            item_id: item.id.clone(),
+            session_id: item.actionable_object_id.clone(),
+            method: ipc::methods::PLANNING_SESSION_SUPERSEDE.to_string(),
+        }),
+        (
+            ipc::OperatorInboxSourceKind::PlanRevisionProposal,
+            ipc::OperatorInboxActionKind::Approve,
+        ) => Ok(ipc::OperatorInboxActionRoute::PlanRevisionProposal {
+            item_id: item.id.clone(),
+            proposal_id: item.actionable_object_id.clone(),
+            method: ipc::methods::PROPOSAL_APPROVE.to_string(),
+        }),
+        (
+            ipc::OperatorInboxSourceKind::PlanRevisionProposal,
+            ipc::OperatorInboxActionKind::Reject,
+        ) => Ok(ipc::OperatorInboxActionRoute::PlanRevisionProposal {
+            item_id: item.id.clone(),
+            proposal_id: item.actionable_object_id.clone(),
+            method: ipc::methods::PROPOSAL_REJECT.to_string(),
+        }),
         (
             ipc::OperatorInboxSourceKind::PlanRevisionProposal,
             ipc::OperatorInboxActionKind::Reconcile,
@@ -1532,7 +1537,8 @@ mod tests {
             source_kind: Some(ipc::OperatorInboxSourceKind::PlanningSession),
             ..Default::default()
         };
-        let items = list_operator_inbox_items(&build_operator_inbox_state(&collaboration), &request);
+        let items =
+            list_operator_inbox_items(&build_operator_inbox_state(&collaboration), &request);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "planning_session::session-1");
     }
@@ -1543,12 +1549,20 @@ mod tests {
         let inbox = build_operator_inbox_state(&collaboration);
 
         let all_changes = operator_inbox_changes_after(&inbox, 0, None);
-        assert!(all_changes.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
+        assert!(
+            all_changes
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
         assert_eq!(all_changes, operator_inbox_changes_after(&inbox, 0, None));
 
         let partial = operator_inbox_changes_after(&inbox, 1, Some(2));
         assert!(partial.iter().all(|change| change.sequence > 1));
-        assert!(partial.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
+        assert!(
+            partial
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
     }
 
     #[tokio::test]
@@ -1556,12 +1570,8 @@ mod tests {
         let inbox = build_operator_inbox_state(&sample_collaboration());
         let (tx, rx) = watch::channel(inbox.checkpoint.clone());
         let waiter = tokio::spawn(async move {
-            wait_for_operator_inbox_checkpoint(
-                rx,
-                inbox.checkpoint.current_sequence,
-                Some(250),
-            )
-            .await
+            wait_for_operator_inbox_checkpoint(rx, inbox.checkpoint.current_sequence, Some(250))
+                .await
         });
 
         tx.send(ipc::OperatorInboxCheckpoint {
@@ -1582,12 +1592,9 @@ mod tests {
         let inbox = build_operator_inbox_state(&sample_collaboration());
         let (_, rx) = watch::channel(inbox.checkpoint.clone());
 
-        let result = wait_for_operator_inbox_checkpoint(
-            rx,
-            inbox.checkpoint.current_sequence,
-            Some(25),
-        )
-        .await;
+        let result =
+            wait_for_operator_inbox_checkpoint(rx, inbox.checkpoint.current_sequence, Some(25))
+                .await;
         assert!(result.is_err());
     }
 
@@ -1597,12 +1604,8 @@ mod tests {
         let base = build_operator_inbox_state(&initial_collaboration);
         let (tx, rx) = watch::channel(base.checkpoint.clone());
         let waiter = tokio::spawn(async move {
-            wait_for_operator_inbox_checkpoint(
-                rx,
-                base.checkpoint.current_sequence,
-                Some(500),
-            )
-            .await
+            wait_for_operator_inbox_checkpoint(rx, base.checkpoint.current_sequence, Some(500))
+                .await
         });
 
         let mut next_collaboration = initial_collaboration.clone();
@@ -1611,7 +1614,8 @@ mod tests {
             sample_supervisor_proposal_record(orcas_core::SupervisorProposalStatus::Approved),
         );
         let next = rebuild_operator_inbox_state(&next_collaboration, Some(&base));
-        tx.send(next.checkpoint.clone()).expect("advance checkpoint");
+        tx.send(next.checkpoint.clone())
+            .expect("advance checkpoint");
         let checkpoint = waiter.await.expect("join waiter").expect("wait succeeds");
         assert_eq!(checkpoint, next.checkpoint);
 
@@ -1621,11 +1625,7 @@ mod tests {
             "peer-loop",
             &checkpoint,
             base.checkpoint.current_sequence,
-            &operator_inbox_changes_after(
-                &next,
-                base.checkpoint.current_sequence,
-                None,
-            ),
+            &operator_inbox_changes_after(&next, base.checkpoint.current_sequence, None),
         )
         .expect("export");
         assert_eq!(export.last_exported_sequence, checkpoint.current_sequence);
@@ -1648,12 +1648,8 @@ mod tests {
         let inbox = build_operator_inbox_state(&sample_collaboration());
         let (tx, rx) = watch::channel(inbox.checkpoint.clone());
         let waiter = tokio::spawn(async move {
-            wait_for_operator_inbox_checkpoint(
-                rx,
-                inbox.checkpoint.current_sequence,
-                Some(500),
-            )
-            .await
+            wait_for_operator_inbox_checkpoint(rx, inbox.checkpoint.current_sequence, Some(500))
+                .await
         });
 
         tx.send(ipc::OperatorInboxCheckpoint {
@@ -1662,7 +1658,10 @@ mod tests {
         })
         .expect("advance 1");
         let first = waiter.await.expect("join waiter").expect("wait succeeds");
-        assert_eq!(first.current_sequence, inbox.checkpoint.current_sequence + 1);
+        assert_eq!(
+            first.current_sequence,
+            inbox.checkpoint.current_sequence + 1
+        );
 
         let rx = tx.subscribe();
         let waiter = tokio::spawn(async move {
@@ -1676,7 +1675,10 @@ mod tests {
         .expect("advance 2");
 
         let second = waiter.await.expect("join waiter").expect("wait succeeds");
-        assert_eq!(second.current_sequence, inbox.checkpoint.current_sequence + 2);
+        assert_eq!(
+            second.current_sequence,
+            inbox.checkpoint.current_sequence + 2
+        );
     }
 
     #[test]
@@ -1743,7 +1745,8 @@ mod tests {
             .planning_sessions
             .remove("session-passive");
         let next = rebuild_operator_inbox_state(&next_collaboration, Some(&base));
-        let incremental = operator_inbox_changes_after(&next, base.checkpoint.current_sequence, None);
+        let incremental =
+            operator_inbox_changes_after(&next, base.checkpoint.current_sequence, None);
 
         let projected = apply_inbox_changes(
             bootstrap_items
@@ -1777,10 +1780,10 @@ mod tests {
         let next = rebuild_operator_inbox_state(&next_collaboration, Some(&base));
         let changes = operator_inbox_changes_after(&next, base.checkpoint.current_sequence, None);
 
-        assert!(changes
-            .iter()
-            .any(|change| change.kind == ipc::OperatorInboxChangeKind::Removed
-                && change.item.id == "supervisor_proposal::proposal-1"));
+        assert!(changes.iter().any(
+            |change| change.kind == ipc::OperatorInboxChangeKind::Removed
+                && change.item.id == "supervisor_proposal::proposal-1"
+        ));
         let projected = apply_inbox_changes(
             base.items
                 .clone()
@@ -1803,12 +1806,10 @@ mod tests {
             initial.checkpoint.current_sequence,
             rebuilt.checkpoint.current_sequence
         );
-        assert!(operator_inbox_changes_after(
-            &rebuilt,
-            initial.checkpoint.current_sequence,
-            None
-        )
-        .is_empty());
+        assert!(
+            operator_inbox_changes_after(&rebuilt, initial.checkpoint.current_sequence, None)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1821,7 +1822,10 @@ mod tests {
         assert!(first_two[0].sequence < first_two[1].sequence);
 
         let tail = operator_inbox_changes_after(&inbox, first_two[1].sequence, None);
-        assert!(tail.iter().all(|change| change.sequence > first_two[1].sequence));
+        assert!(
+            tail.iter()
+                .all(|change| change.sequence > first_two[1].sequence)
+        );
         assert!(!tail.is_empty());
     }
 
@@ -1843,7 +1847,10 @@ mod tests {
             decoded.operator_inbox.checkpoint,
             stored.operator_inbox.checkpoint
         );
-        assert_eq!(decoded.operator_inbox.changes, stored.operator_inbox.changes);
+        assert_eq!(
+            decoded.operator_inbox.changes,
+            stored.operator_inbox.changes
+        );
     }
 
     #[test]
@@ -1855,8 +1862,16 @@ mod tests {
         let second_page = operator_inbox_changes_after(&inbox, first_page[0].sequence, Some(2));
 
         assert_eq!(first_page.len(), 1);
-        assert!(second_page.iter().all(|change| change.sequence > first_page[0].sequence));
-        assert!(!second_page.iter().any(|change| change.sequence == first_page[0].sequence));
+        assert!(
+            second_page
+                .iter()
+                .all(|change| change.sequence > first_page[0].sequence)
+        );
+        assert!(
+            !second_page
+                .iter()
+                .any(|change| change.sequence == first_page[0].sequence)
+        );
     }
 
     #[test]
@@ -1870,7 +1885,8 @@ mod tests {
             sample_supervisor_proposal_record(orcas_core::SupervisorProposalStatus::Approved),
         );
         let next = rebuild_operator_inbox_state(&next_collaboration, Some(&initial));
-        let changes = operator_inbox_changes_after(&next, initial.checkpoint.current_sequence, None);
+        let changes =
+            operator_inbox_changes_after(&next, initial.checkpoint.current_sequence, None);
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].kind, ipc::OperatorInboxChangeKind::Upsert);
@@ -1878,7 +1894,10 @@ mod tests {
             changes[0].item.id,
             "supervisor_proposal::proposal-1".to_string()
         );
-        assert_eq!(changes[0].item.status, ipc::OperatorInboxItemStatus::Resolved);
+        assert_eq!(
+            changes[0].item.status,
+            ipc::OperatorInboxItemStatus::Resolved
+        );
 
         let projected = apply_inbox_changes(
             initial
@@ -1899,11 +1918,9 @@ mod tests {
 
         let proposal = get_operator_inbox_item(&inbox, "supervisor_proposal::proposal-1")
             .expect("proposal item");
-        let route = resolve_operator_inbox_action_route(
-            &proposal,
-            ipc::OperatorInboxActionKind::Approve,
-        )
-        .expect("approve route");
+        let route =
+            resolve_operator_inbox_action_route(&proposal, ipc::OperatorInboxActionKind::Approve)
+                .expect("approve route");
         assert_eq!(
             route,
             ipc::OperatorInboxActionRoute::Proposal {
@@ -1913,11 +1930,9 @@ mod tests {
             }
         );
 
-        let route = resolve_operator_inbox_action_route(
-            &proposal,
-            ipc::OperatorInboxActionKind::Reject,
-        )
-        .expect("reject route");
+        let route =
+            resolve_operator_inbox_action_route(&proposal, ipc::OperatorInboxActionKind::Reject)
+                .expect("reject route");
         assert_eq!(
             route,
             ipc::OperatorInboxActionRoute::Proposal {
@@ -1959,8 +1974,9 @@ mod tests {
 
         let session = get_operator_inbox_item(&inbox, "planning_session::session-1")
             .expect("planning session item");
-        let route = resolve_operator_inbox_action_route(&session, ipc::OperatorInboxActionKind::Approve)
-            .expect("planning session approve route");
+        let route =
+            resolve_operator_inbox_action_route(&session, ipc::OperatorInboxActionKind::Approve)
+                .expect("planning session approve route");
         assert_eq!(
             route,
             ipc::OperatorInboxActionRoute::PlanningSession {
@@ -1970,11 +1986,9 @@ mod tests {
             }
         );
 
-        let route = resolve_operator_inbox_action_route(
-            &session,
-            ipc::OperatorInboxActionKind::Supersede,
-        )
-        .expect("planning session supersede route");
+        let route =
+            resolve_operator_inbox_action_route(&session, ipc::OperatorInboxActionKind::Supersede)
+                .expect("planning session supersede route");
         assert_eq!(
             route,
             ipc::OperatorInboxActionRoute::PlanningSession {
@@ -1986,11 +2000,9 @@ mod tests {
 
         let revision = get_operator_inbox_item(&inbox, "plan_revision_proposal::revision-1")
             .expect("revision item");
-        let route = resolve_operator_inbox_action_route(
-            &revision,
-            ipc::OperatorInboxActionKind::Reconcile,
-        )
-        .expect("reconcile route");
+        let route =
+            resolve_operator_inbox_action_route(&revision, ipc::OperatorInboxActionKind::Reconcile)
+                .expect("reconcile route");
         assert_eq!(
             route,
             ipc::OperatorInboxActionRoute::PlanRevisionProposal {
@@ -2001,9 +2013,8 @@ mod tests {
         );
 
         let mut retryable_collaboration = sample_collaboration();
-        let mut retryable_revision = sample_plan_revision_proposal(
-            PlanRevisionProposalStatus::ApplyFailed,
-            {
+        let mut retryable_revision =
+            sample_plan_revision_proposal(PlanRevisionProposalStatus::ApplyFailed, {
                 let mut recovery = orcas_core::planning::PlanRevisionRecoveryState::default();
                 recovery.phase = PlanRevisionApplyPhase::FailedBeforeDownstream;
                 recovery.failure_kind = Some(PlanRevisionApplyFailureKind::RetryableInfrastructure);
@@ -2012,8 +2023,7 @@ mod tests {
                 recovery.operator_intervention_required = false;
                 recovery.failure_message = Some("retryable".to_string());
                 recovery
-            },
-        );
+            });
         retryable_revision.proposal_id =
             orcas_core::planning::PlanRevisionProposalId::parse("revision-retry")
                 .expect("revision id");
@@ -2022,19 +2032,17 @@ mod tests {
             .revision_proposals
             .insert("revision-retry".to_string(), retryable_revision);
         let retryable_inbox = build_operator_inbox_state(&retryable_collaboration);
-        let retryable = get_operator_inbox_item(
-            &retryable_inbox,
-            "plan_revision_proposal::revision-retry",
-        )
-        .expect("retryable revision item");
-        assert!(retryable
-            .available_actions
-            .contains(&ipc::OperatorInboxActionKind::Retry));
-        let route = resolve_operator_inbox_action_route(
-            &retryable,
-            ipc::OperatorInboxActionKind::Retry,
-        )
-        .expect("retry route");
+        let retryable =
+            get_operator_inbox_item(&retryable_inbox, "plan_revision_proposal::revision-retry")
+                .expect("retryable revision item");
+        assert!(
+            retryable
+                .available_actions
+                .contains(&ipc::OperatorInboxActionKind::Retry)
+        );
+        let route =
+            resolve_operator_inbox_action_route(&retryable, ipc::OperatorInboxActionKind::Retry)
+                .expect("retry route");
         assert_eq!(
             route,
             ipc::OperatorInboxActionRoute::PlanRevisionProposal {
@@ -2054,7 +2062,15 @@ mod tests {
             .map(|change| change.item.id)
             .collect::<Vec<_>>();
 
-        assert!(!change_ids.iter().any(|id| id == "supervisor_proposal::proposal-passive"));
-        assert!(!change_ids.iter().any(|id| id == "planning_session::session-passive"));
+        assert!(
+            !change_ids
+                .iter()
+                .any(|id| id == "supervisor_proposal::proposal-passive")
+        );
+        assert!(
+            !change_ids
+                .iter()
+                .any(|id| id == "planning_session::session-passive")
+        );
     }
 }

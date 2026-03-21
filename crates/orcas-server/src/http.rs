@@ -7,8 +7,17 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use tracing::info;
 
+use crate::delivery::{LogNotificationDeliveryTransport, MockNotificationDeliveryTransport};
 use orcas_core::ipc::{
-    OperatorInboxMirrorApplyRequest, OperatorInboxMirrorApplyResponse,
+    NotificationDeliveryJobGetRequest, NotificationDeliveryJobGetResponse,
+    NotificationDeliveryJobListRequest, NotificationDeliveryJobListResponse,
+    NotificationDeliveryRunPendingRequest, NotificationDeliveryRunPendingResponse,
+    NotificationRecipientListRequest, NotificationRecipientListResponse,
+    NotificationRecipientUpsertRequest, NotificationRecipientUpsertResponse,
+    NotificationSubscriptionListRequest, NotificationSubscriptionListResponse,
+    NotificationSubscriptionSetEnabledRequest, NotificationSubscriptionSetEnabledResponse,
+    NotificationSubscriptionUpsertRequest, NotificationSubscriptionUpsertResponse,
+    NotificationTransportKind, OperatorInboxMirrorApplyRequest, OperatorInboxMirrorApplyResponse,
     OperatorInboxMirrorCheckpointQueryRequest, OperatorInboxMirrorCheckpointQueryResponse,
     OperatorInboxMirrorGetResponse, OperatorInboxMirrorListResponse,
     OperatorNotificationAckRequest, OperatorNotificationAckResponse,
@@ -70,6 +79,38 @@ impl InboxMirrorServer {
             .route(
                 "/operator-notifications/suppress",
                 post(suppress_notification_candidate),
+            )
+            .route(
+                "/operator-notifications/recipients/upsert",
+                post(upsert_notification_recipient),
+            )
+            .route(
+                "/operator-notifications/recipients/list",
+                post(list_notification_recipients),
+            )
+            .route(
+                "/operator-notifications/subscriptions/upsert",
+                post(upsert_notification_subscription),
+            )
+            .route(
+                "/operator-notifications/subscriptions/list",
+                post(list_notification_subscriptions),
+            )
+            .route(
+                "/operator-notifications/subscriptions/set_enabled",
+                post(set_notification_subscription_enabled),
+            )
+            .route(
+                "/operator-notifications/delivery-jobs/list",
+                post(list_notification_delivery_jobs),
+            )
+            .route(
+                "/operator-notifications/delivery-jobs/get",
+                post(get_notification_delivery_job),
+            )
+            .route(
+                "/operator-notifications/delivery/run_pending",
+                post(run_pending_notification_delivery_jobs),
             )
             .with_state(self.store);
         let bind_addr = listener.local_addr()?;
@@ -180,6 +221,105 @@ async fn suppress_notification_candidate(
     Ok(Json(response))
 }
 
+async fn upsert_notification_recipient(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<NotificationRecipientUpsertRequest>,
+) -> Result<Json<NotificationRecipientUpsertResponse>, String> {
+    let response = store
+        .upsert_notification_recipient(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn list_notification_recipients(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<NotificationRecipientListRequest>,
+) -> Result<Json<NotificationRecipientListResponse>, String> {
+    let response = store
+        .list_notification_recipients(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn upsert_notification_subscription(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<NotificationSubscriptionUpsertRequest>,
+) -> Result<Json<NotificationSubscriptionUpsertResponse>, String> {
+    let response = store
+        .upsert_notification_subscription(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn list_notification_subscriptions(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<NotificationSubscriptionListRequest>,
+) -> Result<Json<NotificationSubscriptionListResponse>, String> {
+    let response = store
+        .list_notification_subscriptions(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn set_notification_subscription_enabled(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<NotificationSubscriptionSetEnabledRequest>,
+) -> Result<Json<NotificationSubscriptionSetEnabledResponse>, String> {
+    let response = store
+        .set_notification_subscription_enabled(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn list_notification_delivery_jobs(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<NotificationDeliveryJobListRequest>,
+) -> Result<Json<NotificationDeliveryJobListResponse>, String> {
+    let response = store
+        .list_notification_delivery_jobs(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn get_notification_delivery_job(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<NotificationDeliveryJobGetRequest>,
+) -> Result<Json<NotificationDeliveryJobGetResponse>, String> {
+    let job = store
+        .get_notification_delivery_job(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(NotificationDeliveryJobGetResponse { job }))
+}
+
+async fn run_pending_notification_delivery_jobs(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<NotificationDeliveryRunPendingRequest>,
+) -> Result<Json<NotificationDeliveryRunPendingResponse>, String> {
+    let response = match request
+        .transport_kind
+        .unwrap_or(NotificationTransportKind::Log)
+    {
+        NotificationTransportKind::Log => store
+            .dispatch_pending_notification_delivery_jobs(
+                &LogNotificationDeliveryTransport,
+                request.limit,
+            )
+            .map_err(|error| error.to_string())?,
+        NotificationTransportKind::Mock => store
+            .dispatch_pending_notification_delivery_jobs(
+                &MockNotificationDeliveryTransport::default(),
+                request.limit,
+            )
+            .map_err(|error| error.to_string())?,
+        other => {
+            return Err(format!(
+                "notification delivery transport kind `{other:?}` is not supported by the local server"
+            ));
+        }
+    };
+    Ok(Json(response))
+}
+
 pub fn app(store: InboxMirrorStore) -> Router {
     Router::new()
         .route("/operator-inbox/mirror/apply", post(apply))
@@ -207,6 +347,38 @@ pub fn app(store: InboxMirrorStore) -> Router {
         .route(
             "/operator-notifications/suppress",
             post(suppress_notification_candidate),
+        )
+        .route(
+            "/operator-notifications/recipients/upsert",
+            post(upsert_notification_recipient),
+        )
+        .route(
+            "/operator-notifications/recipients/list",
+            post(list_notification_recipients),
+        )
+        .route(
+            "/operator-notifications/subscriptions/upsert",
+            post(upsert_notification_subscription),
+        )
+        .route(
+            "/operator-notifications/subscriptions/list",
+            post(list_notification_subscriptions),
+        )
+        .route(
+            "/operator-notifications/subscriptions/set_enabled",
+            post(set_notification_subscription_enabled),
+        )
+        .route(
+            "/operator-notifications/delivery-jobs/list",
+            post(list_notification_delivery_jobs),
+        )
+        .route(
+            "/operator-notifications/delivery-jobs/get",
+            post(get_notification_delivery_job),
+        )
+        .route(
+            "/operator-notifications/delivery/run_pending",
+            post(run_pending_notification_delivery_jobs),
         )
         .with_state(Arc::new(store))
 }

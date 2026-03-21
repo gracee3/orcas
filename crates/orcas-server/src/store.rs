@@ -3,7 +3,16 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use orcas_core::ipc::{
-    OperatorInboxChange, OperatorInboxCheckpoint, OperatorInboxItem, OperatorInboxMirrorCheckpoint,
+    NotificationDeliveryJob, NotificationDeliveryJobGetRequest, NotificationDeliveryJobListRequest,
+    NotificationDeliveryJobListResponse, NotificationDeliveryJobStatus,
+    NotificationDeliveryRunPendingResponse, NotificationRecipient,
+    NotificationRecipientListRequest, NotificationRecipientListResponse,
+    NotificationRecipientUpsertRequest, NotificationRecipientUpsertResponse,
+    NotificationSubscription, NotificationSubscriptionListRequest,
+    NotificationSubscriptionListResponse, NotificationSubscriptionSetEnabledRequest,
+    NotificationSubscriptionSetEnabledResponse, NotificationSubscriptionUpsertRequest,
+    NotificationSubscriptionUpsertResponse, NotificationTransportKind, OperatorInboxChange,
+    OperatorInboxCheckpoint, OperatorInboxItem, OperatorInboxMirrorCheckpoint,
     OperatorInboxMirrorListResponse, OperatorNotificationAckRequest,
     OperatorNotificationAckResponse, OperatorNotificationCandidate,
     OperatorNotificationCandidateStatus, OperatorNotificationGetRequest,
@@ -12,6 +21,9 @@ use orcas_core::ipc::{
 };
 use orcas_core::{OrcasError, OrcasResult};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
+
+use crate::delivery::{NotificationDeliveryContext, NotificationDeliveryTransport};
 
 const INITIAL_SCHEMA: &str = r#"
 create table if not exists mirrored_inbox_items (
@@ -56,6 +68,55 @@ create table if not exists mirrored_notification_windows (
   updated_at text not null,
   primary key (origin_node_id, item_id)
 );
+
+create table if not exists notification_recipients (
+  recipient_id text primary key,
+  display_name text not null,
+  enabled integer not null,
+  created_at text not null,
+  updated_at text not null
+);
+
+create table if not exists notification_subscriptions (
+  subscription_id text primary key,
+  recipient_id text not null,
+  transport_kind text not null,
+  endpoint_json text not null,
+  enabled integer not null,
+  created_at text not null,
+  updated_at text not null
+);
+
+create index if not exists notification_subscriptions_recipient_idx
+  on notification_subscriptions(recipient_id, enabled);
+
+create table if not exists notification_delivery_jobs (
+  job_id text primary key,
+  origin_node_id text not null,
+  candidate_id text not null,
+  trigger_sequence integer not null,
+  recipient_id text not null,
+  subscription_id text not null,
+  transport_kind text not null,
+  status text not null,
+  attempt_count integer not null,
+  created_at text not null,
+  updated_at text not null,
+  dispatched_at text,
+  delivered_at text,
+  failed_at text,
+  suppressed_at text,
+  skipped_at text,
+  obsolete_at text,
+  receipt_json text,
+  error_text text
+);
+
+create unique index if not exists notification_delivery_jobs_dedupe_idx
+  on notification_delivery_jobs(candidate_id, subscription_id, trigger_sequence);
+
+create index if not exists notification_delivery_jobs_status_idx
+  on notification_delivery_jobs(status, updated_at desc);
 "#;
 
 fn db_error(error: rusqlite::Error) -> OrcasError {
@@ -110,6 +171,761 @@ impl InboxMirrorStore {
             .optional()
             .map_err(db_error)?;
         Ok(checkpoint.unwrap_or_default())
+    }
+
+    fn load_recipient_tx(
+        transaction: &rusqlite::Transaction<'_>,
+        recipient_id: &str,
+    ) -> OrcasResult<Option<NotificationRecipient>> {
+        let mut statement = transaction
+            .prepare(
+                "select recipient_id, display_name, enabled, created_at, updated_at
+                 from notification_recipients where recipient_id = ?1",
+            )
+            .map_err(db_error)?;
+        let recipient = statement
+            .query_row(params![recipient_id], |row| Self::recipient_from_row(row))
+            .optional()
+            .map_err(db_error)?;
+        Ok(recipient)
+    }
+
+    fn recipient_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> Result<NotificationRecipient, rusqlite::Error> {
+        Ok(NotificationRecipient {
+            recipient_id: row.get::<_, String>(0)?,
+            display_name: row.get::<_, String>(1)?,
+            enabled: row.get::<_, i64>(2)? != 0,
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            updated_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+        })
+    }
+
+    fn load_subscription_tx(
+        transaction: &rusqlite::Transaction<'_>,
+        subscription_id: &str,
+    ) -> OrcasResult<Option<NotificationSubscription>> {
+        let mut statement = transaction
+            .prepare(
+                "select subscription_id, recipient_id, transport_kind, endpoint_json, enabled, created_at, updated_at
+                 from notification_subscriptions where subscription_id = ?1",
+            )
+            .map_err(db_error)?;
+        let subscription = statement
+            .query_row(params![subscription_id], |row| {
+                Self::subscription_from_row(row)
+            })
+            .optional()
+            .map_err(db_error)?;
+        Ok(subscription)
+    }
+
+    fn subscription_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> Result<NotificationSubscription, rusqlite::Error> {
+        Ok(NotificationSubscription {
+            subscription_id: row.get::<_, String>(0)?,
+            recipient_id: row.get::<_, String>(1)?,
+            transport_kind: Self::transport_kind_from_str(&row.get::<_, String>(2)?),
+            endpoint: serde_json::from_str(&row.get::<_, String>(3)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+            enabled: row.get::<_, i64>(4)? != 0,
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            updated_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+        })
+    }
+
+    fn load_delivery_job_tx(
+        transaction: &rusqlite::Transaction<'_>,
+        job_id: &str,
+    ) -> OrcasResult<Option<NotificationDeliveryJob>> {
+        let mut statement = transaction
+            .prepare(
+                "select job_id, origin_node_id, candidate_id, trigger_sequence, recipient_id, subscription_id, transport_kind, status, attempt_count, created_at, updated_at, dispatched_at, delivered_at, failed_at, suppressed_at, skipped_at, obsolete_at, receipt_json, error_text
+                 from notification_delivery_jobs where job_id = ?1",
+            )
+            .map_err(db_error)?;
+        let job = statement
+            .query_row(params![job_id], |row| Self::job_from_row(row))
+            .optional()
+            .map_err(db_error)?;
+        Ok(job)
+    }
+
+    fn job_from_row(row: &rusqlite::Row<'_>) -> Result<NotificationDeliveryJob, rusqlite::Error> {
+        let parse_ts = |index: usize| -> Result<DateTime<Utc>, rusqlite::Error> {
+            DateTime::parse_from_rfc3339(&row.get::<_, String>(index)?)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        index,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+        };
+        let parse_opt_ts = |index: usize| -> Result<Option<DateTime<Utc>>, rusqlite::Error> {
+            row.get::<_, Option<String>>(index)?
+                .map(|value| {
+                    DateTime::parse_from_rfc3339(&value)
+                        .map(|value| value.with_timezone(&Utc))
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                index,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                })
+                .transpose()
+        };
+        Ok(NotificationDeliveryJob {
+            job_id: row.get::<_, String>(0)?,
+            origin_node_id: row.get::<_, String>(1)?,
+            candidate_id: row.get::<_, String>(2)?,
+            trigger_sequence: row.get::<_, i64>(3)? as u64,
+            recipient_id: row.get::<_, String>(4)?,
+            subscription_id: row.get::<_, String>(5)?,
+            transport_kind: Self::transport_kind_from_str(&row.get::<_, String>(6)?),
+            status: Self::delivery_job_status_from_str(&row.get::<_, String>(7)?),
+            attempt_count: row.get::<_, i64>(8)? as u64,
+            created_at: parse_ts(9)?,
+            updated_at: parse_ts(10)?,
+            dispatched_at: parse_opt_ts(11)?,
+            delivered_at: parse_opt_ts(12)?,
+            failed_at: parse_opt_ts(13)?,
+            suppressed_at: parse_opt_ts(14)?,
+            skipped_at: parse_opt_ts(15)?,
+            obsolete_at: parse_opt_ts(16)?,
+            receipt: row
+                .get::<_, Option<String>>(17)?
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        17,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            error: row.get::<_, Option<String>>(18)?,
+        })
+    }
+
+    fn transport_kind_to_str(kind: NotificationTransportKind) -> &'static str {
+        match kind {
+            NotificationTransportKind::Log => "log",
+            NotificationTransportKind::Mock => "mock",
+            NotificationTransportKind::Webhook => "webhook",
+            NotificationTransportKind::Apns => "apns",
+            NotificationTransportKind::Fcm => "fcm",
+            NotificationTransportKind::WebPush => "web_push",
+        }
+    }
+
+    fn transport_kind_from_str(kind: &str) -> NotificationTransportKind {
+        match kind {
+            "mock" => NotificationTransportKind::Mock,
+            "webhook" => NotificationTransportKind::Webhook,
+            "apns" => NotificationTransportKind::Apns,
+            "fcm" => NotificationTransportKind::Fcm,
+            "web_push" => NotificationTransportKind::WebPush,
+            _ => NotificationTransportKind::Log,
+        }
+    }
+
+    fn delivery_job_status_to_str(status: NotificationDeliveryJobStatus) -> &'static str {
+        match status {
+            NotificationDeliveryJobStatus::Pending => "pending",
+            NotificationDeliveryJobStatus::Dispatched => "dispatched",
+            NotificationDeliveryJobStatus::Delivered => "delivered",
+            NotificationDeliveryJobStatus::Failed => "failed",
+            NotificationDeliveryJobStatus::Suppressed => "suppressed",
+            NotificationDeliveryJobStatus::Skipped => "skipped",
+            NotificationDeliveryJobStatus::Obsolete => "obsolete",
+        }
+    }
+
+    fn delivery_job_status_from_str(status: &str) -> NotificationDeliveryJobStatus {
+        match status {
+            "dispatched" => NotificationDeliveryJobStatus::Dispatched,
+            "delivered" => NotificationDeliveryJobStatus::Delivered,
+            "failed" => NotificationDeliveryJobStatus::Failed,
+            "suppressed" => NotificationDeliveryJobStatus::Suppressed,
+            "skipped" => NotificationDeliveryJobStatus::Skipped,
+            "obsolete" => NotificationDeliveryJobStatus::Obsolete,
+            _ => NotificationDeliveryJobStatus::Pending,
+        }
+    }
+
+    fn delivery_job_id(
+        origin_node_id: &str,
+        candidate_id: &str,
+        subscription_id: &str,
+        trigger_sequence: u64,
+    ) -> String {
+        format!("{origin_node_id}::{candidate_id}::{subscription_id}::{trigger_sequence}")
+    }
+
+    fn enqueue_delivery_jobs_for_recipient_tx(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        recipient_id: &str,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<()> {
+        let mut statement = transaction
+            .prepare(
+                "select subscription_id from notification_subscriptions where recipient_id = ?1 and enabled = 1",
+            )
+            .map_err(db_error)?;
+        let mut rows = statement.query(params![recipient_id]).map_err(db_error)?;
+        while let Some(row) = rows.next().map_err(db_error)? {
+            let subscription_id = row.get::<_, String>(0).map_err(db_error)?;
+            self.enqueue_delivery_jobs_for_subscription_tx(transaction, &subscription_id, now)?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_delivery_jobs_for_candidate_tx(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        candidate: &OperatorNotificationCandidate,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<()> {
+        if candidate.status != OperatorNotificationCandidateStatus::Pending {
+            return Ok(());
+        }
+        let mut statement = transaction
+            .prepare(
+                "select subscription_id, recipient_id, transport_kind, endpoint_json, enabled, created_at, updated_at
+                 from notification_subscriptions
+                 where enabled = 1
+                 order by subscription_id asc",
+            )
+            .map_err(db_error)?;
+        let mut rows = statement.query([]).map_err(db_error)?;
+        while let Some(row) = rows.next().map_err(db_error)? {
+            let subscription = Self::subscription_from_row(row).map_err(db_error)?;
+            let recipient =
+                Self::load_recipient_tx(transaction, subscription.recipient_id.as_str())?
+                    .ok_or_else(|| {
+                        OrcasError::Store("notification recipient not found".to_string())
+                    })?;
+            if !recipient.enabled {
+                continue;
+            }
+            self.upsert_delivery_job_for_candidate_tx(
+                transaction,
+                candidate,
+                &recipient,
+                &subscription,
+                now,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_delivery_jobs_for_subscription_tx(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        subscription_id: &str,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<()> {
+        let subscription = Self::load_subscription_tx(transaction, subscription_id)?
+            .ok_or_else(|| OrcasError::Store("notification subscription not found".to_string()))?;
+        if !subscription.enabled {
+            return Ok(());
+        }
+        let recipient =
+            Self::load_recipient_tx(transaction, subscription.recipient_id.as_str())?
+                .ok_or_else(|| OrcasError::Store("notification recipient not found".to_string()))?;
+        if !recipient.enabled {
+            return Ok(());
+        }
+        let mut statement = transaction
+            .prepare(
+                "select candidate_id, origin_node_id, item_id, trigger_sequence, candidate_status, item_json, created_at, updated_at, acknowledged_at, suppressed_at, resolved_at, obsolete_at
+                 from mirrored_notification_candidates
+                 where candidate_status = ?1",
+            )
+            .map_err(db_error)?;
+        let mut rows = statement
+            .query(params![Self::candidate_status_to_str(
+                OperatorNotificationCandidateStatus::Pending
+            )])
+            .map_err(db_error)?;
+        while let Some(row) = rows.next().map_err(db_error)? {
+            let candidate = Self::candidate_from_row(row).map_err(db_error)?;
+            self.upsert_delivery_job_for_candidate_tx(
+                transaction,
+                &candidate,
+                &recipient,
+                &subscription,
+                now,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn disable_delivery_jobs_for_recipient_tx(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        recipient_id: &str,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<()> {
+        transaction
+            .execute(
+                "update notification_delivery_jobs
+                 set status = ?2,
+                     updated_at = ?3,
+                     suppressed_at = coalesce(suppressed_at, ?3)
+                 where recipient_id = ?1
+                   and status in (?4, ?5, ?6, ?7)",
+                params![
+                    recipient_id,
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Suppressed),
+                    now.to_rfc3339(),
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Pending),
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Dispatched),
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Failed),
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Skipped),
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    fn disable_delivery_jobs_for_subscription_tx(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        subscription_id: &str,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<()> {
+        transaction
+            .execute(
+                "update notification_delivery_jobs
+                 set status = ?2,
+                     updated_at = ?3,
+                     suppressed_at = coalesce(suppressed_at, ?3)
+                 where subscription_id = ?1
+                   and status in (?4, ?5, ?6, ?7)",
+                params![
+                    subscription_id,
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Suppressed),
+                    now.to_rfc3339(),
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Pending),
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Dispatched),
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Failed),
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Skipped),
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    fn mark_delivery_jobs_for_candidate_status_tx(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        candidate_id: &str,
+        status: NotificationDeliveryJobStatus,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<()> {
+        let timestamp_column = match status {
+            NotificationDeliveryJobStatus::Suppressed => Some("suppressed_at"),
+            NotificationDeliveryJobStatus::Obsolete => Some("obsolete_at"),
+            _ => None,
+        };
+        let Some(timestamp_column) = timestamp_column else {
+            return Ok(());
+        };
+        let sql_status = Self::delivery_job_status_to_str(status);
+        let sql = format!(
+            "update notification_delivery_jobs
+             set status = ?2,
+                 updated_at = ?3,
+                 {timestamp_column} = coalesce({timestamp_column}, ?3)
+             where candidate_id = ?1
+               and status in (?4, ?5, ?6, ?7)"
+        );
+        transaction
+            .execute(
+                sql.as_str(),
+                params![
+                    candidate_id,
+                    sql_status,
+                    now.to_rfc3339(),
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Pending),
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Dispatched),
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Failed),
+                    Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Skipped),
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    fn upsert_delivery_job_for_candidate_tx(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        candidate: &OperatorNotificationCandidate,
+        recipient: &NotificationRecipient,
+        subscription: &NotificationSubscription,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<()> {
+        if candidate.status != OperatorNotificationCandidateStatus::Pending {
+            return Ok(());
+        }
+        let job_id = Self::delivery_job_id(
+            candidate.origin_node_id.as_str(),
+            candidate.candidate_id.as_str(),
+            subscription.subscription_id.as_str(),
+            candidate.trigger_sequence,
+        );
+        let existing = Self::load_delivery_job_tx(transaction, job_id.as_str())?;
+        match existing {
+            Some(job)
+                if matches!(
+                    job.status,
+                    NotificationDeliveryJobStatus::Pending | NotificationDeliveryJobStatus::Skipped
+                ) =>
+            {
+                transaction
+                    .execute(
+                        "update notification_delivery_jobs
+                     set status = ?3,
+                         updated_at = ?4,
+                         recipient_id = ?5,
+                         transport_kind = ?6,
+                         dispatched_at = null,
+                         delivered_at = null,
+                         failed_at = null,
+                         suppressed_at = null,
+                         skipped_at = null,
+                         obsolete_at = null,
+                         error_text = null,
+                         receipt_json = null
+                     where job_id = ?1 and candidate_id = ?2",
+                        params![
+                            job_id,
+                            candidate.candidate_id.as_str(),
+                            Self::delivery_job_status_to_str(
+                                NotificationDeliveryJobStatus::Pending
+                            ),
+                            now.to_rfc3339(),
+                            recipient.recipient_id.as_str(),
+                            Self::transport_kind_to_str(subscription.transport_kind),
+                        ],
+                    )
+                    .map_err(db_error)?;
+            }
+            Some(_) => {}
+            None => {
+                transaction.execute(
+            "insert into notification_delivery_jobs(job_id, origin_node_id, candidate_id, trigger_sequence, recipient_id, subscription_id, transport_kind, status, attempt_count, created_at, updated_at, dispatched_at, delivered_at, failed_at, suppressed_at, skipped_at, obsolete_at, receipt_json, error_text)
+                     values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, null, null, null, null, null, null, null, null)",
+                    params![
+                        job_id,
+                        candidate.origin_node_id.as_str(),
+                        candidate.candidate_id.as_str(),
+                        candidate.trigger_sequence as i64,
+                        recipient.recipient_id.as_str(),
+                        subscription.subscription_id.as_str(),
+                        Self::transport_kind_to_str(subscription.transport_kind),
+                        Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Pending),
+                        now.to_rfc3339(),
+                        now.to_rfc3339(),
+                    ],
+                ).map_err(db_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn update_delivery_job_status_tx(
+        transaction: &rusqlite::Transaction<'_>,
+        job_id: &str,
+        status: NotificationDeliveryJobStatus,
+        updated_at: DateTime<Utc>,
+        attempt_count_delta: i64,
+        dispatched_at: Option<DateTime<Utc>>,
+        delivered_at: Option<DateTime<Utc>>,
+        failed_at: Option<DateTime<Utc>>,
+        suppressed_at: Option<DateTime<Utc>>,
+        skipped_at: Option<DateTime<Utc>>,
+        obsolete_at: Option<DateTime<Utc>>,
+        receipt: Option<Value>,
+        error: Option<String>,
+    ) -> OrcasResult<()> {
+        transaction
+            .execute(
+                "update notification_delivery_jobs
+                 set status = ?2,
+                     attempt_count = attempt_count + ?3,
+                     updated_at = ?4,
+                     dispatched_at = coalesce(?5, dispatched_at),
+                     delivered_at = coalesce(?6, delivered_at),
+                     failed_at = coalesce(?7, failed_at),
+                     suppressed_at = coalesce(?8, suppressed_at),
+                     skipped_at = coalesce(?9, skipped_at),
+                     obsolete_at = coalesce(?10, obsolete_at),
+                     receipt_json = coalesce(?11, receipt_json),
+                     error_text = coalesce(?12, error_text)
+                 where job_id = ?1",
+                params![
+                    job_id,
+                    Self::delivery_job_status_to_str(status),
+                    attempt_count_delta,
+                    updated_at.to_rfc3339(),
+                    dispatched_at.map(|value| value.to_rfc3339()),
+                    delivered_at.map(|value| value.to_rfc3339()),
+                    failed_at.map(|value| value.to_rfc3339()),
+                    suppressed_at.map(|value| value.to_rfc3339()),
+                    skipped_at.map(|value| value.to_rfc3339()),
+                    obsolete_at.map(|value| value.to_rfc3339()),
+                    receipt.map(|value| value.to_string()),
+                    error,
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    fn dispatch_job_tx<T: NotificationDeliveryTransport + ?Sized>(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        transport: &T,
+        job: NotificationDeliveryJob,
+        candidate: Option<OperatorNotificationCandidate>,
+        subscription: Option<NotificationSubscription>,
+        recipient: Option<NotificationRecipient>,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<NotificationDeliveryJob> {
+        let candidate = match candidate {
+            Some(candidate) => candidate,
+            None => {
+                Self::update_delivery_job_status_tx(
+                    transaction,
+                    job.job_id.as_str(),
+                    NotificationDeliveryJobStatus::Obsolete,
+                    now,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(now),
+                    None,
+                    Some("mirrored notification candidate missing".to_string()),
+                )?;
+                return Self::load_delivery_job_tx(transaction, job.job_id.as_str())?.ok_or_else(
+                    || OrcasError::Store("delivery job disappeared during update".to_string()),
+                );
+            }
+        };
+        let subscription = match subscription {
+            Some(subscription) if subscription.enabled => subscription,
+            _ => {
+                Self::update_delivery_job_status_tx(
+                    transaction,
+                    job.job_id.as_str(),
+                    NotificationDeliveryJobStatus::Skipped,
+                    now,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(now),
+                    None,
+                    None,
+                    Some("notification subscription unavailable or disabled".to_string()),
+                )?;
+                return Self::load_delivery_job_tx(transaction, job.job_id.as_str())?.ok_or_else(
+                    || OrcasError::Store("delivery job disappeared during update".to_string()),
+                );
+            }
+        };
+        let recipient = match recipient {
+            Some(recipient) if recipient.enabled => recipient,
+            _ => {
+                Self::update_delivery_job_status_tx(
+                    transaction,
+                    job.job_id.as_str(),
+                    NotificationDeliveryJobStatus::Skipped,
+                    now,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(now),
+                    None,
+                    None,
+                    Some("notification recipient unavailable or disabled".to_string()),
+                )?;
+                return Self::load_delivery_job_tx(transaction, job.job_id.as_str())?.ok_or_else(
+                    || OrcasError::Store("delivery job disappeared during update".to_string()),
+                );
+            }
+        };
+        match candidate.status {
+            OperatorNotificationCandidateStatus::Pending => {}
+            OperatorNotificationCandidateStatus::Acknowledged
+            | OperatorNotificationCandidateStatus::Suppressed => {
+                Self::update_delivery_job_status_tx(
+                    transaction,
+                    job.job_id.as_str(),
+                    NotificationDeliveryJobStatus::Suppressed,
+                    now,
+                    0,
+                    None,
+                    None,
+                    None,
+                    Some(now),
+                    None,
+                    None,
+                    None,
+                    Some("notification candidate was acknowledged or suppressed".to_string()),
+                )?;
+                return Self::load_delivery_job_tx(transaction, job.job_id.as_str())?.ok_or_else(
+                    || OrcasError::Store("delivery job disappeared during update".to_string()),
+                );
+            }
+            OperatorNotificationCandidateStatus::Obsolete => {
+                Self::update_delivery_job_status_tx(
+                    transaction,
+                    job.job_id.as_str(),
+                    NotificationDeliveryJobStatus::Obsolete,
+                    now,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(now),
+                    None,
+                    Some("notification candidate is obsolete".to_string()),
+                )?;
+                return Self::load_delivery_job_tx(transaction, job.job_id.as_str())?.ok_or_else(
+                    || OrcasError::Store("delivery job disappeared during update".to_string()),
+                );
+            }
+        }
+
+        Self::update_delivery_job_status_tx(
+            transaction,
+            job.job_id.as_str(),
+            NotificationDeliveryJobStatus::Dispatched,
+            now,
+            1,
+            Some(now),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let updated_job = Self::load_delivery_job_tx(transaction, job.job_id.as_str())?
+            .ok_or_else(|| {
+                OrcasError::Store("delivery job disappeared during update".to_string())
+            })?;
+        let context = NotificationDeliveryContext {
+            job: &updated_job,
+            candidate: &candidate,
+            recipient: &recipient,
+            subscription: &subscription,
+        };
+        let outcome = transport.dispatch(&context);
+        let final_status = match outcome.status {
+            NotificationDeliveryJobStatus::Delivered
+            | NotificationDeliveryJobStatus::Failed
+            | NotificationDeliveryJobStatus::Suppressed
+            | NotificationDeliveryJobStatus::Skipped
+            | NotificationDeliveryJobStatus::Obsolete => outcome.status,
+            NotificationDeliveryJobStatus::Pending | NotificationDeliveryJobStatus::Dispatched => {
+                NotificationDeliveryJobStatus::Failed
+            }
+        };
+        let now = Utc::now();
+        Self::update_delivery_job_status_tx(
+            transaction,
+            job.job_id.as_str(),
+            final_status,
+            now,
+            0,
+            None,
+            if final_status == NotificationDeliveryJobStatus::Delivered {
+                Some(now)
+            } else {
+                None
+            },
+            if final_status == NotificationDeliveryJobStatus::Failed {
+                Some(now)
+            } else {
+                None
+            },
+            if final_status == NotificationDeliveryJobStatus::Suppressed {
+                Some(now)
+            } else {
+                None
+            },
+            if final_status == NotificationDeliveryJobStatus::Skipped {
+                Some(now)
+            } else {
+                None
+            },
+            if final_status == NotificationDeliveryJobStatus::Obsolete {
+                Some(now)
+            } else {
+                None
+            },
+            outcome.receipt,
+            outcome.error,
+        )?;
+        Self::load_delivery_job_tx(transaction, job.job_id.as_str())?
+            .ok_or_else(|| OrcasError::Store("delivery job disappeared during update".to_string()))
     }
 
     pub fn list(
@@ -385,6 +1201,12 @@ impl InboxMirrorStore {
                 ));
             }
         };
+        self.mark_delivery_jobs_for_candidate_status_tx(
+            &transaction,
+            request.candidate_id.as_str(),
+            NotificationDeliveryJobStatus::Suppressed,
+            next.updated_at,
+        )?;
         transaction.commit().map_err(db_error)?;
         Ok(OperatorNotificationAckResponse { candidate: next })
     }
@@ -427,8 +1249,338 @@ impl InboxMirrorStore {
                 ));
             }
         };
+        self.mark_delivery_jobs_for_candidate_status_tx(
+            &transaction,
+            request.candidate_id.as_str(),
+            NotificationDeliveryJobStatus::Suppressed,
+            next.updated_at,
+        )?;
         transaction.commit().map_err(db_error)?;
         Ok(OperatorNotificationSuppressResponse { candidate: next })
+    }
+
+    pub fn upsert_notification_recipient(
+        &self,
+        request: &NotificationRecipientUpsertRequest,
+    ) -> OrcasResult<NotificationRecipientUpsertResponse> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        let now = Utc::now();
+        transaction.execute(
+            "insert into notification_recipients(recipient_id, display_name, enabled, created_at, updated_at)
+             values(?1, ?2, ?3, ?4, ?5)
+             on conflict(recipient_id) do update set
+               display_name = excluded.display_name,
+               enabled = excluded.enabled,
+               updated_at = excluded.updated_at",
+            params![
+                request.recipient_id.as_str(),
+                request.display_name.as_str(),
+                request.enabled as i64,
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        ).map_err(db_error)?;
+        let recipient = Self::load_recipient_tx(&transaction, request.recipient_id.as_str())?
+            .expect("recipient just upserted");
+        if recipient.enabled {
+            self.enqueue_delivery_jobs_for_recipient_tx(
+                &transaction,
+                recipient.recipient_id.as_str(),
+                now,
+            )?;
+        } else {
+            self.disable_delivery_jobs_for_recipient_tx(
+                &transaction,
+                recipient.recipient_id.as_str(),
+                now,
+            )?;
+        }
+        transaction.commit().map_err(db_error)?;
+        Ok(NotificationRecipientUpsertResponse { recipient })
+    }
+
+    pub fn list_notification_recipients(
+        &self,
+        request: &NotificationRecipientListRequest,
+    ) -> OrcasResult<NotificationRecipientListResponse> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let mut statement = connection
+            .prepare(
+                "select recipient_id, display_name, enabled, created_at, updated_at
+                 from notification_recipients
+                 order by updated_at desc, recipient_id asc",
+            )
+            .map_err(db_error)?;
+        let mut rows = statement.query([]).map_err(db_error)?;
+        let mut recipients = Vec::new();
+        while let Some(row) = rows.next().map_err(db_error)? {
+            let recipient = Self::recipient_from_row(row).map_err(db_error)?;
+            if !request.include_disabled && !recipient.enabled {
+                continue;
+            }
+            recipients.push(recipient);
+        }
+        Ok(NotificationRecipientListResponse { recipients })
+    }
+
+    pub fn upsert_notification_subscription(
+        &self,
+        request: &NotificationSubscriptionUpsertRequest,
+    ) -> OrcasResult<NotificationSubscriptionUpsertResponse> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        let now = Utc::now();
+        transaction.execute(
+            "insert into notification_subscriptions(subscription_id, recipient_id, transport_kind, endpoint_json, enabled, created_at, updated_at)
+             values(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             on conflict(subscription_id) do update set
+               recipient_id = excluded.recipient_id,
+               transport_kind = excluded.transport_kind,
+               endpoint_json = excluded.endpoint_json,
+               enabled = excluded.enabled,
+               updated_at = excluded.updated_at",
+            params![
+                request.subscription_id.as_str(),
+                request.recipient_id.as_str(),
+                Self::transport_kind_to_str(request.transport_kind),
+                request.endpoint.to_string(),
+                request.enabled as i64,
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        ).map_err(db_error)?;
+        let subscription =
+            Self::load_subscription_tx(&transaction, request.subscription_id.as_str())?
+                .expect("subscription just upserted");
+        if subscription.enabled {
+            self.enqueue_delivery_jobs_for_subscription_tx(
+                &transaction,
+                subscription.subscription_id.as_str(),
+                now,
+            )?;
+        } else {
+            self.disable_delivery_jobs_for_subscription_tx(
+                &transaction,
+                subscription.subscription_id.as_str(),
+                now,
+            )?;
+        }
+        transaction.commit().map_err(db_error)?;
+        Ok(NotificationSubscriptionUpsertResponse { subscription })
+    }
+
+    pub fn list_notification_subscriptions(
+        &self,
+        request: &NotificationSubscriptionListRequest,
+    ) -> OrcasResult<NotificationSubscriptionListResponse> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let mut statement = connection
+            .prepare(
+                "select subscription_id, recipient_id, transport_kind, endpoint_json, enabled, created_at, updated_at
+                 from notification_subscriptions
+                 order by updated_at desc, subscription_id asc",
+            )
+            .map_err(db_error)?;
+        let mut rows = statement.query([]).map_err(db_error)?;
+        let mut subscriptions = Vec::new();
+        while let Some(row) = rows.next().map_err(db_error)? {
+            let subscription = Self::subscription_from_row(row).map_err(db_error)?;
+            if let Some(recipient_id) = request.recipient_id.as_ref() {
+                if subscription.recipient_id != *recipient_id {
+                    continue;
+                }
+            }
+            if request.enabled_only && !subscription.enabled {
+                continue;
+            }
+            subscriptions.push(subscription);
+        }
+        Ok(NotificationSubscriptionListResponse { subscriptions })
+    }
+
+    pub fn set_notification_subscription_enabled(
+        &self,
+        request: &NotificationSubscriptionSetEnabledRequest,
+    ) -> OrcasResult<NotificationSubscriptionSetEnabledResponse> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        let now = Utc::now();
+        transaction.execute(
+            "update notification_subscriptions set enabled = ?2, updated_at = ?3 where subscription_id = ?1",
+            params![
+                request.subscription_id.as_str(),
+                request.enabled as i64,
+                now.to_rfc3339(),
+            ],
+        ).map_err(db_error)?;
+        let subscription =
+            Self::load_subscription_tx(&transaction, request.subscription_id.as_str())?
+                .ok_or_else(|| {
+                    OrcasError::Store("notification subscription not found".to_string())
+                })?;
+        if subscription.enabled {
+            self.enqueue_delivery_jobs_for_subscription_tx(
+                &transaction,
+                subscription.subscription_id.as_str(),
+                now,
+            )?;
+        } else {
+            self.disable_delivery_jobs_for_subscription_tx(
+                &transaction,
+                subscription.subscription_id.as_str(),
+                now,
+            )?;
+        }
+        transaction.commit().map_err(db_error)?;
+        Ok(NotificationSubscriptionSetEnabledResponse { subscription })
+    }
+
+    pub fn list_notification_delivery_jobs(
+        &self,
+        request: &NotificationDeliveryJobListRequest,
+    ) -> OrcasResult<NotificationDeliveryJobListResponse> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let mut statement = connection
+            .prepare(
+            "select job_id, origin_node_id, candidate_id, trigger_sequence, recipient_id, subscription_id, transport_kind, status, attempt_count, created_at, updated_at, dispatched_at, delivered_at, failed_at, suppressed_at, skipped_at, obsolete_at, receipt_json, error_text
+                 from notification_delivery_jobs
+                 order by updated_at desc, job_id asc",
+            )
+            .map_err(db_error)?;
+        let mut rows = statement.query([]).map_err(db_error)?;
+        let mut jobs = Vec::new();
+        while let Some(row) = rows.next().map_err(db_error)? {
+            let job = Self::job_from_row(row).map_err(db_error)?;
+            if let Some(origin) = request.origin_node_id.as_ref() {
+                if job.origin_node_id != *origin {
+                    continue;
+                }
+            }
+            if let Some(candidate_id) = request.candidate_id.as_ref() {
+                if job.candidate_id != *candidate_id {
+                    continue;
+                }
+            }
+            if let Some(subscription_id) = request.subscription_id.as_ref() {
+                if job.subscription_id != *subscription_id {
+                    continue;
+                }
+            }
+            if let Some(status) = request.status {
+                if job.status != status {
+                    continue;
+                }
+            }
+            jobs.push(job);
+        }
+        if let Some(limit) = request.limit {
+            jobs.truncate(limit);
+        }
+        Ok(NotificationDeliveryJobListResponse { jobs })
+    }
+
+    pub fn get_notification_delivery_job(
+        &self,
+        request: &NotificationDeliveryJobGetRequest,
+    ) -> OrcasResult<Option<NotificationDeliveryJob>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let mut statement = connection
+            .prepare(
+            "select job_id, origin_node_id, candidate_id, trigger_sequence, recipient_id, subscription_id, transport_kind, status, attempt_count, created_at, updated_at, dispatched_at, delivered_at, failed_at, suppressed_at, skipped_at, obsolete_at, receipt_json, error_text
+                 from notification_delivery_jobs where job_id = ?1",
+            )
+            .map_err(db_error)?;
+        let job = statement
+            .query_row(params![request.job_id.as_str()], |row| {
+                Self::job_from_row(row)
+            })
+            .optional()
+            .map_err(db_error)?;
+        Ok(job)
+    }
+
+    pub fn dispatch_pending_notification_delivery_jobs<
+        T: NotificationDeliveryTransport + ?Sized,
+    >(
+        &self,
+        transport: &T,
+        limit: Option<usize>,
+    ) -> OrcasResult<NotificationDeliveryRunPendingResponse> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        let transport_kind = Self::transport_kind_to_str(transport.kind());
+        let mut statement = transaction
+            .prepare(
+            "select job_id, origin_node_id, candidate_id, trigger_sequence, recipient_id, subscription_id, transport_kind, status, attempt_count, created_at, updated_at, dispatched_at, delivered_at, failed_at, suppressed_at, skipped_at, obsolete_at, receipt_json, error_text
+                 from notification_delivery_jobs where status = ?1 and transport_kind = ?2 order by created_at asc, job_id asc",
+            )
+            .map_err(db_error)?;
+        let mut rows = statement
+            .query(params![
+                Self::delivery_job_status_to_str(NotificationDeliveryJobStatus::Pending),
+                transport_kind,
+            ])
+            .map_err(db_error)?;
+        let mut jobs = Vec::new();
+        while let Some(row) = rows.next().map_err(db_error)? {
+            let job = Self::job_from_row(row).map_err(db_error)?;
+            let candidate = Self::load_notification_candidate_tx(
+                &transaction,
+                job.origin_node_id.as_str(),
+                job.candidate_id.as_str(),
+            )?;
+            let subscription =
+                Self::load_subscription_tx(&transaction, job.subscription_id.as_str())?;
+            let recipient = subscription.as_ref().and_then(|subscription| {
+                Self::load_recipient_tx(&transaction, subscription.recipient_id.as_str())
+                    .ok()
+                    .flatten()
+            });
+            let updated = self.dispatch_job_tx(
+                &transaction,
+                transport,
+                job,
+                candidate,
+                subscription,
+                recipient,
+                Utc::now(),
+            )?;
+            jobs.push(updated);
+            if let Some(limit) = limit {
+                if jobs.len() >= limit {
+                    break;
+                }
+            }
+        }
+        drop(rows);
+        drop(statement);
+        transaction.commit().map_err(db_error)?;
+        Ok(NotificationDeliveryRunPendingResponse { jobs })
     }
 
     fn load_checkpoint_tx(
@@ -658,6 +1810,23 @@ impl InboxMirrorStore {
                         changed_at,
                     )?;
                 }
+                let candidate_id = existing_window
+                    .as_ref()
+                    .map(|(candidate_id, _)| candidate_id.clone())
+                    .unwrap_or_else(|| {
+                        Self::notification_candidate_id(origin_node_id, item.id.as_str(), sequence)
+                    });
+                if let Some(candidate) = Self::load_notification_candidate_tx(
+                    transaction,
+                    origin_node_id,
+                    candidate_id.as_str(),
+                )? {
+                    self.enqueue_delivery_jobs_for_candidate_tx(
+                        transaction,
+                        &candidate,
+                        changed_at,
+                    )?;
+                }
             }
             (true, true) => {
                 let item =
@@ -679,6 +1848,21 @@ impl InboxMirrorStore {
                         sequence,
                         changed_at,
                     )?;
+                }
+                if let Some((candidate_id, _)) =
+                    Self::load_notification_window_tx(transaction, origin_node_id, item_id)?
+                {
+                    if let Some(candidate) = Self::load_notification_candidate_tx(
+                        transaction,
+                        origin_node_id,
+                        candidate_id.as_str(),
+                    )? {
+                        self.enqueue_delivery_jobs_for_candidate_tx(
+                            transaction,
+                            &candidate,
+                            changed_at,
+                        )?;
+                    }
                 }
             }
             (true, false) => {
@@ -827,6 +2011,12 @@ impl InboxMirrorStore {
                 )
                 .map_err(db_error)?;
         }
+        self.mark_delivery_jobs_for_candidate_status_tx(
+            transaction,
+            candidate_id.as_str(),
+            NotificationDeliveryJobStatus::Obsolete,
+            changed_at,
+        )?;
         transaction.execute(
             "delete from mirrored_notification_windows where origin_node_id = ?1 and item_id = ?2",
             params![origin_node_id, item_id],
@@ -882,12 +2072,17 @@ impl InboxMirrorStore {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
+    use crate::delivery::{MockNotificationDeliveryTransport, NotificationDeliveryOutcome};
     use orcas_core::ipc::{
-        OperatorInboxActionKind, OperatorInboxChange, OperatorInboxChangeKind, OperatorInboxItem,
-        OperatorInboxItemStatus, OperatorInboxSourceKind,
+        NotificationDeliveryJobListRequest, NotificationDeliveryJobStatus,
+        NotificationRecipientUpsertRequest, NotificationSubscriptionUpsertRequest,
+        NotificationTransportKind, OperatorInboxActionKind, OperatorInboxChange,
+        OperatorInboxChangeKind, OperatorInboxItem, OperatorInboxItemStatus,
+        OperatorInboxSourceKind,
     };
 
     fn ts(offset: i64) -> chrono::DateTime<Utc> {
@@ -941,6 +2136,45 @@ mod tests {
             status: None,
             pending_only: false,
             actionable_only: false,
+            limit: None,
+        }
+    }
+
+    fn recipient_request(
+        recipient_id: &str,
+        display_name: &str,
+        enabled: bool,
+    ) -> NotificationRecipientUpsertRequest {
+        NotificationRecipientUpsertRequest {
+            recipient_id: recipient_id.to_string(),
+            display_name: display_name.to_string(),
+            enabled,
+        }
+    }
+
+    fn subscription_request(
+        subscription_id: &str,
+        recipient_id: &str,
+        transport_kind: NotificationTransportKind,
+        enabled: bool,
+    ) -> NotificationSubscriptionUpsertRequest {
+        NotificationSubscriptionUpsertRequest {
+            subscription_id: subscription_id.to_string(),
+            recipient_id: recipient_id.to_string(),
+            transport_kind,
+            endpoint: json!({
+                "endpoint": format!("https://example.invalid/{subscription_id}"),
+            }),
+            enabled,
+        }
+    }
+
+    fn delivery_jobs_request(origin_node_id: &str) -> NotificationDeliveryJobListRequest {
+        NotificationDeliveryJobListRequest {
+            origin_node_id: Some(origin_node_id.to_string()),
+            candidate_id: None,
+            subscription_id: None,
+            status: None,
             limit: None,
         }
     }
@@ -1238,6 +2472,357 @@ mod tests {
             .notification_candidates(&open_notification_request(origin))
             .expect("candidates");
         assert!(candidates.candidates.is_empty());
+    }
+
+    #[test]
+    fn pending_candidates_create_jobs_for_enabled_subscriptions() {
+        let dir = tempdir().expect("tempdir");
+        let store = InboxMirrorStore::open(dir.path().join("server.db")).expect("store");
+        let origin = "origin-a";
+
+        store
+            .upsert_notification_recipient(&recipient_request("recipient-1", "Recipient 1", true))
+            .expect("recipient");
+        store
+            .apply_batch(
+                origin,
+                OperatorInboxCheckpoint::default(),
+                &[change(
+                    1,
+                    OperatorInboxChangeKind::Upsert,
+                    item("proposal-1", 1, "one", ts(1)),
+                )],
+            )
+            .expect("apply");
+
+        store
+            .upsert_notification_subscription(&subscription_request(
+                "subscription-1",
+                "recipient-1",
+                NotificationTransportKind::Mock,
+                true,
+            ))
+            .expect("subscription 1");
+        store
+            .upsert_notification_subscription(&subscription_request(
+                "subscription-2",
+                "recipient-1",
+                NotificationTransportKind::Log,
+                true,
+            ))
+            .expect("subscription 2");
+
+        let jobs = store
+            .list_notification_delivery_jobs(&delivery_jobs_request(origin))
+            .expect("jobs");
+        assert_eq!(jobs.jobs.len(), 2);
+        assert!(
+            jobs.jobs
+                .iter()
+                .all(|job| job.status == NotificationDeliveryJobStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn candidate_snapshot_updates_do_not_duplicate_delivery_jobs() {
+        let dir = tempdir().expect("tempdir");
+        let store = InboxMirrorStore::open(dir.path().join("server.db")).expect("store");
+        let origin = "origin-a";
+
+        store
+            .upsert_notification_recipient(&recipient_request("recipient-1", "Recipient 1", true))
+            .expect("recipient");
+        store
+            .upsert_notification_subscription(&subscription_request(
+                "subscription-1",
+                "recipient-1",
+                NotificationTransportKind::Mock,
+                true,
+            ))
+            .expect("subscription");
+
+        store
+            .apply_batch(
+                origin,
+                OperatorInboxCheckpoint::default(),
+                &[change(
+                    1,
+                    OperatorInboxChangeKind::Upsert,
+                    item("proposal-1", 1, "one", ts(1)),
+                )],
+            )
+            .expect("apply first");
+        store
+            .apply_batch(
+                origin,
+                store.checkpoint(origin).expect("checkpoint"),
+                &[change(
+                    2,
+                    OperatorInboxChangeKind::Upsert,
+                    item("proposal-1", 2, "one-updated", ts(2)),
+                )],
+            )
+            .expect("apply update");
+
+        let jobs = store
+            .list_notification_delivery_jobs(&delivery_jobs_request(origin))
+            .expect("jobs");
+        assert_eq!(jobs.jobs.len(), 1);
+        assert_eq!(
+            jobs.jobs[0].candidate_id,
+            format!("{origin}::proposal-1::1")
+        );
+        assert_eq!(jobs.jobs[0].status, NotificationDeliveryJobStatus::Pending);
+    }
+
+    #[test]
+    fn acknowledged_candidates_suppress_pending_delivery_jobs() {
+        let dir = tempdir().expect("tempdir");
+        let store = InboxMirrorStore::open(dir.path().join("server.db")).expect("store");
+        let origin = "origin-a";
+
+        store
+            .upsert_notification_recipient(&recipient_request("recipient-1", "Recipient 1", true))
+            .expect("recipient");
+        store
+            .upsert_notification_subscription(&subscription_request(
+                "subscription-1",
+                "recipient-1",
+                NotificationTransportKind::Mock,
+                true,
+            ))
+            .expect("subscription");
+        store
+            .apply_batch(
+                origin,
+                OperatorInboxCheckpoint::default(),
+                &[change(
+                    1,
+                    OperatorInboxChangeKind::Upsert,
+                    item("proposal-1", 1, "one", ts(1)),
+                )],
+            )
+            .expect("apply");
+
+        let candidate_id = format!("{origin}::proposal-1::1");
+        store
+            .acknowledge_notification_candidate(&OperatorNotificationAckRequest {
+                origin_node_id: origin.to_string(),
+                candidate_id: candidate_id.clone(),
+            })
+            .expect("ack");
+
+        let jobs = store
+            .list_notification_delivery_jobs(&delivery_jobs_request(origin))
+            .expect("jobs");
+        assert_eq!(jobs.jobs.len(), 1);
+        assert_eq!(
+            jobs.jobs[0].status,
+            NotificationDeliveryJobStatus::Suppressed
+        );
+
+        let pending = store
+            .dispatch_pending_notification_delivery_jobs(
+                &MockNotificationDeliveryTransport::default(),
+                None,
+            )
+            .expect("dispatch");
+        assert!(pending.jobs.is_empty());
+    }
+
+    #[test]
+    fn reopened_items_create_new_delivery_windows() {
+        let dir = tempdir().expect("tempdir");
+        let store = InboxMirrorStore::open(dir.path().join("server.db")).expect("store");
+        let origin = "origin-a";
+
+        store
+            .upsert_notification_recipient(&recipient_request("recipient-1", "Recipient 1", true))
+            .expect("recipient");
+        store
+            .upsert_notification_subscription(&subscription_request(
+                "subscription-1",
+                "recipient-1",
+                NotificationTransportKind::Mock,
+                true,
+            ))
+            .expect("subscription");
+        store
+            .apply_batch(
+                origin,
+                OperatorInboxCheckpoint::default(),
+                &[
+                    change(
+                        1,
+                        OperatorInboxChangeKind::Upsert,
+                        item("proposal-1", 1, "one", ts(1)),
+                    ),
+                    change(
+                        2,
+                        OperatorInboxChangeKind::Upsert,
+                        resolved_item("proposal-1", 2, "one", ts(2)),
+                    ),
+                    change(
+                        3,
+                        OperatorInboxChangeKind::Upsert,
+                        item("proposal-1", 3, "reopened", ts(3)),
+                    ),
+                ],
+            )
+            .expect("apply");
+
+        let jobs = store
+            .list_notification_delivery_jobs(&delivery_jobs_request(origin))
+            .expect("jobs");
+        assert_eq!(jobs.jobs.len(), 2);
+        assert!(
+            jobs.jobs
+                .iter()
+                .any(|job| job.status == NotificationDeliveryJobStatus::Obsolete
+                    && job.trigger_sequence == 1)
+        );
+        assert!(
+            jobs.jobs
+                .iter()
+                .any(|job| job.status == NotificationDeliveryJobStatus::Pending
+                    && job.trigger_sequence == 3)
+        );
+    }
+
+    #[test]
+    fn disabled_subscriptions_do_not_receive_new_delivery_jobs() {
+        let dir = tempdir().expect("tempdir");
+        let store = InboxMirrorStore::open(dir.path().join("server.db")).expect("store");
+        let origin = "origin-a";
+
+        store
+            .upsert_notification_recipient(&recipient_request("recipient-1", "Recipient 1", true))
+            .expect("recipient");
+        store
+            .upsert_notification_subscription(&subscription_request(
+                "subscription-1",
+                "recipient-1",
+                NotificationTransportKind::Mock,
+                false,
+            ))
+            .expect("subscription");
+        store
+            .apply_batch(
+                origin,
+                OperatorInboxCheckpoint::default(),
+                &[change(
+                    1,
+                    OperatorInboxChangeKind::Upsert,
+                    item("proposal-1", 1, "one", ts(1)),
+                )],
+            )
+            .expect("apply");
+
+        let jobs = store
+            .list_notification_delivery_jobs(&delivery_jobs_request(origin))
+            .expect("jobs");
+        assert!(jobs.jobs.is_empty());
+    }
+
+    #[test]
+    fn mock_dispatch_updates_job_status_predictably() {
+        let dir = tempdir().expect("tempdir");
+        let store = InboxMirrorStore::open(dir.path().join("server.db")).expect("store");
+        let origin = "origin-a";
+
+        store
+            .upsert_notification_recipient(&recipient_request("recipient-1", "Recipient 1", true))
+            .expect("recipient");
+        store
+            .upsert_notification_subscription(&subscription_request(
+                "subscription-1",
+                "recipient-1",
+                NotificationTransportKind::Mock,
+                true,
+            ))
+            .expect("subscription");
+        store
+            .apply_batch(
+                origin,
+                OperatorInboxCheckpoint::default(),
+                &[change(
+                    1,
+                    OperatorInboxChangeKind::Upsert,
+                    item("proposal-1", 1, "one", ts(1)),
+                )],
+            )
+            .expect("apply");
+
+        let candidate_id = format!("{origin}::proposal-1::1");
+        let job_id = format!("{origin}::{}::subscription-1::1", candidate_id);
+        let transport = MockNotificationDeliveryTransport::default();
+        transport.set_job_outcome(job_id.clone(), NotificationDeliveryOutcome::failed("boom"));
+        let result = store
+            .dispatch_pending_notification_delivery_jobs(&transport, None)
+            .expect("dispatch");
+        assert_eq!(result.jobs.len(), 1);
+        assert_eq!(result.jobs[0].job_id, job_id);
+        assert_eq!(result.jobs[0].status, NotificationDeliveryJobStatus::Failed);
+        assert_eq!(result.jobs[0].attempt_count, 1);
+        assert_eq!(result.jobs[0].error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn delivery_jobs_persist_across_restart() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("server.db");
+        let origin = "origin-a";
+
+        let store = InboxMirrorStore::open(&path).expect("store");
+        store
+            .upsert_notification_recipient(&recipient_request("recipient-1", "Recipient 1", true))
+            .expect("recipient");
+        store
+            .upsert_notification_subscription(&subscription_request(
+                "subscription-1",
+                "recipient-1",
+                NotificationTransportKind::Mock,
+                true,
+            ))
+            .expect("subscription");
+        store
+            .apply_batch(
+                origin,
+                OperatorInboxCheckpoint::default(),
+                &[change(
+                    1,
+                    OperatorInboxChangeKind::Upsert,
+                    item("proposal-1", 1, "one", ts(1)),
+                )],
+            )
+            .expect("apply");
+
+        let candidate_id = format!("{origin}::proposal-1::1");
+        let job_id = format!("{origin}::{}::subscription-1::1", candidate_id);
+        let result = store
+            .dispatch_pending_notification_delivery_jobs(
+                &MockNotificationDeliveryTransport::with_job_outcome(
+                    job_id.clone(),
+                    NotificationDeliveryOutcome::delivered(Some(json!({
+                        "persisted": true,
+                    }))),
+                ),
+                None,
+            )
+            .expect("dispatch");
+        assert_eq!(result.jobs.len(), 1);
+        drop(store);
+
+        let reopened = InboxMirrorStore::open(&path).expect("reopen");
+        let jobs = reopened
+            .list_notification_delivery_jobs(&delivery_jobs_request(origin))
+            .expect("jobs");
+        assert_eq!(jobs.jobs.len(), 1);
+        assert_eq!(
+            jobs.jobs[0].status,
+            NotificationDeliveryJobStatus::Delivered
+        );
+        assert!(jobs.jobs[0].receipt.is_some());
     }
 
     #[test]

@@ -47,7 +47,11 @@ impl OperatorInboxMirrorHttpClient {
             .json::<OperatorInboxMirrorCheckpointQueryResponse>()
             .await
             .map_err(|error| OrcasError::Transport(error.to_string()))?;
-        debug!(origin_node_id, sequence = response.checkpoint.current_sequence, "mirror checkpoint fetched");
+        debug!(
+            origin_node_id,
+            sequence = response.checkpoint.current_sequence,
+            "mirror checkpoint fetched"
+        );
         Ok(response)
     }
 
@@ -70,10 +74,7 @@ impl OperatorInboxMirrorHttpClient {
         Ok(response)
     }
 
-    pub async fn list(
-        &self,
-        origin_node_id: &str,
-    ) -> OrcasResult<OperatorInboxMirrorListResponse> {
+    pub async fn list(&self, origin_node_id: &str) -> OrcasResult<OperatorInboxMirrorListResponse> {
         let response = self
             .client
             .get(self.url(&format!("operator-inbox/{origin_node_id}/items")))
