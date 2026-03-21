@@ -79,6 +79,8 @@ use crate::landing_execution::landing_execution_matches_authorization_basis;
 use crate::merge_prep::assess_merge_prep;
 use crate::operator_inbox::{
     build_operator_inbox_state, get_operator_inbox_item, list_operator_inbox_items,
+    operator_inbox_changes_after, operator_inbox_checkpoint, rebuild_operator_inbox_state,
+    resolve_operator_inbox_action_route,
 };
 use crate::planning_session::{
     build_planning_revision_proposal, build_research_work_unit,
@@ -104,6 +106,7 @@ struct DaemonState {
     turns: HashMap<TurnKey, ipc::TurnStateView>,
     recent_thread_id: Option<String>,
     collaboration: CollaborationState,
+    operator_inbox: ipc::OperatorInboxState,
 }
 
 #[derive(Debug, Default)]
@@ -156,6 +159,7 @@ impl Default for DaemonState {
             turns: HashMap::new(),
             recent_thread_id: None,
             collaboration: CollaborationState::default(),
+            operator_inbox: ipc::OperatorInboxState::default(),
         }
     }
 }
@@ -424,6 +428,14 @@ impl OrcasDaemonService {
                 .max_by_key(|thread| thread.summary.updated_at)
                 .map(|thread| thread.summary.id.clone());
             state.collaboration = stored.collaboration;
+            state.operator_inbox = if stored.operator_inbox.items.is_empty()
+                && stored.operator_inbox.changes.is_empty()
+                && stored.operator_inbox.checkpoint.current_sequence == 0
+            {
+                build_operator_inbox_state(&state.collaboration)
+            } else {
+                stored.operator_inbox
+            };
             bootstrap_persist = Self::bootstrap_planning_state(&mut state.collaboration);
         }
         self.reconcile_worker_session_tracked_thread_bindings()
@@ -976,6 +988,21 @@ impl OrcasDaemonService {
                 let params: ipc::OperatorInboxGetRequest =
                     Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.operator_inbox_get(params).await?)?
+            }
+            ipc::methods::OPERATOR_INBOX_CHECKPOINT => {
+                let params: ipc::OperatorInboxCheckpointRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.operator_inbox_checkpoint(params).await?)?
+            }
+            ipc::methods::OPERATOR_INBOX_CHANGES => {
+                let params: ipc::OperatorInboxChangesRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.operator_inbox_changes(params).await?)?
+            }
+            ipc::methods::OPERATOR_INBOX_ACTION_ROUTE => {
+                let params: ipc::OperatorInboxActionRouteRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.operator_inbox_action_route(params).await?)?
             }
             ipc::methods::WORKSTREAM_PLAN_GET => {
                 let params: ipc::WorkstreamPlanGetRequest =
@@ -3626,7 +3653,7 @@ impl OrcasDaemonService {
     ) -> OrcasResult<ipc::OperatorInboxListResponse> {
         let state = self.state.read().await;
         Ok(ipc::OperatorInboxListResponse {
-            items: list_operator_inbox_items(&state.collaboration, &params),
+            items: list_operator_inbox_items(&state.operator_inbox, &params),
         })
     }
 
@@ -3634,11 +3661,51 @@ impl OrcasDaemonService {
         &self,
         params: ipc::OperatorInboxGetRequest,
     ) -> OrcasResult<ipc::OperatorInboxGetResponse> {
-        let item = get_operator_inbox_item(&self.state.read().await.collaboration, &params.item_id)
+        let item = get_operator_inbox_item(&self.state.read().await.operator_inbox, &params.item_id)
             .ok_or_else(|| {
                 OrcasError::Protocol(format!("unknown operator inbox item `{}`", params.item_id))
             })?;
         Ok(ipc::OperatorInboxGetResponse { item })
+    }
+
+    async fn operator_inbox_checkpoint(
+        &self,
+        _: ipc::OperatorInboxCheckpointRequest,
+    ) -> OrcasResult<ipc::OperatorInboxCheckpointResponse> {
+        let checkpoint = {
+            let state = self.state.read().await;
+            operator_inbox_checkpoint(&state.operator_inbox)
+        };
+        Ok(ipc::OperatorInboxCheckpointResponse { checkpoint })
+    }
+
+    async fn operator_inbox_changes(
+        &self,
+        params: ipc::OperatorInboxChangesRequest,
+    ) -> OrcasResult<ipc::OperatorInboxChangesResponse> {
+        let state = self.state.read().await;
+        let checkpoint = operator_inbox_checkpoint(&state.operator_inbox);
+        let changes = operator_inbox_changes_after(
+            &state.operator_inbox,
+            params.after_sequence,
+            params.limit,
+        );
+        Ok(ipc::OperatorInboxChangesResponse { checkpoint, changes })
+    }
+
+    async fn operator_inbox_action_route(
+        &self,
+        params: ipc::OperatorInboxActionRouteRequest,
+    ) -> OrcasResult<ipc::OperatorInboxActionRouteResponse> {
+        let item = {
+            let state = self.state.read().await;
+            get_operator_inbox_item(&state.operator_inbox, &params.item_id).ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown operator inbox item `{}`", params.item_id))
+            })?
+        };
+        let route = resolve_operator_inbox_action_route(&item, params.action_kind)
+            .map_err(OrcasError::Protocol)?;
+        Ok(ipc::OperatorInboxActionRouteResponse { route })
     }
 
     async fn planning_session_create(
@@ -11543,6 +11610,7 @@ impl OrcasDaemonService {
         let active_thread = Self::focus_thread_view(&state, &threads);
         let session = state.session.clone();
         let collaboration_state = state.collaboration.clone();
+        let operator_inbox = state.operator_inbox.clone();
         drop(state);
         // `state/get` is now a collaboration-first snapshot plus explicit assignment-compatibility
         // bridges. Authority planning hierarchy reads come from authority queries, not from this
@@ -11550,8 +11618,6 @@ impl OrcasDaemonService {
         // been tombstoned, even though the legacy collaboration copy may still exist on disk.
         let bridge_metadata = self.bridge_snapshot_metadata(&collaboration_state).await?;
         let collaboration = Self::collaboration_snapshot(&collaboration_state, &bridge_metadata);
-        let operator_inbox = build_operator_inbox_state(&collaboration_state);
-
         Ok(ipc::StateSnapshot {
             daemon,
             session,
@@ -13268,7 +13334,10 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
 
     async fn persist_state_snapshot(&self) -> OrcasResult<()> {
         let stored = {
-            let state = self.state.read().await;
+            let mut state = self.state.write().await;
+            let operator_inbox =
+                rebuild_operator_inbox_state(&state.collaboration, Some(&state.operator_inbox));
+            state.operator_inbox = operator_inbox.clone();
             let registry = ThreadRegistry {
                 threads: state
                     .threads
@@ -13299,7 +13368,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     .map(|turn| (format!("{}::{}", turn.thread_id, turn.turn_id), turn))
                     .collect::<BTreeMap<_, _>>(),
                 collaboration: state.collaboration.clone(),
-                operator_inbox: build_operator_inbox_state(&state.collaboration),
+                operator_inbox,
             }
         };
         let result = self.store.save(&stored).await;

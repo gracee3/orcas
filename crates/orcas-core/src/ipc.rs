@@ -91,6 +91,9 @@ pub mod methods {
     pub const AUTHORITY_EVENTS_REPLAY: &str = "authority/events/replay";
     pub const OPERATOR_INBOX_LIST: &str = "operator_inbox/list";
     pub const OPERATOR_INBOX_GET: &str = "operator_inbox/get";
+    pub const OPERATOR_INBOX_CHECKPOINT: &str = "operator_inbox/checkpoint";
+    pub const OPERATOR_INBOX_CHANGES: &str = "operator_inbox/changes";
+    pub const OPERATOR_INBOX_ACTION_ROUTE: &str = "operator_inbox/action_route";
     pub const WORKSTREAM_PLAN_GET: &str = "workstream_plan/get";
     pub const WORKSTREAM_PLAN_LIST: &str = "workstream_plan/list";
     pub const PLAN_ASSESSMENT_LIST: &str = "plan_assessment/list";
@@ -326,6 +329,15 @@ pub enum OperatorInboxActionKind {
     MarkReadyForReview,
 }
 
+/// Kind of mutation route a derived inbox action resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorInboxChangeKind {
+    #[default]
+    Upsert,
+    Removed,
+}
+
 /// A single derived operator-actionable item.
 ///
 /// The item id is stable and derived from the source record identity so the
@@ -333,6 +345,7 @@ pub enum OperatorInboxActionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorInboxItem {
     pub id: String,
+    pub sequence: u64,
     pub source_kind: OperatorInboxSourceKind,
     pub actionable_object_id: String,
     #[serde(default)]
@@ -355,11 +368,40 @@ pub struct OperatorInboxItem {
     pub provenance: Option<String>,
 }
 
+/// A durable checkpoint for the derived inbox read model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorInboxCheckpoint {
+    pub current_sequence: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Default for OperatorInboxCheckpoint {
+    fn default() -> Self {
+        Self {
+            current_sequence: 0,
+            updated_at: Utc::now(),
+        }
+    }
+}
+
+/// A durable incremental change for the inbox projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorInboxChange {
+    pub sequence: u64,
+    pub kind: OperatorInboxChangeKind,
+    pub item: OperatorInboxItem,
+    pub changed_at: DateTime<Utc>,
+}
+
 /// Persisted local state for the derived operator inbox projection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorInboxState {
     #[serde(default)]
     pub items: Vec<OperatorInboxItem>,
+    #[serde(default)]
+    pub checkpoint: OperatorInboxCheckpoint,
+    #[serde(default)]
+    pub changes: Vec<OperatorInboxChange>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -393,6 +435,68 @@ pub struct OperatorInboxGetRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorInboxGetResponse {
     pub item: OperatorInboxItem,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorInboxCheckpointRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxCheckpointResponse {
+    pub checkpoint: OperatorInboxCheckpoint,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorInboxChangesRequest {
+    #[serde(default)]
+    pub after_sequence: u64,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxChangesResponse {
+    pub checkpoint: OperatorInboxCheckpoint,
+    pub changes: Vec<OperatorInboxChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxActionRouteRequest {
+    pub item_id: String,
+    pub action_kind: OperatorInboxActionKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxActionRouteResponse {
+    pub route: OperatorInboxActionRoute,
+}
+
+/// Route metadata for a derived inbox action.
+///
+/// This is read-only guidance that points a remote client back to the existing
+/// proposal/decision/session APIs. It is not an inbox-owned mutation surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OperatorInboxActionRoute {
+    Proposal {
+        item_id: String,
+        proposal_id: String,
+        method: String,
+    },
+    SupervisorDecision {
+        item_id: String,
+        decision_id: String,
+        method: String,
+    },
+    PlanningSession {
+        item_id: String,
+        session_id: String,
+        method: String,
+    },
+    PlanRevisionProposal {
+        item_id: String,
+        proposal_id: String,
+        method: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

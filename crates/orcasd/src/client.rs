@@ -131,6 +131,30 @@ impl OrcasIpcClient {
         self.request(ipc::methods::OPERATOR_INBOX_GET, params).await
     }
 
+    pub async fn operator_inbox_checkpoint(
+        &self,
+        params: &ipc::OperatorInboxCheckpointRequest,
+    ) -> OrcasResult<ipc::OperatorInboxCheckpointResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_CHECKPOINT, params)
+            .await
+    }
+
+    pub async fn operator_inbox_changes(
+        &self,
+        params: &ipc::OperatorInboxChangesRequest,
+    ) -> OrcasResult<ipc::OperatorInboxChangesResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_CHANGES, params)
+            .await
+    }
+
+    pub async fn operator_inbox_action_route(
+        &self,
+        params: &ipc::OperatorInboxActionRouteRequest,
+    ) -> OrcasResult<ipc::OperatorInboxActionRouteResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_ACTION_ROUTE, params)
+            .await
+    }
+
     pub async fn session_get_active(&self) -> OrcasResult<ipc::SessionGetActiveResponse> {
         self.request(
             ipc::methods::SESSION_GET_ACTIVE,

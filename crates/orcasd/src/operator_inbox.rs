@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 #[cfg(test)]
 use chrono::{DateTime, Utc};
 
@@ -32,7 +34,260 @@ use orcas_core::{
 #[cfg(test)]
 use orcas_core::WorkUnit;
 
+pub fn rebuild_operator_inbox_state(
+    collaboration: &CollaborationState,
+    previous: Option<&ipc::OperatorInboxState>,
+) -> ipc::OperatorInboxState {
+    let previous = previous.cloned().unwrap_or_default();
+    let mut next_sequence = previous.checkpoint.current_sequence;
+    let previous_items = previous
+        .items
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect::<BTreeMap<_, _>>();
+    let current_items = derive_current_operator_inbox_items(collaboration);
+
+    let mut changes = previous.changes;
+    let mut retained = Vec::with_capacity(current_items.len());
+
+    for mut item in current_items {
+        match previous_items.get(&item.id) {
+            Some(previous_item) if operator_inbox_items_equivalent(previous_item, &item) => {
+                item.sequence = previous_item.sequence;
+            }
+            Some(_) | None => {
+                next_sequence += 1;
+                item.sequence = next_sequence;
+                changes.push(ipc::OperatorInboxChange {
+                    sequence: next_sequence,
+                    kind: ipc::OperatorInboxChangeKind::Upsert,
+                    item: item.clone(),
+                    changed_at: item.updated_at,
+                });
+            }
+        }
+        retained.push(item);
+    }
+
+    let mut removed = previous_items
+        .into_iter()
+        .filter(|(item_id, _)| !retained.iter().any(|item| item.id == *item_id))
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
+    removed.sort_by(|left, right| {
+        left.sequence
+            .cmp(&right.sequence)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    for item in removed {
+        next_sequence += 1;
+        changes.push(ipc::OperatorInboxChange {
+            sequence: next_sequence,
+            kind: ipc::OperatorInboxChangeKind::Removed,
+            item,
+            changed_at: chrono::Utc::now(),
+        });
+    }
+
+    retained.sort_by(|left, right| {
+        right
+            .sequence
+            .cmp(&left.sequence)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    changes.sort_by(|left, right| {
+        left.sequence
+            .cmp(&right.sequence)
+            .then_with(|| left.item.id.cmp(&right.item.id))
+    });
+
+    ipc::OperatorInboxState {
+        items: retained,
+        checkpoint: ipc::OperatorInboxCheckpoint {
+            current_sequence: next_sequence,
+            updated_at: chrono::Utc::now(),
+        },
+        changes,
+    }
+}
+
+fn operator_inbox_items_equivalent(
+    left: &ipc::OperatorInboxItem,
+    right: &ipc::OperatorInboxItem,
+) -> bool {
+    left.id == right.id
+        && left.source_kind == right.source_kind
+        && left.actionable_object_id == right.actionable_object_id
+        && left.workstream_id == right.workstream_id
+        && left.work_unit_id == right.work_unit_id
+        && left.title == right.title
+        && left.summary == right.summary
+        && left.status == right.status
+        && left.available_actions == right.available_actions
+        && left.created_at == right.created_at
+        && left.updated_at == right.updated_at
+        && left.resolved_at == right.resolved_at
+        && left.rationale == right.rationale
+        && left.provenance == right.provenance
+}
+
 pub fn build_operator_inbox_state(collaboration: &CollaborationState) -> ipc::OperatorInboxState {
+    rebuild_operator_inbox_state(collaboration, None)
+}
+
+pub fn operator_inbox_checkpoint(state: &ipc::OperatorInboxState) -> ipc::OperatorInboxCheckpoint {
+    state.checkpoint.clone()
+}
+
+pub fn operator_inbox_changes_after(
+    state: &ipc::OperatorInboxState,
+    after_sequence: u64,
+    limit: Option<usize>,
+) -> Vec<ipc::OperatorInboxChange> {
+    let mut changes = state
+        .changes
+        .iter()
+        .filter(|change| change.sequence > after_sequence)
+        .cloned()
+        .collect::<Vec<_>>();
+    changes.sort_by(|left, right| {
+        left.sequence
+            .cmp(&right.sequence)
+            .then_with(|| left.item.id.cmp(&right.item.id))
+    });
+    if let Some(limit) = limit {
+        changes.truncate(limit);
+    }
+    changes
+}
+
+pub fn resolve_operator_inbox_action_route(
+    item: &ipc::OperatorInboxItem,
+    action_kind: ipc::OperatorInboxActionKind,
+) -> Result<ipc::OperatorInboxActionRoute, String> {
+    if !item.available_actions.contains(&action_kind) {
+        return Err(format!(
+            "action `{:?}` is not available for inbox item `{}`",
+            action_kind, item.id
+        ));
+    }
+
+    match (item.source_kind, action_kind) {
+        (ipc::OperatorInboxSourceKind::SupervisorProposal, ipc::OperatorInboxActionKind::Approve) => {
+            Ok(ipc::OperatorInboxActionRoute::Proposal {
+                item_id: item.id.clone(),
+                proposal_id: item.actionable_object_id.clone(),
+                method: ipc::methods::PROPOSAL_APPROVE.to_string(),
+            })
+        }
+        (ipc::OperatorInboxSourceKind::SupervisorProposal, ipc::OperatorInboxActionKind::Reject) => {
+            Ok(ipc::OperatorInboxActionRoute::Proposal {
+                item_id: item.id.clone(),
+                proposal_id: item.actionable_object_id.clone(),
+                method: ipc::methods::PROPOSAL_REJECT.to_string(),
+            })
+        }
+        (
+            ipc::OperatorInboxSourceKind::SupervisorDecision,
+            ipc::OperatorInboxActionKind::ApproveAndSend,
+        ) => Ok(ipc::OperatorInboxActionRoute::SupervisorDecision {
+            item_id: item.id.clone(),
+            decision_id: item.actionable_object_id.clone(),
+            method: ipc::methods::SUPERVISOR_DECISION_APPROVE_AND_SEND.to_string(),
+        }),
+        (
+            ipc::OperatorInboxSourceKind::SupervisorDecision,
+            ipc::OperatorInboxActionKind::Reject,
+        ) => Ok(ipc::OperatorInboxActionRoute::SupervisorDecision {
+            item_id: item.id.clone(),
+            decision_id: item.actionable_object_id.clone(),
+            method: ipc::methods::SUPERVISOR_DECISION_REJECT.to_string(),
+        }),
+        (
+            ipc::OperatorInboxSourceKind::SupervisorDecision,
+            ipc::OperatorInboxActionKind::RecordNoAction,
+        ) => Ok(ipc::OperatorInboxActionRoute::SupervisorDecision {
+            item_id: item.id.clone(),
+            decision_id: item.actionable_object_id.clone(),
+            method: ipc::methods::SUPERVISOR_DECISION_RECORD_NO_ACTION.to_string(),
+        }),
+        (
+            ipc::OperatorInboxSourceKind::SupervisorDecision,
+            ipc::OperatorInboxActionKind::ManualRefresh,
+        ) => Ok(ipc::OperatorInboxActionRoute::SupervisorDecision {
+            item_id: item.id.clone(),
+            decision_id: item.actionable_object_id.clone(),
+            method: ipc::methods::SUPERVISOR_DECISION_MANUAL_REFRESH.to_string(),
+        }),
+        (ipc::OperatorInboxSourceKind::PlanningSession, ipc::OperatorInboxActionKind::Approve) => {
+            Ok(ipc::OperatorInboxActionRoute::PlanningSession {
+                item_id: item.id.clone(),
+                session_id: item.actionable_object_id.clone(),
+                method: ipc::methods::PLANNING_SESSION_APPROVE.to_string(),
+            })
+        }
+        (ipc::OperatorInboxSourceKind::PlanningSession, ipc::OperatorInboxActionKind::Reject) => {
+            Ok(ipc::OperatorInboxActionRoute::PlanningSession {
+                item_id: item.id.clone(),
+                session_id: item.actionable_object_id.clone(),
+                method: ipc::methods::PLANNING_SESSION_REJECT.to_string(),
+            })
+        }
+        (ipc::OperatorInboxSourceKind::PlanningSession, ipc::OperatorInboxActionKind::Supersede) => {
+            Ok(ipc::OperatorInboxActionRoute::PlanningSession {
+                item_id: item.id.clone(),
+                session_id: item.actionable_object_id.clone(),
+                method: ipc::methods::PLANNING_SESSION_SUPERSEDE.to_string(),
+            })
+        }
+        (ipc::OperatorInboxSourceKind::PlanRevisionProposal, ipc::OperatorInboxActionKind::Approve) => {
+            Ok(ipc::OperatorInboxActionRoute::PlanRevisionProposal {
+                item_id: item.id.clone(),
+                proposal_id: item.actionable_object_id.clone(),
+                method: ipc::methods::PROPOSAL_APPROVE.to_string(),
+            })
+        }
+        (ipc::OperatorInboxSourceKind::PlanRevisionProposal, ipc::OperatorInboxActionKind::Reject) => {
+            Ok(ipc::OperatorInboxActionRoute::PlanRevisionProposal {
+                item_id: item.id.clone(),
+                proposal_id: item.actionable_object_id.clone(),
+                method: ipc::methods::PROPOSAL_REJECT.to_string(),
+            })
+        }
+        (
+            ipc::OperatorInboxSourceKind::PlanRevisionProposal,
+            ipc::OperatorInboxActionKind::Reconcile,
+        ) => Ok(ipc::OperatorInboxActionRoute::PlanRevisionProposal {
+            item_id: item.id.clone(),
+            proposal_id: item.actionable_object_id.clone(),
+            method: ipc::methods::PROPOSAL_RECONCILE.to_string(),
+        }),
+        (
+            ipc::OperatorInboxSourceKind::PlanRevisionProposal,
+            ipc::OperatorInboxActionKind::Retry,
+        ) => Ok(ipc::OperatorInboxActionRoute::PlanRevisionProposal {
+            item_id: item.id.clone(),
+            proposal_id: item.actionable_object_id.clone(),
+            method: ipc::methods::PROPOSAL_APPROVE.to_string(),
+        }),
+        (
+            ipc::OperatorInboxSourceKind::PlanningSession,
+            ipc::OperatorInboxActionKind::MarkReadyForReview,
+        ) => Ok(ipc::OperatorInboxActionRoute::PlanningSession {
+            item_id: item.id.clone(),
+            session_id: item.actionable_object_id.clone(),
+            method: ipc::methods::PLANNING_SESSION_MARK_READY_FOR_REVIEW.to_string(),
+        }),
+        _ => Err(format!(
+            "action `{:?}` is not routed for inbox item `{}`",
+            action_kind, item.id
+        )),
+    }
+}
+
+fn derive_current_operator_inbox_items(
+    collaboration: &CollaborationState,
+) -> Vec<ipc::OperatorInboxItem> {
     let mut items = collaboration
         .supervisor_proposals
         .values()
@@ -64,15 +319,14 @@ pub fn build_operator_inbox_state(collaboration: &CollaborationState) -> ipc::Op
             .cmp(&left.updated_at)
             .then_with(|| left.id.cmp(&right.id))
     });
-
-    ipc::OperatorInboxState { items }
+    items
 }
 
 pub fn list_operator_inbox_items(
-    collaboration: &CollaborationState,
+    state: &ipc::OperatorInboxState,
     request: &ipc::OperatorInboxListRequest,
 ) -> Vec<ipc::OperatorInboxItem> {
-    let mut items = build_operator_inbox_state(collaboration).items;
+    let mut items = state.items.clone();
     items.retain(|item| {
         request
             .workstream_id
@@ -110,13 +364,10 @@ pub fn list_operator_inbox_items(
 }
 
 pub fn get_operator_inbox_item(
-    collaboration: &CollaborationState,
+    state: &ipc::OperatorInboxState,
     item_id: &str,
 ) -> Option<ipc::OperatorInboxItem> {
-    build_operator_inbox_state(collaboration)
-        .items
-        .into_iter()
-        .find(|item| item.id == item_id)
+    state.items.iter().find(|item| item.id == item_id).cloned()
 }
 
 pub fn operator_inbox_item_is_actionable(item: &ipc::OperatorInboxItem) -> bool {
@@ -180,6 +431,7 @@ fn supervisor_proposal_inbox_item(
 
     Some(ipc::OperatorInboxItem {
         id: format!("supervisor_proposal::{}", proposal.id),
+        sequence: 0,
         source_kind: ipc::OperatorInboxSourceKind::SupervisorProposal,
         actionable_object_id: proposal.id.clone(),
         workstream_id: Some(proposal.workstream_id.clone()),
@@ -273,6 +525,7 @@ fn supervisor_decision_inbox_item(
 
     Some(ipc::OperatorInboxItem {
         id: format!("supervisor_decision::{}", decision.decision_id),
+        sequence: 0,
         source_kind: ipc::OperatorInboxSourceKind::SupervisorDecision,
         actionable_object_id: decision.decision_id.clone(),
         workstream_id,
@@ -360,6 +613,7 @@ fn planning_session_inbox_item(session: &PlanningSession) -> Option<ipc::Operato
 
     Some(ipc::OperatorInboxItem {
         id: format!("planning_session::{}", session.session_id),
+        sequence: 0,
         source_kind: ipc::OperatorInboxSourceKind::PlanningSession,
         actionable_object_id: session.session_id.clone(),
         workstream_id: Some(session.workstream_id.clone()),
@@ -481,6 +735,7 @@ fn plan_revision_inbox_item(
 
     Some(ipc::OperatorInboxItem {
         id: format!("plan_revision_proposal::{}", proposal.proposal_id),
+        sequence: 0,
         source_kind: ipc::OperatorInboxSourceKind::PlanRevisionProposal,
         actionable_object_id: proposal.proposal_id.to_string(),
         workstream_id,
@@ -951,6 +1206,31 @@ fn sample_collaboration() -> CollaborationState {
 mod tests {
     use super::*;
     use orcas_core::store::StoredState;
+    use std::collections::BTreeMap;
+
+    fn apply_inbox_changes(
+        mut items: BTreeMap<String, ipc::OperatorInboxItem>,
+        changes: &[ipc::OperatorInboxChange],
+    ) -> Vec<ipc::OperatorInboxItem> {
+        for change in changes {
+            match change.kind {
+                ipc::OperatorInboxChangeKind::Upsert => {
+                    items.insert(change.item.id.clone(), change.item.clone());
+                }
+                ipc::OperatorInboxChangeKind::Removed => {
+                    items.remove(&change.item.id);
+                }
+            }
+        }
+        let mut items = items.into_values().collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            right
+                .sequence
+                .cmp(&left.sequence)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        items
+    }
 
     #[test]
     fn open_supervisor_proposal_appears_in_inbox() {
@@ -1144,8 +1424,273 @@ mod tests {
             source_kind: Some(ipc::OperatorInboxSourceKind::PlanningSession),
             ..Default::default()
         };
-        let items = list_operator_inbox_items(&collaboration, &request);
+        let items = list_operator_inbox_items(&build_operator_inbox_state(&collaboration), &request);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "planning_session::session-1");
+    }
+
+    #[test]
+    fn inbox_identity_is_stable_across_rebuilds() {
+        let collaboration = sample_collaboration();
+        let initial = build_operator_inbox_state(&collaboration);
+        let rebuilt = rebuild_operator_inbox_state(&collaboration, Some(&initial));
+
+        assert_eq!(initial.items, rebuilt.items);
+        assert_eq!(
+            initial.checkpoint.current_sequence,
+            rebuilt.checkpoint.current_sequence
+        );
+        assert!(operator_inbox_changes_after(
+            &rebuilt,
+            initial.checkpoint.current_sequence,
+            None
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn inbox_change_feed_is_ordered_and_cursorable() {
+        let collaboration = sample_collaboration();
+        let inbox = build_operator_inbox_state(&collaboration);
+
+        let first_two = operator_inbox_changes_after(&inbox, 0, Some(2));
+        assert_eq!(first_two.len(), 2);
+        assert!(first_two[0].sequence < first_two[1].sequence);
+
+        let tail = operator_inbox_changes_after(&inbox, first_two[1].sequence, None);
+        assert!(tail.iter().all(|change| change.sequence > first_two[1].sequence));
+        assert!(!tail.is_empty());
+    }
+
+    #[test]
+    fn inbox_checkpoint_survives_restart() {
+        let collaboration = sample_collaboration();
+        let stored = StoredState {
+            registry: Default::default(),
+            thread_views: Default::default(),
+            turn_states: Default::default(),
+            collaboration: collaboration.clone(),
+            operator_inbox: build_operator_inbox_state(&collaboration),
+        };
+        let encoded = serde_json::to_value(&stored).expect("serialize");
+        let decoded: StoredState = serde_json::from_value(encoded).expect("deserialize");
+
+        assert_eq!(
+            decoded.operator_inbox.checkpoint,
+            stored.operator_inbox.checkpoint
+        );
+        assert_eq!(decoded.operator_inbox.changes, stored.operator_inbox.changes);
+    }
+
+    #[test]
+    fn overlapping_cursor_reads_remain_predictable() {
+        let collaboration = sample_collaboration();
+        let inbox = build_operator_inbox_state(&collaboration);
+
+        let first_page = operator_inbox_changes_after(&inbox, 0, Some(1));
+        let second_page = operator_inbox_changes_after(&inbox, first_page[0].sequence, Some(2));
+
+        assert_eq!(first_page.len(), 1);
+        assert!(second_page.iter().all(|change| change.sequence > first_page[0].sequence));
+        assert!(!second_page.iter().any(|change| change.sequence == first_page[0].sequence));
+    }
+
+    #[test]
+    fn terminal_state_changes_appear_in_incremental_feed() {
+        let initial_collaboration = sample_collaboration();
+        let initial = build_operator_inbox_state(&initial_collaboration);
+
+        let mut next_collaboration = initial_collaboration.clone();
+        next_collaboration.supervisor_proposals.insert(
+            "proposal-1".to_string(),
+            sample_supervisor_proposal_record(orcas_core::SupervisorProposalStatus::Approved),
+        );
+        let next = rebuild_operator_inbox_state(&next_collaboration, Some(&initial));
+        let changes = operator_inbox_changes_after(&next, initial.checkpoint.current_sequence, None);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, ipc::OperatorInboxChangeKind::Upsert);
+        assert_eq!(
+            changes[0].item.id,
+            "supervisor_proposal::proposal-1".to_string()
+        );
+        assert_eq!(changes[0].item.status, ipc::OperatorInboxItemStatus::Resolved);
+
+        let projected = apply_inbox_changes(
+            initial
+                .items
+                .clone()
+                .into_iter()
+                .map(|item| (item.id.clone(), item))
+                .collect(),
+            &changes,
+        );
+        assert_eq!(projected, next.items);
+    }
+
+    #[test]
+    fn action_routing_maps_supported_actions_to_underlying_methods() {
+        let collaboration = sample_collaboration();
+        let inbox = build_operator_inbox_state(&collaboration);
+
+        let proposal = get_operator_inbox_item(&inbox, "supervisor_proposal::proposal-1")
+            .expect("proposal item");
+        let route = resolve_operator_inbox_action_route(
+            &proposal,
+            ipc::OperatorInboxActionKind::Approve,
+        )
+        .expect("approve route");
+        assert_eq!(
+            route,
+            ipc::OperatorInboxActionRoute::Proposal {
+                item_id: proposal.id.clone(),
+                proposal_id: proposal.actionable_object_id.clone(),
+                method: ipc::methods::PROPOSAL_APPROVE.to_string(),
+            }
+        );
+
+        let route = resolve_operator_inbox_action_route(
+            &proposal,
+            ipc::OperatorInboxActionKind::Reject,
+        )
+        .expect("reject route");
+        assert_eq!(
+            route,
+            ipc::OperatorInboxActionRoute::Proposal {
+                item_id: proposal.id.clone(),
+                proposal_id: proposal.actionable_object_id.clone(),
+                method: ipc::methods::PROPOSAL_REJECT.to_string(),
+            }
+        );
+
+        let decision = get_operator_inbox_item(&inbox, "supervisor_decision::decision-1")
+            .expect("decision item");
+        let route = resolve_operator_inbox_action_route(
+            &decision,
+            ipc::OperatorInboxActionKind::ApproveAndSend,
+        )
+        .expect("approve-and-send route");
+        assert_eq!(
+            route,
+            ipc::OperatorInboxActionRoute::SupervisorDecision {
+                item_id: decision.id.clone(),
+                decision_id: decision.actionable_object_id.clone(),
+                method: ipc::methods::SUPERVISOR_DECISION_APPROVE_AND_SEND.to_string(),
+            }
+        );
+
+        let route = resolve_operator_inbox_action_route(
+            &decision,
+            ipc::OperatorInboxActionKind::RecordNoAction,
+        )
+        .expect("record-no-action route");
+        assert_eq!(
+            route,
+            ipc::OperatorInboxActionRoute::SupervisorDecision {
+                item_id: decision.id.clone(),
+                decision_id: decision.actionable_object_id.clone(),
+                method: ipc::methods::SUPERVISOR_DECISION_RECORD_NO_ACTION.to_string(),
+            }
+        );
+
+        let session = get_operator_inbox_item(&inbox, "planning_session::session-1")
+            .expect("planning session item");
+        let route = resolve_operator_inbox_action_route(&session, ipc::OperatorInboxActionKind::Approve)
+            .expect("planning session approve route");
+        assert_eq!(
+            route,
+            ipc::OperatorInboxActionRoute::PlanningSession {
+                item_id: session.id.clone(),
+                session_id: session.actionable_object_id.clone(),
+                method: ipc::methods::PLANNING_SESSION_APPROVE.to_string(),
+            }
+        );
+
+        let route = resolve_operator_inbox_action_route(
+            &session,
+            ipc::OperatorInboxActionKind::Supersede,
+        )
+        .expect("planning session supersede route");
+        assert_eq!(
+            route,
+            ipc::OperatorInboxActionRoute::PlanningSession {
+                item_id: session.id.clone(),
+                session_id: session.actionable_object_id.clone(),
+                method: ipc::methods::PLANNING_SESSION_SUPERSEDE.to_string(),
+            }
+        );
+
+        let revision = get_operator_inbox_item(&inbox, "plan_revision_proposal::revision-1")
+            .expect("revision item");
+        let route = resolve_operator_inbox_action_route(
+            &revision,
+            ipc::OperatorInboxActionKind::Reconcile,
+        )
+        .expect("reconcile route");
+        assert_eq!(
+            route,
+            ipc::OperatorInboxActionRoute::PlanRevisionProposal {
+                item_id: revision.id.clone(),
+                proposal_id: revision.actionable_object_id.clone(),
+                method: ipc::methods::PROPOSAL_RECONCILE.to_string(),
+            }
+        );
+
+        let mut retryable_collaboration = sample_collaboration();
+        let mut retryable_revision = sample_plan_revision_proposal(
+            PlanRevisionProposalStatus::ApplyFailed,
+            {
+                let mut recovery = orcas_core::planning::PlanRevisionRecoveryState::default();
+                recovery.phase = PlanRevisionApplyPhase::FailedBeforeDownstream;
+                recovery.failure_kind = Some(PlanRevisionApplyFailureKind::RetryableInfrastructure);
+                recovery.retry_safe = true;
+                recovery.reconcile_available = false;
+                recovery.operator_intervention_required = false;
+                recovery.failure_message = Some("retryable".to_string());
+                recovery
+            },
+        );
+        retryable_revision.proposal_id =
+            orcas_core::planning::PlanRevisionProposalId::parse("revision-retry")
+                .expect("revision id");
+        retryable_collaboration
+            .planning
+            .revision_proposals
+            .insert("revision-retry".to_string(), retryable_revision);
+        let retryable_inbox = build_operator_inbox_state(&retryable_collaboration);
+        let retryable = get_operator_inbox_item(
+            &retryable_inbox,
+            "plan_revision_proposal::revision-retry",
+        )
+        .expect("retryable revision item");
+        assert!(retryable
+            .available_actions
+            .contains(&ipc::OperatorInboxActionKind::Retry));
+        let route = resolve_operator_inbox_action_route(
+            &retryable,
+            ipc::OperatorInboxActionKind::Retry,
+        )
+        .expect("retry route");
+        assert_eq!(
+            route,
+            ipc::OperatorInboxActionRoute::PlanRevisionProposal {
+                item_id: retryable.id.clone(),
+                proposal_id: retryable.actionable_object_id.clone(),
+                method: ipc::methods::PROPOSAL_APPROVE.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn passive_records_do_not_appear_in_the_incremental_feed() {
+        let collaboration = sample_collaboration();
+        let inbox = build_operator_inbox_state(&collaboration);
+        let change_ids = operator_inbox_changes_after(&inbox, 0, None)
+            .into_iter()
+            .map(|change| change.item.id)
+            .collect::<Vec<_>>();
+
+        assert!(!change_ids.iter().any(|id| id == "supervisor_proposal::proposal-passive"));
+        assert!(!change_ids.iter().any(|id| id == "planning_session::session-passive"));
     }
 }
