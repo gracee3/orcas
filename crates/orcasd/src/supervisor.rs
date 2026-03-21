@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::assignment_comm::{json_fingerprint, stable_fingerprint};
+use orcas_core::planning::PlanExecutionKind;
 use orcas_core::supervisor::{
     DecisionPolicy, DraftAssignment, PriorDecisionContext, PriorReportContext,
     RecentPrimaryHistory, RelatedWorkUnitContext, SupervisorArtifactRef,
@@ -43,6 +44,9 @@ const EXPECTED_REPORT_FIELDS: &[&str] = &[
     "recommended_next_actions",
     "confidence",
 ];
+const SUPERVISOR_SHORT_TEXT_MAX_LEN: u64 = 160;
+const SUPERVISOR_SHORT_LIST_MAX_ITEMS: u64 = 2;
+const SUPERVISOR_REVIEW_LIST_MAX_ITEMS: u64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct SupervisorReasonerResult {
@@ -90,13 +94,21 @@ impl ResponsesApiReasoner {
         }
     }
 
-    fn api_key(&self) -> OrcasResult<String> {
-        std::env::var(&self.config.supervisor.api_key_env).map_err(|_| {
-            OrcasError::Config(format!(
-                "supervisor API key environment variable `{}` is not set",
-                self.config.supervisor.api_key_env
-            ))
-        })
+    fn api_key(&self) -> OrcasResult<Option<String>> {
+        let api_key_env = self.config.supervisor.api_key_env.trim();
+        if api_key_env.is_empty() {
+            return Ok(None);
+        }
+        match std::env::var(api_key_env) {
+            Ok(value) if value.trim().is_empty() => Ok(None),
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Err(OrcasError::Config(format!(
+                "supervisor API key environment variable `{api_key_env}` is not set",
+            ))),
+            Err(std::env::VarError::NotUnicode(_)) => Err(OrcasError::Config(format!(
+                "supervisor API key environment variable `{api_key_env}` is not valid unicode",
+            ))),
+        }
     }
 
     fn endpoint(&self) -> String {
@@ -110,13 +122,10 @@ impl ResponsesApiReasoner {
         &self,
         prompt_render: &SupervisorPromptRenderArtifact,
     ) -> OrcasResult<(Value, String)> {
-        let body = json!({
+        let mut body = json!({
             "model": self.config.supervisor.model,
             "store": false,
             "max_output_tokens": self.config.supervisor.max_output_tokens,
-            "reasoning": {
-                "effort": self.config.supervisor.reasoning_effort,
-            },
             "instructions": prompt_render.instructions_text,
             "input": [{
                 "role": "user",
@@ -134,6 +143,22 @@ impl ResponsesApiReasoner {
                 }
             }
         });
+        if let Some(temperature) = self.config.supervisor.temperature {
+            body.as_object_mut()
+                .expect("request body must be an object")
+                .insert("temperature".to_string(), json!(temperature));
+        }
+        let reasoning_effort = self.config.supervisor.reasoning_effort.trim();
+        if !reasoning_effort.is_empty() {
+            body.as_object_mut()
+                .expect("request body must be an object")
+                .insert(
+                    "reasoning".to_string(),
+                    json!({
+                        "effort": reasoning_effort,
+                    }),
+                );
+        }
         let request_body_hash = json_fingerprint(&body)?;
         Ok((body, request_body_hash))
     }
@@ -233,31 +258,30 @@ impl SupervisorReasoner for ResponsesApiReasoner {
             request_body_hash: Some(request_body_hash),
             ..prompt_render
         };
-        let response = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| {
-                warn!(
-                    work_unit_id = %pack.primary_work_unit.id,
-                    source_report_id = %pack.source_report.id,
-                    stage = "send_request",
-                    duration_ms = started_at.elapsed().as_millis() as u64,
-                    error = %error,
-                    "supervisor proposal generation failed"
-                );
-                self.failure(
-                    SupervisorProposalFailureStage::Backend,
-                    format!("supervisor Responses API request failed: {error}"),
-                    None,
-                    None,
-                    Some(prompt_render.clone()),
-                    None,
-                )
-            })?;
+        let request = self.client.post(self.endpoint()).json(&body);
+        let request = if let Some(api_key) = api_key {
+            request.bearer_auth(api_key)
+        } else {
+            request
+        };
+        let response = request.send().await.map_err(|error| {
+            warn!(
+                work_unit_id = %pack.primary_work_unit.id,
+                source_report_id = %pack.source_report.id,
+                stage = "send_request",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "supervisor proposal generation failed"
+            );
+            self.failure(
+                SupervisorProposalFailureStage::Backend,
+                format!("supervisor Responses API request failed: {error}"),
+                None,
+                None,
+                Some(prompt_render.clone()),
+                None,
+            )
+        })?;
         let captured_at = Utc::now();
 
         let status = response.status();
@@ -437,31 +461,108 @@ impl SupervisorReasoner for ResponsesApiReasoner {
                 None,
             )
         })?;
-        let proposal: SupervisorProposal = serde_json::from_str(&output_text).map_err(|error| {
-            warn!(
-                work_unit_id = %pack.primary_work_unit.id,
-                source_report_id = %pack.source_report.id,
-                stage = "decode_proposal_json",
-                response_id = value
-                    .get("id")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("unknown"),
-                duration_ms = started_at.elapsed().as_millis() as u64,
-                error = %error,
-                "supervisor proposal generation failed"
-            );
-            self.failure(
-                SupervisorProposalFailureStage::ProposalMalformed,
-                format!("failed to decode supervisor proposal JSON: {error}"),
-                value
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-                Some(output_text.clone()),
-                Some(prompt_render.clone()),
-                Some(response_artifact.clone()),
-            )
-        })?;
+        let proposal_value = match serde_json::from_str::<Value>(&output_text) {
+            Ok(value) => value,
+            Err(error) => {
+                let Some(repaired_output_text) = repair_incomplete_json_document(&output_text)
+                else {
+                    warn!(
+                        work_unit_id = %pack.primary_work_unit.id,
+                        source_report_id = %pack.source_report.id,
+                        stage = "decode_proposal_json",
+                        response_id = value
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        duration_ms = started_at.elapsed().as_millis() as u64,
+                        error = %error,
+                        "supervisor proposal generation failed"
+                    );
+                    return Err(self.failure(
+                        SupervisorProposalFailureStage::ProposalMalformed,
+                        format!("failed to decode supervisor proposal JSON: {error}"),
+                        value
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        Some(output_text.clone()),
+                        Some(prompt_render.clone()),
+                        Some(response_artifact.clone()),
+                    ));
+                };
+                match serde_json::from_str::<Value>(&repaired_output_text) {
+                    Ok(value) => {
+                        warn!(
+                            work_unit_id = %pack.primary_work_unit.id,
+                            source_report_id = %pack.source_report.id,
+                            stage = "repair_proposal_json",
+                            response_id = value
+                                .get("id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown"),
+                            duration_ms = started_at.elapsed().as_millis() as u64,
+                            "supervisor proposal JSON was repaired after incomplete output"
+                        );
+                        value
+                    }
+                    Err(repaired_error) => {
+                        warn!(
+                            work_unit_id = %pack.primary_work_unit.id,
+                            source_report_id = %pack.source_report.id,
+                            stage = "decode_proposal_json",
+                            response_id = value
+                                .get("id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown"),
+                            duration_ms = started_at.elapsed().as_millis() as u64,
+                            error = %repaired_error,
+                            "supervisor proposal generation failed"
+                        );
+                        return Err(self.failure(
+                            SupervisorProposalFailureStage::ProposalMalformed,
+                            format!(
+                                "failed to decode supervisor proposal JSON after repair: {repaired_error}"
+                            ),
+                            value
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned),
+                            Some(repaired_output_text),
+                            Some(prompt_render.clone()),
+                            Some(response_artifact.clone()),
+                        ));
+                    }
+                }
+            }
+        };
+        let proposal_value = repair_supervisor_proposal_value(proposal_value, &pack);
+        let mut proposal: SupervisorProposal =
+            serde_json::from_value(proposal_value).map_err(|error| {
+                warn!(
+                    work_unit_id = %pack.primary_work_unit.id,
+                    source_report_id = %pack.source_report.id,
+                    stage = "decode_proposal_json",
+                    response_id = value
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown"),
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "supervisor proposal generation failed"
+                );
+                self.failure(
+                    SupervisorProposalFailureStage::ProposalMalformed,
+                    format!("failed to decode supervisor proposal JSON: {error}"),
+                    value
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    Some(output_text.clone()),
+                    Some(prompt_render.clone()),
+                    Some(response_artifact.clone()),
+                )
+            })?;
+        ensure_required_draft_assignment(&mut proposal, &pack);
         let usage = value.get("usage").map(extract_usage);
         info!(
             work_unit_id = %pack.primary_work_unit.id,
@@ -526,7 +627,7 @@ pub fn render_supervisor_prompt(
     rendered_at: DateTime<Utc>,
 ) -> OrcasResult<SupervisorPromptRenderArtifact> {
     let context_pack_text = serde_json::to_string_pretty(pack)?;
-    let instructions_text = "You are the Orcas supervisor reasoner. Orcas state in the provided packet is the only source of truth. Use the canonical workstream plan, current focus item, exploration policy, and recent alignment assessments when deciding what to do next. Choose exactly one allowed decision for the primary work unit. Never invent ids, hidden context, or extra work units. Do not silently change the canonical plan; structural changes must be proposed for operator approval. Every assignment must be tied to a plan item or a narrow special activity kind. If the decision is continue or redirect, return one bounded draft next assignment. Return JSON only, matching the requested schema.".to_string();
+    let instructions_text = "You are the Orcas supervisor reasoner. Orcas state in the provided packet is the only source of truth. Use the canonical workstream plan, current focus item, exploration policy, and recent alignment assessments when deciding what to do next. Choose exactly one allowed decision for the primary work unit. Never invent ids, hidden context, or extra work units. Do not silently change the canonical plan; structural changes must be proposed for operator approval. Every assignment must be tied to a plan item or a narrow special activity kind. Keep all prose terse. Keep every string short and single-paragraph. Do not quote large report contents. If the decision is continue or redirect, return one bounded draft next assignment with exactly 2 instructions, exactly 2 acceptance criteria, exactly 2 stop conditions, exactly 2 expected report fields, and a concise boundedness note. Set plan_assessment and plan_revision_proposal to null unless explicitly required. Return JSON only, matching the requested schema.".to_string();
     let user_content_text = format!(
         "Return a supervisor proposal JSON object for this Orcas decision point.\nThe packet already contains the allowed decision set and the canonical workstream state.\n\nSupervisorContextPack:\n{context_pack_text}"
     );
@@ -605,6 +706,352 @@ pub fn render_supervisor_response_artifact(
         raw_response_body_hash,
         captured_at,
     })
+}
+
+fn repair_incomplete_json_document(json_text: &str) -> Option<String> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+
+    for ch in json_text.chars() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if in_string || stack.is_empty() {
+        return None;
+    }
+
+    let mut repaired = json_text.to_string();
+    while let Some(closing) = stack.pop() {
+        repaired.push(closing);
+    }
+    Some(repaired)
+}
+
+fn repair_supervisor_proposal_value(
+    mut proposal_value: Value,
+    pack: &SupervisorContextPack,
+) -> Value {
+    let proposal_snapshot = proposal_value.clone();
+    let Some(proposal_object) = proposal_value.as_object_mut() else {
+        return proposal_value;
+    };
+    if !proposal_object.contains_key("summary") {
+        proposal_object.insert(
+            "summary".to_string(),
+            synthesize_supervisor_summary(&proposal_snapshot),
+        );
+    }
+    proposal_object
+        .entry("schema_version".to_string())
+        .or_insert_with(|| Value::String(PROPOSAL_SCHEMA_VERSION.to_string()));
+    proposal_object
+        .entry("plan_assessment".to_string())
+        .or_insert(Value::Null);
+    proposal_object
+        .entry("plan_revision_proposal".to_string())
+        .or_insert(Value::Null);
+    proposal_object
+        .entry("warnings".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    proposal_object
+        .entry("open_questions".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let decision_type = proposal_object
+        .get("proposed_decision")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("decision_type"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    if let Some(decision_type) = decision_type.as_deref() {
+        let requires_assignment = decision_requires_assignment_label(decision_type);
+        if let Some(proposed_decision) = proposal_object
+            .get_mut("proposed_decision")
+            .and_then(Value::as_object_mut)
+        {
+            proposed_decision.insert(
+                "expected_work_unit_status".to_string(),
+                Value::String(
+                    expected_work_unit_status_for_decision_label(decision_type).to_string(),
+                ),
+            );
+        }
+        if requires_assignment {
+            let draft_repair_needed = matches!(
+                proposal_object.get("draft_next_assignment"),
+                None | Some(Value::Null)
+            );
+            if draft_repair_needed {
+                proposal_object.insert(
+                    "draft_next_assignment".to_string(),
+                    synthesize_supervisor_draft_assignment_value(pack, decision_type),
+                );
+            } else if let Some(Value::Object(draft_object)) =
+                proposal_object.get_mut("draft_next_assignment")
+            {
+                repair_supervisor_draft_assignment_value(draft_object, pack, decision_type);
+            }
+        }
+    }
+    proposal_value
+}
+
+fn ensure_required_draft_assignment(
+    proposal: &mut SupervisorProposal,
+    pack: &SupervisorContextPack,
+) {
+    if !proposal.proposed_decision.requires_assignment {
+        return;
+    }
+    if proposal.draft_next_assignment.is_none() {
+        proposal.draft_next_assignment = Some(synthesize_supervisor_draft_assignment(
+            pack,
+            proposal.proposed_decision.decision_type,
+        ));
+    }
+}
+
+fn synthesize_supervisor_draft_assignment(
+    pack: &SupervisorContextPack,
+    decision_type: DecisionType,
+) -> DraftAssignment {
+    let source_summary = pack
+        .source_report
+        .summary
+        .trim()
+        .strip_suffix('.')
+        .unwrap_or(pack.source_report.summary.as_str())
+        .to_string();
+    DraftAssignment {
+        target_work_unit_id: pack.primary_work_unit.id.clone(),
+        predecessor_assignment_id: pack.current_assignment.id.clone(),
+        derived_from_decision_type: decision_type,
+        plan_id: pack
+            .workstream_plan
+            .as_ref()
+            .map(|context| context.active_plan.plan_id.to_string()),
+        plan_version: pack
+            .workstream_plan
+            .as_ref()
+            .map(|context| context.active_plan.version),
+        plan_item_id: pack
+            .workstream_plan
+            .as_ref()
+            .and_then(|context| context.active_plan.current_focus_item_id.as_ref())
+            .map(ToString::to_string),
+        execution_kind: PlanExecutionKind::DirectExecution,
+        alignment_rationale: Some("bounded follow-up from a live report".to_string()),
+        preferred_worker_id: Some(pack.current_assignment.worker_id.clone()),
+        worker_kind: Some(pack.worker_session.backend_type.clone()),
+        objective: format!("Continue the bounded follow-up for {source_summary}"),
+        instructions: vec![
+            "Review the live report and keep the next step narrow.".to_string(),
+            "Make only the smallest change needed to validate the report's follow-up.".to_string(),
+        ],
+        acceptance_criteria: vec![
+            "The next turn stays bounded to the current work unit.".to_string(),
+            "The follow-up remains consistent with the live report.".to_string(),
+        ],
+        stop_conditions: vec![
+            "Stop if the requested follow-up would broaden the scope.".to_string(),
+            "Stop if the change cannot stay within one file.".to_string(),
+        ],
+        required_context_refs: vec![
+            pack.primary_work_unit.id.clone(),
+            pack.source_report.id.clone(),
+            pack.current_assignment.id.clone(),
+        ],
+        expected_report_fields: vec!["summary".to_string(), "findings".to_string()],
+        boundedness_note: "Bounded to the current work unit and live report.".to_string(),
+    }
+}
+
+fn synthesize_supervisor_draft_assignment_value(
+    pack: &SupervisorContextPack,
+    decision_type: &str,
+) -> Value {
+    let decision = match decision_type {
+        "accept" => DecisionType::Accept,
+        "continue" => DecisionType::Continue,
+        "redirect" => DecisionType::Redirect,
+        "mark_complete" => DecisionType::MarkComplete,
+        "escalate_to_human" => DecisionType::EscalateToHuman,
+        _ => DecisionType::Continue,
+    };
+    let draft = synthesize_supervisor_draft_assignment(pack, decision);
+    serde_json::to_value(draft).unwrap_or(Value::Null)
+}
+
+fn repair_supervisor_draft_assignment_value(
+    draft_object: &mut serde_json::Map<String, Value>,
+    pack: &SupervisorContextPack,
+    decision_type: &str,
+) {
+    draft_object
+        .entry("target_work_unit_id".to_string())
+        .or_insert_with(|| Value::String(pack.primary_work_unit.id.clone()));
+    draft_object
+        .entry("predecessor_assignment_id".to_string())
+        .or_insert_with(|| Value::String(pack.current_assignment.id.clone()));
+    draft_object
+        .entry("derived_from_decision_type".to_string())
+        .or_insert_with(|| Value::String(decision_type.to_string()));
+    draft_object
+        .entry("execution_kind".to_string())
+        .or_insert_with(|| Value::String("direct_execution".to_string()));
+    draft_object
+        .entry("alignment_rationale".to_string())
+        .or_insert(Value::String(
+            "bounded follow-up from a live report".to_string(),
+        ));
+    draft_object
+        .entry("preferred_worker_id".to_string())
+        .or_insert_with(|| Value::String(pack.current_assignment.worker_id.clone()));
+    draft_object
+        .entry("worker_kind".to_string())
+        .or_insert_with(|| Value::String(pack.worker_session.backend_type.clone()));
+    draft_object
+        .entry("objective".to_string())
+        .or_insert_with(|| {
+            Value::String(format!(
+                "Continue the bounded follow-up for {}",
+                pack.source_report.summary
+            ))
+        });
+    draft_object
+        .entry("instructions".to_string())
+        .or_insert_with(|| {
+            Value::Array(vec![
+                Value::String("Review the live report and keep the next step narrow.".to_string()),
+                Value::String(
+                    "Make only the smallest change needed to validate the report's follow-up."
+                        .to_string(),
+                ),
+            ])
+        });
+    draft_object
+        .entry("acceptance_criteria".to_string())
+        .or_insert_with(|| {
+            Value::Array(vec![
+                Value::String("The next turn stays bounded to the current work unit.".to_string()),
+                Value::String("The follow-up remains consistent with the live report.".to_string()),
+            ])
+        });
+    draft_object
+        .entry("stop_conditions".to_string())
+        .or_insert_with(|| {
+            Value::Array(vec![
+                Value::String(
+                    "Stop if the requested follow-up would broaden the scope.".to_string(),
+                ),
+                Value::String("Stop if the change cannot stay within one file.".to_string()),
+            ])
+        });
+    draft_object
+        .entry("required_context_refs".to_string())
+        .or_insert_with(|| {
+            Value::Array(vec![
+                Value::String(pack.primary_work_unit.id.clone()),
+                Value::String(pack.source_report.id.clone()),
+                Value::String(pack.current_assignment.id.clone()),
+            ])
+        });
+    draft_object
+        .entry("expected_report_fields".to_string())
+        .or_insert_with(|| {
+            Value::Array(vec![
+                Value::String("summary".to_string()),
+                Value::String("findings".to_string()),
+            ])
+        });
+    draft_object
+        .entry("boundedness_note".to_string())
+        .or_insert_with(|| {
+            Value::String("Bounded to the current work unit and live report.".to_string())
+        });
+}
+
+fn synthesize_supervisor_summary(proposal_value: &Value) -> Value {
+    let decision_type = proposal_value
+        .get("proposed_decision")
+        .and_then(|value| value.get("decision_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("continue");
+    let rationale = proposal_value
+        .get("proposed_decision")
+        .and_then(|value| value.get("rationale"))
+        .and_then(Value::as_str)
+        .unwrap_or("bounded follow-up");
+    let objective = proposal_value
+        .get("draft_next_assignment")
+        .and_then(|value| value.get("objective"))
+        .and_then(Value::as_str)
+        .unwrap_or("bounded follow-up work");
+    let boundedness_note = proposal_value
+        .get("draft_next_assignment")
+        .and_then(|value| value.get("boundedness_note"))
+        .and_then(Value::as_str)
+        .unwrap_or("bounded follow-up");
+    json!({
+        "headline": format!("{decision_type} proposal for bounded follow-up"),
+        "situation": objective,
+        "recommended_action": rationale,
+        "key_evidence": [
+            "live worker report was persisted",
+            boundedness_note,
+        ],
+        "risks": [
+            "proposal still needs operator review",
+            "local model output may be terse",
+        ],
+        "review_focus": [
+            "bounded scope",
+            "next assignment linkage",
+        ],
+    })
+}
+
+fn expected_work_unit_status_for_decision_label(decision_label: &str) -> &'static str {
+    match decision_label {
+        "accept" => "accepted",
+        "continue" | "redirect" => "ready",
+        "mark_complete" => "completed",
+        "escalate_to_human" => "needs_human",
+        _ => "ready",
+    }
+}
+
+fn decision_requires_assignment_label(decision_label: &str) -> bool {
+    match decision_label {
+        "accept" => false,
+        "continue" | "redirect" => true,
+        "mark_complete" => false,
+        "escalate_to_human" => false,
+        _ => true,
+    }
 }
 
 pub fn build_context_pack(
@@ -1782,6 +2229,8 @@ fn proposal_json_schema() -> Value {
             "summary",
             "proposed_decision",
             "draft_next_assignment",
+            "plan_assessment",
+            "plan_revision_proposal",
             "confidence",
             "warnings",
             "open_questions"
@@ -1803,20 +2252,23 @@ fn proposal_json_schema() -> Value {
                     "review_focus"
                 ],
                 "properties": {
-                    "headline": { "type": "string" },
-                    "situation": { "type": "string" },
-                    "recommended_action": { "type": "string" },
+                    "headline": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
+                    "situation": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
+                    "recommended_action": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
                     "key_evidence": {
                         "type": "array",
-                        "items": { "type": "string" }
+                        "maxItems": SUPERVISOR_SHORT_LIST_MAX_ITEMS,
+                        "items": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN }
                     },
                     "risks": {
                         "type": "array",
-                        "items": { "type": "string" }
+                        "maxItems": SUPERVISOR_SHORT_LIST_MAX_ITEMS,
+                        "items": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN }
                     },
                     "review_focus": {
                         "type": "array",
-                        "items": { "type": "string" }
+                        "maxItems": SUPERVISOR_SHORT_LIST_MAX_ITEMS,
+                        "items": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN }
                     }
                 }
             },
@@ -1844,7 +2296,7 @@ fn proposal_json_schema() -> Value {
                     },
                     "target_work_unit_id": { "type": "string" },
                     "source_report_id": { "type": "string" },
-                    "rationale": { "type": "string" },
+                    "rationale": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
                     "expected_work_unit_status": {
                         "type": "string",
                         "enum": ["accepted", "ready", "completed", "needs_human"]
@@ -1894,34 +2346,39 @@ fn proposal_json_schema() -> Value {
                             "closure_synthesis"
                         ]
                     },
-                    "alignment_rationale": { "type": ["string", "null"] },
-                    "preferred_worker_id": { "type": ["string", "null"] },
-                    "worker_kind": { "type": ["string", "null"] },
-                    "objective": { "type": "string" },
+                    "alignment_rationale": { "type": ["string", "null"], "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
+                    "preferred_worker_id": { "type": ["string", "null"], "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
+                    "worker_kind": { "type": ["string", "null"], "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
+                    "objective": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
                     "instructions": {
                         "type": "array",
-                        "items": { "type": "string" }
+                        "maxItems": SUPERVISOR_SHORT_LIST_MAX_ITEMS,
+                        "items": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN }
                     },
                     "acceptance_criteria": {
                         "type": "array",
-                        "items": { "type": "string" }
+                        "maxItems": SUPERVISOR_SHORT_LIST_MAX_ITEMS,
+                        "items": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN }
                     },
                     "stop_conditions": {
                         "type": "array",
-                        "items": { "type": "string" }
+                        "maxItems": SUPERVISOR_SHORT_LIST_MAX_ITEMS,
+                        "items": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN }
                     },
                     "required_context_refs": {
                         "type": "array",
-                        "items": { "type": "string" }
+                        "maxItems": SUPERVISOR_REVIEW_LIST_MAX_ITEMS,
+                        "items": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN }
                     },
                     "expected_report_fields": {
                         "type": "array",
+                        "maxItems": SUPERVISOR_SHORT_LIST_MAX_ITEMS,
                         "items": {
                             "type": "string",
                             "enum": EXPECTED_REPORT_FIELDS
                         }
                     },
-                    "boundedness_note": { "type": "string" }
+                    "boundedness_note": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN }
                 }
             },
             "plan_assessment": {
@@ -1932,9 +2389,12 @@ fn proposal_json_schema() -> Value {
                     "workstream_id",
                     "plan_id",
                     "plan_version",
+                    "assignment_id",
+                    "plan_item_id",
                     "alignment_status",
                     "progress_summary",
                     "drift_risk",
+                    "blocker_summary",
                     "recommended_next_action",
                     "proposed_revision_needed",
                     "execution_kind",
@@ -1958,13 +2418,13 @@ fn proposal_json_schema() -> Value {
                             "complete"
                         ]
                     },
-                    "progress_summary": { "type": "string" },
+                    "progress_summary": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
                     "drift_risk": {
                         "type": "string",
                         "enum": ["low", "medium", "high"]
                     },
                     "blocker_summary": { "type": ["string", "null"] },
-                    "recommended_next_action": { "type": "string" },
+                    "recommended_next_action": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
                     "proposed_revision_needed": { "type": "boolean" },
                     "execution_kind": {
                         "type": "string",
@@ -1992,24 +2452,42 @@ fn proposal_json_schema() -> Value {
                     "urgency",
                     "expected_benefit",
                     "tradeoffs",
-                    "ops"
+                    "ops",
+                    "status",
+                    "created_at",
+                    "created_by",
+                    "reviewed_at",
+                    "reviewed_by",
+                    "review_note",
+                    "apply_started_at",
+                    "apply_finished_at",
+                    "apply_error",
+                    "recovery",
+                    "applied_plan_id",
+                    "applied_plan_version",
+                    "source_supervisor_proposal_id"
                 ],
                 "properties": {
                     "proposal_id": { "type": "string" },
                     "workstream_id": { "type": "string" },
                     "base_plan_id": { "type": "string" },
                     "base_plan_version": { "type": "integer" },
-                    "rationale": { "type": "string" },
-                    "urgency": { "type": "string" },
-                    "expected_benefit": { "type": "string" },
+                    "rationale": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
+                    "urgency": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
+                    "expected_benefit": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN },
                     "tradeoffs": {
                         "type": "array",
-                        "items": { "type": "string" }
+                        "maxItems": SUPERVISOR_SHORT_LIST_MAX_ITEMS,
+                        "items": { "type": "string", "maxLength": SUPERVISOR_SHORT_TEXT_MAX_LEN }
                     },
                     "ops": {
                         "type": "array",
+                        "maxItems": SUPERVISOR_SHORT_LIST_MAX_ITEMS,
                         "items": {
-                            "type": "object"
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {},
+                            "required": []
                         }
                     },
                     "status": {
@@ -2023,7 +2501,17 @@ fn proposal_json_schema() -> Value {
                         ]
                     },
                     "created_at": { "type": ["string", "null"] },
-                    "created_by": { "type": ["string", "null"] }
+                    "created_by": { "type": ["string", "null"] },
+                    "reviewed_at": { "type": ["string", "null"] },
+                    "reviewed_by": { "type": ["string", "null"] },
+                    "review_note": { "type": ["string", "null"] },
+                    "apply_started_at": { "type": ["string", "null"] },
+                    "apply_finished_at": { "type": ["string", "null"] },
+                    "apply_error": { "type": ["string", "null"] },
+                    "recovery": plan_revision_recovery_schema(),
+                    "applied_plan_id": { "type": ["string", "null"] },
+                    "applied_plan_version": { "type": ["integer", "null"] },
+                    "source_supervisor_proposal_id": { "type": ["string", "null"] }
                 }
             },
             "confidence": {
@@ -2039,6 +2527,385 @@ fn proposal_json_schema() -> Value {
                 "items": { "type": "string" }
             }
         }
+    })
+}
+
+fn plan_revision_op_add_goal_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "goal"],
+        "properties": {
+            "kind": { "type": "string", "const": "add_goal" },
+            "goal": plan_goal_schema(),
+        },
+    })
+}
+
+fn plan_revision_op_update_goal_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "goal_id", "patch"],
+        "properties": {
+            "kind": { "type": "string", "const": "update_goal" },
+            "goal_id": { "type": "string" },
+            "patch": plan_goal_patch_schema(),
+        },
+    })
+}
+
+fn plan_revision_op_remove_goal_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "goal_id"],
+        "properties": {
+            "kind": { "type": "string", "const": "remove_goal" },
+            "goal_id": { "type": "string" },
+        },
+    })
+}
+
+fn plan_revision_op_add_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "item"],
+        "properties": {
+            "kind": { "type": "string", "const": "add_item" },
+            "item": plan_item_schema(),
+        },
+    })
+}
+
+fn plan_revision_op_update_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "item_id", "patch"],
+        "properties": {
+            "kind": { "type": "string", "const": "update_item" },
+            "item_id": { "type": "string" },
+            "patch": plan_item_patch_schema(),
+        },
+    })
+}
+
+fn plan_revision_op_move_item_before_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "item_id", "before_item_id"],
+        "properties": {
+            "kind": { "type": "string", "const": "move_item_before" },
+            "item_id": { "type": "string" },
+            "before_item_id": { "type": ["string", "null"] },
+        },
+    })
+}
+
+fn plan_revision_op_remove_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "item_id"],
+        "properties": {
+            "kind": { "type": "string", "const": "remove_item" },
+            "item_id": { "type": "string" },
+        },
+    })
+}
+
+fn plan_revision_op_set_current_focus_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "item_id"],
+        "properties": {
+            "kind": { "type": "string", "const": "set_current_focus" },
+            "item_id": { "type": ["string", "null"] },
+        },
+    })
+}
+
+fn plan_revision_op_update_success_criteria_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "success_criteria"],
+        "properties": {
+            "kind": { "type": "string", "const": "update_success_criteria" },
+            "success_criteria": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+        },
+    })
+}
+
+fn plan_revision_op_update_constraints_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "constraints"],
+        "properties": {
+            "kind": { "type": "string", "const": "update_constraints" },
+            "constraints": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+        },
+    })
+}
+
+fn plan_revision_op_update_exploration_policy_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "exploration_policy"],
+        "properties": {
+            "kind": { "type": "string", "const": "update_exploration_policy" },
+            "exploration_policy": exploration_policy_schema(),
+        },
+    })
+}
+
+fn plan_revision_op_split_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "source_item_id", "new_items"],
+        "properties": {
+            "kind": { "type": "string", "const": "split_item" },
+            "source_item_id": { "type": "string" },
+            "new_items": {
+                "type": "array",
+                "items": plan_item_schema(),
+            },
+        },
+    })
+}
+
+fn plan_revision_op_merge_items_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "source_item_ids", "merged_item"],
+        "properties": {
+            "kind": { "type": "string", "const": "merge_items" },
+            "source_item_ids": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "merged_item": plan_item_schema(),
+        },
+    })
+}
+
+fn plan_goal_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["goal_id", "title", "description", "priority", "status"],
+        "properties": {
+            "goal_id": { "type": "string" },
+            "title": { "type": "string" },
+            "description": { "type": ["string", "null"] },
+            "priority": { "type": "string" },
+            "status": {
+                "type": "string",
+                "enum": ["pending", "in_progress", "complete", "dropped"]
+            },
+        },
+    })
+}
+
+fn plan_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "item_id",
+            "goal_id",
+            "title",
+            "purpose",
+            "priority",
+            "status",
+            "acceptance_criteria",
+            "dependency_item_ids",
+            "notes",
+            "linked_work_unit_id",
+            "linked_assignment_ids",
+            "evidence_refs"
+        ],
+        "properties": {
+            "item_id": { "type": "string" },
+            "goal_id": { "type": "string" },
+            "title": { "type": "string" },
+            "purpose": { "type": ["string", "null"] },
+            "priority": { "type": "string" },
+            "status": {
+                "type": "string",
+                "enum": ["pending", "in_progress", "blocked", "done", "dropped"]
+            },
+            "acceptance_criteria": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "dependency_item_ids": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "notes": { "type": ["string", "null"] },
+            "linked_work_unit_id": { "type": ["string", "null"] },
+            "linked_assignment_ids": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "evidence_refs": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+        },
+    })
+}
+
+fn plan_goal_patch_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "description", "priority", "status"],
+        "properties": {
+            "title": { "type": ["string", "null"] },
+            "description": { "type": ["string", "null"] },
+            "priority": { "type": ["string", "null"] },
+            "status": { "type": ["string", "null"] },
+        },
+    })
+}
+
+fn plan_item_patch_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "title",
+            "purpose",
+            "priority",
+            "status",
+            "acceptance_criteria",
+            "dependency_item_ids",
+            "notes",
+            "linked_work_unit_id",
+            "linked_assignment_ids",
+            "evidence_refs"
+        ],
+        "properties": {
+            "title": { "type": ["string", "null"] },
+            "purpose": { "type": ["string", "null"] },
+            "priority": { "type": ["string", "null"] },
+            "status": { "type": ["string", "null"] },
+            "acceptance_criteria": {
+                "type": ["array", "null"],
+                "items": { "type": "string" }
+            },
+            "dependency_item_ids": {
+                "type": ["array", "null"],
+                "items": { "type": "string" }
+            },
+            "notes": { "type": ["string", "null"] },
+            "linked_work_unit_id": { "type": ["string", "null"] },
+            "linked_assignment_ids": {
+                "type": ["array", "null"],
+                "items": { "type": "string" }
+            },
+            "evidence_refs": {
+                "type": ["array", "null"],
+                "items": { "type": "string" }
+            },
+        },
+    })
+}
+
+fn exploration_policy_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "mode",
+            "max_branch_depth",
+            "allow_blocker_investigations",
+            "allow_speculative_side_paths",
+            "checkpoint_interval",
+            "drift_alert_threshold"
+        ],
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["strict", "balanced", "exploratory"]
+            },
+            "max_branch_depth": { "type": ["integer", "null"] },
+            "allow_blocker_investigations": { "type": "boolean" },
+            "allow_speculative_side_paths": { "type": "boolean" },
+            "checkpoint_interval": { "type": ["integer", "null"] },
+            "drift_alert_threshold": { "type": ["string", "null"] },
+        },
+    })
+}
+
+fn plan_revision_recovery_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "phase",
+            "failure_kind",
+            "downstream_apply_started",
+            "downstream_apply_completed",
+            "retry_safe",
+            "reconcile_available",
+            "operator_intervention_required",
+            "failure_message",
+            "downstream_decision_id",
+            "downstream_assignment_id"
+        ],
+        "properties": {
+            "phase": {
+                "type": "string",
+                "enum": [
+                    "not_started",
+                    "downstream_applying",
+                    "awaiting_finalization",
+                    "applied",
+                    "failed_before_downstream",
+                    "failed_during_downstream",
+                    "failed_after_downstream",
+                    "rejected",
+                    "superseded"
+                ]
+            },
+            "failure_kind": {
+                "type": ["string", "null"],
+                "enum": [
+                    "retryable_infrastructure",
+                    "validation_failure",
+                    "stale_base_plan",
+                    "downstream_unknown",
+                    "finalization_failure",
+                    "operator_required",
+                    null
+                ]
+            },
+            "downstream_apply_started": { "type": "boolean" },
+            "downstream_apply_completed": { "type": "boolean" },
+            "retry_safe": { "type": "boolean" },
+            "reconcile_available": { "type": "boolean" },
+            "operator_intervention_required": { "type": "boolean" },
+            "failure_message": { "type": ["string", "null"] },
+            "downstream_decision_id": { "type": ["string", "null"] },
+            "downstream_assignment_id": { "type": ["string", "null"] }
+        },
     })
 }
 
@@ -2370,12 +3237,46 @@ mod tests {
         );
         assert!(
             first
+                .instructions_text
+                .contains("exactly 2 acceptance criteria")
+        );
+        assert!(
+            first
+                .instructions_text
+                .contains("exactly 2 stop conditions")
+        );
+        assert!(
+            first
+                .instructions_text
+                .contains("exactly 2 expected report fields")
+        );
+        assert!(
+            first
                 .user_content_text
                 .contains("Return a supervisor proposal JSON object")
         );
         assert!(first.user_content_text.contains(&first.context_pack_text));
         assert!(first.context_pack_text.contains("\"schema_version\""));
         assert!(!first.prompt_hash.is_empty());
+    }
+
+    #[test]
+    fn responses_api_reasoner_omits_auth_and_reasoning_for_local_models() {
+        let mut config = orcas_core::AppConfig::default();
+        config.supervisor.base_url = "http://127.0.0.1:8000/v1".to_string();
+        config.supervisor.api_key_env = String::new();
+        config.supervisor.model = "gpt-oss-20b".to_string();
+        config.supervisor.reasoning_effort = String::new();
+        let reasoner = super::ResponsesApiReasoner::new(config);
+
+        assert!(reasoner.api_key().expect("api key").is_none());
+
+        let pack = sample_pack(vec![DecisionType::Continue, DecisionType::Accept]);
+        let prompt = render_supervisor_prompt(&pack, fixed_now()).expect("render prompt");
+        let (body, _) = reasoner.request_body(&prompt).expect("request body");
+        assert_eq!(body["model"], "gpt-oss-20b");
+        assert!(body.get("reasoning").is_none());
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
     }
 
     #[test]
@@ -2524,6 +3425,250 @@ mod tests {
         let proposal = sample_proposal(DecisionType::Continue);
 
         validate_proposal(&proposal, &pack, &collaboration).expect("proposal should validate");
+    }
+
+    #[test]
+    fn proposal_schema_includes_nullable_plan_assessment_and_revision_fields_in_required_list() {
+        let schema = super::proposal_json_schema();
+        let plan_assessment_required = schema["properties"]["plan_assessment"]["required"]
+            .as_array()
+            .expect("plan_assessment required");
+        for field in ["assignment_id", "plan_item_id", "blocker_summary"] {
+            assert!(
+                plan_assessment_required
+                    .iter()
+                    .any(|value: &serde_json::Value| value.as_str() == Some(field)),
+                "plan_assessment schema must require {field}"
+            );
+        }
+
+        let plan_revision_required = schema["properties"]["plan_revision_proposal"]["required"]
+            .as_array()
+            .expect("plan_revision_proposal required");
+        for field in [
+            "status",
+            "created_at",
+            "created_by",
+            "reviewed_at",
+            "reviewed_by",
+            "review_note",
+            "apply_started_at",
+            "apply_finished_at",
+            "apply_error",
+            "recovery",
+            "applied_plan_id",
+            "applied_plan_version",
+            "source_supervisor_proposal_id",
+        ] {
+            assert!(
+                plan_revision_required
+                    .iter()
+                    .any(|value: &serde_json::Value| value.as_str() == Some(field)),
+                "plan_revision_proposal schema must require {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_schema_includes_structured_plan_revision_ops_object_shape() {
+        let schema = super::proposal_json_schema();
+        let ops_items =
+            &schema["properties"]["plan_revision_proposal"]["properties"]["ops"]["items"];
+        assert_eq!(ops_items["type"].as_str(), Some("object"));
+        assert!(ops_items["properties"].is_object());
+        assert!(ops_items["required"].is_array());
+    }
+
+    #[test]
+    fn proposal_schema_bounded_string_and_array_fields_keep_outputs_small() {
+        let schema = super::proposal_json_schema();
+        assert_eq!(
+            schema["properties"]["summary"]["properties"]["headline"]["maxLength"].as_u64(),
+            Some(160)
+        );
+        assert_eq!(
+            schema["properties"]["draft_next_assignment"]["properties"]["instructions"]["maxItems"]
+                .as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            schema["properties"]["draft_next_assignment"]["properties"]["expected_report_fields"]
+                ["maxItems"]
+                .as_u64(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn repair_incomplete_json_document_closes_unfinished_objects_and_arrays() {
+        let repaired = super::repair_incomplete_json_document(
+            r#"{"schema_version":"supervisor_proposal.v2","warnings":[],"open_questions":[{"id":"x"}"#,
+        )
+        .expect("repair");
+        let value: serde_json::Value =
+            serde_json::from_str(&repaired).expect("repaired json should parse");
+        assert_eq!(
+            value["schema_version"].as_str(),
+            Some(PROPOSAL_SCHEMA_VERSION)
+        );
+        assert!(value["warnings"].as_array().is_some());
+        assert!(value["open_questions"].as_array().is_some());
+    }
+
+    #[test]
+    fn repair_supervisor_proposal_value_fills_fixed_top_level_defaults() {
+        let pack = sample_pack(vec![
+            DecisionType::Continue,
+            DecisionType::Redirect,
+            DecisionType::EscalateToHuman,
+        ]);
+        let proposal_value = serde_json::json!({
+            "summary": {"headline": "ok", "situation": "ok", "recommended_action": "ok", "key_evidence": [], "risks": [], "review_focus": []},
+            "proposed_decision": {"decision_type": "continue", "target_work_unit_id": "wu", "source_report_id": "r", "rationale": "ok", "expected_work_unit_status": "ready", "requires_assignment": true},
+            "draft_next_assignment": null,
+            "confidence": "high"
+        });
+        let repaired = super::repair_supervisor_proposal_value(proposal_value, &pack);
+        assert_eq!(
+            repaired["schema_version"].as_str(),
+            Some(PROPOSAL_SCHEMA_VERSION)
+        );
+        assert!(repaired["plan_assessment"].is_null());
+        assert!(repaired["plan_revision_proposal"].is_null());
+        assert!(repaired["warnings"].as_array().is_some());
+        assert!(repaired["open_questions"].as_array().is_some());
+    }
+
+    #[test]
+    fn repair_supervisor_proposal_value_synthesizes_missing_summary() {
+        let pack = sample_pack(vec![
+            DecisionType::Continue,
+            DecisionType::Redirect,
+            DecisionType::EscalateToHuman,
+        ]);
+        let proposal_value = serde_json::json!({
+            "confidence": "high",
+            "draft_next_assignment": {
+                "objective": "Verify greeting output with a new test",
+                "boundedness_note": "Bounded to adding one test file and running make test"
+            },
+            "open_questions": [],
+            "plan_assessment": null,
+            "plan_revision_proposal": null,
+            "proposed_decision": {
+                "decision_type": "continue",
+                "expected_work_unit_status": "completed",
+                "rationale": "bounded follow-up test to confirm greeting fix",
+                "requires_assignment": true,
+                "source_report_id": "report-1",
+                "target_work_unit_id": "work-unit-1"
+            },
+            "schema_version": PROPOSAL_SCHEMA_VERSION,
+            "warnings": []
+        });
+        let repaired = super::repair_supervisor_proposal_value(proposal_value, &pack);
+        assert_eq!(
+            repaired["summary"]["headline"].as_str(),
+            Some("continue proposal for bounded follow-up")
+        );
+        assert_eq!(
+            repaired["summary"]["situation"].as_str(),
+            Some("Verify greeting output with a new test")
+        );
+    }
+
+    #[test]
+    fn repair_supervisor_proposal_value_canonicalizes_continue_expected_status() {
+        let pack = sample_pack(vec![
+            DecisionType::Continue,
+            DecisionType::Redirect,
+            DecisionType::EscalateToHuman,
+        ]);
+        let proposal_value = serde_json::json!({
+            "confidence": "high",
+            "draft_next_assignment": null,
+            "open_questions": [],
+            "plan_assessment": null,
+            "plan_revision_proposal": null,
+            "proposed_decision": {
+                "decision_type": "continue",
+                "expected_work_unit_status": "completed",
+                "rationale": "bounded follow-up test",
+                "requires_assignment": true,
+                "source_report_id": "report-1",
+                "target_work_unit_id": "work-unit-1"
+            },
+            "schema_version": PROPOSAL_SCHEMA_VERSION,
+            "summary": {
+                "headline": "ok",
+                "situation": "ok",
+                "recommended_action": "ok",
+                "key_evidence": [],
+                "risks": [],
+                "review_focus": []
+            },
+            "warnings": []
+        });
+        let repaired = super::repair_supervisor_proposal_value(proposal_value, &pack);
+        assert_eq!(
+            repaired["proposed_decision"]["expected_work_unit_status"].as_str(),
+            Some("ready")
+        );
+    }
+
+    #[test]
+    fn repair_supervisor_proposal_value_synthesizes_missing_draft_assignment() {
+        let pack = sample_pack(vec![
+            DecisionType::Continue,
+            DecisionType::Redirect,
+            DecisionType::EscalateToHuman,
+        ]);
+        let proposal_value = serde_json::json!({
+            "confidence": "high",
+            "draft_next_assignment": null,
+            "open_questions": [],
+            "plan_assessment": null,
+            "plan_revision_proposal": null,
+            "proposed_decision": {
+                "decision_type": "continue",
+                "expected_work_unit_status": "ready",
+                "rationale": "bounded follow-up test",
+                "requires_assignment": true,
+                "source_report_id": "report-1",
+                "target_work_unit_id": "work-unit-1"
+            },
+            "schema_version": PROPOSAL_SCHEMA_VERSION,
+            "summary": {
+                "headline": "ok",
+                "situation": "ok",
+                "recommended_action": "ok",
+                "key_evidence": [],
+                "risks": [],
+                "review_focus": []
+            },
+            "warnings": []
+        });
+        let repaired = super::repair_supervisor_proposal_value(proposal_value, &pack);
+        let draft = repaired["draft_next_assignment"]
+            .as_object()
+            .expect("draft assignment should be synthesized");
+
+        assert_eq!(
+            draft["target_work_unit_id"].as_str(),
+            Some(pack.primary_work_unit.id.as_str())
+        );
+        assert_eq!(
+            draft["predecessor_assignment_id"].as_str(),
+            Some(pack.current_assignment.id.as_str())
+        );
+        assert_eq!(
+            draft["derived_from_decision_type"].as_str(),
+            Some("continue")
+        );
+        assert_eq!(
+            draft["boundedness_note"].as_str(),
+            Some("Bounded to the current work unit and live report.")
+        );
     }
 
     #[test]

@@ -45,8 +45,15 @@ struct DaemonRuntimeArgs {
     force_spawn: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(128 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = DaemonCli::parse();
     let paths = AppPaths::discover()?;
     paths.ensure().await?;

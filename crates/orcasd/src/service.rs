@@ -23,7 +23,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -34,9 +34,7 @@ use orcas_codex::{
     RejectingApprovalRouter, WebSocketTransport,
 };
 use orcas_core::authority;
-use orcas_core::authority::{
-    AuthorityCommand, AuthorityEventStore, AuthorityProjectionStore, AuthorityQueryStore,
-};
+use orcas_core::authority::{AuthorityCommand, AuthorityQueryStore};
 use orcas_core::collaboration::{
     PlanningSession, PlanningSessionResearchStatus, PlanningSessionStatus,
     PlanningSessionStructuredSummary,
@@ -65,32 +63,23 @@ use orcas_core::{
     TrackedThreadPruneWorkspaceContract, TrackedThreadPruneWorkspaceResultStatus,
     TrackedThreadWorkspaceOperationContract, TrackedThreadWorkspaceOperationKind,
     TrackedThreadWorkspaceOperationStatus, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
-    WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, WorkspaceOperationRecord,
-    Workstream, WorkstreamStatus,
+    WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, WorkerWorkspaceReport,
+    WorkspaceOperationRecord, Workstream, WorkstreamStatus,
 };
 
-use crate::assignment_comm::parse::parse_worker_report_for_turn;
+use crate::assignment_comm::parse::{ParsedWorkerReport, parse_worker_report_for_turn};
 use crate::assignment_comm::policy::validate_assignment_packet;
 use crate::assignment_comm::render::build_assignment_communication_record;
 use crate::assignment_comm::stable_fingerprint;
 use crate::authority_store::{AuthorityMutationResult, AuthoritySqliteStore};
-use crate::inbox_mirror::OperatorInboxMirrorHttpClient;
 use crate::landing_authorization::landing_authorization_is_current;
 use crate::landing_execution::landing_execution_matches_authorization_basis;
 use crate::merge_prep::assess_merge_prep;
-use crate::operator_inbox::{
-    build_operator_inbox_state, get_operator_inbox_item, list_operator_inbox_items,
-    operator_inbox_changes_after, operator_inbox_checkpoint, operator_inbox_replay_items,
-    rebuild_operator_inbox_state, resolve_operator_inbox_action_route,
-    update_operator_inbox_ack_checkpoint, update_operator_inbox_export_checkpoint,
-    wait_for_operator_inbox_checkpoint,
-};
 use crate::planning_session::{
     build_planning_revision_proposal, build_research_work_unit,
     planning_session_status_is_terminal, planning_session_thread_prompt,
 };
 use crate::process::{OrcasDaemonProcessManager, OrcasRuntimeOverrides, apply_runtime_overrides};
-use crate::remote_action::RemoteActionHttpClient;
 use crate::supervisor::{
     ResponsesApiReasoner, SupervisorReasoner, apply_edits, build_context_pack,
     compile_assignment_instructions, proposal_freshness_error, state_anchor_freshness_error,
@@ -110,25 +99,6 @@ struct DaemonState {
     turns: HashMap<TurnKey, ipc::TurnStateView>,
     recent_thread_id: Option<String>,
     collaboration: CollaborationState,
-    operator_inbox: ipc::OperatorInboxState,
-    operator_inbox_mirrors: BTreeMap<String, ipc::OperatorInboxMirrorCheckpoint>,
-}
-
-#[derive(Debug)]
-enum MirrorLoopProgress {
-    Waiting {
-        after_sequence: u64,
-    },
-    Mirrored {
-        applied_changes: usize,
-        checkpoint: ipc::OperatorInboxCheckpoint,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemoteActionLoopProgress {
-    Idle,
-    Claimed { count: usize },
 }
 
 #[derive(Debug, Default)]
@@ -181,8 +151,6 @@ impl Default for DaemonState {
             turns: HashMap::new(),
             recent_thread_id: None,
             collaboration: CollaborationState::default(),
-            operator_inbox: ipc::OperatorInboxState::default(),
-            operator_inbox_mirrors: BTreeMap::new(),
         }
     }
 }
@@ -191,6 +159,31 @@ impl Default for DaemonState {
 struct PreparedAssignment {
     assignment: Assignment,
     created_new: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AssignmentTurnIngestionPlan {
+    assignment_id: String,
+    worker_id: String,
+    worker_session_id: String,
+    work_unit_id: String,
+    assignment_status: AssignmentStatus,
+    session_runtime_status: WorkerSessionRuntimeStatus,
+    session_attachability: WorkerSessionAttachability,
+    parsed_report: ParsedWorkerReport,
+    report: Report,
+    raw_output_hash: String,
+    workspace_report: Option<WorkerWorkspaceReport>,
+    workspace_operation_contract: Option<TrackedThreadWorkspaceOperationContract>,
+    landing_execution_contract: Option<TrackedThreadLandingExecutionContract>,
+}
+
+#[derive(Debug, Clone)]
+struct AssignmentTurnIngestionCoreOutcome {
+    report: Report,
+    assignment_after_report: Assignment,
+    work_unit_after_report: WorkUnit,
+    stale_proposals: Vec<SupervisorProposalRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,7 +261,6 @@ pub struct OrcasDaemonService {
     event_tx: broadcast::Sender<ipc::DaemonEventEnvelope>,
     client_count: AtomicUsize,
     shutdown: Notify,
-    operator_inbox_checkpoint_tx: watch::Sender<ipc::OperatorInboxCheckpoint>,
     supervisor_reasoner: Arc<dyn SupervisorReasoner>,
 }
 
@@ -317,7 +309,6 @@ impl OrcasDaemonService {
             event_tx,
             client_count: AtomicUsize::new(0),
             shutdown: Notify::new(),
-            operator_inbox_checkpoint_tx: watch::channel(ipc::OperatorInboxCheckpoint::default()).0,
         });
 
         service.initialize_state().await?;
@@ -349,8 +340,6 @@ impl OrcasDaemonService {
         }
 
         info!(socket = %self.paths.socket_file.display(), "orcasd listening");
-        self.clone().spawn_operator_inbox_mirror_loop();
-        self.clone().spawn_remote_action_loop();
 
         loop {
             tokio::select! {
@@ -455,18 +444,6 @@ impl OrcasDaemonService {
                 .max_by_key(|thread| thread.summary.updated_at)
                 .map(|thread| thread.summary.id.clone());
             state.collaboration = stored.collaboration;
-            state.operator_inbox = if stored.operator_inbox.items.is_empty()
-                && stored.operator_inbox.changes.is_empty()
-                && stored.operator_inbox.checkpoint.current_sequence == 0
-            {
-                build_operator_inbox_state(&state.collaboration)
-            } else {
-                stored.operator_inbox
-            };
-            state.operator_inbox_mirrors = stored.operator_inbox_mirrors;
-            let _ = self
-                .operator_inbox_checkpoint_tx
-                .send(state.operator_inbox.checkpoint.clone());
             bootstrap_persist = Self::bootstrap_planning_state(&mut state.collaboration);
         }
         self.reconcile_worker_session_tracked_thread_bindings()
@@ -699,374 +676,6 @@ impl OrcasDaemonService {
         });
     }
 
-    fn spawn_operator_inbox_mirror_loop(self: Arc<Self>) {
-        let Some(server_url) = self.config.inbox_mirror.server_url.clone() else {
-            return;
-        };
-        let service = Arc::clone(&self);
-        tokio::spawn(async move {
-            let client = match service.config.inbox_mirror.operator_api_token.clone() {
-                Some(token) => {
-                    OperatorInboxMirrorHttpClient::with_operator_api_token(server_url, token)
-                }
-                None => OperatorInboxMirrorHttpClient::new(server_url),
-            };
-            if let Err(error) = service.run_operator_inbox_mirror_loop(client).await {
-                warn!(%error, "operator inbox mirror loop stopped");
-            }
-        });
-    }
-
-    fn spawn_remote_action_loop(self: Arc<Self>) {
-        let Some(server_url) = self.config.inbox_mirror.server_url.clone() else {
-            return;
-        };
-        let service = Arc::clone(&self);
-        tokio::spawn(async move {
-            let client = match service.config.inbox_mirror.operator_api_token.clone() {
-                Some(token) => RemoteActionHttpClient::with_operator_api_token(server_url, token),
-                None => RemoteActionHttpClient::new(server_url),
-            };
-            if let Err(error) = service.run_remote_action_loop(client).await {
-                warn!(%error, "remote action loop stopped");
-            }
-        });
-    }
-
-    async fn run_operator_inbox_mirror_loop(
-        self: Arc<Self>,
-        client: OperatorInboxMirrorHttpClient,
-    ) -> OrcasResult<()> {
-        let origin_node_id = self.authority_store.origin_node_id()?.to_string();
-        let peer_id = format!("orcas-server::{origin_node_id}");
-        loop {
-            tokio::select! {
-                _ = self.shutdown.notified() => break,
-                result = self.mirror_operator_inbox_once(&client, &origin_node_id, &peer_id) => {
-                    match result {
-                        Ok(MirrorLoopProgress::Mirrored { .. }) => continue,
-                        Ok(MirrorLoopProgress::Waiting { after_sequence }) => {
-                            let wait_future = self.operator_inbox_wait_for_checkpoint(
-                                ipc::OperatorInboxWaitRequest {
-                                    after_sequence,
-                                    timeout_ms: Some(30_000),
-                                },
-                            );
-                            tokio::select! {
-                                wait = wait_future => {
-                                    let wait = wait?;
-                                    if wait.timed_out {
-                                        continue;
-                                    }
-                                }
-                                _ = self.shutdown.notified() => break,
-                            }
-                        }
-                        Err(error) => {
-                            warn!(%error, "operator inbox mirror loop iteration failed");
-                            sleep(Duration::from_secs(1)).await;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn run_remote_action_loop(
-        self: Arc<Self>,
-        client: RemoteActionHttpClient,
-    ) -> OrcasResult<()> {
-        let origin_node_id = self.authority_store.origin_node_id()?.to_string();
-        let worker_id = format!("orcasd::{origin_node_id}");
-        loop {
-            tokio::select! {
-                _ = self.shutdown.notified() => break,
-                result = self.remote_action_once(&client, &origin_node_id, &worker_id) => {
-                    match result {
-                        Ok(RemoteActionLoopProgress::Claimed { count }) => {
-                            debug!(count, "remote action batch claimed");
-                            continue;
-                        }
-                        Ok(RemoteActionLoopProgress::Idle) => {
-                            tokio::select! {
-                                _ = sleep(Duration::from_secs(5)) => {}
-                                _ = self.shutdown.notified() => break,
-                            }
-                        }
-                        Err(error) => {
-                            warn!(%error, "remote action loop iteration failed");
-                            sleep(Duration::from_secs(1)).await;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn remote_action_once(
-        &self,
-        client: &RemoteActionHttpClient,
-        origin_node_id: &str,
-        worker_id: &str,
-    ) -> OrcasResult<RemoteActionLoopProgress> {
-        let claim = client
-            .claim(&ipc::OperatorRemoteActionClaimRequest {
-                origin_node_id: origin_node_id.to_string(),
-                worker_id: worker_id.to_string(),
-                limit: Some(8),
-                lease_ms: Some(120_000),
-            })
-            .await?;
-        if claim.requests.is_empty() {
-            return Ok(RemoteActionLoopProgress::Idle);
-        }
-
-        for claimed in &claim.requests {
-            let result = self.execute_remote_action_request(&claimed.request).await;
-            match result {
-                Ok(result) => {
-                    client
-                        .complete(&ipc::OperatorRemoteActionCompleteRequest {
-                            origin_node_id: origin_node_id.to_string(),
-                            request_id: claimed.request.request_id.clone(),
-                            claim_token: claimed.claim_token.clone(),
-                            result,
-                        })
-                        .await?;
-                }
-                Err(error) => {
-                    client
-                        .fail(&ipc::OperatorRemoteActionFailRequest {
-                            origin_node_id: origin_node_id.to_string(),
-                            request_id: claimed.request.request_id.clone(),
-                            claim_token: claimed.claim_token.clone(),
-                            error: error.to_string(),
-                        })
-                        .await?;
-                }
-            }
-        }
-
-        Ok(RemoteActionLoopProgress::Claimed {
-            count: claim.requests.len(),
-        })
-    }
-
-    async fn execute_remote_action_request(
-        &self,
-        request: &ipc::OperatorRemoteActionRequest,
-    ) -> OrcasResult<Value> {
-        let item = {
-            let state = self.state.read().await;
-            get_operator_inbox_item(&state.operator_inbox, request.item_id.as_str()).ok_or_else(
-                || {
-                    OrcasError::Protocol(format!(
-                        "unknown operator inbox item `{}` for remote action request `{}`",
-                        request.item_id, request.request_id
-                    ))
-                },
-            )?
-        };
-        let route = resolve_operator_inbox_action_route(&item, request.action_kind)
-            .map_err(OrcasError::Protocol)?;
-        match route {
-            ipc::OperatorInboxActionRoute::Proposal {
-                proposal_id,
-                method,
-                ..
-            }
-            | ipc::OperatorInboxActionRoute::PlanRevisionProposal {
-                proposal_id,
-                method,
-                ..
-            } => match method.as_str() {
-                ipc::methods::PROPOSAL_APPROVE => Ok(serde_json::to_value(
-                    self.proposal_approve(ipc::ProposalApproveRequest {
-                        proposal_id,
-                        reviewed_by: request.requested_by.clone(),
-                        review_note: request.request_note.clone(),
-                        edits: Default::default(),
-                    })
-                    .await?,
-                )?),
-                ipc::methods::PROPOSAL_REJECT => Ok(serde_json::to_value(
-                    self.proposal_reject(ipc::ProposalRejectRequest {
-                        proposal_id,
-                        reviewed_by: request.requested_by.clone(),
-                        review_note: request.request_note.clone(),
-                    })
-                    .await?,
-                )?),
-                ipc::methods::PROPOSAL_RECONCILE => Ok(serde_json::to_value(
-                    self.proposal_reconcile(ipc::ProposalReconcileRequest {
-                        proposal_id,
-                        reviewed_by: request.requested_by.clone(),
-                        review_note: request.request_note.clone(),
-                    })
-                    .await?,
-                )?),
-                other => Err(OrcasError::Protocol(format!(
-                    "proposal remote action method `{other}` is not supported"
-                ))),
-            },
-            ipc::OperatorInboxActionRoute::SupervisorDecision {
-                decision_id,
-                method,
-                ..
-            } => match method.as_str() {
-                ipc::methods::SUPERVISOR_DECISION_APPROVE_AND_SEND => Ok(serde_json::to_value(
-                    self.supervisor_decision_approve_and_send(
-                        ipc::SupervisorDecisionApproveAndSendRequest {
-                            decision_id,
-                            reviewed_by: request.requested_by.clone(),
-                            review_note: request.request_note.clone(),
-                        },
-                    )
-                    .await?,
-                )?),
-                ipc::methods::SUPERVISOR_DECISION_REJECT => Ok(serde_json::to_value(
-                    self.supervisor_decision_reject(ipc::SupervisorDecisionRejectRequest {
-                        decision_id,
-                        reviewed_by: request.requested_by.clone(),
-                        review_note: request.request_note.clone(),
-                    })
-                    .await?,
-                )?),
-                ipc::methods::SUPERVISOR_DECISION_RECORD_NO_ACTION => Ok(serde_json::to_value(
-                    self.supervisor_decision_record_no_action(
-                        ipc::SupervisorDecisionRecordNoActionRequest {
-                            decision_id,
-                            reviewed_by: request.requested_by.clone(),
-                            review_note: request.request_note.clone(),
-                        },
-                    )
-                    .await?,
-                )?),
-                ipc::methods::SUPERVISOR_DECISION_MANUAL_REFRESH => Ok(serde_json::to_value({
-                    let assignment_id = {
-                        let state = self.state.read().await;
-                        state
-                                .collaboration
-                                .supervisor_turn_decisions
-                                .get(&decision_id)
-                                .map(|decision| decision.assignment_id.clone())
-                                .ok_or_else(|| {
-                                    OrcasError::Protocol(format!(
-                                        "unknown supervisor decision `{decision_id}` for remote action request `{}`",
-                                        request.request_id
-                                    ))
-                                })?
-                    };
-                    self.supervisor_decision_manual_refresh(
-                        ipc::SupervisorDecisionManualRefreshRequest {
-                            assignment_id,
-                            requested_by: request.requested_by.clone(),
-                            rationale_note: request.request_note.clone(),
-                        },
-                    )
-                    .await?
-                })?),
-                other => Err(OrcasError::Protocol(format!(
-                    "supervisor decision remote action method `{other}` is not supported"
-                ))),
-            },
-            ipc::OperatorInboxActionRoute::PlanningSession {
-                session_id, method, ..
-            } => match method.as_str() {
-                ipc::methods::PLANNING_SESSION_APPROVE => Ok(serde_json::to_value(
-                    self.planning_session_approve(ipc::PlanningSessionApproveRequest {
-                        session_id,
-                        approved_by: request.requested_by.clone(),
-                        review_note: request.request_note.clone(),
-                    })
-                    .await?,
-                )?),
-                ipc::methods::PLANNING_SESSION_REJECT => Ok(serde_json::to_value(
-                    self.planning_session_reject(ipc::PlanningSessionRejectRequest {
-                        session_id,
-                        rejected_by: request.requested_by.clone(),
-                        review_note: request.request_note.clone(),
-                    })
-                    .await?,
-                )?),
-                ipc::methods::PLANNING_SESSION_SUPERSEDE => Ok(serde_json::to_value(
-                    self.planning_session_supersede(ipc::PlanningSessionSupersedeRequest {
-                        session_id,
-                        superseded_by_session_id: None,
-                        updated_by: request.requested_by.clone(),
-                        note: request.request_note.clone(),
-                    })
-                    .await?,
-                )?),
-                ipc::methods::PLANNING_SESSION_MARK_READY_FOR_REVIEW => Ok(serde_json::to_value(
-                    self.planning_session_mark_ready_for_review(
-                        ipc::PlanningSessionMarkReadyForReviewRequest {
-                            session_id,
-                            updated_by: request.requested_by.clone(),
-                            note: request.request_note.clone(),
-                        },
-                    )
-                    .await?,
-                )?),
-                other => Err(OrcasError::Protocol(format!(
-                    "planning session remote action method `{other}` is not supported"
-                ))),
-            },
-        }
-    }
-
-    async fn mirror_operator_inbox_once(
-        &self,
-        client: &OperatorInboxMirrorHttpClient,
-        origin_node_id: &str,
-        peer_id: &str,
-    ) -> OrcasResult<MirrorLoopProgress> {
-        let server_checkpoint = client.checkpoint(origin_node_id).await?.checkpoint;
-        let local_checkpoint = self
-            .operator_inbox_checkpoint(ipc::OperatorInboxCheckpointRequest::default())
-            .await?
-            .checkpoint;
-        if local_checkpoint.current_sequence <= server_checkpoint.current_sequence {
-            return Ok(MirrorLoopProgress::Waiting {
-                after_sequence: server_checkpoint.current_sequence,
-            });
-        }
-
-        let export = self
-            .operator_inbox_export(ipc::OperatorInboxExportRequest {
-                peer_id: peer_id.to_string(),
-                after_sequence: Some(server_checkpoint.current_sequence),
-                limit: Some(256),
-            })
-            .await?;
-        if export.changes.is_empty() {
-            return Ok(MirrorLoopProgress::Waiting {
-                after_sequence: server_checkpoint.current_sequence,
-            });
-        }
-
-        let apply = client
-            .apply(&ipc::OperatorInboxMirrorApplyRequest {
-                origin_node_id: origin_node_id.to_string(),
-                checkpoint: export.checkpoint.clone(),
-                changes: export.changes.clone(),
-            })
-            .await?;
-        let _ = self
-            .operator_inbox_ack(ipc::OperatorInboxAckRequest {
-                peer_id: peer_id.to_string(),
-                through_sequence: apply.mirror_checkpoint.last_exported_sequence,
-            })
-            .await?;
-
-        Ok(MirrorLoopProgress::Mirrored {
-            applied_changes: apply.applied_changes,
-            checkpoint: apply.checkpoint,
-        })
-    }
-
     async fn handle_client(self: Arc<Self>, stream: UnixStream) {
         self.client_count.fetch_add(1, Ordering::SeqCst);
         let _client_guard = ClientGuard::new(Arc::clone(&self));
@@ -1168,6 +777,21 @@ impl OrcasDaemonService {
     }
 
     async fn handle_request(
+        self: &Arc<Self>,
+        request: JsonRpcRequest,
+        outbound: mpsc::Sender<String>,
+        subscription_task: &mut Option<tokio::task::JoinHandle<()>>,
+    ) -> OrcasResult<()> {
+        debug!(
+            request_id = ?request.id,
+            method = request.method.as_str(),
+            "routing ipc request through boxed dispatcher"
+        );
+        Box::pin(self.handle_request_dispatch(request, outbound, subscription_task)).await
+    }
+
+    #[inline(never)]
+    async fn handle_request_dispatch(
         self: &Arc<Self>,
         request: JsonRpcRequest,
         outbound: mpsc::Sender<String>,
@@ -1362,71 +986,6 @@ impl OrcasDaemonService {
                 let params: ipc::AuthorityTrackedThreadGetRequest =
                     Self::decode_params(request.params.clone())?;
                 serde_json::to_value(self.authority_tracked_thread_get(params).await?)?
-            }
-            ipc::methods::AUTHORITY_EVENTS_EXPORT => {
-                let params: ipc::AuthorityEventsExportRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.authority_events_export(params).await?)?
-            }
-            ipc::methods::AUTHORITY_EVENTS_ACK => {
-                let params: ipc::AuthorityEventsAckRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.authority_events_ack(params).await?)?
-            }
-            ipc::methods::AUTHORITY_EVENTS_REPLAY => {
-                let params: ipc::AuthorityEventsReplayRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.authority_events_replay(params).await?)?
-            }
-            ipc::methods::OPERATOR_INBOX_LIST => {
-                let params: ipc::OperatorInboxListRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.operator_inbox_list(params).await?)?
-            }
-            ipc::methods::OPERATOR_INBOX_GET => {
-                let params: ipc::OperatorInboxGetRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.operator_inbox_get(params).await?)?
-            }
-            ipc::methods::OPERATOR_INBOX_CHECKPOINT => {
-                let params: ipc::OperatorInboxCheckpointRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.operator_inbox_checkpoint(params).await?)?
-            }
-            ipc::methods::OPERATOR_INBOX_CHANGES => {
-                let params: ipc::OperatorInboxChangesRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.operator_inbox_changes(params).await?)?
-            }
-            ipc::methods::OPERATOR_INBOX_ACTION_ROUTE => {
-                let params: ipc::OperatorInboxActionRouteRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.operator_inbox_action_route(params).await?)?
-            }
-            ipc::methods::OPERATOR_INBOX_WAIT_FOR_CHECKPOINT => {
-                let params: ipc::OperatorInboxWaitRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.operator_inbox_wait_for_checkpoint(params).await?)?
-            }
-            ipc::methods::OPERATOR_INBOX_REPLAY => {
-                let params: ipc::OperatorInboxReplayRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.operator_inbox_replay(params).await?)?
-            }
-            ipc::methods::OPERATOR_INBOX_EXPORT => {
-                let params: ipc::OperatorInboxExportRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.operator_inbox_export(params).await?)?
-            }
-            ipc::methods::OPERATOR_INBOX_ACK => {
-                let params: ipc::OperatorInboxAckRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.operator_inbox_ack(params).await?)?
-            }
-            ipc::methods::OPERATOR_INBOX_MIRROR_CHECKPOINT => {
-                let params: ipc::OperatorInboxMirrorCheckpointRequest =
-                    Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.operator_inbox_mirror_checkpoint(params).await?)?
             }
             ipc::methods::WORKSTREAM_PLAN_GET => {
                 let params: ipc::WorkstreamPlanGetRequest =
@@ -1907,6 +1466,13 @@ impl OrcasDaemonService {
             }
         }
 
+        self.thread_get_fresh(params).await
+    }
+
+    async fn thread_get_fresh(
+        &self,
+        params: ipc::ThreadGetRequest,
+    ) -> OrcasResult<ipc::ThreadGetResponse> {
         self.connect_upstream().await?;
         let response = self
             .codex_client
@@ -2995,74 +2561,6 @@ impl OrcasDaemonService {
         })
     }
 
-    async fn authority_events_export(
-        &self,
-        params: ipc::AuthorityEventsExportRequest,
-    ) -> OrcasResult<ipc::AuthorityEventsExportResponse> {
-        if params.peer_id.trim().is_empty() {
-            return Err(OrcasError::Protocol(
-                "authority events export requires a non-empty peer_id".to_string(),
-            ));
-        }
-        let checkpoint = self
-            .authority_store
-            .load_replication_checkpoint(&params.peer_id)
-            .await?;
-        let cursor = params
-            .after_sequence
-            .or_else(|| {
-                checkpoint
-                    .as_ref()
-                    .map(|checkpoint| checkpoint.last_exported_sequence)
-            })
-            .unwrap_or(0);
-        let limit = params.limit.unwrap_or(256).max(1);
-        let events = self
-            .authority_store
-            .list_events(Some(cursor), limit)
-            .await?;
-        let export_through_sequence = events.last().map(|event| event.sequence).unwrap_or(cursor);
-        let checkpoint = self
-            .authority_store
-            .mark_replication_exported(&params.peer_id, export_through_sequence)
-            .await?;
-        Ok(ipc::AuthorityEventsExportResponse { events, checkpoint })
-    }
-
-    async fn authority_events_ack(
-        &self,
-        params: ipc::AuthorityEventsAckRequest,
-    ) -> OrcasResult<ipc::AuthorityEventsAckResponse> {
-        if params.peer_id.trim().is_empty() {
-            return Err(OrcasError::Protocol(
-                "authority events ack requires a non-empty peer_id".to_string(),
-            ));
-        }
-        let checkpoint = self
-            .authority_store
-            .mark_replication_acked(&params.peer_id, params.through_sequence)
-            .await?;
-        Ok(ipc::AuthorityEventsAckResponse { checkpoint })
-    }
-
-    async fn authority_events_replay(
-        &self,
-        params: ipc::AuthorityEventsReplayRequest,
-    ) -> OrcasResult<ipc::AuthorityEventsReplayResponse> {
-        let replayed_events = self
-            .authority_store
-            .replay_stored_events(&params.events)
-            .await?;
-        let projection_checkpoint = self
-            .authority_store
-            .load_projection_checkpoint("authority_current")
-            .await?;
-        Ok(ipc::AuthorityEventsReplayResponse {
-            replayed_events,
-            projection_checkpoint,
-        })
-    }
-
     async fn authority_tracked_thread_prepare_workspace(
         &self,
         params: ipc::AuthorityTrackedThreadPrepareWorkspaceRequest,
@@ -4071,183 +3569,6 @@ impl OrcasDaemonService {
         Ok(ipc::PlanRevisionProposalListResponse { proposals })
     }
 
-    async fn operator_inbox_list(
-        &self,
-        params: ipc::OperatorInboxListRequest,
-    ) -> OrcasResult<ipc::OperatorInboxListResponse> {
-        let state = self.state.read().await;
-        Ok(ipc::OperatorInboxListResponse {
-            items: list_operator_inbox_items(&state.operator_inbox, &params),
-        })
-    }
-
-    async fn operator_inbox_get(
-        &self,
-        params: ipc::OperatorInboxGetRequest,
-    ) -> OrcasResult<ipc::OperatorInboxGetResponse> {
-        let item =
-            get_operator_inbox_item(&self.state.read().await.operator_inbox, &params.item_id)
-                .ok_or_else(|| {
-                    OrcasError::Protocol(format!(
-                        "unknown operator inbox item `{}`",
-                        params.item_id
-                    ))
-                })?;
-        Ok(ipc::OperatorInboxGetResponse { item })
-    }
-
-    async fn operator_inbox_replay(
-        &self,
-        _: ipc::OperatorInboxReplayRequest,
-    ) -> OrcasResult<ipc::OperatorInboxReplayResponse> {
-        let state = self.state.read().await;
-        Ok(ipc::OperatorInboxReplayResponse {
-            checkpoint: operator_inbox_checkpoint(&state.operator_inbox),
-            items: operator_inbox_replay_items(&state.operator_inbox),
-        })
-    }
-
-    async fn operator_inbox_export(
-        &self,
-        params: ipc::OperatorInboxExportRequest,
-    ) -> OrcasResult<ipc::OperatorInboxExportResponse> {
-        let (checkpoint, changes, mirror_checkpoint) = {
-            let mut state = self.state.write().await;
-            let checkpoint = operator_inbox_checkpoint(&state.operator_inbox);
-            let changes = operator_inbox_changes_after(
-                &state.operator_inbox,
-                params.after_sequence.unwrap_or_default(),
-                params.limit,
-            );
-            let mirror_checkpoint = update_operator_inbox_export_checkpoint(
-                &mut state.operator_inbox_mirrors,
-                &params.peer_id,
-                &checkpoint,
-                params.after_sequence.unwrap_or_default(),
-                &changes,
-            )
-            .map_err(OrcasError::Protocol)?;
-            (checkpoint, changes, mirror_checkpoint)
-        };
-        self.persist_state_snapshot().await?;
-        Ok(ipc::OperatorInboxExportResponse {
-            checkpoint,
-            mirror_checkpoint,
-            changes,
-        })
-    }
-
-    async fn operator_inbox_ack(
-        &self,
-        params: ipc::OperatorInboxAckRequest,
-    ) -> OrcasResult<ipc::OperatorInboxAckResponse> {
-        let mirror_checkpoint = {
-            let mut state = self.state.write().await;
-            update_operator_inbox_ack_checkpoint(
-                &mut state.operator_inbox_mirrors,
-                &params.peer_id,
-                params.through_sequence,
-            )
-            .map_err(OrcasError::Protocol)?
-        };
-        self.persist_state_snapshot().await?;
-        Ok(ipc::OperatorInboxAckResponse { mirror_checkpoint })
-    }
-
-    async fn operator_inbox_mirror_checkpoint(
-        &self,
-        params: ipc::OperatorInboxMirrorCheckpointRequest,
-    ) -> OrcasResult<ipc::OperatorInboxMirrorCheckpointResponse> {
-        let state = self.state.read().await;
-        let mirror_checkpoint = state
-            .operator_inbox_mirrors
-            .get(&params.peer_id)
-            .cloned()
-            .unwrap_or_else(|| ipc::OperatorInboxMirrorCheckpoint {
-                peer_id: params.peer_id.clone(),
-                ..Default::default()
-            });
-        Ok(ipc::OperatorInboxMirrorCheckpointResponse { mirror_checkpoint })
-    }
-
-    async fn operator_inbox_checkpoint(
-        &self,
-        _: ipc::OperatorInboxCheckpointRequest,
-    ) -> OrcasResult<ipc::OperatorInboxCheckpointResponse> {
-        let checkpoint = {
-            let state = self.state.read().await;
-            operator_inbox_checkpoint(&state.operator_inbox)
-        };
-        Ok(ipc::OperatorInboxCheckpointResponse { checkpoint })
-    }
-
-    async fn operator_inbox_wait_for_checkpoint(
-        &self,
-        params: ipc::OperatorInboxWaitRequest,
-    ) -> OrcasResult<ipc::OperatorInboxWaitResponse> {
-        let current_checkpoint = {
-            let state = self.state.read().await;
-            operator_inbox_checkpoint(&state.operator_inbox)
-        };
-        if current_checkpoint.current_sequence > params.after_sequence {
-            return Ok(ipc::OperatorInboxWaitResponse {
-                checkpoint: current_checkpoint,
-                advanced: true,
-                timed_out: false,
-            });
-        }
-
-        let rx = self.operator_inbox_checkpoint_tx.subscribe();
-        match wait_for_operator_inbox_checkpoint(rx, params.after_sequence, params.timeout_ms).await
-        {
-            Ok(checkpoint) => Ok(ipc::OperatorInboxWaitResponse {
-                advanced: checkpoint.current_sequence > params.after_sequence,
-                timed_out: false,
-                checkpoint,
-            }),
-            Err(error) if error.starts_with("timed out waiting for operator inbox checkpoint") => {
-                Ok(ipc::OperatorInboxWaitResponse {
-                    checkpoint: current_checkpoint,
-                    advanced: false,
-                    timed_out: true,
-                })
-            }
-            Err(error) => Err(OrcasError::Protocol(error)),
-        }
-    }
-
-    async fn operator_inbox_changes(
-        &self,
-        params: ipc::OperatorInboxChangesRequest,
-    ) -> OrcasResult<ipc::OperatorInboxChangesResponse> {
-        let state = self.state.read().await;
-        let checkpoint = operator_inbox_checkpoint(&state.operator_inbox);
-        let changes = operator_inbox_changes_after(
-            &state.operator_inbox,
-            params.after_sequence,
-            params.limit,
-        );
-        Ok(ipc::OperatorInboxChangesResponse {
-            checkpoint,
-            changes,
-        })
-    }
-
-    async fn operator_inbox_action_route(
-        &self,
-        params: ipc::OperatorInboxActionRouteRequest,
-    ) -> OrcasResult<ipc::OperatorInboxActionRouteResponse> {
-        let item = {
-            let state = self.state.read().await;
-            get_operator_inbox_item(&state.operator_inbox, &params.item_id).ok_or_else(|| {
-                OrcasError::Protocol(format!("unknown operator inbox item `{}`", params.item_id))
-            })?
-        };
-        let route = resolve_operator_inbox_action_route(&item, params.action_kind)
-            .map_err(OrcasError::Protocol)?;
-        Ok(ipc::OperatorInboxActionRouteResponse { route })
-    }
-
     async fn planning_session_create(
         &self,
         params: ipc::PlanningSessionCreateRequest,
@@ -4326,10 +3647,16 @@ impl OrcasDaemonService {
                 .open_questions
                 .push(format!("Supervisor note: {note}"));
         }
+        let status = if summary.ready_for_review {
+            PlanningSessionStatus::AwaitingApproval
+        } else {
+            PlanningSessionStatus::Chatting
+        };
+
         let session_preview = PlanningSession {
             session_id: session_id.clone(),
             workstream_id: workstream.id.clone(),
-            status: PlanningSessionStatus::Chatting,
+            status,
             planning_thread_id: planning_thread_id.clone(),
             base_plan_id: Some(active_plan.plan_id.clone()),
             base_plan_version: Some(active_plan.version),
@@ -4446,26 +3773,18 @@ impl OrcasDaemonService {
                     session.session_id
                 )));
             }
-            if session.status != PlanningSessionStatus::Chatting {
-                return Err(OrcasError::Protocol(format!(
-                    "planning session `{}` can only be updated while chatting",
-                    session.session_id
-                )));
-            }
             if params.summary.research_status == PlanningSessionResearchStatus::Requested {
                 return Err(OrcasError::Protocol(format!(
                     "planning session `{}` summary cannot declare research as requested; use planning_session_request_research after creation",
                     session.session_id
                 )));
             }
-            if params.summary.ready_for_review {
-                return Err(OrcasError::Protocol(format!(
-                    "planning session `{}` summary cannot mark the session ready for review; use planning_session_mark_ready_for_review",
-                    session.session_id
-                )));
-            }
             session.latest_structured_summary = params.summary.clone();
-            session.status = PlanningSessionStatus::Chatting;
+            session.status = if session.latest_structured_summary.ready_for_review {
+                PlanningSessionStatus::AwaitingApproval
+            } else {
+                PlanningSessionStatus::Chatting
+            };
             session.updated_at = Utc::now();
             session.updated_by = updated_by.clone();
             if let Some(note) = params.note.as_ref().filter(|note| !note.trim().is_empty()) {
@@ -4500,12 +3819,6 @@ impl OrcasDaemonService {
             if planning_session_status_is_terminal(session.status) {
                 return Err(OrcasError::Protocol(format!(
                     "planning session `{}` is already closed",
-                    session.session_id
-                )));
-            }
-            if session.status != PlanningSessionStatus::Chatting {
-                return Err(OrcasError::Protocol(format!(
-                    "planning session `{}` can only request supervisor context while chatting",
                     session.session_id
                 )));
             }
@@ -4547,12 +3860,6 @@ impl OrcasDaemonService {
         if planning_session_status_is_terminal(session_snapshot.status) {
             return Err(OrcasError::Protocol(format!(
                 "planning session `{}` is already closed",
-                session_snapshot.session_id
-            )));
-        }
-        if session_snapshot.status != PlanningSessionStatus::Chatting {
-            return Err(OrcasError::Protocol(format!(
-                "planning session `{}` can only request research while chatting",
                 session_snapshot.session_id
             )));
         }
@@ -4658,20 +3965,6 @@ impl OrcasDaemonService {
                 return Err(error);
             }
         };
-        if assignment_response.assignment.work_unit_id != work_unit.id.to_string() {
-            return Err(OrcasError::Protocol(format!(
-                "planning session `{}` research assignment was linked to the wrong work unit",
-                session_snapshot.session_id
-            )));
-        }
-        if assignment_response.report.work_unit_id != work_unit.id.to_string()
-            || assignment_response.report.assignment_id != assignment_response.assignment.id
-        {
-            return Err(OrcasError::Protocol(format!(
-                "planning session `{}` research report was not linked to the research assignment",
-                session_snapshot.session_id
-            )));
-        }
         let completed_at = Utc::now();
 
         let session = {
@@ -4739,12 +4032,6 @@ impl OrcasDaemonService {
             if planning_session_status_is_terminal(session.status) {
                 return Err(OrcasError::Protocol(format!(
                     "planning session `{}` is already closed",
-                    session.session_id
-                )));
-            }
-            if session.status != PlanningSessionStatus::Chatting {
-                return Err(OrcasError::Protocol(format!(
-                    "planning session `{}` can only be marked ready while chatting",
                     session.session_id
                 )));
             }
@@ -4922,9 +4209,6 @@ impl OrcasDaemonService {
             session.clone()
         };
         self.persist_collaboration_state().await?;
-        // Session approval stages a canonical revision proposal only; the
-        // plan remains unchanged until the existing proposal approval/apply
-        // machinery runs on that staged revision.
         Ok(ipc::PlanningSessionApproveResponse {
             session,
             revision_proposal: Some(proposal),
@@ -5659,7 +4943,7 @@ impl OrcasDaemonService {
     ) -> Option<orcas_core::TrackedThreadPruneWorkspaceResult> {
         let status = operation.prune_result_status?;
         Some(orcas_core::TrackedThreadPruneWorkspaceResult {
-            tracked_thread_id: operation.tracked_thread_id.clone(),
+            tracked_thread_id: Some(operation.tracked_thread_id.clone()),
             worktree_path: operation.target_worktree_path.clone()?,
             branch_name: operation.target_branch_name.clone(),
             status,
@@ -6136,361 +5420,18 @@ impl OrcasDaemonService {
         turn_state: ipc::TurnStateView,
         raw_output: String,
     ) -> OrcasResult<(Report, Assignment, WorkUnit, Vec<SupervisorProposalRecord>)> {
-        Box::pin(async move {
-            let started_at = Instant::now();
-            info!(
-                assignment_id = %assignment_id,
-                worker_id = %worker_id,
-                worker_session_id = %worker_session_id,
-                "recording assignment turn outcome"
-            );
-            self.ensure_assignment_communication_record(assignment_id, None, None)
-                .await?;
-            let (assignment_for_parse, communication_record) = {
-                let state = self.state.read().await;
-                let assignment = state
-                    .collaboration
-                    .assignments
-                    .get(assignment_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
-                    })?;
-                let record = state
-                    .collaboration
-                    .assignment_communications
-                    .get(assignment_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        OrcasError::Protocol(format!(
-                            "missing assignment communication record for `{assignment_id}`"
-                        ))
-                    })?;
-                (assignment, record)
-            };
-            let parsed_report = parse_worker_report_for_turn(
-                &raw_output,
-                turn_state.lifecycle,
-                &assignment_for_parse,
-                &communication_record,
-            );
-            info!(
-                assignment_id = %assignment_id,
-                worker_id = %worker_id,
-                worker_session_id = %worker_session_id,
-                parse_result = ?parsed_report.validation.parse_result,
-                disposition = ?parsed_report.disposition,
-                "assignment turn outcome parsed"
-            );
-            let workspace_report = parsed_report
-                .envelope
-                .as_ref()
-                .and_then(|envelope| envelope.workspace_report.clone());
-            let raw_output_hash = stable_fingerprint(&raw_output);
-            let now = Utc::now();
-            let mut state = self.state.write().await;
+        let started_at = Instant::now();
+        info!(
+            assignment_id = %assignment_id,
+            worker_id = %worker_id,
+            worker_session_id = %worker_session_id,
+            "recording assignment turn outcome"
+        );
+        self.ensure_assignment_communication_record(assignment_id, None, None)
+            .await?;
+        let (assignment_for_parse, communication_record) = {
+            let state = self.state.read().await;
             let assignment = state
-                .collaboration
-                .assignments
-                .get_mut(assignment_id)
-                .ok_or_else(|| {
-                    OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
-                })?;
-            let work_unit_id = assignment.work_unit_id.clone();
-            assignment.status = match turn_state.lifecycle {
-                ipc::TurnLifecycleState::Interrupted => AssignmentStatus::Interrupted,
-                ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
-                    AssignmentStatus::Lost
-                }
-                _ => AssignmentStatus::AwaitingDecision,
-            };
-            assignment.updated_at = now;
-
-            let report_id = Self::new_object_id("report");
-            let summary = parsed_report.summary.clone();
-            let report = Report {
-                id: report_id.clone(),
-                work_unit_id: work_unit_id.clone(),
-                assignment_id: assignment_id.to_string(),
-                worker_id: worker_id.to_string(),
-                disposition: parsed_report.disposition,
-                summary,
-                findings: parsed_report.findings,
-                blockers: parsed_report.blockers,
-                questions: parsed_report.questions,
-                recommended_next_actions: parsed_report.recommended_next_actions,
-                confidence: parsed_report.confidence,
-                raw_output,
-                parse_result: parsed_report.validation.parse_result,
-                needs_supervisor_review: parsed_report.validation.needs_supervisor_review,
-                created_at: now,
-            };
-            state
-                .collaboration
-                .reports
-                .insert(report.id.clone(), report.clone());
-            if let Some(record) = state
-                .collaboration
-                .assignment_communications
-                .get_mut(assignment_id)
-            {
-                record.response_envelope = parsed_report.envelope.clone();
-                record.validation = Some(parsed_report.validation.clone());
-                record.raw_output_hash = Some(raw_output_hash);
-            }
-            if let Some(work_unit) = state.collaboration.work_units.get_mut(&work_unit_id) {
-                work_unit.status = WorkUnitStatus::AwaitingDecision;
-                work_unit.latest_report_id = Some(report.id.clone());
-                work_unit.current_assignment_id = Some(assignment_id.to_string());
-                work_unit.updated_at = now;
-            }
-            if let Some(worker) = state.collaboration.workers.get_mut(worker_id) {
-                worker.status = WorkerStatus::Idle;
-                worker.current_assignment_id = None;
-            }
-            if let Some(session) = state
-                .collaboration
-                .worker_sessions
-                .get_mut(worker_session_id)
-            {
-                session.active_turn_id = None;
-                session.runtime_status = match turn_state.lifecycle {
-                    ipc::TurnLifecycleState::Interrupted => WorkerSessionRuntimeStatus::Interrupted,
-                    ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
-                        WorkerSessionRuntimeStatus::Lost
-                    }
-                    _ => WorkerSessionRuntimeStatus::Completed,
-                };
-                session.attachability = if turn_state.attachable {
-                    WorkerSessionAttachability::Attachable
-                } else {
-                    WorkerSessionAttachability::NotAttachable
-                };
-                session.updated_at = now;
-            }
-            drop(state);
-            info!(
-                assignment_id = %assignment_id,
-                worker_id = %worker_id,
-                worker_session_id = %worker_session_id,
-                report_id = %report.id,
-                "assignment turn outcome state updated"
-            );
-
-            if parsed_report.validation.parse_result != ReportParseResult::Invalid
-                && let Some(workspace_report) = workspace_report.as_ref()
-                && let Err(error) = self
-                    .record_worker_workspace_report(assignment_id, workspace_report)
-                    .await
-            {
-                warn!(
-                    assignment_id,
-                    worker_id,
-                    worker_session_id,
-                    error = %error,
-                    "worker workspace report persistence failed"
-                );
-            }
-
-            if let Some(workspace_operation_contract) = assignment_for_parse
-                .communication_seed
-                .as_ref()
-                .and_then(|seed| seed.workspace_operation.as_ref())
-            {
-                match workspace_operation_contract.kind {
-                    TrackedThreadWorkspaceOperationKind::PruneWorkspace => {
-                        let prune_workspace_result = parsed_report
-                            .envelope
-                            .as_ref()
-                            .and_then(|envelope| envelope.prune_workspace_result.as_ref());
-                        let prune_workspace_result_status =
-                            prune_workspace_result.map(|result| result.status);
-                        let target_worktree_path = prune_workspace_result
-                            .map(|result| result.worktree_path.clone())
-                            .or_else(|| {
-                                Some(workspace_operation_contract.workspace.worktree_path.clone())
-                            });
-                        let target_branch_name = prune_workspace_result
-                            .and_then(|result| result.branch_name.clone())
-                            .or_else(|| {
-                                Some(workspace_operation_contract.workspace.branch_name.clone())
-                            });
-                        let worktree_removed =
-                            prune_workspace_result.and_then(|result| result.worktree_removed);
-                        let branch_removed =
-                            prune_workspace_result.and_then(|result| result.branch_removed);
-                        let refusal_reason =
-                            prune_workspace_result.and_then(|result| result.refusal_reason.clone());
-                        let failure_reason =
-                            prune_workspace_result.and_then(|result| result.failure_reason.clone());
-                        let prune_notes =
-                            prune_workspace_result.and_then(|result| result.notes.clone());
-                        let successful_prune = parsed_report.validation.parse_result
-                            != ReportParseResult::Invalid
-                            && workspace_report.is_some()
-                            && prune_workspace_result.is_some()
-                            && matches!(
-                                prune_workspace_result_status,
-                                Some(TrackedThreadPruneWorkspaceResultStatus::Succeeded)
-                            )
-                            && parsed_report.disposition == ReportDisposition::Completed;
-                        if successful_prune {
-                            self.mark_workspace_operation_completed(
-                                assignment_id,
-                                Some(report_id.clone()),
-                                Some(parsed_report.disposition),
-                                Some(parsed_report.summary.clone()),
-                                prune_workspace_result_status,
-                                target_worktree_path,
-                                target_branch_name,
-                                worktree_removed,
-                                branch_removed,
-                                refusal_reason,
-                                failure_reason,
-                                prune_notes,
-                            )
-                            .await?;
-                        } else {
-                            self.mark_workspace_operation_failed(
-                                assignment_id,
-                                Some(report_id.clone()),
-                                Some(parsed_report.summary.clone()),
-                                prune_workspace_result_status,
-                                target_worktree_path,
-                                target_branch_name,
-                                worktree_removed,
-                                branch_removed,
-                                refusal_reason,
-                                failure_reason,
-                                prune_notes,
-                            )
-                            .await?;
-                        }
-                    }
-                    _ => {
-                        if parsed_report.validation.parse_result != ReportParseResult::Invalid
-                            && workspace_report.is_some()
-                            && parsed_report.disposition == ReportDisposition::Completed
-                        {
-                            self.mark_workspace_operation_completed(
-                                assignment_id,
-                                Some(report_id.clone()),
-                                Some(parsed_report.disposition),
-                                Some(parsed_report.summary.clone()),
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                            )
-                            .await?;
-                        } else {
-                            self.mark_workspace_operation_failed(
-                                assignment_id,
-                                Some(report_id.clone()),
-                                Some(parsed_report.summary.clone()),
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            } else if assignment_for_parse
-                .communication_seed
-                .as_ref()
-                .and_then(|seed| seed.landing_execution.as_ref())
-                .is_some()
-            {
-                let landing_execution_result = parsed_report
-                    .envelope
-                    .as_ref()
-                    .and_then(|envelope| envelope.landing_execution_result.as_ref());
-                let execution_result_status = landing_execution_result.map(|result| result.status);
-                let attempted_head_commit =
-                    landing_execution_result.map(|result| result.attempted_head_commit.clone());
-                let landed_commit =
-                    landing_execution_result.and_then(|result| result.landed_commit.clone());
-                let landing_ref_updated =
-                    landing_execution_result.and_then(|result| result.landing_ref_updated);
-                let failure_reason =
-                    landing_execution_result.and_then(|result| result.failure_reason.clone());
-                let notes = landing_execution_result.and_then(|result| result.notes.clone());
-                let authorization_id = assignment_for_parse
-                    .communication_seed
-                    .as_ref()
-                    .and_then(|seed| seed.landing_execution.as_ref())
-                    .map(|contract| contract.landing_authorization_id.clone());
-                let authorized = matches!(
-                    execution_result_status,
-                    Some(TrackedThreadLandingExecutionResultStatus::Succeeded)
-                );
-                if parsed_report.validation.parse_result == ReportParseResult::Parsed
-                    && workspace_report.is_some()
-                    && landing_execution_result.is_some()
-                    && authorized
-                    && parsed_report.disposition == ReportDisposition::Completed
-                {
-                    self.mark_landing_execution_completed(
-                        assignment_id,
-                        Some(report_id.clone()),
-                        Some(parsed_report.disposition),
-                        Some(parsed_report.summary.clone()),
-                        execution_result_status,
-                        attempted_head_commit,
-                        landed_commit,
-                        landing_ref_updated,
-                        failure_reason,
-                        notes,
-                    )
-                    .await?;
-                    if let Some(authorization_id) = authorization_id {
-                        self.mark_landing_authorization_completed(
-                            &authorization_id,
-                            Some(parsed_report.summary.clone()),
-                        )
-                        .await?;
-                    }
-                } else {
-                    self.mark_landing_execution_failed(
-                        assignment_id,
-                        Some(report_id.clone()),
-                        Some(parsed_report.disposition),
-                        Some(parsed_report.summary.clone()),
-                        execution_result_status,
-                        attempted_head_commit,
-                        landed_commit,
-                        landing_ref_updated,
-                        failure_reason,
-                        notes,
-                    )
-                    .await?;
-                    if let Some(authorization_id) = authorization_id {
-                        self.mark_landing_authorization_failed(
-                            &authorization_id,
-                            Some(parsed_report.summary.clone()),
-                        )
-                        .await?;
-                    }
-                }
-            }
-
-            let mut state = self.state.write().await;
-            let stale_proposals = Self::refresh_stale_proposals_for_work_unit(
-                &mut state.collaboration,
-                &work_unit_id,
-            );
-            Self::refresh_workstream_statuses(&mut state.collaboration);
-            let assignment_after_report = state
                 .collaboration
                 .assignments
                 .get(assignment_id)
@@ -6498,39 +5439,519 @@ impl OrcasDaemonService {
                 .ok_or_else(|| {
                     OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
                 })?;
-            let work_unit_after_report = state
+            let record = state
                 .collaboration
-                .work_units
-                .get(&work_unit_id)
+                .assignment_communications
+                .get(assignment_id)
                 .cloned()
                 .ok_or_else(|| {
-                    OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`"))
+                    OrcasError::Protocol(format!(
+                        "missing assignment communication record for `{assignment_id}`"
+                    ))
                 })?;
-            drop(state);
-            self.persist_collaboration_state().await?;
-            info!(
-                assignment_id,
-                worker_id,
-                worker_session_id,
-                work_unit_id = %work_unit_after_report.id,
-                report_id = %report.id,
-                parse_result = ?report.parse_result,
-                needs_supervisor_review = report.needs_supervisor_review,
-                disposition = ?report.disposition,
-                stale_proposal_count = stale_proposals.len(),
-                duration_ms = started_at.elapsed().as_millis() as u64,
-                "recorded assignment turn outcome"
-            );
-            Ok((
-                report,
-                assignment_after_report,
-                work_unit_after_report,
-                stale_proposals,
-            ))
-        })
-        .await
+            (assignment, record)
+        };
+        let plan = Self::derive_assignment_turn_ingestion_plan(
+            assignment_id,
+            worker_id,
+            worker_session_id,
+            &turn_state,
+            raw_output,
+            assignment_for_parse,
+            communication_record,
+        );
+        info!(
+            assignment_id = %assignment_id,
+            worker_id = %worker_id,
+            worker_session_id = %worker_session_id,
+            parse_result = ?plan.parsed_report.validation.parse_result,
+            disposition = ?plan.parsed_report.disposition,
+            "assignment turn outcome plan derived"
+        );
+        let core = self.persist_assignment_turn_ingestion_core(&plan).await?;
+        info!(
+            assignment_id = %assignment_id,
+            worker_id = %worker_id,
+            worker_session_id = %worker_session_id,
+            report_id = %core.report.id,
+            "assignment turn outcome state updated"
+        );
+        self.run_assignment_turn_record_effects(&plan, &core)
+            .await?;
+        info!(
+            assignment_id = %assignment_id,
+            worker_id = %worker_id,
+            worker_session_id = %worker_session_id,
+            report_id = %core.report.id,
+            "recorded assignment turn outcome"
+        );
+        info!(
+            assignment_id = %assignment_id,
+            worker_id = %worker_id,
+            worker_session_id = %worker_session_id,
+            work_unit_id = %core.work_unit_after_report.id,
+            report_id = %core.report.id,
+            parse_result = ?core.report.parse_result,
+            needs_supervisor_review = core.report.needs_supervisor_review,
+            disposition = ?core.report.disposition,
+            stale_proposal_count = core.stale_proposals.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "recorded assignment turn outcome"
+        );
+        Ok((
+            core.report,
+            core.assignment_after_report,
+            core.work_unit_after_report,
+            core.stale_proposals,
+        ))
     }
 
+    fn derive_assignment_turn_ingestion_plan(
+        assignment_id: &str,
+        worker_id: &str,
+        worker_session_id: &str,
+        turn_state: &ipc::TurnStateView,
+        raw_output: String,
+        assignment_for_parse: Assignment,
+        communication_record: AssignmentCommunicationRecord,
+    ) -> AssignmentTurnIngestionPlan {
+        let parsed_report = parse_worker_report_for_turn(
+            &raw_output,
+            turn_state.lifecycle,
+            &assignment_for_parse,
+            &communication_record,
+        );
+        let workspace_report = parsed_report
+            .envelope
+            .as_ref()
+            .and_then(|envelope| envelope.workspace_report.clone());
+        let raw_output_hash = stable_fingerprint(&raw_output);
+        let work_unit_id = assignment_for_parse.work_unit_id.clone();
+        let assignment_status = match turn_state.lifecycle {
+            ipc::TurnLifecycleState::Interrupted => AssignmentStatus::Interrupted,
+            ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
+                AssignmentStatus::Lost
+            }
+            _ => AssignmentStatus::AwaitingDecision,
+        };
+        let session_runtime_status = match turn_state.lifecycle {
+            ipc::TurnLifecycleState::Interrupted => WorkerSessionRuntimeStatus::Interrupted,
+            ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
+                WorkerSessionRuntimeStatus::Lost
+            }
+            _ => WorkerSessionRuntimeStatus::Completed,
+        };
+        let session_attachability = if turn_state.attachable {
+            WorkerSessionAttachability::Attachable
+        } else {
+            WorkerSessionAttachability::NotAttachable
+        };
+        let report = Report {
+            id: Self::new_object_id("report"),
+            work_unit_id: work_unit_id.clone(),
+            assignment_id: assignment_id.to_string(),
+            worker_id: worker_id.to_string(),
+            disposition: parsed_report.disposition,
+            summary: parsed_report.summary.clone(),
+            findings: parsed_report.findings.clone(),
+            blockers: parsed_report.blockers.clone(),
+            questions: parsed_report.questions.clone(),
+            recommended_next_actions: parsed_report.recommended_next_actions.clone(),
+            confidence: parsed_report.confidence,
+            raw_output,
+            parse_result: parsed_report.validation.parse_result,
+            needs_supervisor_review: parsed_report.validation.needs_supervisor_review,
+            created_at: Utc::now(),
+        };
+        let workspace_operation_contract = assignment_for_parse
+            .communication_seed
+            .as_ref()
+            .and_then(|seed| seed.workspace_operation.clone());
+        let landing_execution_contract = assignment_for_parse
+            .communication_seed
+            .as_ref()
+            .and_then(|seed| seed.landing_execution.clone());
+        AssignmentTurnIngestionPlan {
+            assignment_id: assignment_id.to_string(),
+            worker_id: worker_id.to_string(),
+            worker_session_id: worker_session_id.to_string(),
+            work_unit_id,
+            assignment_status,
+            session_runtime_status,
+            session_attachability,
+            parsed_report,
+            report,
+            raw_output_hash,
+            workspace_report,
+            workspace_operation_contract,
+            landing_execution_contract,
+        }
+    }
+
+    async fn persist_assignment_turn_ingestion_core(
+        &self,
+        plan: &AssignmentTurnIngestionPlan,
+    ) -> OrcasResult<AssignmentTurnIngestionCoreOutcome> {
+        let started_at = Instant::now();
+        info!(
+            assignment_id = %plan.assignment_id,
+            worker_id = %plan.worker_id,
+            worker_session_id = %plan.worker_session_id,
+            "persisting assignment turn outcome core"
+        );
+        let now = Utc::now();
+        let (assignment_after_report, work_unit_after_report, stale_proposals) = {
+            let mut state = self.state.write().await;
+            Self::apply_assignment_turn_ingestion_state(&mut state.collaboration, plan, now)?
+        };
+        self.persist_collaboration_state().await?;
+        info!(
+            assignment_id = %plan.assignment_id,
+            worker_id = %plan.worker_id,
+            worker_session_id = %plan.worker_session_id,
+            report_id = %plan.report.id,
+            stale_proposal_count = stale_proposals.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "assignment turn outcome core persisted"
+        );
+        Ok(AssignmentTurnIngestionCoreOutcome {
+            report: plan.report.clone(),
+            assignment_after_report,
+            work_unit_after_report,
+            stale_proposals,
+        })
+    }
+
+    fn apply_assignment_turn_ingestion_state(
+        collaboration: &mut CollaborationState,
+        plan: &AssignmentTurnIngestionPlan,
+        now: chrono::DateTime<Utc>,
+    ) -> OrcasResult<(Assignment, WorkUnit, Vec<SupervisorProposalRecord>)> {
+        let assignment = collaboration
+            .assignments
+            .get_mut(&plan.assignment_id)
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown assignment `{}`", plan.assignment_id))
+            })?;
+        assignment.status = plan.assignment_status;
+        assignment.updated_at = now;
+
+        collaboration
+            .reports
+            .insert(plan.report.id.clone(), plan.report.clone());
+        if let Some(record) = collaboration
+            .assignment_communications
+            .get_mut(&plan.assignment_id)
+        {
+            record.response_envelope = plan.parsed_report.envelope.clone();
+            record.validation = Some(plan.parsed_report.validation.clone());
+            record.raw_output_hash = Some(plan.raw_output_hash.clone());
+        }
+
+        if let Some(work_unit) = collaboration.work_units.get_mut(&plan.work_unit_id) {
+            work_unit.status = WorkUnitStatus::AwaitingDecision;
+            work_unit.latest_report_id = Some(plan.report.id.clone());
+            work_unit.current_assignment_id = Some(plan.assignment_id.clone());
+            work_unit.updated_at = now;
+        } else {
+            return Err(OrcasError::Protocol(format!(
+                "unknown work unit `{}`",
+                plan.work_unit_id
+            )));
+        }
+
+        if let Some(worker) = collaboration.workers.get_mut(&plan.worker_id) {
+            worker.status = WorkerStatus::Idle;
+            worker.current_assignment_id = None;
+        }
+        if let Some(session) = collaboration
+            .worker_sessions
+            .get_mut(&plan.worker_session_id)
+        {
+            session.active_turn_id = None;
+            session.runtime_status = plan.session_runtime_status;
+            session.attachability = plan.session_attachability;
+            session.updated_at = now;
+        }
+
+        let stale_proposals =
+            Self::refresh_stale_proposals_for_work_unit(collaboration, &plan.work_unit_id);
+        Self::refresh_workstream_statuses(collaboration);
+        let assignment_after_report = collaboration
+            .assignments
+            .get(&plan.assignment_id)
+            .cloned()
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown assignment `{}`", plan.assignment_id))
+            })?;
+        let work_unit_after_report = collaboration
+            .work_units
+            .get(&plan.work_unit_id)
+            .cloned()
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown work unit `{}`", plan.work_unit_id))
+            })?;
+        Ok((
+            assignment_after_report,
+            work_unit_after_report,
+            stale_proposals,
+        ))
+    }
+
+    async fn emit_assignment_turn_ingestion_events(
+        &self,
+        core: &AssignmentTurnIngestionCoreOutcome,
+    ) {
+        self.emit_report_recorded(&core.report).await;
+        let assignment_event_action = match core.assignment_after_report.status {
+            AssignmentStatus::Interrupted => ipc::AssignmentLifecycleAction::Interrupted,
+            AssignmentStatus::Failed | AssignmentStatus::Lost => {
+                ipc::AssignmentLifecycleAction::Failed
+            }
+            AssignmentStatus::AwaitingDecision => ipc::AssignmentLifecycleAction::Reported,
+            _ => ipc::AssignmentLifecycleAction::Reported,
+        };
+        self.emit_assignment_lifecycle(assignment_event_action, &core.assignment_after_report)
+            .await;
+        self.emit_work_unit_lifecycle(
+            ipc::CollaborationLifecycleAction::Updated,
+            &core.work_unit_after_report,
+        )
+        .await;
+        for proposal in &core.stale_proposals {
+            self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                .await;
+        }
+    }
+
+    async fn apply_assignment_turn_workspace_operation_effects(
+        &self,
+        plan: &AssignmentTurnIngestionPlan,
+        core: &AssignmentTurnIngestionCoreOutcome,
+    ) -> OrcasResult<()> {
+        let Some(workspace_operation_contract) = plan.workspace_operation_contract.as_ref() else {
+            return Ok(());
+        };
+        match workspace_operation_contract.kind {
+            TrackedThreadWorkspaceOperationKind::PruneWorkspace => {
+                let prune_workspace_result = plan
+                    .parsed_report
+                    .envelope
+                    .as_ref()
+                    .and_then(|envelope| envelope.prune_workspace_result.as_ref());
+                let prune_workspace_result_status =
+                    prune_workspace_result.map(|result| result.status);
+                let target_worktree_path = prune_workspace_result
+                    .map(|result| result.worktree_path.clone())
+                    .or_else(|| Some(workspace_operation_contract.workspace.worktree_path.clone()));
+                let target_branch_name = prune_workspace_result
+                    .and_then(|result| result.branch_name.clone())
+                    .or_else(|| Some(workspace_operation_contract.workspace.branch_name.clone()));
+                let worktree_removed =
+                    prune_workspace_result.and_then(|result| result.worktree_removed);
+                let branch_removed =
+                    prune_workspace_result.and_then(|result| result.branch_removed);
+                let refusal_reason =
+                    prune_workspace_result.and_then(|result| result.refusal_reason.clone());
+                let failure_reason =
+                    prune_workspace_result.and_then(|result| result.failure_reason.clone());
+                let prune_notes = prune_workspace_result.and_then(|result| result.notes.clone());
+                let successful_prune = plan.parsed_report.validation.parse_result
+                    != ReportParseResult::Invalid
+                    && plan.workspace_report.is_some()
+                    && prune_workspace_result.is_some()
+                    && matches!(
+                        prune_workspace_result_status,
+                        Some(TrackedThreadPruneWorkspaceResultStatus::Succeeded)
+                    )
+                    && plan.parsed_report.disposition == ReportDisposition::Completed;
+                if successful_prune {
+                    self.mark_workspace_operation_completed(
+                        &plan.assignment_id,
+                        Some(core.report.id.clone()),
+                        Some(plan.parsed_report.disposition),
+                        Some(plan.parsed_report.summary.clone()),
+                        prune_workspace_result_status,
+                        target_worktree_path,
+                        target_branch_name,
+                        worktree_removed,
+                        branch_removed,
+                        refusal_reason,
+                        failure_reason,
+                        prune_notes,
+                    )
+                    .await?;
+                } else {
+                    self.mark_workspace_operation_failed(
+                        &plan.assignment_id,
+                        Some(core.report.id.clone()),
+                        Some(plan.parsed_report.summary.clone()),
+                        prune_workspace_result_status,
+                        target_worktree_path,
+                        target_branch_name,
+                        worktree_removed,
+                        branch_removed,
+                        refusal_reason,
+                        failure_reason,
+                        prune_notes,
+                    )
+                    .await?;
+                }
+            }
+            _ => {
+                if plan.parsed_report.validation.parse_result != ReportParseResult::Invalid
+                    && plan.workspace_report.is_some()
+                    && plan.parsed_report.disposition == ReportDisposition::Completed
+                {
+                    self.mark_workspace_operation_completed(
+                        &plan.assignment_id,
+                        Some(core.report.id.clone()),
+                        Some(plan.parsed_report.disposition),
+                        Some(plan.parsed_report.summary.clone()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                } else {
+                    self.mark_workspace_operation_failed(
+                        &plan.assignment_id,
+                        Some(core.report.id.clone()),
+                        Some(plan.parsed_report.summary.clone()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_assignment_turn_landing_execution_effects(
+        &self,
+        plan: &AssignmentTurnIngestionPlan,
+        core: &AssignmentTurnIngestionCoreOutcome,
+    ) -> OrcasResult<()> {
+        let Some(landing_execution_contract) = plan.landing_execution_contract.as_ref() else {
+            return Ok(());
+        };
+        let landing_execution_result = plan
+            .parsed_report
+            .envelope
+            .as_ref()
+            .and_then(|envelope| envelope.landing_execution_result.as_ref());
+        let execution_result_status = landing_execution_result.map(|result| result.status);
+        let attempted_head_commit =
+            landing_execution_result.map(|result| result.attempted_head_commit.clone());
+        let landed_commit =
+            landing_execution_result.and_then(|result| result.landed_commit.clone());
+        let landing_ref_updated =
+            landing_execution_result.and_then(|result| result.landing_ref_updated);
+        let failure_reason =
+            landing_execution_result.and_then(|result| result.failure_reason.clone());
+        let notes = landing_execution_result.and_then(|result| result.notes.clone());
+        let authorized = matches!(
+            execution_result_status,
+            Some(TrackedThreadLandingExecutionResultStatus::Succeeded)
+        );
+        if plan.parsed_report.validation.parse_result == ReportParseResult::Parsed
+            && plan.workspace_report.is_some()
+            && landing_execution_result.is_some()
+            && authorized
+            && plan.parsed_report.disposition == ReportDisposition::Completed
+        {
+            self.mark_landing_execution_completed(
+                &plan.assignment_id,
+                Some(core.report.id.clone()),
+                Some(plan.parsed_report.disposition),
+                Some(plan.parsed_report.summary.clone()),
+                execution_result_status,
+                attempted_head_commit,
+                landed_commit,
+                landing_ref_updated,
+                failure_reason,
+                notes,
+            )
+            .await?;
+            self.mark_landing_authorization_completed(
+                &landing_execution_contract.landing_authorization_id,
+                Some(plan.parsed_report.summary.clone()),
+            )
+            .await?;
+        } else {
+            self.mark_landing_execution_failed(
+                &plan.assignment_id,
+                Some(core.report.id.clone()),
+                Some(plan.parsed_report.disposition),
+                Some(plan.parsed_report.summary.clone()),
+                execution_result_status,
+                attempted_head_commit,
+                landed_commit,
+                landing_ref_updated,
+                failure_reason,
+                notes,
+            )
+            .await?;
+            self.mark_landing_authorization_failed(
+                &landing_execution_contract.landing_authorization_id,
+                Some(plan.parsed_report.summary.clone()),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn run_assignment_turn_record_effects(
+        &self,
+        plan: &AssignmentTurnIngestionPlan,
+        core: &AssignmentTurnIngestionCoreOutcome,
+    ) -> OrcasResult<()> {
+        let started_at = Instant::now();
+        info!(
+            assignment_id = %plan.assignment_id,
+            worker_id = %plan.worker_id,
+            worker_session_id = %plan.worker_session_id,
+            report_id = %core.report.id,
+            "running assignment turn record side effects"
+        );
+        if plan.parsed_report.validation.parse_result != ReportParseResult::Invalid
+            && let Some(workspace_report) = plan.workspace_report.as_ref()
+            && let Err(error) = self
+                .record_worker_workspace_report(&plan.assignment_id, workspace_report)
+                .await
+        {
+            warn!(
+                assignment_id = %plan.assignment_id,
+                worker_id = %plan.worker_id,
+                worker_session_id = %plan.worker_session_id,
+                error = %error,
+                "worker workspace report persistence failed"
+            );
+        }
+        Box::pin(self.apply_assignment_turn_workspace_operation_effects(plan, core)).await?;
+        Box::pin(self.apply_assignment_turn_landing_execution_effects(plan, core)).await?;
+        info!(
+            assignment_id = %plan.assignment_id,
+            worker_id = %plan.worker_id,
+            worker_session_id = %plan.worker_session_id,
+            report_id = %core.report.id,
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "assignment turn record side effects complete"
+        );
+        Ok(())
+    }
     async fn record_worker_workspace_report(
         &self,
         assignment_id: &str,
@@ -6652,61 +6073,44 @@ impl OrcasDaemonService {
         turn_state: ipc::TurnStateView,
         raw_output: String,
     ) -> OrcasResult<(Report, Assignment, WorkUnit)> {
-        Box::pin(async move {
-            info!(
-                assignment_id = %assignment_id,
-                worker_id = %worker_id,
-                worker_session_id = %worker_session_id,
-                "ingesting assignment turn outcome"
-            );
-            let (report, assignment_after_report, work_unit_after_report, stale_proposals) =
-                Box::pin(self.record_assignment_turn_outcome(
-                    assignment_id,
-                    worker_id,
-                    worker_session_id,
-                    turn_state,
-                    raw_output,
-                ))
-                .await?;
-            info!(
-                assignment_id = %assignment_id,
-                worker_id = %worker_id,
-                worker_session_id = %worker_session_id,
-                report_id = %report.id,
-                "assignment turn outcome recorded"
-            );
-            self.persist_collaboration_state().await?;
-            self.emit_report_recorded(&report).await;
-            let assignment_event_action = match assignment_after_report.status {
-                AssignmentStatus::Interrupted => ipc::AssignmentLifecycleAction::Interrupted,
-                AssignmentStatus::Failed | AssignmentStatus::Lost => {
-                    ipc::AssignmentLifecycleAction::Failed
-                }
-                AssignmentStatus::AwaitingDecision => ipc::AssignmentLifecycleAction::Reported,
-                _ => ipc::AssignmentLifecycleAction::Reported,
-            };
-            self.emit_assignment_lifecycle(assignment_event_action, &assignment_after_report)
-                .await;
-            self.emit_work_unit_lifecycle(
-                ipc::CollaborationLifecycleAction::Updated,
-                &work_unit_after_report,
+        info!(
+            assignment_id = %assignment_id,
+            worker_id = %worker_id,
+            worker_session_id = %worker_session_id,
+            "ingesting assignment turn outcome"
+        );
+        let (report, assignment_after_report, work_unit_after_report, stale_proposals) = self
+            .record_assignment_turn_outcome(
+                assignment_id,
+                worker_id,
+                worker_session_id,
+                turn_state,
+                raw_output,
             )
-            .await;
-            for proposal in &stale_proposals {
-                self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
-                    .await;
-            }
-            self.maybe_auto_create_proposal_for_report(&report).await;
-            info!(
-                assignment_id = %assignment_id,
-                worker_id = %worker_id,
-                worker_session_id = %worker_session_id,
-                report_id = %report.id,
-                "assignment turn outcome ingestion complete"
-            );
-            Ok((report, assignment_after_report, work_unit_after_report))
-        })
-        .await
+            .await?;
+        info!(
+            assignment_id = %assignment_id,
+            worker_id = %worker_id,
+            worker_session_id = %worker_session_id,
+            report_id = %report.id,
+            "assignment turn outcome recorded"
+        );
+        let core = AssignmentTurnIngestionCoreOutcome {
+            report: report.clone(),
+            assignment_after_report: assignment_after_report.clone(),
+            work_unit_after_report: work_unit_after_report.clone(),
+            stale_proposals: stale_proposals.clone(),
+        };
+        self.emit_assignment_turn_ingestion_events(&core).await;
+        self.maybe_auto_create_proposal_for_report(&report).await;
+        info!(
+            assignment_id = %assignment_id,
+            worker_id = %worker_id,
+            worker_session_id = %worker_session_id,
+            report_id = %report.id,
+            "assignment turn outcome ingestion complete"
+        );
+        Ok((report, assignment_after_report, work_unit_after_report))
     }
 
     async fn assignment_get(
@@ -12187,7 +11591,6 @@ impl OrcasDaemonService {
         let active_thread = Self::focus_thread_view(&state, &threads);
         let session = state.session.clone();
         let collaboration_state = state.collaboration.clone();
-        let operator_inbox = state.operator_inbox.clone();
         drop(state);
         // `state/get` is now a collaboration-first snapshot plus explicit assignment-compatibility
         // bridges. Authority planning hierarchy reads come from authority queries, not from this
@@ -12195,13 +11598,13 @@ impl OrcasDaemonService {
         // been tombstoned, even though the legacy collaboration copy may still exist on disk.
         let bridge_metadata = self.bridge_snapshot_metadata(&collaboration_state).await?;
         let collaboration = Self::collaboration_snapshot(&collaboration_state, &bridge_metadata);
+
         Ok(ipc::StateSnapshot {
             daemon,
             session,
             threads,
             active_thread,
             collaboration,
-            operator_inbox,
             recent_events: self.recent_events.lock().await.iter().cloned().collect(),
         })
     }
@@ -13035,153 +12438,11 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             let Some(thread) = state.threads.get(thread_id).cloned() else {
                 return Ok(());
             };
-
-            let (stale, mut updated_assignments) =
-                Self::stale_open_supervisor_decisions_for_thread_locked(
-                    &mut state.collaboration,
-                    &thread,
-                );
-            let mut created = Vec::new();
-
-            if thread.summary.active_turn_id.is_none() {
-                let assignment_ids = state
-                    .collaboration
-                    .codex_thread_assignments
-                    .values()
-                    .filter(|assignment| {
-                        assignment.codex_thread_id == thread.summary.id
-                            && Self::codex_assignment_supports_decisions(assignment.status)
-                    })
-                    .map(|assignment| assignment.assignment_id.clone())
-                    .collect::<Vec<_>>();
-
-                for assignment_id in assignment_ids {
-                    if Self::open_supervisor_decision_id_for_assignment(
-                        &state.collaboration,
-                        &assignment_id,
-                    )
-                    .is_some()
-                    {
-                        continue;
-                    }
-                    let Some(assignment_snapshot) = state
-                        .collaboration
-                        .codex_thread_assignments
-                        .get(&assignment_id)
-                        .cloned()
-                    else {
-                        continue;
-                    };
-                    let basis_turn_id = thread.summary.last_seen_turn_id.clone();
-                    if Self::latest_current_basis_recorded_no_action(
-                        &state.collaboration,
-                        &assignment_snapshot.assignment_id,
-                        basis_turn_id.as_deref(),
-                    )
-                    .is_some()
-                    {
-                        continue;
-                    }
-
-                    let proposal_kind = if assignment_snapshot.bootstrap_state
-                        == CodexThreadBootstrapState::Pending
-                    {
-                        SupervisorTurnProposalKind::Bootstrap
-                    } else {
-                        SupervisorTurnProposalKind::ContinueAfterTurn
-                    };
-                    let proposed_text = Some(match proposal_kind {
-                        SupervisorTurnProposalKind::Bootstrap => {
-                            Self::generate_bootstrap_turn_text(
-                                &assignment_snapshot,
-                                state
-                                    .collaboration
-                                    .workstreams
-                                    .get(&assignment_snapshot.workstream_id),
-                                state
-                                    .collaboration
-                                    .work_units
-                                    .get(&assignment_snapshot.work_unit_id),
-                            )
-                        }
-                        SupervisorTurnProposalKind::ContinueAfterTurn
-                        | SupervisorTurnProposalKind::ManualRefresh => {
-                            Self::generate_continue_turn_text(
-                                &assignment_snapshot,
-                                state
-                                    .collaboration
-                                    .workstreams
-                                    .get(&assignment_snapshot.workstream_id),
-                                state
-                                    .collaboration
-                                    .work_units
-                                    .get(&assignment_snapshot.work_unit_id),
-                                basis_turn_id.as_deref(),
-                            )
-                        }
-                        SupervisorTurnProposalKind::OperatorSteer => {
-                            unreachable!("operator steer proposals are only created explicitly")
-                        }
-                        SupervisorTurnProposalKind::OperatorInterrupt => {
-                            unreachable!("operator interrupt proposals are only created explicitly")
-                        }
-                    });
-                    let rationale_summary = match proposal_kind {
-                        SupervisorTurnProposalKind::Bootstrap => format!(
-                            "Assignment `{}` is active, the thread is idle, and the bootstrap proposal has not been sent yet.",
-                            assignment_snapshot.assignment_id
-                        ),
-                        SupervisorTurnProposalKind::ContinueAfterTurn
-                        | SupervisorTurnProposalKind::ManualRefresh => format!(
-                            "Assignment `{}` remains active and thread `{}` is idle after basis turn {:?}.",
-                            assignment_snapshot.assignment_id, thread.summary.id, basis_turn_id
-                        ),
-                        SupervisorTurnProposalKind::OperatorSteer => {
-                            unreachable!("operator steer proposals are only created explicitly")
-                        }
-                        SupervisorTurnProposalKind::OperatorInterrupt => {
-                            unreachable!("operator interrupt proposals are only created explicitly")
-                        }
-                    };
-                    let decision = SupervisorTurnDecision {
-                        decision_id: Self::new_object_id("std"),
-                        assignment_id: assignment_snapshot.assignment_id.clone(),
-                        codex_thread_id: assignment_snapshot.codex_thread_id.clone(),
-                        basis_turn_id: basis_turn_id.clone(),
-                        kind: SupervisorTurnDecisionKind::NextTurn,
-                        proposal_kind,
-                        proposed_text,
-                        rationale_summary,
-                        status: SupervisorTurnDecisionStatus::ProposedToHuman,
-                        created_at: now,
-                        approved_at: None,
-                        rejected_at: None,
-                        sent_at: None,
-                        superseded_by: None,
-                        sent_turn_id: None,
-                        notes: None,
-                    };
-                    state
-                        .collaboration
-                        .supervisor_turn_decisions
-                        .insert(decision.decision_id.clone(), decision.clone());
-                    if let Some(assignment) = state
-                        .collaboration
-                        .codex_thread_assignments
-                        .get_mut(&assignment_snapshot.assignment_id)
-                    {
-                        assignment.latest_decision_id = Some(decision.decision_id.clone());
-                        assignment.latest_basis_turn_id = basis_turn_id.clone();
-                        assignment.updated_at = now;
-                        if proposal_kind == SupervisorTurnProposalKind::Bootstrap {
-                            assignment.bootstrap_state = CodexThreadBootstrapState::Proposed;
-                        }
-                        updated_assignments.push(assignment.clone());
-                    }
-                    created.push(decision);
-                }
-            }
-            (created, stale, updated_assignments)
+            Self::refresh_codex_supervisor_state_for_thread_locked(
+                &mut state.collaboration,
+                &thread,
+                now,
+            )
         };
         if created.is_empty() && stale.is_empty() && updated_assignments.is_empty() {
             return Ok(());
@@ -13210,6 +12471,147 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         }
         info!(thread_id = %thread_id, "finished refreshing codex supervisor state for thread");
         Ok(())
+    }
+
+    fn refresh_codex_supervisor_state_for_thread_locked(
+        collaboration: &mut CollaborationState,
+        thread: &ipc::ThreadView,
+        now: chrono::DateTime<Utc>,
+    ) -> (
+        Vec<SupervisorTurnDecision>,
+        Vec<SupervisorTurnDecision>,
+        Vec<CodexThreadAssignment>,
+    ) {
+        let (stale, mut updated_assignments) =
+            Self::stale_open_supervisor_decisions_for_thread_locked(collaboration, thread);
+        let mut created = Vec::new();
+
+        if thread.summary.active_turn_id.is_none() {
+            let assignment_ids = collaboration
+                .codex_thread_assignments
+                .values()
+                .filter(|assignment| {
+                    assignment.codex_thread_id == thread.summary.id
+                        && Self::codex_assignment_supports_decisions(assignment.status)
+                })
+                .map(|assignment| assignment.assignment_id.clone())
+                .collect::<Vec<_>>();
+
+            for assignment_id in assignment_ids {
+                if Self::open_supervisor_decision_id_for_assignment(collaboration, &assignment_id)
+                    .is_some()
+                {
+                    continue;
+                }
+                let Some(assignment_snapshot) = collaboration
+                    .codex_thread_assignments
+                    .get(&assignment_id)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let basis_turn_id = thread.summary.last_seen_turn_id.clone();
+                if Self::latest_current_basis_recorded_no_action(
+                    collaboration,
+                    &assignment_snapshot.assignment_id,
+                    basis_turn_id.as_deref(),
+                )
+                .is_some()
+                {
+                    continue;
+                }
+
+                let proposal_kind =
+                    if assignment_snapshot.bootstrap_state == CodexThreadBootstrapState::Pending {
+                        SupervisorTurnProposalKind::Bootstrap
+                    } else {
+                        SupervisorTurnProposalKind::ContinueAfterTurn
+                    };
+                let proposed_text = Some(match proposal_kind {
+                    SupervisorTurnProposalKind::Bootstrap => Self::generate_bootstrap_turn_text(
+                        &assignment_snapshot,
+                        collaboration
+                            .workstreams
+                            .get(&assignment_snapshot.workstream_id),
+                        collaboration
+                            .work_units
+                            .get(&assignment_snapshot.work_unit_id),
+                    ),
+                    SupervisorTurnProposalKind::ContinueAfterTurn
+                    | SupervisorTurnProposalKind::ManualRefresh => {
+                        Self::generate_continue_turn_text(
+                            &assignment_snapshot,
+                            collaboration
+                                .workstreams
+                                .get(&assignment_snapshot.workstream_id),
+                            collaboration
+                                .work_units
+                                .get(&assignment_snapshot.work_unit_id),
+                            basis_turn_id.as_deref(),
+                        )
+                    }
+                    SupervisorTurnProposalKind::OperatorSteer => {
+                        unreachable!("operator steer proposals are only created explicitly")
+                    }
+                    SupervisorTurnProposalKind::OperatorInterrupt => {
+                        unreachable!("operator interrupt proposals are only created explicitly")
+                    }
+                });
+                let rationale_summary = match proposal_kind {
+                    SupervisorTurnProposalKind::Bootstrap => format!(
+                        "Assignment `{}` is active, the thread is idle, and the bootstrap proposal has not been sent yet.",
+                        assignment_snapshot.assignment_id
+                    ),
+                    SupervisorTurnProposalKind::ContinueAfterTurn
+                    | SupervisorTurnProposalKind::ManualRefresh => format!(
+                        "Assignment `{}` remains active and thread `{}` is idle after basis turn {:?}.",
+                        assignment_snapshot.assignment_id, thread.summary.id, basis_turn_id
+                    ),
+                    SupervisorTurnProposalKind::OperatorSteer => {
+                        unreachable!("operator steer proposals are only created explicitly")
+                    }
+                    SupervisorTurnProposalKind::OperatorInterrupt => {
+                        unreachable!("operator interrupt proposals are only created explicitly")
+                    }
+                };
+                let decision = SupervisorTurnDecision {
+                    decision_id: Self::new_object_id("std"),
+                    assignment_id: assignment_snapshot.assignment_id.clone(),
+                    codex_thread_id: assignment_snapshot.codex_thread_id.clone(),
+                    basis_turn_id: basis_turn_id.clone(),
+                    kind: SupervisorTurnDecisionKind::NextTurn,
+                    proposal_kind,
+                    proposed_text,
+                    rationale_summary,
+                    status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                    created_at: now,
+                    approved_at: None,
+                    rejected_at: None,
+                    sent_at: None,
+                    superseded_by: None,
+                    sent_turn_id: None,
+                    notes: None,
+                };
+                collaboration
+                    .supervisor_turn_decisions
+                    .insert(decision.decision_id.clone(), decision.clone());
+                if let Some(assignment) = collaboration
+                    .codex_thread_assignments
+                    .get_mut(&assignment_snapshot.assignment_id)
+                {
+                    assignment.latest_decision_id = Some(decision.decision_id.clone());
+                    assignment.latest_basis_turn_id = basis_turn_id.clone();
+                    assignment.updated_at = now;
+                    if proposal_kind == SupervisorTurnProposalKind::Bootstrap {
+                        assignment.bootstrap_state = CodexThreadBootstrapState::Proposed;
+                    }
+                    updated_assignments.push(assignment.clone());
+                }
+                created.push(decision);
+            }
+        }
+
+        (created, stale, updated_assignments)
     }
 
     async fn mark_supervisor_decision_stale(
@@ -13271,7 +12673,6 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         .await;
         Ok(decision)
     }
-
     fn report_summary(report: &Report) -> ipc::ReportSummary {
         ipc::ReportSummary {
             id: report.id.clone(),
@@ -13910,16 +13311,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
     }
 
     async fn persist_state_snapshot(&self) -> OrcasResult<()> {
-        let mut checkpoint_to_send = None;
         let stored = {
-            let mut state = self.state.write().await;
-            let previous_sequence = state.operator_inbox.checkpoint.current_sequence;
-            let operator_inbox =
-                rebuild_operator_inbox_state(&state.collaboration, Some(&state.operator_inbox));
-            if operator_inbox.checkpoint.current_sequence > previous_sequence {
-                checkpoint_to_send = Some(operator_inbox.checkpoint.clone());
-            }
-            state.operator_inbox = operator_inbox.clone();
+            let state = self.state.read().await;
             let registry = ThreadRegistry {
                 threads: state
                     .threads
@@ -13950,16 +13343,9 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     .map(|turn| (format!("{}::{}", turn.thread_id, turn.turn_id), turn))
                     .collect::<BTreeMap<_, _>>(),
                 collaboration: state.collaboration.clone(),
-                operator_inbox,
-                operator_inbox_mirrors: state.operator_inbox_mirrors.clone(),
             }
         };
         let result = self.store.save(&stored).await;
-        if result.is_ok() {
-            if let Some(checkpoint) = checkpoint_to_send {
-                let _ = self.operator_inbox_checkpoint_tx.send(checkpoint);
-            }
-        }
         result
     }
 
@@ -14005,25 +13391,166 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         thread_id: &str,
         turn_id: &str,
     ) -> OrcasResult<Option<ipc::TurnStateView>> {
-        if let Some(turn) = self.turn_from_registry(thread_id, turn_id).await {
-            return Ok(Some(turn));
+        let registry_turn = self.turn_from_registry(thread_id, turn_id).await;
+        let needs_remote_reconciliation = registry_turn
+            .as_ref()
+            .is_some_and(Self::turn_needs_remote_reconciliation);
+
+        if needs_remote_reconciliation {
+            info!(
+                thread_id = %thread_id,
+                turn_id = %turn_id,
+                "reconciling detached turn against upstream snapshot"
+            );
         }
 
-        if let Some(thread) = self.thread_from_state(thread_id).await
+        if let Some(turn) = registry_turn.as_ref()
+            && !needs_remote_reconciliation
+        {
+            return Ok(Some(turn.clone()));
+        }
+
+        let remote_turn = if needs_remote_reconciliation {
+            info!(
+                thread_id = %thread_id,
+                turn_id = %turn_id,
+                "detached turn reconciliation: fetching upstream snapshot"
+            );
+            match self
+                .thread_get_fresh(ipc::ThreadGetRequest {
+                    thread_id: thread_id.to_string(),
+                })
+                .await
+            {
+                Ok(response) => {
+                    let turn = Self::turn_state_from_thread_view(&response.thread, turn_id);
+                    if let Some(turn) = turn.as_ref() {
+                        info!(
+                            thread_id = %thread_id,
+                            turn_id = %turn_id,
+                            terminal = turn.terminal,
+                            "detached turn reconciliation: evaluated upstream turn"
+                        );
+                    } else {
+                        info!(
+                            thread_id = %thread_id,
+                            turn_id = %turn_id,
+                            "detached turn reconciliation: upstream snapshot did not include the turn"
+                        );
+                    }
+                    turn
+                }
+                Err(error) => {
+                    info!(
+                        thread_id = %thread_id,
+                        turn_id = %turn_id,
+                        error = %error,
+                        "detached turn reconciliation: upstream fetch failed"
+                    );
+                    None
+                }
+            }
+        } else if let Some(thread) = self.thread_from_state(thread_id).await
             && let Some(turn) = Self::turn_state_from_thread_view(&thread, turn_id)
         {
+            Some(turn)
+        } else {
+            match self
+                .thread_get_fresh(ipc::ThreadGetRequest {
+                    thread_id: thread_id.to_string(),
+                })
+                .await
+            {
+                Ok(response) => Self::turn_state_from_thread_view(&response.thread, turn_id),
+                Err(_) => None,
+            }
+        };
+
+        if let Some(turn) = remote_turn {
+            if turn.terminal {
+                if needs_remote_reconciliation {
+                    info!(
+                        thread_id = %thread_id,
+                        turn_id = %turn_id,
+                        "detached turn reconciliation: persisting terminal snapshot"
+                    );
+                    let _ = self.persist_turn_state_view(&turn).await;
+                    if let Some((assignment_id, worker_id, worker_session_id)) =
+                        self.assignment_for_terminal_turn(thread_id, turn_id).await
+                    {
+                        let report_exists = {
+                            let state = self.state.read().await;
+                            state
+                                .collaboration
+                                .reports
+                                .values()
+                                .any(|report| report.assignment_id == assignment_id)
+                        };
+                        if !report_exists {
+                            info!(
+                                thread_id = %thread_id,
+                                turn_id = %turn_id,
+                                assignment_id = %assignment_id,
+                                "detached turn reconciliation: ingesting recovered terminal outcome"
+                            );
+                            let raw_output = turn.recent_output.clone().unwrap_or_default();
+                            let _ = self
+                                .ingest_assignment_turn_outcome(
+                                    &assignment_id,
+                                    &worker_id,
+                                    &worker_session_id,
+                                    turn.clone(),
+                                    raw_output,
+                                )
+                                .await;
+                        }
+                    }
+                }
+                return Ok(Some(turn));
+            }
+            if needs_remote_reconciliation {
+                info!(
+                    thread_id = %thread_id,
+                    turn_id = %turn_id,
+                    "detached turn reconciliation: upstream turn was not terminal"
+                );
+                return Ok(registry_turn);
+            }
             return Ok(Some(turn));
         }
 
-        match self
-            .thread_get(ipc::ThreadGetRequest {
-                thread_id: thread_id.to_string(),
+        Ok(registry_turn)
+    }
+
+    async fn assignment_for_terminal_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Option<(String, String, String)> {
+        let state = self.state.read().await;
+        state
+            .collaboration
+            .assignments
+            .values()
+            .filter_map(|assignment| {
+                let session = state
+                    .collaboration
+                    .worker_sessions
+                    .get(&assignment.worker_session_id)?;
+                let matches_thread = session.thread_id.as_deref() == Some(thread_id);
+                let matches_turn = session.active_turn_id.as_deref() == Some(turn_id);
+                let matches_running = matches!(assignment.status, AssignmentStatus::Running);
+                if matches_thread && matches_turn && matches_running {
+                    Some((
+                        assignment.id.clone(),
+                        assignment.worker_id.clone(),
+                        assignment.worker_session_id.clone(),
+                    ))
+                } else {
+                    None
+                }
             })
-            .await
-        {
-            Ok(response) => Ok(Self::turn_state_from_thread_view(&response.thread, turn_id)),
-            Err(_) => Ok(None),
-        }
+            .max_by(|left, right| left.0.cmp(&right.0))
     }
 
     async fn known_thread_summaries(&self) -> Vec<ipc::ThreadSummary> {
@@ -14115,169 +13642,287 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             .await;
     }
 
+    async fn apply_codex_connection_state_changed(&self, upstream: ConnectionState) {
+        let (maybe_session, threads_to_persist, turns_to_persist) = {
+            let mut state = self.state.write().await;
+            state.upstream = upstream.clone();
+            if upstream.status != "connected" {
+                info!(
+                    endpoint = %upstream.endpoint,
+                    status = %upstream.status,
+                    "codex transport disconnected; detaching active turns without overwriting execution outcome"
+                );
+                Self::mark_turns_lost(&mut state);
+            }
+            Self::refresh_session_from_turns(&mut state);
+            (
+                state.session.clone(),
+                state.threads.values().cloned().collect::<Vec<_>>(),
+                state.turns.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        if upstream.status != "connected" {
+            for thread in &threads_to_persist {
+                let _ = self.persist_thread_view(thread).await;
+            }
+            for turn in &turns_to_persist {
+                let _ = self.persist_turn_state_view(turn).await;
+            }
+        }
+        self.emit(ipc::DaemonEvent::UpstreamStatusChanged { upstream })
+            .await;
+        self.emit(ipc::DaemonEvent::SessionChanged {
+            session: maybe_session,
+        })
+        .await;
+    }
+
+    async fn apply_codex_thread_started(&self, thread_id: String, preview: String) {
+        let maybe_thread = self.codex_client.snapshot_thread(&thread_id).await;
+        let summary = if let Some(thread) = maybe_thread {
+            let existing = self.thread_from_state(&thread_id).await;
+            let view =
+                Self::thread_view_from_codex(thread, existing.as_ref(), Some("live_observed"));
+            let _ = self.persist_thread_view(&view).await;
+            let mut state = self.state.write().await;
+            state.recent_thread_id = Some(view.summary.id.clone());
+            state.threads.insert(view.summary.id.clone(), view.clone());
+            view.summary
+        } else {
+            let mut state = self.state.write().await;
+            let summary = {
+                let thread = Self::ensure_thread_entry(&mut state, &thread_id);
+                thread.summary.preview = preview;
+                thread.summary.status = "started".to_string();
+                thread.summary.scope = Self::prefer_scope(&thread.summary.scope, "live_observed");
+                thread.summary.recent_event = Some("thread started".to_string());
+                Self::touch_thread(thread);
+                Self::refresh_thread_summary(thread);
+                thread.summary.clone()
+            };
+            state.recent_thread_id = Some(thread_id.clone());
+            summary
+        };
+        if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
+            let _ = self.persist_thread_view(thread_view).await;
+        }
+        self.emit(ipc::DaemonEvent::ThreadUpdated { thread: summary })
+            .await;
+    }
+
+    async fn apply_codex_thread_status_changed(&self, thread_id: String, status: String) {
+        let summary = {
+            let mut state = self.state.write().await;
+            let summary = {
+                let thread = Self::ensure_thread_entry(&mut state, &thread_id);
+                thread.summary.status = status;
+                thread.summary.loaded_status =
+                    Self::thread_loaded_status_from_label(&thread.summary.status);
+                thread.summary.recent_event = Some(format!("thread {}", thread.summary.status));
+                Self::touch_thread(thread);
+                Self::refresh_thread_summary(thread);
+                thread.summary.clone()
+            };
+            state.recent_thread_id = Some(thread_id.clone());
+            summary
+        };
+        if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
+            let _ = self.persist_thread_view(thread_view).await;
+        }
+        self.emit(ipc::DaemonEvent::ThreadUpdated { thread: summary })
+            .await;
+    }
+
+    async fn apply_codex_turn_completed(&self, thread_id: String, turn_id: String, status: String) {
+        info!(
+            thread_id = %thread_id,
+            turn_id = %turn_id,
+            status = %status,
+            "processing upstream turn completion event"
+        );
+        let (session, turn, thread, turn_state) = {
+            let mut state = self.state.write().await;
+            let (turn, thread_summary, turn_state) = {
+                let thread = Self::ensure_thread_entry(&mut state, &thread_id);
+                Self::touch_thread(thread);
+                thread.summary.recent_event = Some(format!("turn {status}"));
+                let turn = Self::upsert_turn(
+                    thread,
+                    ipc::TurnView {
+                        id: turn_id.clone(),
+                        status: status.clone(),
+                        error_message: None,
+                        error_summary: None,
+                        started_at: None,
+                        completed_at: Some(Utc::now()),
+                        latest_diff: None,
+                        latest_plan_snapshot: None,
+                        token_usage_snapshot: None,
+                        items: Vec::new(),
+                    },
+                );
+                Self::refresh_thread_summary(thread);
+                let recent_output =
+                    Self::turn_output(&turn).or_else(|| thread.summary.recent_output.clone());
+                let recent_event = Some(format!("turn {status}"));
+                (
+                    turn.clone(),
+                    thread.summary.clone(),
+                    ipc::TurnStateView {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        lifecycle: Self::turn_lifecycle_from_status(&status),
+                        status: status.clone(),
+                        attachable: false,
+                        live_stream: false,
+                        terminal: true,
+                        recent_output,
+                        recent_event,
+                        updated_at: Utc::now(),
+                        error_message: turn.error_message.clone(),
+                    },
+                )
+            };
+            Self::upsert_turn_state(&mut state, turn_state.clone());
+            Self::refresh_session_from_turns(&mut state);
+            state.recent_thread_id = Some(thread_id.clone());
+            if state.session.active_turns.is_empty() {
+                state.session.active_thread_id = Some(thread_id.clone());
+            }
+            (state.session.clone(), turn, thread_summary, turn_state)
+        };
+        let _ = (thread, session, turn);
+        info!(
+            thread_id = %thread_id,
+            turn_id = %turn_id,
+            status = %status,
+            "processed upstream turn completion event"
+        );
+        let _ = self
+            .refresh_codex_supervisor_state_for_thread(&thread_id)
+            .await;
+        let _ = turn_state;
+    }
+
+    async fn apply_codex_turn_started(&self, thread_id: String, turn_id: String) {
+        self.record_turn_started(&thread_id, &turn_id, "in_progress")
+            .await;
+    }
+
+    async fn apply_codex_item_started(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: String,
+    ) {
+        let item = self
+            .update_item_state(
+                &thread_id,
+                &turn_id,
+                &item_id,
+                &item_type,
+                Some("started"),
+                None,
+            )
+            .await;
+        if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
+            let _ = self.persist_thread_view(thread_view).await;
+        }
+        self.emit(ipc::DaemonEvent::ItemUpdated {
+            thread_id,
+            turn_id,
+            item,
+        })
+        .await;
+    }
+
+    async fn apply_codex_item_completed(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: String,
+    ) {
+        let item = self
+            .update_item_state(
+                &thread_id,
+                &turn_id,
+                &item_id,
+                &item_type,
+                Some("completed"),
+                None,
+            )
+            .await;
+        if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
+            let _ = self.persist_thread_view(thread_view).await;
+        }
+        self.emit(ipc::DaemonEvent::ItemUpdated {
+            thread_id,
+            turn_id,
+            item,
+        })
+        .await;
+    }
+
+    async fn apply_codex_agent_message_delta(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        delta: String,
+    ) {
+        let _ = self
+            .update_item_state(
+                &thread_id,
+                &turn_id,
+                &item_id,
+                "agent_message",
+                Some("streaming"),
+                Some(delta.clone()),
+            )
+            .await;
+        self.emit(ipc::DaemonEvent::OutputDelta {
+            thread_id,
+            turn_id,
+            item_id,
+            delta,
+        })
+        .await;
+    }
+
+    async fn apply_codex_server_request(&self, method: String) {
+        self.emit(ipc::DaemonEvent::Warning {
+            message: format!("server request pending: {method}"),
+        })
+        .await;
+    }
+
+    async fn apply_codex_warning(&self, message: String) {
+        self.emit(ipc::DaemonEvent::Warning { message }).await;
+    }
+
     async fn apply_codex_event(&self, envelope: EventEnvelope) {
+        debug!(event = ?envelope.event, "processing codex event");
         match envelope.event {
             OrcasEvent::ConnectionStateChanged(upstream) => {
-                let (maybe_session, threads_to_persist, turns_to_persist) = {
-                    let mut state = self.state.write().await;
-                    state.upstream = upstream.clone();
-                    if upstream.status != "connected" {
-                        Self::mark_turns_lost(&mut state);
-                    }
-                    Self::refresh_session_from_turns(&mut state);
-                    (
-                        state.session.clone(),
-                        state.threads.values().cloned().collect::<Vec<_>>(),
-                        state.turns.values().cloned().collect::<Vec<_>>(),
-                    )
-                };
-                if upstream.status != "connected" {
-                    for thread in &threads_to_persist {
-                        let _ = self.persist_thread_view(thread).await;
-                    }
-                    for turn in &turns_to_persist {
-                        let _ = self.persist_turn_state_view(turn).await;
-                    }
-                }
-                self.emit(ipc::DaemonEvent::UpstreamStatusChanged { upstream })
-                    .await;
-                self.emit(ipc::DaemonEvent::SessionChanged {
-                    session: maybe_session,
-                })
-                .await;
+                Box::pin(self.apply_codex_connection_state_changed(upstream)).await;
             }
             OrcasEvent::ThreadStarted { thread_id, preview } => {
-                let maybe_thread = self.codex_client.snapshot_thread(&thread_id).await;
-                let summary = if let Some(thread) = maybe_thread {
-                    let existing = self.thread_from_state(&thread_id).await;
-                    let view = Self::thread_view_from_codex(
-                        thread,
-                        existing.as_ref(),
-                        Some("live_observed"),
-                    );
-                    let _ = self.persist_thread_view(&view).await;
-                    let mut state = self.state.write().await;
-                    state.recent_thread_id = Some(view.summary.id.clone());
-                    state.threads.insert(view.summary.id.clone(), view.clone());
-                    view.summary
-                } else {
-                    let mut state = self.state.write().await;
-                    let summary = {
-                        let thread = Self::ensure_thread_entry(&mut state, &thread_id);
-                        thread.summary.preview = preview;
-                        thread.summary.status = "started".to_string();
-                        thread.summary.scope =
-                            Self::prefer_scope(&thread.summary.scope, "live_observed");
-                        thread.summary.recent_event = Some("thread started".to_string());
-                        Self::touch_thread(thread);
-                        Self::refresh_thread_summary(thread);
-                        thread.summary.clone()
-                    };
-                    state.recent_thread_id = Some(thread_id.clone());
-                    summary
-                };
-                if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view).await;
-                }
-                self.emit(ipc::DaemonEvent::ThreadUpdated { thread: summary })
-                    .await;
+                Box::pin(self.apply_codex_thread_started(thread_id, preview)).await;
             }
             OrcasEvent::ThreadStatusChanged { thread_id, status } => {
-                let summary = {
-                    let mut state = self.state.write().await;
-                    let summary = {
-                        let thread = Self::ensure_thread_entry(&mut state, &thread_id);
-                        thread.summary.status = status;
-                        thread.summary.loaded_status =
-                            Self::thread_loaded_status_from_label(&thread.summary.status);
-                        thread.summary.recent_event =
-                            Some(format!("thread {}", thread.summary.status));
-                        Self::touch_thread(thread);
-                        Self::refresh_thread_summary(thread);
-                        thread.summary.clone()
-                    };
-                    state.recent_thread_id = Some(thread_id.clone());
-                    summary
-                };
-                if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view).await;
-                }
-                self.emit(ipc::DaemonEvent::ThreadUpdated { thread: summary })
-                    .await;
+                Box::pin(self.apply_codex_thread_status_changed(thread_id, status)).await;
             }
             OrcasEvent::TurnStarted { thread_id, turn_id } => {
-                self.record_turn_started(&thread_id, &turn_id, "in_progress")
-                    .await;
+                Box::pin(self.apply_codex_turn_started(thread_id, turn_id)).await;
             }
             OrcasEvent::TurnCompleted {
                 thread_id,
                 turn_id,
                 status,
             } => {
-                info!(
-                    thread_id = %thread_id,
-                    turn_id = %turn_id,
-                    status = %status,
-                    "processing upstream turn completion event"
-                );
-                let (session, turn, thread) = {
-                    let mut state = self.state.write().await;
-                    let (turn, thread_summary, turn_state) = {
-                        let thread = Self::ensure_thread_entry(&mut state, &thread_id);
-                        Self::touch_thread(thread);
-                        thread.summary.recent_event = Some(format!("turn {status}"));
-                        let turn = Self::upsert_turn(
-                            thread,
-                            ipc::TurnView {
-                                id: turn_id.clone(),
-                                status: status.clone(),
-                                error_message: None,
-                                error_summary: None,
-                                started_at: None,
-                                completed_at: Some(Utc::now()),
-                                latest_diff: None,
-                                latest_plan_snapshot: None,
-                                token_usage_snapshot: None,
-                                items: Vec::new(),
-                            },
-                        );
-                        Self::refresh_thread_summary(thread);
-                        let recent_output = Self::turn_output(&turn)
-                            .or_else(|| thread.summary.recent_output.clone());
-                        let recent_event = Some(format!("turn {status}"));
-                        (
-                            turn.clone(),
-                            thread.summary.clone(),
-                            ipc::TurnStateView {
-                                thread_id: thread_id.clone(),
-                                turn_id: turn_id.clone(),
-                                lifecycle: Self::turn_lifecycle_from_status(&status),
-                                status: status.clone(),
-                                attachable: false,
-                                live_stream: false,
-                                terminal: true,
-                                recent_output,
-                                recent_event,
-                                updated_at: Utc::now(),
-                                error_message: turn.error_message.clone(),
-                            },
-                        )
-                    };
-                    Self::upsert_turn_state(&mut state, turn_state.clone());
-                    Self::refresh_session_from_turns(&mut state);
-                    state.recent_thread_id = Some(thread_id.clone());
-                    if state.session.active_turns.is_empty() {
-                        state.session.active_thread_id = Some(thread_id.clone());
-                    }
-                    (state.session.clone(), turn, thread_summary)
-                };
-                let _ = (thread, session, turn);
-                info!(
-                    thread_id = %thread_id,
-                    turn_id = %turn_id,
-                    status = %status,
-                    "processed upstream turn completion event"
-                );
+                Box::pin(self.apply_codex_turn_completed(thread_id, turn_id, status)).await;
             }
             OrcasEvent::ItemStarted {
                 thread_id,
@@ -14285,25 +13930,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 item_id,
                 item_type,
             } => {
-                let item = self
-                    .update_item_state(
-                        &thread_id,
-                        &turn_id,
-                        &item_id,
-                        &item_type,
-                        Some("started"),
-                        None,
-                    )
+                Box::pin(self.apply_codex_item_started(thread_id, turn_id, item_id, item_type))
                     .await;
-                if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view).await;
-                }
-                self.emit(ipc::DaemonEvent::ItemUpdated {
-                    thread_id,
-                    turn_id,
-                    item,
-                })
-                .await;
             }
             OrcasEvent::ItemCompleted {
                 thread_id,
@@ -14311,25 +13939,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 item_id,
                 item_type,
             } => {
-                let item = self
-                    .update_item_state(
-                        &thread_id,
-                        &turn_id,
-                        &item_id,
-                        &item_type,
-                        Some("completed"),
-                        None,
-                    )
+                Box::pin(self.apply_codex_item_completed(thread_id, turn_id, item_id, item_type))
                     .await;
-                if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view).await;
-                }
-                self.emit(ipc::DaemonEvent::ItemUpdated {
-                    thread_id,
-                    turn_id,
-                    item,
-                })
-                .await;
             }
             OrcasEvent::AgentMessageDelta {
                 thread_id,
@@ -14337,32 +13948,14 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 item_id,
                 delta,
             } => {
-                let _ = self
-                    .update_item_state(
-                        &thread_id,
-                        &turn_id,
-                        &item_id,
-                        "agent_message",
-                        Some("streaming"),
-                        Some(delta.clone()),
-                    )
+                Box::pin(self.apply_codex_agent_message_delta(thread_id, turn_id, item_id, delta))
                     .await;
-                self.emit(ipc::DaemonEvent::OutputDelta {
-                    thread_id,
-                    turn_id,
-                    item_id,
-                    delta,
-                })
-                .await;
             }
             OrcasEvent::ServerRequest { method } => {
-                self.emit(ipc::DaemonEvent::Warning {
-                    message: format!("server request pending: {method}"),
-                })
-                .await;
+                Box::pin(self.apply_codex_server_request(method)).await;
             }
             OrcasEvent::Warning { message } => {
-                self.emit(ipc::DaemonEvent::Warning { message }).await;
+                Box::pin(self.apply_codex_warning(message)).await;
             }
         }
     }
@@ -15115,36 +14708,29 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
     }
 
     fn mark_turns_lost(state: &mut DaemonState) {
-        let lost_message = "daemon lost turn continuity".to_string();
+        let lost_message =
+            "daemon transport disconnected; preserving execution outcome for reconciliation"
+                .to_string();
         for turn in state.turns.values_mut() {
             if turn.attachable && matches!(turn.lifecycle, ipc::TurnLifecycleState::Active) {
-                turn.lifecycle = ipc::TurnLifecycleState::Lost;
-                turn.status = "lost".to_string();
                 turn.attachable = false;
                 turn.live_stream = false;
-                turn.terminal = true;
                 turn.recent_event = Some(lost_message.clone());
                 turn.updated_at = Utc::now();
             }
         }
 
         for thread in state.threads.values_mut() {
-            for turn in &mut thread.turns {
-                if turn.status == "submitted"
-                    || turn.status == "started"
-                    || turn.status == "in_progress"
-                {
-                    turn.status = "lost".to_string();
-                    if turn.error_message.is_none() {
-                        turn.error_message = Some(lost_message.clone());
-                    }
-                }
-            }
             if thread.summary.turn_in_flight {
                 thread.summary.recent_event = Some(lost_message.clone());
                 Self::refresh_thread_summary(thread);
             }
         }
+    }
+
+    fn turn_needs_remote_reconciliation(turn: &ipc::TurnStateView) -> bool {
+        matches!(turn.lifecycle, ipc::TurnLifecycleState::Active)
+            && (!turn.attachable || !turn.live_stream)
     }
 
     fn turn_state_from_thread_view(
@@ -15303,7 +14889,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use serde_json::{Map, Value};
-    use tokio::sync::{Mutex, Notify, RwLock, broadcast};
+    use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc};
     use tokio::time::Duration;
     use uuid::Uuid;
 
@@ -15312,8 +14898,6 @@ mod tests {
     use crate::assignment_comm::parse::{parse_worker_report, parse_worker_report_for_turn};
     use crate::assignment_comm::render::{build_assignment_communication_record, render_prompt};
     use crate::authority_store::AuthoritySqliteStore;
-    use crate::inbox_mirror::OperatorInboxMirrorHttpClient;
-    use crate::remote_action::RemoteActionHttpClient;
     use crate::supervisor::{
         SupervisorReasoner, SupervisorReasonerFailure, SupervisorReasonerResult,
         render_supervisor_prompt, render_supervisor_response_artifact,
@@ -15336,7 +14920,6 @@ mod tests {
         WorkUnit, WorkUnitStatus, WorkerSessionAttachability, WorkerSessionRuntimeStatus,
         WorkerStatus, Workstream, WorkstreamStatus, ipc,
     };
-    use orcas_server::{InboxMirrorServer, InboxMirrorStore};
 
     #[test]
     fn upstream_connect_never_forces_spawn_always_restarts() {
@@ -15358,6 +14941,34 @@ mod tests {
             CodexDaemonLaunch::IfNeeded => {}
             other => panic!("expected IfNeeded, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn boxed_ipc_request_dispatch_handles_daemon_status() {
+        let service = test_service().await;
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        let request = orcas_core::jsonrpc::JsonRpcRequest::new(
+            orcas_core::RequestId::Integer(1),
+            ipc::methods::DAEMON_STATUS,
+            None,
+        );
+
+        let mut subscription_task = None;
+        service
+            .handle_request(request, outbound_tx, &mut subscription_task)
+            .await
+            .expect("daemon/status request");
+
+        let raw_response = outbound_rx.recv().await.expect("ipc response");
+        let response: orcas_core::jsonrpc::JsonRpcResponse =
+            serde_json::from_str(&raw_response).expect("parse response");
+        assert_eq!(response.id, orcas_core::RequestId::Integer(1));
+        let status: ipc::DaemonStatusResponse =
+            serde_json::from_value(response.result).expect("decode daemon status");
+        assert_eq!(
+            status.socket_path,
+            service.paths.socket_file.display().to_string()
+        );
     }
 
     #[tokio::test]
@@ -15463,720 +15074,6 @@ mod tests {
                 .to_string()
                 .contains("summary cannot declare research as requested")
         );
-    }
-
-    fn sample_planning_session_summary(
-        objective: &str,
-        ready_for_review: bool,
-    ) -> orcas_core::collaboration::PlanningSessionStructuredSummary {
-        orcas_core::collaboration::PlanningSessionStructuredSummary {
-            objective: objective.to_string(),
-            requirements: vec!["Keep it bounded.".to_string()],
-            constraints: vec!["No broad refactor.".to_string()],
-            non_goals: vec!["Do not widen scope.".to_string()],
-            open_questions: vec!["Is this still bounded?".to_string()],
-            research_status: orcas_core::collaboration::PlanningSessionResearchStatus::NotRequested,
-            draft_plan_summary: Some("A narrow planning pass.".to_string()),
-            ready_for_review,
-        }
-    }
-
-    fn sample_bare_workstream(id: &str) -> Workstream {
-        let now = Utc::now();
-        Workstream {
-            id: id.to_string(),
-            title: format!("Planning {id}"),
-            objective: "Plan one bounded change.".to_string(),
-            status: WorkstreamStatus::Active,
-            priority: "high".to_string(),
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    async fn insert_bare_workstream(
-        service: &Arc<OrcasDaemonService>,
-        workstream: Workstream,
-    ) -> Workstream {
-        {
-            let mut state = service.state.write().await;
-            state
-                .collaboration
-                .workstreams
-                .insert(workstream.id.clone(), workstream.clone());
-        }
-        workstream
-    }
-
-    async fn create_planning_session_for_workstream(
-        service: &Arc<OrcasDaemonService>,
-        workstream_id: &str,
-        objective: &str,
-    ) -> orcas_core::collaboration::PlanningSession {
-        service
-            .planning_session_create(ipc::PlanningSessionCreateRequest {
-                workstream_id: workstream_id.to_string(),
-                planning_thread_id: None,
-                initial_objective: objective.to_string(),
-                research_status:
-                    orcas_core::collaboration::PlanningSessionResearchStatus::NotRequested,
-                requirements: vec!["Keep it bounded.".to_string()],
-                constraints: vec!["No broad refactor.".to_string()],
-                non_goals: vec!["Do not widen scope.".to_string()],
-                open_questions: vec!["Is this still bounded?".to_string()],
-                draft_plan_summary: Some("A narrow planning pass.".to_string()),
-                created_by: Some("tester".to_string()),
-                request_note: None,
-                model: None,
-                cwd: None,
-            })
-            .await
-            .expect("planning session create")
-            .session
-    }
-
-    #[tokio::test]
-    async fn planning_session_create_bootstraps_bare_workstream_without_active_plan() {
-        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
-            AppConfig::default(),
-            Arc::new(StaticSupervisorReasoner::default()),
-            sample_runtime_report_output_template(),
-            FakeCodexTerminalOutcome::Completed,
-        )
-        .await;
-        let workstream = insert_bare_workstream(&service, sample_bare_workstream("ws-bare")).await;
-
-        let session = create_planning_session_for_workstream(
-            &service,
-            workstream.id.as_ref(),
-            "Plan one bounded change.",
-        )
-        .await;
-
-        let state = service.state.read().await;
-        let active_plan = state
-            .collaboration
-            .planning
-            .active_plan(&workstream.id)
-            .cloned()
-            .expect("active plan");
-        assert_eq!(
-            session.status,
-            orcas_core::collaboration::PlanningSessionStatus::Chatting
-        );
-        assert_eq!(session.base_plan_id.as_ref(), Some(&active_plan.plan_id));
-        assert_eq!(session.base_plan_version, Some(active_plan.version));
-        assert_eq!(active_plan.workstream_id, workstream.id);
-        assert_eq!(active_plan.status, orcas_core::planning::PlanStatus::Active);
-    }
-
-    #[tokio::test]
-    async fn planning_session_create_uses_existing_active_plan_without_mutating_it() {
-        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
-            AppConfig::default(),
-            Arc::new(StaticSupervisorReasoner::default()),
-            sample_runtime_report_output_template(),
-            FakeCodexTerminalOutcome::Completed,
-        )
-        .await;
-        let workstream = service
-            .workstream_create(ipc::WorkstreamCreateRequest {
-                title: "Planning active".to_string(),
-                objective: "Plan one bounded change.".to_string(),
-                priority: Some("high".to_string()),
-            })
-            .await
-            .expect("workstream create")
-            .workstream;
-        let active_plan_before = {
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .active_plan(&workstream.id)
-                .cloned()
-                .expect("active plan")
-        };
-
-        let session = create_planning_session_for_workstream(
-            &service,
-            workstream.id.as_str(),
-            "Plan one bounded change.",
-        )
-        .await;
-
-        let active_plan_after = {
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .active_plan(&workstream.id)
-                .cloned()
-                .expect("active plan")
-        };
-        assert_eq!(
-            session.status,
-            orcas_core::collaboration::PlanningSessionStatus::Chatting
-        );
-        assert_eq!(
-            session.base_plan_id.as_ref(),
-            Some(&active_plan_before.plan_id)
-        );
-        assert_eq!(session.base_plan_version, Some(active_plan_before.version));
-        assert_eq!(
-            active_plan_before.plan_id.clone(),
-            active_plan_after.plan_id.clone()
-        );
-        assert_eq!(active_plan_before.version, active_plan_after.version);
-        assert_eq!(
-            active_plan_before.status,
-            orcas_core::planning::PlanStatus::Active
-        );
-        assert_eq!(
-            active_plan_after.status,
-            orcas_core::planning::PlanStatus::Active
-        );
-    }
-
-    #[tokio::test]
-    async fn planning_session_update_summary_is_descriptive_and_leaves_canonical_plan_unchanged() {
-        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
-            AppConfig::default(),
-            Arc::new(StaticSupervisorReasoner::default()),
-            "unused",
-            FakeCodexTerminalOutcome::Completed,
-        )
-        .await;
-        let workstream = service
-            .workstream_create(ipc::WorkstreamCreateRequest {
-                title: "Planning summary".to_string(),
-                objective: "Plan one bounded change.".to_string(),
-                priority: Some("high".to_string()),
-            })
-            .await
-            .expect("workstream create")
-            .workstream;
-        let session = create_planning_session_for_workstream(
-            &service,
-            workstream.id.as_ref(),
-            "Plan one bounded change.",
-        )
-        .await;
-        let active_plan_before = {
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .active_plan(&workstream.id)
-                .cloned()
-                .expect("active plan")
-        };
-
-        let updated = service
-            .planning_session_update_summary(ipc::PlanningSessionUpdateSummaryRequest {
-                session_id: session.session_id.clone(),
-                summary: sample_planning_session_summary(
-                    "Refined objective for the next planning pass.",
-                    false,
-                ),
-                updated_by: Some("tester".to_string()),
-                note: Some("keep the session descriptive".to_string()),
-            })
-            .await
-            .expect("update summary")
-            .session;
-
-        let active_plan_after = {
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .active_plan(&workstream.id)
-                .cloned()
-                .expect("active plan")
-        };
-        assert_eq!(
-            updated.status,
-            orcas_core::collaboration::PlanningSessionStatus::Chatting
-        );
-        assert_eq!(
-            updated.latest_structured_summary.objective,
-            "Refined objective for the next planning pass."
-        );
-        assert_eq!(
-            active_plan_before.plan_id.clone(),
-            active_plan_after.plan_id.clone()
-        );
-        assert_eq!(active_plan_before.version, active_plan_after.version);
-        assert_eq!(active_plan_before.title, active_plan_after.title);
-
-        let readiness_error = service
-            .planning_session_update_summary(ipc::PlanningSessionUpdateSummaryRequest {
-                session_id: updated.session_id.clone(),
-                summary: sample_planning_session_summary(
-                    "Refined objective for the next planning pass.",
-                    true,
-                ),
-                updated_by: Some("tester".to_string()),
-                note: None,
-            })
-            .await
-            .expect_err("ready-for-review should be explicit");
-        assert!(readiness_error.to_string().contains("ready for review"));
-    }
-
-    #[tokio::test]
-    async fn planning_session_request_research_is_bounded_and_links_report_to_session() {
-        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
-            AppConfig::default(),
-            Arc::new(StaticSupervisorReasoner::default()),
-            "unused",
-            FakeCodexTerminalOutcome::Completed,
-        )
-        .await;
-        let origin_node_id = service.authority_store.origin_node_id().expect("origin");
-        let workstream = service
-            .authority_workstream_create(ipc::AuthorityWorkstreamCreateRequest {
-                command: orcas_core::authority::CreateWorkstream {
-                    metadata: orcas_core::authority::CommandMetadata {
-                        command_id: orcas_core::authority::CommandId::new(),
-                        issued_at: Utc::now(),
-                        origin_node_id,
-                        actor: orcas_core::authority::CommandActor::parse("planning_test")
-                            .expect("command actor"),
-                        correlation_id: Some(
-                            orcas_core::authority::CorrelationId::parse("corr-planning-research")
-                                .expect("correlation id"),
-                        ),
-                    },
-                    workstream_id: orcas_core::authority::WorkstreamId::parse("planning-research")
-                        .expect("workstream id"),
-                    title: "Planning research".to_string(),
-                    objective: "Plan one bounded change.".to_string(),
-                    status: WorkstreamStatus::Active,
-                    priority: "high".to_string(),
-                },
-            })
-            .await
-            .expect("authority workstream")
-            .workstream;
-        let session = create_planning_session_for_workstream(
-            &service,
-            workstream.id.as_str(),
-            "Plan one bounded change.",
-        )
-        .await;
-
-        let response = service
-            .planning_session_request_research(ipc::PlanningSessionRequestResearchRequest {
-                session_id: session.session_id.clone(),
-                worker_id: "worker-research".to_string(),
-                requested_by: Some("tester".to_string()),
-                request_note: Some("Need one bounded research turn".to_string()),
-                worker_kind: Some("codex".to_string()),
-                model: None,
-                cwd: None,
-            })
-            .await
-            .expect("request research");
-
-        assert_eq!(
-            response.session.status,
-            orcas_core::collaboration::PlanningSessionStatus::Chatting
-        );
-        assert_eq!(
-            response.session.research_assignment_id.as_deref(),
-            Some(response.assignment.id.as_str())
-        );
-        assert_eq!(
-            response.session.research_report_id.as_deref(),
-            Some(response.report.id.as_str())
-        );
-        assert_eq!(
-            response.assignment.work_unit_id,
-            response.report.work_unit_id
-        );
-        assert_eq!(response.report.assignment_id, response.assignment.id);
-        assert_ne!(
-            response.session.latest_structured_summary.research_status,
-            orcas_core::collaboration::PlanningSessionResearchStatus::NotRequested
-        );
-
-        let second_error = service
-            .planning_session_request_research(ipc::PlanningSessionRequestResearchRequest {
-                session_id: response.session.session_id.clone(),
-                worker_id: "worker-research-2".to_string(),
-                requested_by: Some("tester".to_string()),
-                request_note: Some("Should be rejected".to_string()),
-                worker_kind: Some("codex".to_string()),
-                model: None,
-                cwd: None,
-            })
-            .await
-            .expect_err("second research request should fail");
-        assert!(
-            second_error
-                .to_string()
-                .contains("already used its bounded research turn")
-        );
-    }
-
-    #[tokio::test]
-    async fn planning_session_approve_stages_a_revision_proposal_without_applying_the_plan() {
-        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
-            AppConfig::default(),
-            Arc::new(StaticSupervisorReasoner::default()),
-            "unused",
-            FakeCodexTerminalOutcome::Completed,
-        )
-        .await;
-        let workstream = service
-            .workstream_create(ipc::WorkstreamCreateRequest {
-                title: "Planning approval".to_string(),
-                objective: "Plan one bounded change.".to_string(),
-                priority: Some("high".to_string()),
-            })
-            .await
-            .expect("workstream create")
-            .workstream;
-        let session = create_planning_session_for_workstream(
-            &service,
-            &workstream.id,
-            "Plan one bounded change.",
-        )
-        .await;
-        let active_plan_before = {
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .active_plan(&workstream.id)
-                .cloned()
-                .expect("active plan")
-        };
-
-        service
-            .planning_session_mark_ready_for_review(ipc::PlanningSessionMarkReadyForReviewRequest {
-                session_id: session.session_id.clone(),
-                updated_by: Some("tester".to_string()),
-                note: Some("ready for approval".to_string()),
-            })
-            .await
-            .expect("mark ready");
-
-        let approval = service
-            .planning_session_approve(ipc::PlanningSessionApproveRequest {
-                session_id: session.session_id.clone(),
-                approved_by: Some("tester".to_string()),
-                review_note: Some("stage the revision".to_string()),
-            })
-            .await
-            .expect("approve session");
-
-        let revision_proposal = approval
-            .revision_proposal
-            .expect("staged revision proposal");
-        assert_eq!(
-            approval.session.approved_plan_id.as_ref(),
-            Some(&active_plan_before.plan_id)
-        );
-        assert_eq!(
-            approval.session.approved_plan_version,
-            Some(active_plan_before.version)
-        );
-        assert_eq!(
-            revision_proposal.base_plan_id,
-            active_plan_before.plan_id.clone()
-        );
-        assert_eq!(
-            revision_proposal.base_plan_version,
-            active_plan_before.version
-        );
-        assert_eq!(
-            revision_proposal.status,
-            orcas_core::planning::PlanRevisionProposalStatus::Pending
-        );
-
-        let active_plan_after = {
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .active_plan(&workstream.id)
-                .cloned()
-                .expect("active plan")
-        };
-        assert_eq!(
-            active_plan_before.plan_id.clone(),
-            active_plan_after.plan_id.clone()
-        );
-        assert_eq!(active_plan_before.version, active_plan_after.version);
-        assert_eq!(active_plan_before.status, active_plan_after.status);
-        assert_eq!(
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .revision_proposals
-                .get(revision_proposal.proposal_id.as_str())
-                .expect("stored revision")
-                .status,
-            orcas_core::planning::PlanRevisionProposalStatus::Pending
-        );
-    }
-
-    #[tokio::test]
-    async fn planning_session_reject_keeps_canonical_plan_unchanged() {
-        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
-            AppConfig::default(),
-            Arc::new(StaticSupervisorReasoner::default()),
-            "unused",
-            FakeCodexTerminalOutcome::Completed,
-        )
-        .await;
-        let workstream = service
-            .workstream_create(ipc::WorkstreamCreateRequest {
-                title: "Planning reject".to_string(),
-                objective: "Plan one bounded change.".to_string(),
-                priority: Some("high".to_string()),
-            })
-            .await
-            .expect("workstream create")
-            .workstream;
-        let session = create_planning_session_for_workstream(
-            &service,
-            &workstream.id,
-            "Plan one bounded change.",
-        )
-        .await;
-        let active_plan_before = {
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .active_plan(&workstream.id)
-                .cloned()
-                .expect("active plan")
-        };
-
-        let rejected = service
-            .planning_session_reject(ipc::PlanningSessionRejectRequest {
-                session_id: session.session_id.clone(),
-                rejected_by: Some("tester".to_string()),
-                review_note: Some("reject the session".to_string()),
-            })
-            .await
-            .expect("reject session")
-            .session;
-        assert_eq!(
-            rejected.status,
-            orcas_core::collaboration::PlanningSessionStatus::Rejected
-        );
-
-        let active_plan_after = {
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .active_plan(&workstream.id)
-                .cloned()
-                .expect("active plan")
-        };
-        assert_eq!(
-            active_plan_before.plan_id.clone(),
-            active_plan_after.plan_id.clone()
-        );
-        assert_eq!(active_plan_before.version, active_plan_after.version);
-
-        let update_error = service
-            .planning_session_update_summary(ipc::PlanningSessionUpdateSummaryRequest {
-                session_id: rejected.session_id.clone(),
-                summary: sample_planning_session_summary("Should be rejected", false),
-                updated_by: Some("tester".to_string()),
-                note: None,
-            })
-            .await
-            .expect_err("rejected session should be closed");
-        assert!(update_error.to_string().contains("already closed"));
-    }
-
-    #[tokio::test]
-    async fn planning_session_abort_keeps_canonical_plan_unchanged() {
-        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
-            AppConfig::default(),
-            Arc::new(StaticSupervisorReasoner::default()),
-            "unused",
-            FakeCodexTerminalOutcome::Completed,
-        )
-        .await;
-        let workstream = service
-            .workstream_create(ipc::WorkstreamCreateRequest {
-                title: "Planning abort".to_string(),
-                objective: "Plan one bounded change.".to_string(),
-                priority: Some("high".to_string()),
-            })
-            .await
-            .expect("workstream create")
-            .workstream;
-        let session = create_planning_session_for_workstream(
-            &service,
-            &workstream.id,
-            "Plan one bounded change.",
-        )
-        .await;
-        let active_plan_before = {
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .active_plan(&workstream.id)
-                .cloned()
-                .expect("active plan")
-        };
-
-        let aborted = service
-            .planning_session_abort(ipc::PlanningSessionAbortRequest {
-                session_id: session.session_id.clone(),
-                updated_by: Some("tester".to_string()),
-                note: Some("abort the session".to_string()),
-            })
-            .await
-            .expect("abort session")
-            .session;
-        assert_eq!(
-            aborted.status,
-            orcas_core::collaboration::PlanningSessionStatus::Aborted
-        );
-
-        let active_plan_after = {
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .active_plan(&workstream.id)
-                .cloned()
-                .expect("active plan")
-        };
-        assert_eq!(
-            active_plan_before.plan_id.clone(),
-            active_plan_after.plan_id.clone()
-        );
-        assert_eq!(active_plan_before.version, active_plan_after.version);
-
-        let approve_error = service
-            .planning_session_approve(ipc::PlanningSessionApproveRequest {
-                session_id: aborted.session_id.clone(),
-                approved_by: Some("tester".to_string()),
-                review_note: None,
-            })
-            .await
-            .expect_err("aborted session should be closed");
-        assert!(approve_error.to_string().contains("already closed"));
-    }
-
-    #[tokio::test]
-    async fn planning_session_supersede_keeps_canonical_plan_unchanged() {
-        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
-            AppConfig::default(),
-            Arc::new(StaticSupervisorReasoner::default()),
-            "unused",
-            FakeCodexTerminalOutcome::Completed,
-        )
-        .await;
-        let workstream = service
-            .workstream_create(ipc::WorkstreamCreateRequest {
-                title: "Planning supersede".to_string(),
-                objective: "Plan one bounded change.".to_string(),
-                priority: Some("high".to_string()),
-            })
-            .await
-            .expect("workstream create")
-            .workstream;
-        let session = create_planning_session_for_workstream(
-            &service,
-            &workstream.id,
-            "Plan one bounded change.",
-        )
-        .await;
-        let active_plan_before = {
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .active_plan(&workstream.id)
-                .cloned()
-                .expect("active plan")
-        };
-
-        let superseded = service
-            .planning_session_supersede(ipc::PlanningSessionSupersedeRequest {
-                session_id: session.session_id.clone(),
-                superseded_by_session_id: Some("planning-session-next".to_string()),
-                updated_by: Some("tester".to_string()),
-                note: Some("supersede the session".to_string()),
-            })
-            .await
-            .expect("supersede session")
-            .session;
-        assert_eq!(
-            superseded.status,
-            orcas_core::collaboration::PlanningSessionStatus::Superseded
-        );
-
-        let active_plan_after = {
-            service
-                .state
-                .read()
-                .await
-                .collaboration
-                .planning
-                .active_plan(&workstream.id)
-                .cloned()
-                .expect("active plan")
-        };
-        assert_eq!(
-            active_plan_before.plan_id.clone(),
-            active_plan_after.plan_id.clone()
-        );
-        assert_eq!(active_plan_before.version, active_plan_after.version);
-
-        let research_error = service
-            .planning_session_request_research(ipc::PlanningSessionRequestResearchRequest {
-                session_id: superseded.session_id.clone(),
-                worker_id: "worker-research".to_string(),
-                requested_by: Some("tester".to_string()),
-                request_note: None,
-                worker_kind: Some("codex".to_string()),
-                model: None,
-                cwd: None,
-            })
-            .await
-            .expect_err("superseded session should be closed");
-        assert!(research_error.to_string().contains("already closed"));
     }
 
     #[derive(Debug)]
@@ -17340,10 +16237,6 @@ mod tests {
             event_tx,
             client_count: AtomicUsize::new(0),
             shutdown: Notify::new(),
-            operator_inbox_checkpoint_tx: tokio::sync::watch::channel(
-                ipc::OperatorInboxCheckpoint::default(),
-            )
-            .0,
             supervisor_reasoner,
         });
         service.initialize_state().await.expect("initialize state");
@@ -20770,6 +19663,81 @@ ORCAS_REPORT_END"#
     }
 
     #[tokio::test]
+    async fn assignment_turn_ingestion_core_persists_terminal_state_before_side_effects() {
+        let reasoner = Arc::new(PackDrivenSupervisorReasoner::new(DecisionType::Continue));
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(false))
+                .await;
+        let (_workstream, work_unit, assignment, turn_state, raw_output) =
+            seed_running_assignment_fixture(&service, "ingest-core").await;
+        let (assignment_for_parse, communication_record) = {
+            let state = service.state.read().await;
+            (
+                state
+                    .collaboration
+                    .assignments
+                    .get(&assignment.id)
+                    .cloned()
+                    .expect("assignment"),
+                state
+                    .collaboration
+                    .assignment_communications
+                    .get(&assignment.id)
+                    .cloned()
+                    .expect("communication record"),
+            )
+        };
+        let plan = OrcasDaemonService::derive_assignment_turn_ingestion_plan(
+            &assignment.id,
+            &assignment.worker_id,
+            &assignment.worker_session_id,
+            &turn_state,
+            raw_output,
+            assignment_for_parse,
+            communication_record,
+        );
+
+        let core = service
+            .persist_assignment_turn_ingestion_core(&plan)
+            .await
+            .expect("persist core");
+
+        assert_eq!(core.report.work_unit_id, work_unit.id);
+        assert_eq!(
+            core.assignment_after_report.status,
+            AssignmentStatus::AwaitingDecision
+        );
+        assert_eq!(
+            core.work_unit_after_report.status,
+            WorkUnitStatus::AwaitingDecision
+        );
+        let state = service.state.read().await;
+        assert_eq!(
+            state
+                .collaboration
+                .reports
+                .get(&core.report.id)
+                .map(|report| &report.id),
+            Some(&core.report.id)
+        );
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].latest_report_id,
+            Some(core.report.id.clone())
+        );
+        drop(state);
+        assert!(
+            service
+                .proposal_list_for_workunit(ipc::ProposalListForWorkunitRequest {
+                    work_unit_id: work_unit.id.clone(),
+                })
+                .await
+                .expect("proposal list")
+                .proposals
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn real_report_ingestion_path_creates_auto_proposal_and_suppresses_redundant_trigger() {
         let reasoner = Arc::new(PackDrivenSupervisorReasoner::new(DecisionType::Continue));
         let service =
@@ -21740,7 +20708,7 @@ ORCAS_REPORT_END"#
     }
 
     #[test]
-    fn mark_turns_lost_clears_attachment_and_session() {
+    fn mark_turns_lost_detaches_without_terminalizing() {
         let mut state = DaemonState::default();
         let mut thread = sample_thread("thread-1", "orcas_managed", 200);
         thread.summary.turn_in_flight = true;
@@ -21791,11 +20759,420 @@ ORCAS_REPORT_END"#
             .turns
             .get(&TurnKey::new("thread-1", "turn-1"))
             .expect("turn exists");
-        assert_eq!(turn.lifecycle, ipc::TurnLifecycleState::Lost);
+        assert_eq!(turn.lifecycle, ipc::TurnLifecycleState::Active);
         assert!(!turn.attachable);
-        assert_eq!(turn.status, "lost");
         assert!(state.session.active_turns.is_empty());
-        assert_eq!(state.threads["thread-1"].turns[0].status, "lost");
+        assert_eq!(state.threads["thread-1"].turns[0].status, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn resolve_turn_state_reconciles_detached_turn_from_upstream_snapshot() {
+        let config = auto_proposal_config(false);
+        let (service, fake_runtime_state) = test_service_with_fake_codex_runtime_capture(
+            config,
+            Arc::new(StaticSupervisorReasoner::default()),
+            "irrelevant",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+
+        let thread_id = "thread-reconcile".to_string();
+        let turn_id = "turn-reconcile".to_string();
+        {
+            let mut state = service.state.write().await;
+            state.threads.insert(
+                thread_id.clone(),
+                sample_thread(&thread_id, "live_observed", 200),
+            );
+            state.turns.insert(
+                TurnKey::new(&thread_id, &turn_id),
+                ipc::TurnStateView {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    lifecycle: ipc::TurnLifecycleState::Active,
+                    status: "in_progress".to_string(),
+                    attachable: false,
+                    live_stream: false,
+                    terminal: false,
+                    recent_output: Some("partial output".to_string()),
+                    recent_event: Some("transport disconnected".to_string()),
+                    updated_at: Utc::now(),
+                    error_message: None,
+                },
+            );
+        }
+
+        {
+            let mut runtime = fake_runtime_state.lock().await;
+            runtime.threads.insert(
+                thread_id.clone(),
+                types::Thread {
+                    id: thread_id.clone(),
+                    preview: "preview".to_string(),
+                    ephemeral: false,
+                    model_provider: "openai".to_string(),
+                    created_at: Utc::now().timestamp(),
+                    updated_at: Utc::now().timestamp(),
+                    status: types::ThreadStatus::Idle,
+                    path: None,
+                    cwd: "/tmp/orcas".to_string(),
+                    cli_version: "test".to_string(),
+                    source: None,
+                    name: None,
+                    turns: vec![types::Turn {
+                        id: turn_id.clone(),
+                        items: vec![{
+                            let mut extra = Map::new();
+                            extra.insert("text".to_string(), Value::String("hello world".into()));
+                            types::ThreadItem {
+                                id: "item-1".to_string(),
+                                item_type: "agent_message".to_string(),
+                                extra,
+                            }
+                        }],
+                        status: types::TurnStatus::Completed,
+                        error: None,
+                    }],
+                    extra: Map::new(),
+                },
+            );
+        }
+
+        let resolved = service
+            .resolve_turn_state(&thread_id, &turn_id)
+            .await
+            .expect("resolve turn")
+            .expect("turn");
+
+        assert_eq!(resolved.lifecycle, ipc::TurnLifecycleState::Completed);
+        assert!(resolved.terminal);
+        assert_eq!(resolved.status, "completed");
+
+        let persisted = service
+            .turn_get(ipc::TurnGetRequest {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+            })
+            .await
+            .expect("turn get")
+            .turn
+            .expect("persisted turn");
+        assert_eq!(persisted.lifecycle, ipc::TurnLifecycleState::Completed);
+        assert!(persisted.terminal);
+    }
+
+    #[tokio::test]
+    async fn resolve_turn_state_reconciles_detached_terminal_turn_and_recovers_report() {
+        let config = auto_proposal_config(false);
+        let (service, fake_runtime_state) = test_service_with_fake_codex_runtime_capture(
+            config,
+            Arc::new(StaticSupervisorReasoner::default()),
+            sample_runtime_report_output_template(),
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Recovery stream".to_string(),
+                objective: "Exercise detached turn recovery".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: "Recovery unit".to_string(),
+                task_statement: "Recover one detached turn cleanly.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-recovery".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Recover the detached turn and report honestly.".to_string()),
+                model: None,
+                cwd: None,
+                ..Default::default()
+            })
+            .await
+            .expect("prepare assignment");
+        let turn_id = "turn-recovery".to_string();
+        let thread_id = "thread-recovery".to_string();
+        let packet_id = {
+            let state = service.state.read().await;
+            state
+                .collaboration
+                .assignment_communications
+                .get(&prepared.assignment.id)
+                .expect("assignment communication")
+                .packet
+                .packet_id
+                .clone()
+        };
+
+        {
+            let mut state = service.state.write().await;
+            state.threads.insert(
+                thread_id.clone(),
+                sample_active_thread(&thread_id, "live_observed", 200, &turn_id),
+            );
+            state.turns.insert(
+                TurnKey::new(&thread_id, &turn_id),
+                ipc::TurnStateView {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    lifecycle: ipc::TurnLifecycleState::Active,
+                    status: "in_progress".to_string(),
+                    attachable: false,
+                    live_stream: false,
+                    terminal: false,
+                    recent_output: Some("partial output".to_string()),
+                    recent_event: Some("transport disconnected".to_string()),
+                    updated_at: Utc::now(),
+                    error_message: None,
+                },
+            );
+            let assignment = state
+                .collaboration
+                .assignments
+                .get_mut(&prepared.assignment.id)
+                .expect("assignment");
+            assignment.status = AssignmentStatus::Running;
+            assignment.updated_at = Utc::now();
+            let work_unit = state
+                .collaboration
+                .work_units
+                .get_mut(&prepared.assignment.work_unit_id)
+                .expect("work unit");
+            work_unit.status = WorkUnitStatus::Running;
+            work_unit.current_assignment_id = Some(prepared.assignment.id.clone());
+            work_unit.updated_at = Utc::now();
+            let worker = state
+                .collaboration
+                .workers
+                .get_mut(&prepared.assignment.worker_id)
+                .expect("worker");
+            worker.status = WorkerStatus::Busy;
+            worker.current_assignment_id = Some(prepared.assignment.id.clone());
+            let session = state
+                .collaboration
+                .worker_sessions
+                .get_mut(&prepared.assignment.worker_session_id)
+                .expect("worker session");
+            session.thread_id = Some(thread_id.clone());
+            session.active_turn_id = Some(turn_id.clone());
+            session.runtime_status = WorkerSessionRuntimeStatus::Running;
+            session.attachability = WorkerSessionAttachability::Attachable;
+            session.updated_at = Utc::now();
+        }
+
+        {
+            let mut runtime = fake_runtime_state.lock().await;
+            runtime.threads.insert(
+                thread_id.clone(),
+                types::Thread {
+                    id: thread_id.clone(),
+                    preview: "preview".to_string(),
+                    ephemeral: false,
+                    model_provider: "openai".to_string(),
+                    created_at: Utc::now().timestamp(),
+                    updated_at: Utc::now().timestamp(),
+                    status: types::ThreadStatus::Idle,
+                    path: None,
+                    cwd: "/tmp/orcas".to_string(),
+                    cli_version: "test".to_string(),
+                    source: None,
+                    name: None,
+                    turns: vec![types::Turn {
+                        id: turn_id.clone(),
+                        items: vec![{
+                            let mut extra = Map::new();
+                            extra.insert(
+                                "text".to_string(),
+                                Value::String(sample_runtime_report_output_for(
+                                    &prepared.assignment.id,
+                                    &packet_id,
+                                )),
+                            );
+                            types::ThreadItem {
+                                id: "item-recovery".to_string(),
+                                item_type: "agent_message".to_string(),
+                                extra,
+                            }
+                        }],
+                        status: types::TurnStatus::Completed,
+                        error: None,
+                    }],
+                    extra: Map::new(),
+                },
+            );
+        }
+
+        let resolved = service
+            .resolve_turn_state(&thread_id, &turn_id)
+            .await
+            .expect("resolve turn")
+            .expect("turn");
+
+        assert_eq!(resolved.lifecycle, ipc::TurnLifecycleState::Completed);
+        assert!(resolved.terminal);
+
+        let assignment_get = service
+            .assignment_get(ipc::AssignmentGetRequest {
+                assignment_id: prepared.assignment.id.clone(),
+            })
+            .await
+            .expect("assignment get");
+        assert_eq!(
+            assignment_get.assignment.status,
+            AssignmentStatus::AwaitingDecision
+        );
+        assert!(assignment_get.report.is_some());
+        assert_eq!(
+            assignment_get
+                .report
+                .as_ref()
+                .expect("report")
+                .assignment_id,
+            prepared.assignment.id
+        );
+
+        let work_unit = service
+            .workunit_get(ipc::WorkunitGetRequest {
+                work_unit_id: prepared.assignment.work_unit_id.clone(),
+            })
+            .await
+            .expect("work unit");
+        assert_eq!(work_unit.work_unit.status, WorkUnitStatus::AwaitingDecision);
+        assert_eq!(
+            work_unit.work_unit.latest_report_id,
+            assignment_get
+                .report
+                .as_ref()
+                .map(|report| report.id.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_turn_state_forces_fresh_upstream_read_for_detached_cached_turn() {
+        let config = auto_proposal_config(false);
+        let (service, fake_runtime_state) = test_service_with_fake_codex_runtime_capture(
+            config,
+            Arc::new(StaticSupervisorReasoner::default()),
+            "irrelevant",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+
+        let thread_id = "thread-detached-cache".to_string();
+        let turn_id = "turn-detached-cache".to_string();
+        {
+            let mut state = service.state.write().await;
+            let mut thread = sample_thread(&thread_id, "live_observed", 200);
+            thread.turns.push(ipc::TurnView {
+                id: turn_id.clone(),
+                status: "in_progress".to_string(),
+                error_message: None,
+                error_summary: None,
+                started_at: None,
+                completed_at: None,
+                latest_diff: None,
+                latest_plan_snapshot: None,
+                token_usage_snapshot: None,
+                items: vec![ipc::ItemView {
+                    id: "item-stale".to_string(),
+                    item_type: "agent_message".to_string(),
+                    status: Some("streaming".to_string()),
+                    text: Some("partial output".to_string()),
+                    summary: Some("partial output".to_string()),
+                    payload: None,
+                }],
+            });
+            state.threads.insert(thread_id.clone(), thread);
+            state.turns.insert(
+                TurnKey::new(&thread_id, &turn_id),
+                ipc::TurnStateView {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    lifecycle: ipc::TurnLifecycleState::Active,
+                    status: "in_progress".to_string(),
+                    attachable: false,
+                    live_stream: false,
+                    terminal: false,
+                    recent_output: Some("partial output".to_string()),
+                    recent_event: Some("transport disconnected".to_string()),
+                    updated_at: Utc::now(),
+                    error_message: None,
+                },
+            );
+        }
+
+        {
+            let mut runtime = fake_runtime_state.lock().await;
+            runtime.threads.insert(
+                thread_id.clone(),
+                types::Thread {
+                    id: thread_id.clone(),
+                    preview: "preview".to_string(),
+                    ephemeral: false,
+                    model_provider: "openai".to_string(),
+                    created_at: Utc::now().timestamp(),
+                    updated_at: Utc::now().timestamp(),
+                    status: types::ThreadStatus::Idle,
+                    path: None,
+                    cwd: "/tmp/orcas".to_string(),
+                    cli_version: "test".to_string(),
+                    source: None,
+                    name: None,
+                    turns: vec![types::Turn {
+                        id: turn_id.clone(),
+                        items: vec![{
+                            let mut extra = Map::new();
+                            extra.insert("text".to_string(), Value::String("hello world".into()));
+                            types::ThreadItem {
+                                id: "item-fresh".to_string(),
+                                item_type: "agent_message".to_string(),
+                                extra,
+                            }
+                        }],
+                        status: types::TurnStatus::Completed,
+                        error: None,
+                    }],
+                    extra: Map::new(),
+                },
+            );
+        }
+
+        let resolved = service
+            .resolve_turn_state(&thread_id, &turn_id)
+            .await
+            .expect("resolve turn")
+            .expect("turn");
+
+        assert_eq!(resolved.lifecycle, ipc::TurnLifecycleState::Completed);
+        assert!(resolved.terminal);
+        assert_eq!(resolved.status, "completed");
+        assert_eq!(resolved.recent_output.as_deref(), Some("hello world"));
+
+        let persisted = service
+            .turn_get(ipc::TurnGetRequest {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+            })
+            .await
+            .expect("turn get")
+            .turn
+            .expect("persisted turn");
+        assert_eq!(persisted.lifecycle, ipc::TurnLifecycleState::Completed);
+        assert!(persisted.terminal);
+        assert_eq!(persisted.recent_output.as_deref(), Some("hello world"));
     }
 
     #[test]
@@ -22477,10 +21854,6 @@ ORCAS_REPORT_END"#
                 },
             ))
             .await;
-        service
-            .refresh_codex_supervisor_state_for_thread(&thread.summary.id)
-            .await
-            .expect("refresh supervisor state after idle");
 
         let decisions = service
             .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
@@ -25187,10 +24560,6 @@ ORCAS_REPORT_END"#
                 },
             ))
             .await;
-        service
-            .refresh_codex_supervisor_state_for_thread(&thread.summary.id)
-            .await
-            .expect("refresh supervisor state after interrupt proposal");
 
         let stored = service
             .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
@@ -25242,10 +24611,6 @@ ORCAS_REPORT_END"#
                 },
             ))
             .await;
-        service
-            .refresh_codex_supervisor_state_for_thread(&thread.summary.id)
-            .await
-            .expect("refresh supervisor state after steer proposal");
 
         let stored = service
             .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
@@ -26487,8 +25852,9 @@ Boundedness note: Stay within the legacy compatibility boundary."#
 
         let parsed = parse_worker_report(&raw, &assignment, &record);
 
-        assert_eq!(parsed.validation.parse_result, ReportParseResult::Invalid);
-        assert!(parsed.validation.needs_supervisor_review);
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Parsed);
+        assert!(!parsed.validation.needs_supervisor_review);
+        assert!(parsed.questions.is_empty());
     }
 
     #[test]
@@ -26496,8 +25862,9 @@ Boundedness note: Stay within the legacy compatibility boundary."#
         let (assignment, record) = sample_assignment_and_communication_record();
 
         let parsed = parse_worker_report("no structured report here", &assignment, &record);
-        assert_eq!(parsed.validation.parse_result, ReportParseResult::Invalid);
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Ambiguous);
         assert!(parsed.validation.needs_supervisor_review);
+        assert!(parsed.envelope.is_some());
     }
 
     #[test]
@@ -28016,808 +27383,5 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             loaded.upstream_thread_id.as_deref(),
             Some("upstream-service-thread")
         );
-    }
-
-    async fn start_inbox_mirror_server() -> (String, String, PathBuf, tokio::task::JoinHandle<()>) {
-        let base = std::env::temp_dir().join(format!("orcas-server-test-{}", Uuid::new_v4()));
-        let db_path = base.join("server.db");
-        let operator_api_token = format!("test-token-{}", Uuid::new_v4());
-        std::fs::create_dir_all(&base).expect("server base");
-        let store = InboxMirrorStore::open(&db_path).expect("mirror store");
-        let server =
-            InboxMirrorServer::with_operator_api_token(store, Some(operator_api_token.clone()));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind server");
-        let server_url = format!("http://{}", listener.local_addr().expect("listener addr"));
-        let handle = tokio::spawn(async move {
-            server
-                .serve_with_listener(listener)
-                .await
-                .expect("mirror server");
-        });
-        (server_url, operator_api_token, db_path, handle)
-    }
-
-    async fn inbox_mirror_test_service(
-        base: PathBuf,
-        server_url: Option<String>,
-        operator_api_token: Option<String>,
-    ) -> Arc<OrcasDaemonService> {
-        let mut config = AppConfig::default();
-        config.inbox_mirror.server_url = server_url;
-        config.inbox_mirror.operator_api_token = operator_api_token;
-        test_service_at_with_reasoner_and_config(
-            base,
-            Arc::new(StaticSupervisorReasoner::default()),
-            config,
-        )
-        .await
-    }
-
-    async fn seed_open_planning_session_fixture(
-        service: &Arc<OrcasDaemonService>,
-    ) -> (String, String) {
-        let workstream = service
-            .workstream_create(ipc::WorkstreamCreateRequest {
-                title: "Inbox mirror stream".to_string(),
-                objective: "Exercise inbox mirroring".to_string(),
-                priority: Some("normal".to_string()),
-            })
-            .await
-            .expect("workstream create")
-            .workstream;
-        let session = service
-            .planning_session_create(ipc::PlanningSessionCreateRequest {
-                workstream_id: workstream.id.clone(),
-                planning_thread_id: None,
-                initial_objective: "Create a mirrored inbox item".to_string(),
-                research_status: orcas_core::PlanningSessionResearchStatus::NotRequested,
-                requirements: Vec::new(),
-                constraints: Vec::new(),
-                non_goals: Vec::new(),
-                open_questions: Vec::new(),
-                draft_plan_summary: Some("Draft summary".to_string()),
-                created_by: Some("test".to_string()),
-                request_note: Some("mirror bootstrap".to_string()),
-                model: None,
-                cwd: None,
-            })
-            .await
-            .expect("planning session create")
-            .session;
-        let session = service
-            .planning_session_mark_ready_for_review(ipc::PlanningSessionMarkReadyForReviewRequest {
-                session_id: session.session_id.clone(),
-                updated_by: Some("test".to_string()),
-                note: Some("ready for review".to_string()),
-            })
-            .await
-            .expect("mark ready for review")
-            .session;
-        (workstream.id, session.session_id)
-    }
-
-    #[tokio::test]
-    async fn operator_inbox_mirror_bootstrap_and_incremental_catch_up_match_server_view() {
-        let base = std::env::temp_dir().join(format!("orcas-mirror-test-{}", Uuid::new_v4()));
-        let (server_url, server_token, server_db_path, server_handle) =
-            start_inbox_mirror_server().await;
-        let service = inbox_mirror_test_service(
-            base.clone(),
-            Some(server_url.clone()),
-            Some(server_token.clone()),
-        )
-        .await;
-        let origin_node_id = service
-            .authority_store
-            .origin_node_id()
-            .expect("origin node id")
-            .to_string();
-        let peer_id = format!("orcas-server::{origin_node_id}");
-        let client = OperatorInboxMirrorHttpClient::with_operator_api_token(
-            server_url.clone(),
-            server_token.clone(),
-        );
-
-        let (_workstream_id, session_id) = seed_open_planning_session_fixture(&service).await;
-
-        let bootstrap = service
-            .mirror_operator_inbox_once(&client, &origin_node_id, &peer_id)
-            .await
-            .expect("bootstrap mirror");
-        match bootstrap {
-            super::MirrorLoopProgress::Mirrored {
-                applied_changes, ..
-            } => {
-                assert!(applied_changes > 0);
-            }
-            other => panic!("expected mirrored bootstrap, got {other:?}"),
-        }
-
-        let server_list = client.list(&origin_node_id).await.expect("server list");
-        let local_replay = service
-            .operator_inbox_replay(ipc::OperatorInboxReplayRequest::default())
-            .await
-            .expect("local replay");
-        assert_eq!(server_list.items.len(), local_replay.items.len());
-        assert_eq!(server_list.items[0].id, local_replay.items[0].id);
-        assert_eq!(server_list.items[0].status, local_replay.items[0].status);
-        assert_eq!(
-            server_list.checkpoint.current_sequence,
-            local_replay.checkpoint.current_sequence
-        );
-        let server_store = InboxMirrorStore::open(&server_db_path).expect("server store reopen");
-        let pending_notifications = server_store
-            .notification_candidates(&orcas_core::ipc::OperatorNotificationListRequest {
-                origin_node_id: origin_node_id.clone(),
-                pending_only: true,
-                actionable_only: true,
-                ..Default::default()
-            })
-            .expect("pending notifications");
-        assert!(
-            pending_notifications
-                .candidates
-                .iter()
-                .any(|candidate| candidate.status
-                    == orcas_core::ipc::OperatorNotificationCandidateStatus::Pending)
-        );
-
-        let approved = service
-            .planning_session_approve(ipc::PlanningSessionApproveRequest {
-                session_id: session_id.clone(),
-                approved_by: Some("test".to_string()),
-                review_note: Some("approved".to_string()),
-            })
-            .await
-            .expect("approve planning session");
-        assert_eq!(
-            approved.session.status,
-            orcas_core::PlanningSessionStatus::Approved
-        );
-
-        let incremental = service
-            .mirror_operator_inbox_once(&client, &origin_node_id, &peer_id)
-            .await
-            .expect("incremental mirror");
-        match incremental {
-            super::MirrorLoopProgress::Mirrored {
-                applied_changes, ..
-            } => {
-                assert!(applied_changes > 0);
-            }
-            other => panic!("expected mirrored incremental update, got {other:?}"),
-        }
-
-        let server_list = client.list(&origin_node_id).await.expect("server list");
-        let local_replay = service
-            .operator_inbox_replay(ipc::OperatorInboxReplayRequest::default())
-            .await
-            .expect("local replay");
-        assert_eq!(server_list.items.len(), local_replay.items.len());
-        assert_eq!(server_list.items[0].id, local_replay.items[0].id);
-        assert_eq!(server_list.items[0].status, local_replay.items[0].status);
-        assert_eq!(
-            server_list.checkpoint.current_sequence,
-            local_replay.checkpoint.current_sequence
-        );
-        assert_eq!(
-            server_list.items[0].status,
-            ipc::OperatorInboxItemStatus::Resolved
-        );
-        let notifications_after_resolve = InboxMirrorStore::open(&server_db_path)
-            .expect("server store reopen")
-            .notification_candidates(&orcas_core::ipc::OperatorNotificationListRequest {
-                origin_node_id: origin_node_id.clone(),
-                pending_only: false,
-                actionable_only: false,
-                ..Default::default()
-            })
-            .expect("notifications after resolve");
-        assert!(
-            notifications_after_resolve
-                .candidates
-                .iter()
-                .any(|candidate| candidate.status
-                    == orcas_core::ipc::OperatorNotificationCandidateStatus::Obsolete)
-        );
-
-        let passive_workstream = service
-            .workstream_create(ipc::WorkstreamCreateRequest {
-                title: "Passive workstream".to_string(),
-                objective: "Should not affect the inbox mirror".to_string(),
-                priority: Some("low".to_string()),
-            })
-            .await
-            .expect("passive workstream")
-            .workstream;
-        assert!(!passive_workstream.id.is_empty());
-
-        let checkpoint_before = service
-            .operator_inbox_checkpoint(ipc::OperatorInboxCheckpointRequest::default())
-            .await
-            .expect("checkpoint before");
-        let passive = service
-            .mirror_operator_inbox_once(&client, &origin_node_id, &peer_id)
-            .await
-            .expect("passive mirror");
-        match passive {
-            super::MirrorLoopProgress::Waiting { after_sequence } => {
-                assert_eq!(
-                    after_sequence,
-                    checkpoint_before.checkpoint.current_sequence
-                );
-            }
-            other => panic!("expected passive wait, got {other:?}"),
-        }
-
-        let server_list_after_passive = client.list(&origin_node_id).await.expect("server list");
-        assert_eq!(
-            server_list_after_passive.items.len(),
-            local_replay.items.len()
-        );
-
-        server_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn operator_inbox_mirror_checkpoint_survives_restart() {
-        let base = std::env::temp_dir().join(format!("orcas-mirror-restart-{}", Uuid::new_v4()));
-        let (server_url, server_token, _server_db_path, server_handle) =
-            start_inbox_mirror_server().await;
-        let service = inbox_mirror_test_service(
-            base.clone(),
-            Some(server_url.clone()),
-            Some(server_token.clone()),
-        )
-        .await;
-        let origin_node_id = service
-            .authority_store
-            .origin_node_id()
-            .expect("origin node id")
-            .to_string();
-        let peer_id = format!("orcas-server::{origin_node_id}");
-        let client = OperatorInboxMirrorHttpClient::with_operator_api_token(
-            server_url.clone(),
-            server_token.clone(),
-        );
-        let (_workstream_id, _session_id) = seed_open_planning_session_fixture(&service).await;
-
-        let _ = service
-            .mirror_operator_inbox_once(&client, &origin_node_id, &peer_id)
-            .await
-            .expect("bootstrap mirror");
-        let before_restart = service
-            .operator_inbox_mirror_checkpoint(ipc::OperatorInboxMirrorCheckpointRequest {
-                peer_id: peer_id.clone(),
-            })
-            .await
-            .expect("mirror checkpoint before restart")
-            .mirror_checkpoint;
-
-        drop(service);
-        let restarted =
-            inbox_mirror_test_service(base, Some(server_url.clone()), Some(server_token.clone()))
-                .await;
-        let after_restart = restarted
-            .operator_inbox_mirror_checkpoint(ipc::OperatorInboxMirrorCheckpointRequest {
-                peer_id: peer_id.clone(),
-            })
-            .await
-            .expect("mirror checkpoint after restart")
-            .mirror_checkpoint;
-        assert_eq!(before_restart, after_restart);
-
-        let passive = restarted
-            .mirror_operator_inbox_once(&client, &origin_node_id, &peer_id)
-            .await
-            .expect("post-restart mirror");
-        match passive {
-            super::MirrorLoopProgress::Waiting { .. } => {}
-            other => panic!("expected post-restart wait, got {other:?}"),
-        }
-
-        server_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn remote_action_request_executes_through_local_source_domain_apis() {
-        let base = std::env::temp_dir().join(format!("orcas-remote-action-{}", Uuid::new_v4()));
-        let (server_url, server_token, server_db_path, server_handle) =
-            start_inbox_mirror_server().await;
-        let service = inbox_mirror_test_service(
-            base.clone(),
-            Some(server_url.clone()),
-            Some(server_token.clone()),
-        )
-        .await;
-        let origin_node_id = service
-            .authority_store
-            .origin_node_id()
-            .expect("origin node id")
-            .to_string();
-        let authority_peer_id = format!("orcas-server::{origin_node_id}");
-        let client = OperatorInboxMirrorHttpClient::with_operator_api_token(
-            server_url.clone(),
-            server_token.clone(),
-        );
-        let remote_client = RemoteActionHttpClient::with_operator_api_token(
-            server_url.clone(),
-            server_token.clone(),
-        );
-
-        let authority_before = service
-            .authority_store
-            .load_replication_checkpoint(&authority_peer_id)
-            .await
-            .expect("authority checkpoint before");
-
-        let (_workstream_id, session_id) = seed_open_planning_session_fixture(&service).await;
-        let bootstrap = service
-            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
-            .await
-            .expect("bootstrap mirror");
-        match bootstrap {
-            super::MirrorLoopProgress::Mirrored { .. } => {}
-            other => panic!("expected mirrored bootstrap, got {other:?}"),
-        }
-
-        let local_items = service
-            .operator_inbox_list(ipc::OperatorInboxListRequest {
-                source_kind: Some(orcas_core::ipc::OperatorInboxSourceKind::PlanningSession),
-                actionable_only: true,
-                ..Default::default()
-            })
-            .await
-            .expect("operator inbox list")
-            .items;
-        let item = local_items
-            .into_iter()
-            .find(|item| item.actionable_object_id == session_id)
-            .expect("planning session inbox item");
-
-        let created = remote_client
-            .create(&orcas_core::ipc::OperatorRemoteActionCreateRequest {
-                origin_node_id: origin_node_id.clone(),
-                item_id: item.id.clone(),
-                action_kind: orcas_core::ipc::OperatorInboxActionKind::Approve,
-                idempotency_key: Some("mirror-action-session".to_string()),
-                requested_by: Some("remote-client".to_string()),
-                request_note: Some("approve session".to_string()),
-            })
-            .await
-            .expect("create remote action request");
-        assert_eq!(
-            created.request.status,
-            orcas_core::ipc::OperatorRemoteActionRequestStatus::Pending
-        );
-
-        let worker_progress = service
-            .remote_action_once(&remote_client, &origin_node_id, "remote-worker")
-            .await
-            .expect("remote action worker");
-        match worker_progress {
-            super::RemoteActionLoopProgress::Claimed { .. } => {}
-            other => panic!("expected claimed progress, got {other:?}"),
-        }
-
-        let completed = remote_client
-            .get(&orcas_core::ipc::OperatorRemoteActionGetRequest {
-                origin_node_id: origin_node_id.clone(),
-                request_id: created.request.request_id.clone(),
-            })
-            .await
-            .expect("get remote action request")
-            .request
-            .expect("request present");
-        assert_eq!(
-            completed.status,
-            orcas_core::ipc::OperatorRemoteActionRequestStatus::Completed
-        );
-
-        let incremental = service
-            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
-            .await
-            .expect("mirror after remote action");
-        match incremental {
-            super::MirrorLoopProgress::Mirrored { .. } => {}
-            other => panic!("expected mirrored incremental update, got {other:?}"),
-        }
-
-        let server_list = client.list(&origin_node_id).await.expect("server list");
-        assert!(
-            server_list
-                .items
-                .iter()
-                .any(|item| item.id == created.request.item_id
-                    && item.status == ipc::OperatorInboxItemStatus::Resolved)
-        );
-
-        let authority_after = service
-            .authority_store
-            .load_replication_checkpoint(&authority_peer_id)
-            .await
-            .expect("authority checkpoint after");
-        assert_eq!(authority_before, authority_after);
-
-        std::fs::remove_file(server_db_path).ok();
-        server_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn remote_action_request_executes_proposal_approval_through_local_source_domain_apis() {
-        let (server_url, server_token, server_db_path, server_handle) =
-            start_inbox_mirror_server().await;
-        let reasoner = Arc::new(StaticSupervisorReasoner::default());
-        let service = test_service_with_reasoner_and_config(reasoner.clone(), {
-            let mut config = AppConfig::default();
-            config.inbox_mirror.server_url = Some(server_url.clone());
-            config.inbox_mirror.operator_api_token = Some(server_token.clone());
-            config
-        })
-        .await;
-        let origin_node_id = service
-            .authority_store
-            .origin_node_id()
-            .expect("origin node id")
-            .to_string();
-        let authority_peer_id = format!("orcas-server::{origin_node_id}");
-        let client = OperatorInboxMirrorHttpClient::with_operator_api_token(
-            server_url.clone(),
-            server_token.clone(),
-        );
-        let remote_client = RemoteActionHttpClient::with_operator_api_token(
-            server_url.clone(),
-            server_token.clone(),
-        );
-
-        let (_workstream, work_unit, assignment, report) =
-            seed_awaiting_decision_fixture(&service, "remote-proposal").await;
-        let proposal =
-            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
-                .await
-                .proposal;
-
-        let _ = service
-            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
-            .await
-            .expect("bootstrap mirror");
-        let item = service
-            .operator_inbox_list(ipc::OperatorInboxListRequest {
-                source_kind: Some(orcas_core::ipc::OperatorInboxSourceKind::SupervisorProposal),
-                actionable_only: true,
-                ..Default::default()
-            })
-            .await
-            .expect("operator inbox list")
-            .items
-            .into_iter()
-            .find(|item| item.actionable_object_id == proposal.id)
-            .expect("proposal inbox item");
-
-        let created = remote_client
-            .create(&orcas_core::ipc::OperatorRemoteActionCreateRequest {
-                origin_node_id: origin_node_id.clone(),
-                item_id: item.id.clone(),
-                action_kind: orcas_core::ipc::OperatorInboxActionKind::Approve,
-                idempotency_key: Some("mirror-action-proposal".to_string()),
-                requested_by: Some("remote-client".to_string()),
-                request_note: Some("approve proposal".to_string()),
-            })
-            .await
-            .expect("create proposal action");
-
-        let worker_progress = service
-            .remote_action_once(&remote_client, &origin_node_id, "remote-worker")
-            .await
-            .expect("remote action worker");
-        match worker_progress {
-            super::RemoteActionLoopProgress::Claimed { .. } => {}
-            other => panic!("expected claimed progress, got {other:?}"),
-        }
-
-        let completed = remote_client
-            .get(&orcas_core::ipc::OperatorRemoteActionGetRequest {
-                origin_node_id: origin_node_id.clone(),
-                request_id: created.request.request_id.clone(),
-            })
-            .await
-            .expect("get remote action request")
-            .request
-            .expect("request present");
-        assert_eq!(
-            completed.status,
-            orcas_core::ipc::OperatorRemoteActionRequestStatus::Completed
-        );
-
-        let _ = service
-            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
-            .await
-            .expect("mirror after remote action");
-        let server_list = client.list(&origin_node_id).await.expect("server list");
-        assert!(server_list.items.iter().any(|item| {
-            item.id == created.request.item_id
-                && item.status == ipc::OperatorInboxItemStatus::Resolved
-        }));
-
-        std::fs::remove_file(server_db_path).ok();
-        server_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn remote_action_request_executes_supervisor_decision_through_local_source_domain_apis() {
-        let base = std::env::temp_dir().join(format!("orcas-remote-decision-{}", Uuid::new_v4()));
-        let (server_url, server_token, server_db_path, server_handle) =
-            start_inbox_mirror_server().await;
-        let service = inbox_mirror_test_service(
-            base.clone(),
-            Some(server_url.clone()),
-            Some(server_token.clone()),
-        )
-        .await;
-        let origin_node_id = service
-            .authority_store
-            .origin_node_id()
-            .expect("origin node id")
-            .to_string();
-        let authority_peer_id = format!("orcas-server::{origin_node_id}");
-        let client = OperatorInboxMirrorHttpClient::with_operator_api_token(
-            server_url.clone(),
-            server_token.clone(),
-        );
-        let remote_client = RemoteActionHttpClient::with_operator_api_token(
-            server_url.clone(),
-            server_token.clone(),
-        );
-
-        let thread =
-            sample_active_thread("remote-decision-thread", "live_observed", 200, "turn-live");
-        let (workstream, work_unit) =
-            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
-        let assignment = service
-            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
-                codex_thread_id: thread.summary.id.clone(),
-                workstream_id: workstream.id,
-                work_unit_id: work_unit.id,
-                supervisor_id: "supervisor-a".to_string(),
-                assigned_by: "tester".to_string(),
-                send_policy: None,
-                notes: None,
-            })
-            .await
-            .expect("assignment create")
-            .assignment;
-        let decision = service
-            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
-                assignment_id: assignment.assignment_id.clone(),
-                requested_by: Some("remote-client".to_string()),
-                proposed_text: Some("steer toward a remote action test".to_string()),
-                rationale_note: Some("remote action test".to_string()),
-            })
-            .await
-            .expect("propose steer")
-            .decision;
-
-        let _ = service
-            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
-            .await
-            .expect("bootstrap mirror");
-        let item = service
-            .operator_inbox_list(ipc::OperatorInboxListRequest {
-                source_kind: Some(orcas_core::ipc::OperatorInboxSourceKind::SupervisorDecision),
-                actionable_only: true,
-                ..Default::default()
-            })
-            .await
-            .expect("operator inbox list")
-            .items
-            .into_iter()
-            .find(|item| item.actionable_object_id == decision.decision_id)
-            .expect("decision inbox item");
-
-        let created = remote_client
-            .create(&orcas_core::ipc::OperatorRemoteActionCreateRequest {
-                origin_node_id: origin_node_id.clone(),
-                item_id: item.id.clone(),
-                action_kind: orcas_core::ipc::OperatorInboxActionKind::Reject,
-                idempotency_key: Some("mirror-action-decision".to_string()),
-                requested_by: Some("remote-client".to_string()),
-                request_note: Some("reject decision".to_string()),
-            })
-            .await
-            .expect("create decision action");
-
-        let worker_progress = service
-            .remote_action_once(&remote_client, &origin_node_id, "remote-worker")
-            .await
-            .expect("remote action worker");
-        match worker_progress {
-            super::RemoteActionLoopProgress::Claimed { .. } => {}
-            other => panic!("expected claimed progress, got {other:?}"),
-        }
-
-        let completed = remote_client
-            .get(&orcas_core::ipc::OperatorRemoteActionGetRequest {
-                origin_node_id: origin_node_id.clone(),
-                request_id: created.request.request_id.clone(),
-            })
-            .await
-            .expect("get remote action request")
-            .request
-            .expect("request present");
-        assert_eq!(
-            completed.status,
-            orcas_core::ipc::OperatorRemoteActionRequestStatus::Completed
-        );
-
-        let _ = service
-            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
-            .await
-            .expect("mirror after remote action");
-        let server_list = client.list(&origin_node_id).await.expect("server list");
-        assert!(server_list.items.iter().any(|item| {
-            item.id == created.request.item_id
-                && item.status == ipc::OperatorInboxItemStatus::Resolved
-        }));
-
-        std::fs::remove_file(server_db_path).ok();
-        server_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn operator_server_routes_reject_missing_or_invalid_tokens() {
-        let (server_url, server_token, _server_db_path, server_handle) =
-            start_inbox_mirror_server().await;
-        let client = reqwest::Client::new();
-        let request = orcas_core::ipc::OperatorRemoteActionListRequest {
-            origin_node_id: "origin-a".to_string(),
-            candidate_id: None,
-            item_id: None,
-            action_kind: None,
-            status: None,
-            pending_only: false,
-            actionable_only: false,
-            limit: None,
-        };
-
-        let missing = client
-            .post(format!("{server_url}/operator-actions/list"))
-            .json(&request)
-            .send()
-            .await
-            .expect("missing-token request");
-        assert_eq!(missing.status(), reqwest::StatusCode::UNAUTHORIZED);
-
-        let invalid = client
-            .post(format!("{server_url}/operator-actions/list"))
-            .bearer_auth("definitely-wrong")
-            .json(&request)
-            .send()
-            .await
-            .expect("invalid-token request");
-        assert_eq!(invalid.status(), reqwest::StatusCode::UNAUTHORIZED);
-
-        let authorized = client
-            .post(format!("{server_url}/operator-actions/list"))
-            .bearer_auth(server_token)
-            .json(&request)
-            .send()
-            .await
-            .expect("authorized request");
-        assert_eq!(authorized.status(), reqwest::StatusCode::OK);
-
-        server_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn remote_action_wait_resolves_when_request_updates() {
-        let (server_url, server_token, _server_db_path, server_handle) =
-            start_inbox_mirror_server().await;
-        let reasoner = Arc::new(StaticSupervisorReasoner::default());
-        let service = test_service_with_reasoner_and_config(reasoner.clone(), {
-            let mut config = AppConfig::default();
-            config.inbox_mirror.server_url = Some(server_url.clone());
-            config.inbox_mirror.operator_api_token = Some(server_token.clone());
-            config
-        })
-        .await;
-        let origin_node_id = service
-            .authority_store
-            .origin_node_id()
-            .expect("origin node id")
-            .to_string();
-        let authority_peer_id = format!("orcas-server::{origin_node_id}");
-        let client = OperatorInboxMirrorHttpClient::with_operator_api_token(
-            server_url.clone(),
-            server_token.clone(),
-        );
-        let remote_client = RemoteActionHttpClient::with_operator_api_token(
-            server_url.clone(),
-            server_token.clone(),
-        );
-
-        let (_workstream, work_unit, assignment, report) =
-            seed_awaiting_decision_fixture(&service, "remote-wait").await;
-        let proposal =
-            create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
-                .await
-                .proposal;
-
-        let _ = service
-            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
-            .await
-            .expect("bootstrap mirror");
-        let item = service
-            .operator_inbox_list(ipc::OperatorInboxListRequest {
-                source_kind: Some(orcas_core::ipc::OperatorInboxSourceKind::SupervisorProposal),
-                actionable_only: true,
-                ..Default::default()
-            })
-            .await
-            .expect("operator inbox list")
-            .items
-            .into_iter()
-            .find(|item| item.actionable_object_id == proposal.id)
-            .expect("proposal inbox item");
-
-        let created = remote_client
-            .create(&orcas_core::ipc::OperatorRemoteActionCreateRequest {
-                origin_node_id: origin_node_id.clone(),
-                item_id: item.id.clone(),
-                action_kind: orcas_core::ipc::OperatorInboxActionKind::Approve,
-                idempotency_key: Some("wait-candidate".to_string()),
-                requested_by: Some("remote-client".to_string()),
-                request_note: Some("wait for update".to_string()),
-            })
-            .await
-            .expect("create request");
-        let original = remote_client
-            .get(&orcas_core::ipc::OperatorRemoteActionGetRequest {
-                origin_node_id: origin_node_id.clone(),
-                request_id: created.request.request_id.clone(),
-            })
-            .await
-            .expect("get original")
-            .request
-            .expect("request present");
-
-        let waiter = {
-            let remote_client = remote_client.clone();
-            let origin_node_id = origin_node_id.clone();
-            let request_id = created.request.request_id.clone();
-            tokio::spawn(async move {
-                remote_client
-                    .wait(&orcas_core::ipc::OperatorRemoteActionWaitRequest {
-                        origin_node_id,
-                        request_id,
-                        after_updated_at: Some(original.updated_at),
-                        timeout_ms: Some(10_000),
-                    })
-                    .await
-            })
-        };
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let claimed = remote_client
-            .claim(&orcas_core::ipc::OperatorRemoteActionClaimRequest {
-                origin_node_id: origin_node_id.clone(),
-                worker_id: "remote-worker".to_string(),
-                limit: Some(1),
-                lease_ms: Some(60_000),
-            })
-            .await
-            .expect("claim request");
-        assert_eq!(claimed.requests.len(), 1);
-
-        let waited = waiter.await.expect("wait task").expect("wait response");
-        assert!(!waited.timed_out);
-        assert_eq!(waited.origin_node_id, origin_node_id);
-        assert_eq!(
-            waited.request.as_ref().expect("waited request").status,
-            orcas_core::ipc::OperatorRemoteActionRequestStatus::Claimed
-        );
-
-        server_handle.abort();
     }
 }

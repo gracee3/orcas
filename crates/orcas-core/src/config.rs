@@ -142,6 +142,8 @@ pub struct SupervisorConfig {
     pub api_key_env: String,
     pub model: String,
     pub reasoning_effort: String,
+    #[serde(default)]
+    pub temperature: Option<f64>,
     pub max_output_tokens: u32,
     #[serde(default)]
     pub proposals: SupervisorProposalConfig,
@@ -154,6 +156,7 @@ impl Default for SupervisorConfig {
             api_key_env: "OPENAI_API_KEY".to_string(),
             model: "gpt-5.4".to_string(),
             reasoning_effort: "high".to_string(),
+            temperature: None,
             max_output_tokens: 2_000,
             proposals: SupervisorProposalConfig::default(),
         }
@@ -250,6 +253,7 @@ mod tests {
             "api_key_env": "EXAMPLE_API_KEY",
             "model": "gpt-test",
             "reasoning_effort": "medium",
+            "temperature": 0.2,
             "max_output_tokens": 512
         }))
         .expect("deserialize supervisor config");
