@@ -8,7 +8,6 @@ The build produces three executables:
 
 1. `orcas` for the operator CLI.
 2. `orcasd` for the daemon service.
-3. `orcas-tui` for the interactive TUI.
 
 ## Install From Release Tarball
 
@@ -27,7 +26,6 @@ To make the binaries available on your `PATH`, install them into a bin directory
 mkdir -p ~/.local/bin
 install -m 0755 bin/orcas ~/.local/bin/orcas
 install -m 0755 bin/orcasd ~/.local/bin/orcasd
-install -m 0755 bin/orcas-tui ~/.local/bin/orcas-tui
 ```
 
 For a system-wide install, use `/usr/local/bin` instead of `~/.local/bin`.
@@ -35,7 +33,6 @@ For a system-wide install, use `/usr/local/bin` instead of `~/.local/bin`.
 ```bash
 sudo install -m 0755 bin/orcas /usr/local/bin/orcas
 sudo install -m 0755 bin/orcasd /usr/local/bin/orcasd
-sudo install -m 0755 bin/orcas-tui /usr/local/bin/orcas-tui
 ```
 
 ## Install Via `.deb`
@@ -48,7 +45,7 @@ sudo dpkg -i ./orcas_0.1.0_amd64.deb
 
 The package installs the executables into `/usr/bin`, the daemon user unit as `orcas-daemon.service`, and package documentation under `/usr/share/doc/orcas`.
 
-After installation, manage the daemon with the user service manager so it shares the same XDG paths as the CLI and TUI.
+After installation, manage the daemon with the user service manager so it shares the same XDG paths as the CLI.
 
 ```bash
 systemctl --user enable --now orcas-daemon.service
@@ -102,7 +99,6 @@ If you installed to `~/.local/bin`, remove the files directly.
 ```bash
 rm -f ~/.local/bin/orcas
 rm -f ~/.local/bin/orcasd
-rm -f ~/.local/bin/orcas-tui
 ```
 
 If you installed system-wide without the Makefile targets, remove the binaries from `/usr/local/bin` and delete `orcas-daemon.service` from the user systemd unit directory in use on your host.

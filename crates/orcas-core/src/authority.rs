@@ -741,7 +741,7 @@ impl From<&WorkUnitRecord> for WorkUnitSummary {
 ///
 /// This is an Orcas-owned local binding record that may reference an upstream
 /// thread identifier. It is part of planning authority, but it is distinct from
-/// TUI-local PTY resume state.
+/// operator-client-local PTY resume state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackedThreadRecord {
     pub id: TrackedThreadId,

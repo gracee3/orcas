@@ -29,12 +29,11 @@ RUST_LOG=info orcasd
 RUST_LOG=debug orcasd
 RUST_LOG=orcasd=debug,tokio=info orcasd
 RUST_LOG=orcas=debug orcas doctor
-RUST_LOG=orcas-tui=debug,tokio=info orcas-tui
 ```
 
 Orcas also supports one logging-related boolean env var:
 
-1. `ORCAS_LOG_RUNTIME_CYCLE` enables extra TUI runtime-cycle logs when set to `1`, `true`, `yes`, or `on`.
+1. `ORCAS_LOG_RUNTIME_CYCLE` enables extra runtime-cycle logs when set to `1`, `true`, `yes`, or `on`.
 
 ## Log Locations
 
@@ -50,8 +49,7 @@ Current log files:
 
 1. `orcasd.log` for the daemon.
 2. `orcas.log` for the operator CLI.
-3. `orcas-tui.log` for the terminal UI.
-4. `codex-app-server.log` for raw Codex app-server stdout/stderr diagnostics.
+3. `codex-app-server.log` for raw Codex app-server stdout/stderr diagnostics.
 
 The log, config, data, and runtime directories are created automatically on startup.
 
@@ -61,7 +59,6 @@ Start with the component log that matches the failing surface:
 
 1. `orcasd.log` for daemon startup, IPC, persistence, authority-store, and upstream lifecycle issues.
 2. `orcas.log` for CLI command issues.
-3. `orcas-tui.log` for TUI startup, backend reconnect, and PTY/session issues.
 
 Use `codex-app-server.log` only when the semantic daemon logs point to an upstream Codex app-server problem and you need the raw subprocess output.
 

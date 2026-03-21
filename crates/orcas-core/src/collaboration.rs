@@ -80,7 +80,7 @@ pub struct CollaborationState {
 /// Lifecycle of a Codex thread assignment mirror in collaboration state.
 ///
 /// This is runtime state, not planning hierarchy state. The values are persisted
-/// because they drive daemon and TUI execution flows.
+/// because they drive daemon and operator client execution flows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexThreadAssignmentStatus {
@@ -517,7 +517,7 @@ pub struct Worker {
 
 /// Persisted runtime state for a worker session.
 ///
-/// This is the daemon's view of a worker session lifecycle, not the TUI-local
+/// This is the daemon's view of a worker session lifecycle, not the operator-client-local
 /// PTY session manager state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

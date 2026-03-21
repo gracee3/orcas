@@ -157,7 +157,7 @@ Division of responsibility:
 * persists operational records
 * inspects local git state read-only
 * gates risky flows based on explicit rules
-* surfaces audit and lifecycle state to CLI/TUI
+* surfaces audit and lifecycle state to CLI/operator client
 
 ### Operator-visible workflow summary
 

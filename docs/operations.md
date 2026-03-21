@@ -8,7 +8,7 @@ Start the daemon directly when you want to run it in the foreground.
 orcasd
 ```
 
-Use the systemd user manager when you want the daemon managed as a service that shares the same XDG paths as the CLI and TUI.
+Use the systemd user manager when you want the daemon managed as a service that shares the same XDG paths as the CLI.
 
 ```bash
 systemctl --user start orcas-daemon.service
@@ -52,7 +52,6 @@ Use the file logs for the application’s own tracing output.
 ```bash
 tail -f ~/.local/share/orcas/logs/orcasd.log
 tail -f ~/.local/share/orcas/logs/orcas.log
-tail -f ~/.local/share/orcas/logs/orcas-tui.log
 ```
 
 Common log patterns include socket bind failures, stale runtime cleanup, upstream connection failures, and request validation errors. If a client cannot connect, check the daemon log first, then confirm the socket path exists and is responsive. Use `codex-app-server.log` only when you need raw upstream subprocess output.
@@ -97,7 +96,7 @@ If the daemon cannot create its config, data, log, or runtime directories, check
 
 ### Binary Not Found In `PATH`
 
-If `orcas`, `orcasd`, or `orcas-tui` are not found, install them into a directory on your `PATH` or invoke them with an absolute path.
+If `orcas` or `orcasd` are not found, install them into a directory on your `PATH` or invoke them with an absolute path.
 
 ```bash
 install -m 0755 bin/orcas ~/.local/bin/orcas

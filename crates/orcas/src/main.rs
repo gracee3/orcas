@@ -3,9 +3,8 @@ mod remote;
 mod streaming;
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use orcas_core::{
     AppPaths, DecisionType, WorkUnitStatus, WorkstreamStatus, authority, init_file_logger,
@@ -90,7 +89,6 @@ enum TopCommand {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    Tui,
     Doctor,
     Remote {
         #[command(subcommand)]
@@ -1226,7 +1224,6 @@ async fn main() -> Result<()> {
         force_spawn: global.force_spawn,
     };
     match cli.command {
-        TopCommand::Tui => launch_tui()?,
         TopCommand::Remote { command } => {
             run_remote(&global, command).await?;
         }
@@ -1767,43 +1764,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn launch_tui() -> Result<()> {
-    let binary = resolve_tui_binary();
-    let status = Command::new(&binary)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .with_context(|| format!("failed to launch `{}`", binary.display()))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("`{}` exited with status {status}", binary.display())
-    }
-}
-
-fn resolve_tui_binary() -> PathBuf {
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            let candidate = parent.join(tui_binary_name());
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-
-    PathBuf::from(tui_binary_name())
-}
-
-fn tui_binary_name() -> &'static str {
-    if cfg!(windows) {
-        "orcas-tui.exe"
-    } else {
-        "orcas-tui"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1877,16 +1837,6 @@ mod tests {
             TopCommand::Daemon {
                 command: DaemonCommand::Status,
             } => {}
-            other => panic!("unexpected command parse: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_top_level_tui_command() {
-        let cli = Cli::parse_from(["orcas", "tui"]);
-
-        match cli.command {
-            TopCommand::Tui => {}
             other => panic!("unexpected command parse: {other:?}"),
         }
     }

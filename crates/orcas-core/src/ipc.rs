@@ -1,7 +1,7 @@
 //! Shared JSON-RPC, snapshot, and event vocabulary for ORCAS.
 //!
 //! This module defines the public wire contract used by the daemon, CLI, and
-//! TUI. It intentionally separates three classes of surface:
+//! operator client. It intentionally separates three classes of surface:
 //! - snapshot and recovery reads such as `state/get` and `events/subscribe`
 //! - canonical authority planning reads and writes under `authority/*`
 //! - retained runtime-detail exceptions such as `workunit/get`
@@ -2088,7 +2088,7 @@ pub struct WorkunitGetRequest {
 /// exception.
 ///
 /// This is not a canonical planning API. It carries execution detail that the
-/// TUI and operator tools still need even when planning authority lives under
+/// operator client and operator tools still need even when planning authority lives under
 /// `authority/*`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkunitGetResponse {

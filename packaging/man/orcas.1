@@ -19,7 +19,7 @@ acts as a client of that daemon.
 
 The current packaged
 .I orcas-daemon.service
-unit is intended for the user service manager, so the CLI, TUI, and daemon all
+unit is intended for the user service manager, so the CLI and daemon all
 share the same XDG config, data, log, and socket paths.
 
 The current workflow boundary is mixed. Legacy collaboration state remains in
@@ -136,8 +136,7 @@ If unset, Orcas keeps the configured or default
 .B spawn_if_needed
 behavior.
 .SH SEE ALSO
-.BR orcasd (1),
-.BR orcas-tui (1)
+.BR orcasd (1)
 
 Project documentation is installed under:
 

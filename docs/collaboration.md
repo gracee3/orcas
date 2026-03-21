@@ -2,7 +2,7 @@
 
 ## Overview
 
-Orcas keeps supervision state local, but the current implementation has more than one live state surface. The daemon owns the local IPC contract, the live bridge to the upstream Codex app-server, legacy collaboration state, and the authority store. The CLI is a daemon client. The TUI reads and mutates supervised state through the daemon, while also owning a local PTY-backed `codex resume` helper for interactive attachment to a selected thread.
+Orcas keeps supervision state local, but the current implementation has more than one live state surface. The daemon owns the local IPC contract, the live bridge to the upstream Codex app-server, legacy collaboration state, and the authority store. The CLI is a daemon client. The operator client reads and mutates supervised state through the daemon, while also owning a local PTY-backed `codex resume` helper for interactive attachment to a selected thread.
 
 This document describes the current implemented contract rather than an aspirational target. It focuses on:
 
@@ -11,19 +11,19 @@ This document describes the current implemented contract rather than an aspirati
 - merged read models such as `state/get`
 - current mutation visibility and event behavior
 - restart and reconnect expectations
-- current operator surface splits between the CLI, the TUI, and the daemon
+- current operator surface splits between the CLI, the operator client, and the daemon
 
 The local-authority rationale remains documented in [Local-Authority MVP Backend Design](design/local-authority-mvp-backend.md). The tracked-thread local binding decision remains documented in [ADR 0001](adr/0001-tracked-thread-is-a-local-binding-record.md).
 
 ## Collaboration Model
 
-Orcas currently models work across two daemon-owned stores plus one TUI-local session surface.
+Orcas currently models work across two daemon-owned stores plus one operator-client-local session surface.
 
 - Legacy collaboration state lives in daemon memory and is persisted to `state.json`.
 - Authority state for authority workstreams, authority work units, and tracked threads lives in SQLite `state.db`.
 - `state/get` is a merged derived snapshot that combines daemon state with collaboration-owned summaries plus any explicit authority compatibility bridge rows needed for assignment execution.
 - `authority/hierarchy/get` is an authority-only hierarchy query over the SQLite store.
-- The TUI also keeps local PTY-backed `codex resume` session state that is not daemon-owned.
+- The operator client also keeps local PTY-backed `codex resume` session state that is not daemon-owned.
 
 Tracked threads are Orcas-owned local binding records, not upstream Codex thread rows. A tracked thread may reference an `upstream_thread_id`, but create, edit, and delete operations act on the local Orcas record rather than claiming ownership of upstream runtime storage.
 
@@ -38,7 +38,7 @@ ORCAS now treats public and internal surfaces as belonging to one of four bucket
   - operator-facing CLI namespaces `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...`
   - daemon authority planning RPCs such as `authority/hierarchy/get`, `authority/workstream/*`, `authority/workunit/*`, and `authority/tracked_thread/*`
 - Runtime-detail exception:
-  - `workunit/get`, which remains public because the TUI uses it for collaboration execution detail such as assignments, reports, decisions, and proposals
+  - `workunit/get`, which remains public because the operator client uses it for collaboration execution detail such as assignments, reports, decisions, and proposals
 - Compatibility/internal:
   - collaboration-shaped bridge rows in `state/get`
   - collaboration planning mirrors persisted in `state.json`
@@ -109,7 +109,7 @@ The review and collaboration operator surfaces now render plan revision recovery
 | Worker session | Daemon collaboration state | `state.json` | Internal daemon-only selection and lifecycle updates | No dedicated public query; visible indirectly through assignment behavior and persisted collaboration state | No | No |
 | Live thread state | Daemon live state mirrored from Codex | Thread mirror data in `state.json` | `thread/start`, `thread/resume`, daemon Codex event bridge, internal mirror maintenance | `state/get`, `threads/list*`, `thread/read*`, `thread/get` | Yes | No |
 | Live turn state | Daemon live state mirrored from Codex | Turn mirror data in `state.json` | `turn/start`, `turn/steer`, `turn/interrupt`, daemon Codex event bridge, internal mirror maintenance | `state/get` active thread view, `turns/list_active`, `turns/recent`, `turn/get`, `turn/attach` | Yes, through session and active thread data | No |
-| Local PTY-backed Codex resume session state | TUI-local `CodexSessionManager` | None | TUI `ResumeSelectedThreadInCodex` action and local PTY lifecycle | TUI-local state only | No | No |
+| Local PTY-backed Codex resume session state | operator-client-local `CodexSessionManager` | None | operator client `ResumeSelectedThreadInCodex` action and local PTY lifecycle | operator-client-local state only | No | No |
 
 ### Projection, Visibility, And Restart Behavior
 
@@ -119,7 +119,7 @@ The review and collaboration operator surfaces now render plan revision recovery
 | Workstream, authority record | Not globally projected into `state/get`. A workstream can appear there only as an explicit assignment-compatibility bridge row, and that row is still collaboration-shaped rather than authority-shaped. | `authority/workstream/create`, `authority/workstream/edit`, and `authority/workstream/delete` emit `WorkstreamLifecycle` with `created`, `updated`, and `deleted` actions | Survives daemon restart through `state.db`; previously bridged collaboration copies also survive in `state.json`, but `state/get` hides bridged rows whose authority source is now tombstoned |
 | Work unit, legacy collaboration record | Collaboration-shaped native record | `WorkUnitLifecycle` for collaboration updates | Survives daemon restart through `state.json`; clients reload via snapshot-first flow |
 | Work unit, authority record | Not globally projected into `state/get`. It appears there only after assignment compatibility bridging has injected a collaboration-shaped row. | `authority/workunit/create`, `authority/workunit/edit`, and `authority/workunit/delete` emit `WorkUnitLifecycle` with `created`, `updated`, and `deleted` actions | Survives daemon restart through `state.db`; assignment-created collaboration compatibility state also survives in `state.json`, but `state/get` hides bridged rows whose authority source is now tombstoned |
-| Tracked thread, authority record | Not projected into `state/get`; the TUI now reloads authority detail instead of synthesizing local authority records for edit flows | `authority/tracked_thread/create`, `authority/tracked_thread/edit`, and `authority/tracked_thread/delete` emit `TrackedThreadLifecycle` with `created`, `updated`, and `deleted` actions | Survives daemon restart through `state.db`; clients still reload authority hierarchy or detail queries when they need the current read model rather than just the lifecycle notification |
+| Tracked thread, authority record | Not projected into `state/get`; the operator client now reloads authority detail instead of synthesizing local authority records for edit flows | `authority/tracked_thread/create`, `authority/tracked_thread/edit`, and `authority/tracked_thread/delete` emit `TrackedThreadLifecycle` with `created`, `updated`, and `deleted` actions | Survives daemon restart through `state.db`; clients still reload authority hierarchy or detail queries when they need the current read model rather than just the lifecycle notification |
 | Assignment | Collaboration-native | `AssignmentLifecycle` | Survives daemon restart through `state.json`; clients reload via snapshot-first flow |
 | Proposal | Collaboration-native; there is no top-level proposal list in `state/get`, though collaboration work unit summaries can carry nested proposal summaries | `ProposalLifecycle` | Survives daemon restart through `state.json`; clients must re-query proposal RPCs after reconnect when they need full proposal records |
 | Decision | Collaboration-native | `DecisionApplied` | Survives daemon restart through `state.json`; visible again through `state/get` |
@@ -127,7 +127,7 @@ The review and collaboration operator surfaces now render plan revision recovery
 | Worker session | Collaboration-native internal state | No dedicated worker-session event | Survives daemon restart through `state.json`; no dedicated client reload surface exists today |
 | Live thread state | Derived from Codex plus daemon mirrors; not authority state | `UpstreamStatusChanged`, `SessionChanged`, `ThreadUpdated`, `TurnUpdated`, `ItemUpdated`, `OutputDelta` as applicable | Stored mirrors reload from `state.json`, but clients still treat reconnect as snapshot-first and `turn/attach` as daemon-instance scoped |
 | Live turn state | Derived from Codex plus daemon mirrors | `TurnUpdated`, `ItemUpdated`, `OutputDelta`, `SessionChanged` as applicable | Stored mirrors reload from `state.json`, but attach and stream continuity are not promised across daemon restart |
-| Local PTY-backed Codex resume session state | TUI-only derived and runtime-managed; not reflected in daemon read models | No daemon event visibility | Does not survive TUI process exit or restart; daemon reconnect does not recreate it |
+| Local PTY-backed Codex resume session state | operator client-only derived and runtime-managed; not reflected in daemon read models | No daemon event visibility | Does not survive operator client process exit or restart; daemon reconnect does not recreate it |
 
 ## IPC Contract
 
@@ -214,7 +214,7 @@ Notifications are delivered on `events/notification` with Orcas-owned event enve
 - authority revisions, tombstones, or origin-node metadata
 - top-level proposal records, though work unit summaries can carry nested proposal summaries for collaboration-owned work units
 - worker-session records
-- TUI-local PTY session state
+- operator-client-local PTY session state
 
 Current limitations of the merged collaboration snapshot:
 
@@ -259,14 +259,14 @@ This read model is the current source for:
 
 - The CLI uses authority-backed planning CRUD for `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...`, while still using `state/get` and focused RPCs for collaboration and runtime state.
 - There is no longer an operator-facing legacy planning command namespace in the CLI.
-- The TUI bootstraps from both `state/get` and `authority/hierarchy/get`.
-- The TUI uses authority detail RPCs such as `authority/workstream/get`, `authority/workunit/get`, and `authority/tracked_thread/get` for focused editing surfaces.
-- The TUI still uses `workunit/get` for collaboration execution detail on a selected work unit because that read includes assignments, reports, decisions, and proposals that are not part of the authority planning hierarchy.
+- The operator client bootstraps from both `state/get` and `authority/hierarchy/get`.
+- The operator client uses authority detail RPCs such as `authority/workstream/get`, `authority/workunit/get`, and `authority/tracked_thread/get` for focused editing surfaces.
+- The operator client still uses `workunit/get` for collaboration execution detail on a selected work unit because that read includes assignments, reports, decisions, and proposals that are not part of the authority planning hierarchy.
 - Existing subscribers should treat events as incremental hints layered on top of snapshot reloads, not as a complete replayable truth source for authority state.
 
 ### Current Client-Side Synthesis
 
-The TUI no longer synthesizes authority-shaped edit records from hierarchy summaries.
+The operator client no longer synthesizes authority-shaped edit records from hierarchy summaries.
 
 - Edit forms now wait for `authority/workstream/get`, `authority/workunit/get`, or `authority/tracked_thread/get` to return.
 - Hierarchy summaries are treated as navigation data, not as interchangeable authority detail records.
@@ -318,7 +318,7 @@ The current client reconnect flow is:
 5. If the socket drops or the daemon restarts, treat the old subscription as closed.
 6. Reconnect, request fresh reads again, and only then consume new incremental events.
 
-This remains the recommended flow for both the CLI and the TUI. The TUI adds an authority reload step because its main hierarchy depends on both `state/get` and `authority/hierarchy/get`.
+This remains the recommended flow for both the CLI and the operator client. The operator client adds an authority reload step because its main hierarchy depends on both `state/get` and `authority/hierarchy/get`.
 
 There is still no replay contract for missed daemon events. A closed or interrupted subscription means the client must re-read current state rather than infer what happened while it was disconnected.
 
@@ -337,24 +337,24 @@ There is still no replay contract for missed daemon events. A closed or interrup
 ### What Clients Must Reload
 
 - `state/get` after reconnect
-- `authority/hierarchy/get` for TUI hierarchy views after reconnect
+- `authority/hierarchy/get` for operator client hierarchy views after reconnect
 - authority detail queries when exact authority fields are needed
 - proposal and other focused RPCs for data that is not included in `state/get`
 
-The current TUI reconnect path also treats authority-only view state as invalidated until those reloads complete:
+The current operator client reconnect path also treats authority-only view state as invalidated until those reloads complete:
 
 - authority hierarchy rows are cleared when the daemon connection is lost
 - cached authority detail records are cleared when the daemon connection is lost
 - the main-footer edit or delete mode resets to inspect on disconnect or fresh snapshot load
 - the current authority selection is preserved only as selection intent and is restored after a fresh hierarchy reload if that row still exists
 
-### TUI PTY Exception
+### operator client PTY Exception
 
-The TUI-local PTY-backed `codex resume` session manager is not part of daemon state. It does not live in `state/get` or `authority/hierarchy/get`, and it is not reconstructed by daemon reconnect.
+The operator-client-local PTY-backed `codex resume` session manager is not part of daemon state. It does not live in `state/get` or `authority/hierarchy/get`, and it is not reconstructed by daemon reconnect.
 
-- If the daemon restarts, the TUI must reconnect and reload daemon-owned state separately.
-- If the TUI process stays alive, an already-running local PTY helper can continue independently while the daemon reconnects because that PTY session is TUI-owned rather than daemon-owned.
-- If the TUI exits, the local PTY helper exits with it unless the operator detached it separately.
+- If the daemon restarts, the operator client must reconnect and reload daemon-owned state separately.
+- If the operator client process stays alive, an already-running local PTY helper can continue independently while the daemon reconnects because that PTY session is operator client-owned rather than daemon-owned.
+- If the operator client exits, the local PTY helper exits with it unless the operator detached it separately.
 - Local PTY session state should therefore be treated as operator convenience state rather than durable workflow state.
 
 ## Upstream Codex Integration
@@ -363,25 +363,25 @@ The TUI-local PTY-backed `codex resume` session manager is not part of daemon st
 
 The daemon connects to a configured WebSocket endpoint, with a localhost endpoint used by default in the current configuration. The upstream transport details remain an internal implementation concern. Orcas surfaces the resulting thread, turn, collaboration, and authority query state through its own IPC contract instead of mirroring the upstream wire format wholesale.
 
-The one intentional exception is the TUI's local PTY-backed `codex resume` helper. That path is a local interactive attachment convenience rather than a daemon-owned source of supervision truth.
+The one intentional exception is the operator client's local PTY-backed `codex resume` helper. That path is a local interactive attachment convenience rather than a daemon-owned source of supervision truth.
 
 ## Operator And Client Surfaces
 
 - The canonical operator CRUD surface for planning hierarchy objects is now authority-backed in both clients:
   - CLI: `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...`
-  - TUI: authority CRUD plus `authority/hierarchy/get` and authority detail RPCs
+  - operator client: authority CRUD plus `authority/hierarchy/get` and authority detail RPCs
 - There is no longer an operator-facing legacy planning command namespace. Legacy collaboration planning rows can still exist in `state.json`, but they are no longer exposed as a peer CLI surface.
 - Both clients still depend on daemon snapshots and focused daemon RPCs for thread, turn, assignment, report, decision, and proposal views.
-- The TUI retains one collaboration work-unit detail read, `workunit/get`, because it carries execution detail that is outside the authority planning hierarchy.
+- The operator client retains one collaboration work-unit detail read, `workunit/get`, because it carries execution detail that is outside the authority planning hierarchy.
 - Non-canonical surfaces are intentionally frozen: new planning behavior should not be added to `workunit/get`, bridge rows, or other collaboration compatibility paths.
 - The daemon event stream is shared and now carries post-commit create, update, and delete notifications for authority workstreams, work units, and tracked threads.
-- The TUI's PTY-backed `codex resume` path is local to the TUI process and should be understood as an operator convenience layer rather than a daemon-managed session model.
+- The operator client's PTY-backed `codex resume` path is local to the operator client process and should be understood as an operator convenience layer rather than a daemon-managed session model.
 
 ## Known Limitations Carried Into Later Phases
 
 - `state/get` still contains mixed-semantics workstream and work unit lists because collaboration-native rows and explicit compatibility bridge rows share summary types.
 - Authority deletes hide previously bridged rows from `state/get`, but do not currently scrub the underlying bridge copy from `state.json`.
 - Tracked-thread lifecycle events do not remove the need for authority query reloads when a client needs full record detail rather than an event summary.
-- The daemon still carries one collaboration planning-era public read, `workunit/get`, because the TUI uses it for execution detail that is not modeled by authority planning reads. The rest of the old `workstream/*` and `workunit/*` planning CRUD/list surface has been retired from the public daemon contract.
+- The daemon still carries one collaboration planning-era public read, `workunit/get`, because the operator client uses it for execution detail that is not modeled by authority planning reads. The rest of the old `workstream/*` and `workunit/*` planning CRUD/list surface has been retired from the public daemon contract.
 
 These are current implementation truths, not guarantees that later hardening phases will preserve unchanged. Later phases can normalize the boundary, but this document intentionally describes the boundary as it exists today.

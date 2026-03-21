@@ -28,7 +28,7 @@ Positive:
 
 - Orcas can run fully offline and still own a complete local supervision model.
 - Delete semantics stay honest.
-- The TUI can treat tracked threads as normal local CRUD objects.
+- The operator client can treat tracked threads as normal local CRUD objects.
 - Later sync can replicate Orcas records without pretending Orcas owns remote runtime storage.
 
 Tradeoff:

@@ -18,7 +18,7 @@ SCENARIO ?=
 TAG ?=
 
 MAIN_BIN := orcas
-AUX_BINS := orcasd orcas-tui
+AUX_BINS := orcasd
 ALL_BINS := $(MAIN_BIN) $(AUX_BINS)
 
 RELEASE_DIR := target/$(TARGET)/release
@@ -67,7 +67,6 @@ install: build
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -m 0755 "$(RELEASE_DIR)/$(MAIN_BIN)" "$(DESTDIR)$(BINDIR)/$(MAIN_BIN)"
 	install -m 0755 "$(RELEASE_DIR)/orcasd" "$(DESTDIR)$(BINDIR)/orcasd"
-	install -m 0755 "$(RELEASE_DIR)/orcas-tui" "$(DESTDIR)$(BINDIR)/orcas-tui"
 
 .PHONY: install-user
 install-user:
@@ -94,7 +93,6 @@ disable-systemd:
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/orcas"
 	rm -f "$(DESTDIR)$(BINDIR)/orcasd"
-	rm -f "$(DESTDIR)$(BINDIR)/orcas-tui"
 
 .PHONY: uninstall-systemd
 uninstall-systemd:
@@ -107,7 +105,6 @@ dist: build
 	install -d "$(DIST_DIR)/packaging/systemd"
 	install -m 0755 "$(RELEASE_DIR)/orcas" "$(DIST_DIR)/bin/orcas"
 	install -m 0755 "$(RELEASE_DIR)/orcasd" "$(DIST_DIR)/bin/orcasd"
-	install -m 0755 "$(RELEASE_DIR)/orcas-tui" "$(DIST_DIR)/bin/orcas-tui"
 	install -m 0644 packaging/systemd/orcas-daemon.service \
 		"$(DIST_DIR)/packaging/systemd/orcas-daemon.service"
 	test ! -f README.md || install -m 0644 README.md "$(DIST_DIR)/README.md"

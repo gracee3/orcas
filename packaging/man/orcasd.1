@@ -16,12 +16,12 @@ The daemon is normally managed by
 through
 .I orcas-daemon.service
 and is designed to run under the user service manager so it shares the same
-XDG paths and local socket contract as the CLI and TUI rather than acting as a
-public network daemon.
+XDG paths and local socket contract as the CLI rather than acting as a public
+network daemon.
 
 Orcas records workstreams, work units, assignments, reports, decisions,
-proposals, thread state, and turn state in Orcas-native storage. The CLI and
-TUI connect to the daemon for inspection and control.
+proposals, thread state, and turn state in Orcas-native storage. The CLI
+connects to the daemon for inspection and control.
 
 The current daemon owns two live persistence systems: legacy collaboration and
 thread or turn mirror state in \fIstate.json\fR, and authority state in
@@ -104,7 +104,6 @@ If unset, Orcas keeps the configured or default
 behavior.
 .SH SEE ALSO
 .BR orcas (1),
-.BR orcas-tui (1),
 .BR systemd (1)
 .SH AUTHOR
 Orcas contributors.

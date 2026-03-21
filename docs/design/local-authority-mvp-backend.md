@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-This design makes `orcasd` the explicit local authority for Orcas state in the MVP. The daemon becomes the only write path for mutable operator objects, backed by a small SQLite store with a canonical event log and a set of query projections that directly power the TUI.
+This design makes `orcasd` the explicit local authority for Orcas state in the MVP. The daemon becomes the only write path for mutable operator objects, backed by a small SQLite store with a canonical event log and a set of query projections that directly power the operator client.
 
 The recommended MVP keeps the architecture intentionally disciplined:
 
@@ -10,7 +10,7 @@ The recommended MVP keeps the architecture intentionally disciplined:
 - Rust-first
 - SQLite-backed
 - explicit commands and events
-- thin TUI over daemon IPC
+- thin operator client over daemon IPC
 - single-writer mutation path
 - tombstone-based deletes
 - future-ready seams for later replication without turning the local core into a fake cloud system now
@@ -23,7 +23,7 @@ This document is design rationale for the MVP rather than a current protocol ref
 
 ### Decision
 
-Use SQLite as the local durable store. Treat the SQLite event log as the canonical write history. Maintain current-state projection tables in the same database for fast TUI reads.
+Use SQLite as the local durable store. Treat the SQLite event log as the canonical write history. Maintain current-state projection tables in the same database for fast operator client reads.
 
 ### Practical Shape
 
@@ -38,7 +38,7 @@ Use SQLite as the local durable store. Treat the SQLite event log as the canonic
   - projector
   - JSON-RPC handlers
   - event notification fanout after commit
-- `orcas-tui`
+- `operator client`
   - query-driven UI
   - generic footer/composer state for create, edit, and delete confirmation
   - no direct row mutation logic
@@ -161,7 +161,7 @@ This resolves the semantic question as follows:
   - examples: title, notes, preferred cwd, preferred model, local association to a different upstream thread if explicitly allowed
 - delete:
   - tombstone the Orcas tracking record locally
-  - remove it from normal TUI hierarchy queries
+  - remove it from normal operator client hierarchy queries
   - never imply upstream hard deletion
 
 This is the right MVP contract because Orcas does control local supervision records, but it does not control the full lifecycle guarantees of upstream runtime storage. The tracked-thread model preserves a clean future seam:
@@ -173,7 +173,7 @@ Product wording should prefer `tracked thread`. Internally and in architecture l
 
 ## 4. Command Catalog
 
-Every mutation should be an explicit command. No direct row updates from the TUI.
+Every mutation should be an explicit command. No direct row updates from the operator client.
 
 ### Command Envelope
 
@@ -215,7 +215,7 @@ Each command should carry:
 - `DeleteTrackedThread`
   - fields: `tracked_thread_id`, `expected_revision`, `delete_token`
 
-### Command Mapping From TUI
+### Command Mapping From operator client
 
 - footer create workstream -> `CreateWorkstream`
 - footer edit workstream -> `EditWorkstream`
@@ -432,9 +432,9 @@ UUIDv7 is preferred over UUIDv4 because it keeps ordering saner in SQLite and la
 
 ### Projection Ownership
 
-Projection tables should be owned by the daemon store layer, not by the TUI.
+Projection tables should be owned by the daemon store layer, not by the operator client.
 
-The TUI should read:
+The operator client should read:
 
 - hierarchy lists from `workstreams`, `work_units`, `tracked_threads`, or `tui_hierarchy`
 - detail surfaces from entity projection tables
@@ -447,7 +447,7 @@ The TUI should read:
 - workstream list with counts
 - work unit list for a workstream
 - tracked thread list for a work unit
-- combined hierarchy snapshot for fast TUI bootstrap
+- combined hierarchy snapshot for fast operator client bootstrap
 
 #### Detail
 
@@ -466,7 +466,7 @@ The TUI should read:
 
 ### Projection Contract
 
-Normal list and detail queries should exclude tombstoned rows by default. An `include_deleted` flag can exist for debugging and later sync tooling, but the TUI should not use it for routine browsing.
+Normal list and detail queries should exclude tombstoned rows by default. An `include_deleted` flag can exist for debugging and later sync tooling, but the operator client should not use it for routine browsing.
 
 ## 8. Daemon API Surface Sketch
 
@@ -542,9 +542,9 @@ The existing event subscription model remains valid. Add lifecycle notifications
 - work unit created, edited, deleted
 - tracked thread created, edited, deleted
 
-The TUI should still be able to do snapshot-first boot plus event follow.
+The operator client should still be able to do snapshot-first boot plus event follow.
 
-## 9. TUI Footer And Composer Mode Model
+## 9. operator client Footer And Composer Mode Model
 
 The current bottom pane should evolve from a steer-only composer into a generic mutation footer for the Main program surface. Review should stay as-is for this pass.
 
@@ -574,7 +574,7 @@ enum FooterMode {
 - selecting a work unit enables create child tracked thread, edit, and delete
 - selecting a tracked thread enables edit and delete
 - composer submit sends a daemon command
-- on success, composer closes and the TUI waits for snapshot refresh or lifecycle event
+- on success, composer closes and the operator client waits for snapshot refresh or lifecycle event
 - on validation error, composer stays open and shows inline error text
 
 ### Suggested Field Sets
@@ -642,14 +642,14 @@ Reasons:
 Recommended flow:
 
 1. Operator invokes delete on current selection.
-2. TUI calls `delete/plan`.
+2. operator client calls `delete/plan`.
 3. Footer switches to `ConfirmDelete`.
 4. Footer shows impact summary.
 5. For leaf deletes, `Enter` confirms.
 6. For cascading deletes, require typed `delete`.
-7. TUI sends delete command with `confirmation_token`.
+7. operator client sends delete command with `confirmation_token`.
 
-This gives the TUI a clean operator flow while keeping policy enforcement in the daemon.
+This gives the operator client a clean operator flow while keeping policy enforcement in the daemon.
 
 ## 11. Boot, Replay, And Recovery Model
 
@@ -680,7 +680,7 @@ Because writes are transactional, a crash should leave the database at the last 
 
 - no partially committed command should appear
 - the daemon can emit a warning if projection rebuild was needed
-- the TUI reconnects snapshot-first as it already does
+- the operator client reconnects snapshot-first as it already does
 
 ### Migration From Current JSON State
 
@@ -751,7 +751,7 @@ The intended later evolution is straightforward:
 - add `delete/plan`
 - update `state/get` and hierarchy queries to read projections
 
-### Pass 5: TUI Main Footer/Composer
+### Pass 5: operator client Main Footer/Composer
 
 - replace the current one-off footer logic with a generic Main-surface composer state
 - support create, edit, and delete-confirm flows
@@ -783,9 +783,9 @@ Each implementation pass should ship tests at the level it changes.
 #### Daemon IPC
 
 - request/response tests for create, edit, delete, and `delete/plan`
-- snapshot-plus-event tests proving the TUI can rebuild from daemon output
+- snapshot-plus-event tests proving the operator client can rebuild from daemon output
 
-#### TUI
+#### operator client
 
 - reducer/state-machine tests for footer mode transitions
 - composer validation tests

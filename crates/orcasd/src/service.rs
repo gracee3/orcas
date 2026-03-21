@@ -12104,7 +12104,7 @@ impl OrcasDaemonService {
         tracked_thread: &orcas_core::authority::TrackedThreadRecord,
     ) {
         // Tracked-thread events carry Orcas-owned binding records, not upstream
-        // thread ownership or TUI-local PTY session ownership.
+        // thread ownership or operator-client-local PTY session ownership.
         self.emit(ipc::DaemonEvent::TrackedThreadLifecycle {
             action,
             tracked_thread: tracked_thread.into(),

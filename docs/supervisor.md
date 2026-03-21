@@ -652,7 +652,7 @@ Later work added explicit inspection/export surfaces such as:
 - full artifact detail IPC
 - workunit-scoped summary list IPC
 - CLI inspection/export
-- TUI inspection/export
+- operator client inspection/export
 
 These are useful, but they are **not the architecture itself**.
 
@@ -729,7 +729,7 @@ The operator is governed by:
 
 - `crates/orcasd/src/service.rs`
   - proposal lifecycle transitions
-- TUI/CLI layers
+- operator-client/CLI layers
   - inspection/export only; not the core logic
 
 ---

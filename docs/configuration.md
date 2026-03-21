@@ -10,7 +10,7 @@ The practical rule is:
 2. Use environment variables for per-process overrides.
 3. Use CLI flags for one-off operator sessions.
 
-The current packaged systemd unit is a user service. It inherits the same XDG config, data, log, and runtime directories as the CLI and TUI rather than introducing a separate root-owned config layer.
+The current packaged systemd unit is a user service. It inherits the same XDG config, data, log, and runtime directories as the CLI rather than introducing a separate root-owned config layer.
 
 ## Environment Variables
 
@@ -80,9 +80,8 @@ ${XDG_DATA_HOME:-~/.local/share}/orcas/logs/
 The current files are:
 
 1. `orcasd.log` for the daemon component log.
-2. `orcas-tui.log` for the TUI component log.
-3. `orcas.log` for the operator CLI log.
-4. `codex-app-server.log` for raw Codex app-server stdout/stderr diagnostics.
+2. `orcas.log` for the operator CLI log.
+3. `codex-app-server.log` for raw Codex app-server stdout/stderr diagnostics.
 
 The log, config, data, and runtime directories are created automatically on startup.
 
