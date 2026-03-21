@@ -1707,11 +1707,17 @@ impl SupervisorService {
         non_goals: Vec<String>,
         open_questions: Vec<String>,
         draft_plan_summary: Option<String>,
+        ready_for_review: bool,
         created_by: Option<String>,
         request_note: Option<String>,
         model: Option<String>,
         cwd: Option<PathBuf>,
     ) -> Result<()> {
+        if ready_for_review {
+            bail!(
+                "planning session create cannot mark a session ready for review; use planning-sessions mark-ready-for-review after creation"
+            );
+        }
         let client = self.daemon_state_client().await?;
         let response = client
             .planning_session_create(&ipc::PlanningSessionCreateRequest {
@@ -1924,6 +1930,9 @@ impl SupervisorService {
         print_planning_session(&response.session);
         if let Some(proposal) = response.revision_proposal.as_ref() {
             print_planning_revision_proposal(proposal);
+            println!(
+                "planning_session_approval_effect: staged_revision_proposal_only; apply it through the existing plan revision approval path"
+            );
         }
         Ok(())
     }

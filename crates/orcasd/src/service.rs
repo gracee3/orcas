@@ -3600,16 +3600,10 @@ impl OrcasDaemonService {
                 .open_questions
                 .push(format!("Supervisor note: {note}"));
         }
-        let status = if summary.ready_for_review {
-            PlanningSessionStatus::AwaitingApproval
-        } else {
-            PlanningSessionStatus::Chatting
-        };
-
         let session_preview = PlanningSession {
             session_id: session_id.clone(),
             workstream_id: workstream.id.clone(),
-            status,
+            status: PlanningSessionStatus::Chatting,
             planning_thread_id: planning_thread_id.clone(),
             base_plan_id: Some(active_plan.plan_id.clone()),
             base_plan_version: Some(active_plan.version),
@@ -3726,18 +3720,26 @@ impl OrcasDaemonService {
                     session.session_id
                 )));
             }
+            if session.status != PlanningSessionStatus::Chatting {
+                return Err(OrcasError::Protocol(format!(
+                    "planning session `{}` can only be updated while chatting",
+                    session.session_id
+                )));
+            }
             if params.summary.research_status == PlanningSessionResearchStatus::Requested {
                 return Err(OrcasError::Protocol(format!(
                     "planning session `{}` summary cannot declare research as requested; use planning_session_request_research after creation",
                     session.session_id
                 )));
             }
+            if params.summary.ready_for_review {
+                return Err(OrcasError::Protocol(format!(
+                    "planning session `{}` summary cannot mark the session ready for review; use planning_session_mark_ready_for_review",
+                    session.session_id
+                )));
+            }
             session.latest_structured_summary = params.summary.clone();
-            session.status = if session.latest_structured_summary.ready_for_review {
-                PlanningSessionStatus::AwaitingApproval
-            } else {
-                PlanningSessionStatus::Chatting
-            };
+            session.status = PlanningSessionStatus::Chatting;
             session.updated_at = Utc::now();
             session.updated_by = updated_by.clone();
             if let Some(note) = params.note.as_ref().filter(|note| !note.trim().is_empty()) {
@@ -3772,6 +3774,12 @@ impl OrcasDaemonService {
             if planning_session_status_is_terminal(session.status) {
                 return Err(OrcasError::Protocol(format!(
                     "planning session `{}` is already closed",
+                    session.session_id
+                )));
+            }
+            if session.status != PlanningSessionStatus::Chatting {
+                return Err(OrcasError::Protocol(format!(
+                    "planning session `{}` can only request supervisor context while chatting",
                     session.session_id
                 )));
             }
@@ -3813,6 +3821,12 @@ impl OrcasDaemonService {
         if planning_session_status_is_terminal(session_snapshot.status) {
             return Err(OrcasError::Protocol(format!(
                 "planning session `{}` is already closed",
+                session_snapshot.session_id
+            )));
+        }
+        if session_snapshot.status != PlanningSessionStatus::Chatting {
+            return Err(OrcasError::Protocol(format!(
+                "planning session `{}` can only request research while chatting",
                 session_snapshot.session_id
             )));
         }
@@ -3918,6 +3932,20 @@ impl OrcasDaemonService {
                 return Err(error);
             }
         };
+        if assignment_response.assignment.work_unit_id != work_unit.id.to_string() {
+            return Err(OrcasError::Protocol(format!(
+                "planning session `{}` research assignment was linked to the wrong work unit",
+                session_snapshot.session_id
+            )));
+        }
+        if assignment_response.report.work_unit_id != work_unit.id.to_string()
+            || assignment_response.report.assignment_id != assignment_response.assignment.id
+        {
+            return Err(OrcasError::Protocol(format!(
+                "planning session `{}` research report was not linked to the research assignment",
+                session_snapshot.session_id
+            )));
+        }
         let completed_at = Utc::now();
 
         let session = {
@@ -3985,6 +4013,12 @@ impl OrcasDaemonService {
             if planning_session_status_is_terminal(session.status) {
                 return Err(OrcasError::Protocol(format!(
                     "planning session `{}` is already closed",
+                    session.session_id
+                )));
+            }
+            if session.status != PlanningSessionStatus::Chatting {
+                return Err(OrcasError::Protocol(format!(
+                    "planning session `{}` can only be marked ready while chatting",
                     session.session_id
                 )));
             }
@@ -4162,6 +4196,9 @@ impl OrcasDaemonService {
             session.clone()
         };
         self.persist_collaboration_state().await?;
+        // Session approval stages a canonical revision proposal only; the
+        // plan remains unchanged until the existing proposal approval/apply
+        // machinery runs on that staged revision.
         Ok(ipc::PlanningSessionApproveResponse {
             session,
             revision_proposal: Some(proposal),
@@ -4527,8 +4564,8 @@ impl OrcasDaemonService {
         turn_state: ipc::TurnStateView,
         raw_output: String,
     ) -> OrcasResult<Report> {
-        let (report, _assignment_after_report, _work_unit_after_report) =
-            self.ingest_assignment_turn_outcome(
+        let (report, _assignment_after_report, _work_unit_after_report) = self
+            .ingest_assignment_turn_outcome(
                 assignment_id,
                 worker_id,
                 worker_session_id,
@@ -5374,18 +5411,360 @@ impl OrcasDaemonService {
         raw_output: String,
     ) -> OrcasResult<(Report, Assignment, WorkUnit, Vec<SupervisorProposalRecord>)> {
         Box::pin(async move {
-        let started_at = Instant::now();
-        info!(
-            assignment_id = %assignment_id,
-            worker_id = %worker_id,
-            worker_session_id = %worker_session_id,
-            "recording assignment turn outcome"
-        );
-        self.ensure_assignment_communication_record(assignment_id, None, None)
-            .await?;
-        let (assignment_for_parse, communication_record) = {
-            let state = self.state.read().await;
+            let started_at = Instant::now();
+            info!(
+                assignment_id = %assignment_id,
+                worker_id = %worker_id,
+                worker_session_id = %worker_session_id,
+                "recording assignment turn outcome"
+            );
+            self.ensure_assignment_communication_record(assignment_id, None, None)
+                .await?;
+            let (assignment_for_parse, communication_record) = {
+                let state = self.state.read().await;
+                let assignment = state
+                    .collaboration
+                    .assignments
+                    .get(assignment_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
+                    })?;
+                let record = state
+                    .collaboration
+                    .assignment_communications
+                    .get(assignment_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        OrcasError::Protocol(format!(
+                            "missing assignment communication record for `{assignment_id}`"
+                        ))
+                    })?;
+                (assignment, record)
+            };
+            let parsed_report = parse_worker_report_for_turn(
+                &raw_output,
+                turn_state.lifecycle,
+                &assignment_for_parse,
+                &communication_record,
+            );
+            info!(
+                assignment_id = %assignment_id,
+                worker_id = %worker_id,
+                worker_session_id = %worker_session_id,
+                parse_result = ?parsed_report.validation.parse_result,
+                disposition = ?parsed_report.disposition,
+                "assignment turn outcome parsed"
+            );
+            let workspace_report = parsed_report
+                .envelope
+                .as_ref()
+                .and_then(|envelope| envelope.workspace_report.clone());
+            let raw_output_hash = stable_fingerprint(&raw_output);
+            let now = Utc::now();
+            let mut state = self.state.write().await;
             let assignment = state
+                .collaboration
+                .assignments
+                .get_mut(assignment_id)
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
+                })?;
+            let work_unit_id = assignment.work_unit_id.clone();
+            assignment.status = match turn_state.lifecycle {
+                ipc::TurnLifecycleState::Interrupted => AssignmentStatus::Interrupted,
+                ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
+                    AssignmentStatus::Lost
+                }
+                _ => AssignmentStatus::AwaitingDecision,
+            };
+            assignment.updated_at = now;
+
+            let report_id = Self::new_object_id("report");
+            let summary = parsed_report.summary.clone();
+            let report = Report {
+                id: report_id.clone(),
+                work_unit_id: work_unit_id.clone(),
+                assignment_id: assignment_id.to_string(),
+                worker_id: worker_id.to_string(),
+                disposition: parsed_report.disposition,
+                summary,
+                findings: parsed_report.findings,
+                blockers: parsed_report.blockers,
+                questions: parsed_report.questions,
+                recommended_next_actions: parsed_report.recommended_next_actions,
+                confidence: parsed_report.confidence,
+                raw_output,
+                parse_result: parsed_report.validation.parse_result,
+                needs_supervisor_review: parsed_report.validation.needs_supervisor_review,
+                created_at: now,
+            };
+            state
+                .collaboration
+                .reports
+                .insert(report.id.clone(), report.clone());
+            if let Some(record) = state
+                .collaboration
+                .assignment_communications
+                .get_mut(assignment_id)
+            {
+                record.response_envelope = parsed_report.envelope.clone();
+                record.validation = Some(parsed_report.validation.clone());
+                record.raw_output_hash = Some(raw_output_hash);
+            }
+            if let Some(work_unit) = state.collaboration.work_units.get_mut(&work_unit_id) {
+                work_unit.status = WorkUnitStatus::AwaitingDecision;
+                work_unit.latest_report_id = Some(report.id.clone());
+                work_unit.current_assignment_id = Some(assignment_id.to_string());
+                work_unit.updated_at = now;
+            }
+            if let Some(worker) = state.collaboration.workers.get_mut(worker_id) {
+                worker.status = WorkerStatus::Idle;
+                worker.current_assignment_id = None;
+            }
+            if let Some(session) = state
+                .collaboration
+                .worker_sessions
+                .get_mut(worker_session_id)
+            {
+                session.active_turn_id = None;
+                session.runtime_status = match turn_state.lifecycle {
+                    ipc::TurnLifecycleState::Interrupted => WorkerSessionRuntimeStatus::Interrupted,
+                    ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
+                        WorkerSessionRuntimeStatus::Lost
+                    }
+                    _ => WorkerSessionRuntimeStatus::Completed,
+                };
+                session.attachability = if turn_state.attachable {
+                    WorkerSessionAttachability::Attachable
+                } else {
+                    WorkerSessionAttachability::NotAttachable
+                };
+                session.updated_at = now;
+            }
+            drop(state);
+            info!(
+                assignment_id = %assignment_id,
+                worker_id = %worker_id,
+                worker_session_id = %worker_session_id,
+                report_id = %report.id,
+                "assignment turn outcome state updated"
+            );
+
+            if parsed_report.validation.parse_result != ReportParseResult::Invalid
+                && let Some(workspace_report) = workspace_report.as_ref()
+                && let Err(error) = self
+                    .record_worker_workspace_report(assignment_id, workspace_report)
+                    .await
+            {
+                warn!(
+                    assignment_id,
+                    worker_id,
+                    worker_session_id,
+                    error = %error,
+                    "worker workspace report persistence failed"
+                );
+            }
+
+            if let Some(workspace_operation_contract) = assignment_for_parse
+                .communication_seed
+                .as_ref()
+                .and_then(|seed| seed.workspace_operation.as_ref())
+            {
+                match workspace_operation_contract.kind {
+                    TrackedThreadWorkspaceOperationKind::PruneWorkspace => {
+                        let prune_workspace_result = parsed_report
+                            .envelope
+                            .as_ref()
+                            .and_then(|envelope| envelope.prune_workspace_result.as_ref());
+                        let prune_workspace_result_status =
+                            prune_workspace_result.map(|result| result.status);
+                        let target_worktree_path = prune_workspace_result
+                            .map(|result| result.worktree_path.clone())
+                            .or_else(|| {
+                                Some(workspace_operation_contract.workspace.worktree_path.clone())
+                            });
+                        let target_branch_name = prune_workspace_result
+                            .and_then(|result| result.branch_name.clone())
+                            .or_else(|| {
+                                Some(workspace_operation_contract.workspace.branch_name.clone())
+                            });
+                        let worktree_removed =
+                            prune_workspace_result.and_then(|result| result.worktree_removed);
+                        let branch_removed =
+                            prune_workspace_result.and_then(|result| result.branch_removed);
+                        let refusal_reason =
+                            prune_workspace_result.and_then(|result| result.refusal_reason.clone());
+                        let failure_reason =
+                            prune_workspace_result.and_then(|result| result.failure_reason.clone());
+                        let prune_notes =
+                            prune_workspace_result.and_then(|result| result.notes.clone());
+                        let successful_prune = parsed_report.validation.parse_result
+                            != ReportParseResult::Invalid
+                            && workspace_report.is_some()
+                            && prune_workspace_result.is_some()
+                            && matches!(
+                                prune_workspace_result_status,
+                                Some(TrackedThreadPruneWorkspaceResultStatus::Succeeded)
+                            )
+                            && parsed_report.disposition == ReportDisposition::Completed;
+                        if successful_prune {
+                            self.mark_workspace_operation_completed(
+                                assignment_id,
+                                Some(report_id.clone()),
+                                Some(parsed_report.disposition),
+                                Some(parsed_report.summary.clone()),
+                                prune_workspace_result_status,
+                                target_worktree_path,
+                                target_branch_name,
+                                worktree_removed,
+                                branch_removed,
+                                refusal_reason,
+                                failure_reason,
+                                prune_notes,
+                            )
+                            .await?;
+                        } else {
+                            self.mark_workspace_operation_failed(
+                                assignment_id,
+                                Some(report_id.clone()),
+                                Some(parsed_report.summary.clone()),
+                                prune_workspace_result_status,
+                                target_worktree_path,
+                                target_branch_name,
+                                worktree_removed,
+                                branch_removed,
+                                refusal_reason,
+                                failure_reason,
+                                prune_notes,
+                            )
+                            .await?;
+                        }
+                    }
+                    _ => {
+                        if parsed_report.validation.parse_result != ReportParseResult::Invalid
+                            && workspace_report.is_some()
+                            && parsed_report.disposition == ReportDisposition::Completed
+                        {
+                            self.mark_workspace_operation_completed(
+                                assignment_id,
+                                Some(report_id.clone()),
+                                Some(parsed_report.disposition),
+                                Some(parsed_report.summary.clone()),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await?;
+                        } else {
+                            self.mark_workspace_operation_failed(
+                                assignment_id,
+                                Some(report_id.clone()),
+                                Some(parsed_report.summary.clone()),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            } else if assignment_for_parse
+                .communication_seed
+                .as_ref()
+                .and_then(|seed| seed.landing_execution.as_ref())
+                .is_some()
+            {
+                let landing_execution_result = parsed_report
+                    .envelope
+                    .as_ref()
+                    .and_then(|envelope| envelope.landing_execution_result.as_ref());
+                let execution_result_status = landing_execution_result.map(|result| result.status);
+                let attempted_head_commit =
+                    landing_execution_result.map(|result| result.attempted_head_commit.clone());
+                let landed_commit =
+                    landing_execution_result.and_then(|result| result.landed_commit.clone());
+                let landing_ref_updated =
+                    landing_execution_result.and_then(|result| result.landing_ref_updated);
+                let failure_reason =
+                    landing_execution_result.and_then(|result| result.failure_reason.clone());
+                let notes = landing_execution_result.and_then(|result| result.notes.clone());
+                let authorization_id = assignment_for_parse
+                    .communication_seed
+                    .as_ref()
+                    .and_then(|seed| seed.landing_execution.as_ref())
+                    .map(|contract| contract.landing_authorization_id.clone());
+                let authorized = matches!(
+                    execution_result_status,
+                    Some(TrackedThreadLandingExecutionResultStatus::Succeeded)
+                );
+                if parsed_report.validation.parse_result == ReportParseResult::Parsed
+                    && workspace_report.is_some()
+                    && landing_execution_result.is_some()
+                    && authorized
+                    && parsed_report.disposition == ReportDisposition::Completed
+                {
+                    self.mark_landing_execution_completed(
+                        assignment_id,
+                        Some(report_id.clone()),
+                        Some(parsed_report.disposition),
+                        Some(parsed_report.summary.clone()),
+                        execution_result_status,
+                        attempted_head_commit,
+                        landed_commit,
+                        landing_ref_updated,
+                        failure_reason,
+                        notes,
+                    )
+                    .await?;
+                    if let Some(authorization_id) = authorization_id {
+                        self.mark_landing_authorization_completed(
+                            &authorization_id,
+                            Some(parsed_report.summary.clone()),
+                        )
+                        .await?;
+                    }
+                } else {
+                    self.mark_landing_execution_failed(
+                        assignment_id,
+                        Some(report_id.clone()),
+                        Some(parsed_report.disposition),
+                        Some(parsed_report.summary.clone()),
+                        execution_result_status,
+                        attempted_head_commit,
+                        landed_commit,
+                        landing_ref_updated,
+                        failure_reason,
+                        notes,
+                    )
+                    .await?;
+                    if let Some(authorization_id) = authorization_id {
+                        self.mark_landing_authorization_failed(
+                            &authorization_id,
+                            Some(parsed_report.summary.clone()),
+                        )
+                        .await?;
+                    }
+                }
+            }
+
+            let mut state = self.state.write().await;
+            let stale_proposals = Self::refresh_stale_proposals_for_work_unit(
+                &mut state.collaboration,
+                &work_unit_id,
+            );
+            Self::refresh_workstream_statuses(&mut state.collaboration);
+            let assignment_after_report = state
                 .collaboration
                 .assignments
                 .get(assignment_id)
@@ -5393,369 +5772,35 @@ impl OrcasDaemonService {
                 .ok_or_else(|| {
                     OrcasError::Protocol(format!("unknown assignment `{assignment_id}`"))
                 })?;
-            let record = state
+            let work_unit_after_report = state
                 .collaboration
-                .assignment_communications
-                .get(assignment_id)
+                .work_units
+                .get(&work_unit_id)
                 .cloned()
                 .ok_or_else(|| {
-                    OrcasError::Protocol(format!(
-                        "missing assignment communication record for `{assignment_id}`"
-                    ))
+                    OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`"))
                 })?;
-            (assignment, record)
-        };
-        let parsed_report = parse_worker_report_for_turn(
-            &raw_output,
-            turn_state.lifecycle,
-            &assignment_for_parse,
-            &communication_record,
-        );
-        info!(
-            assignment_id = %assignment_id,
-            worker_id = %worker_id,
-            worker_session_id = %worker_session_id,
-            parse_result = ?parsed_report.validation.parse_result,
-            disposition = ?parsed_report.disposition,
-            "assignment turn outcome parsed"
-        );
-        let workspace_report = parsed_report
-            .envelope
-            .as_ref()
-            .and_then(|envelope| envelope.workspace_report.clone());
-        let raw_output_hash = stable_fingerprint(&raw_output);
-        let now = Utc::now();
-        let mut state = self.state.write().await;
-        let assignment = state
-            .collaboration
-            .assignments
-            .get_mut(assignment_id)
-            .ok_or_else(|| OrcasError::Protocol(format!("unknown assignment `{assignment_id}`")))?;
-        let work_unit_id = assignment.work_unit_id.clone();
-        assignment.status = match turn_state.lifecycle {
-            ipc::TurnLifecycleState::Interrupted => AssignmentStatus::Interrupted,
-            ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
-                AssignmentStatus::Lost
-            }
-            _ => AssignmentStatus::AwaitingDecision,
-        };
-        assignment.updated_at = now;
-
-        let report_id = Self::new_object_id("report");
-        let summary = parsed_report.summary.clone();
-        let report = Report {
-            id: report_id.clone(),
-            work_unit_id: work_unit_id.clone(),
-            assignment_id: assignment_id.to_string(),
-            worker_id: worker_id.to_string(),
-            disposition: parsed_report.disposition,
-            summary,
-            findings: parsed_report.findings,
-            blockers: parsed_report.blockers,
-            questions: parsed_report.questions,
-            recommended_next_actions: parsed_report.recommended_next_actions,
-            confidence: parsed_report.confidence,
-            raw_output,
-            parse_result: parsed_report.validation.parse_result,
-            needs_supervisor_review: parsed_report.validation.needs_supervisor_review,
-            created_at: now,
-        };
-        state
-            .collaboration
-            .reports
-            .insert(report.id.clone(), report.clone());
-        if let Some(record) = state
-            .collaboration
-            .assignment_communications
-            .get_mut(assignment_id)
-        {
-            record.response_envelope = parsed_report.envelope.clone();
-            record.validation = Some(parsed_report.validation.clone());
-            record.raw_output_hash = Some(raw_output_hash);
-        }
-        if let Some(work_unit) = state.collaboration.work_units.get_mut(&work_unit_id) {
-            work_unit.status = WorkUnitStatus::AwaitingDecision;
-            work_unit.latest_report_id = Some(report.id.clone());
-            work_unit.current_assignment_id = Some(assignment_id.to_string());
-            work_unit.updated_at = now;
-        }
-        if let Some(worker) = state.collaboration.workers.get_mut(worker_id) {
-            worker.status = WorkerStatus::Idle;
-            worker.current_assignment_id = None;
-        }
-        if let Some(session) = state
-            .collaboration
-            .worker_sessions
-            .get_mut(worker_session_id)
-        {
-            session.active_turn_id = None;
-            session.runtime_status = match turn_state.lifecycle {
-                ipc::TurnLifecycleState::Interrupted => WorkerSessionRuntimeStatus::Interrupted,
-                ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
-                    WorkerSessionRuntimeStatus::Lost
-                }
-                _ => WorkerSessionRuntimeStatus::Completed,
-            };
-            session.attachability = if turn_state.attachable {
-                WorkerSessionAttachability::Attachable
-            } else {
-                WorkerSessionAttachability::NotAttachable
-            };
-            session.updated_at = now;
-        }
-        drop(state);
-        info!(
-            assignment_id = %assignment_id,
-            worker_id = %worker_id,
-            worker_session_id = %worker_session_id,
-            report_id = %report.id,
-            "assignment turn outcome state updated"
-        );
-
-        if parsed_report.validation.parse_result != ReportParseResult::Invalid
-            && let Some(workspace_report) = workspace_report.as_ref()
-            && let Err(error) = self
-                .record_worker_workspace_report(assignment_id, workspace_report)
-                .await
-        {
-            warn!(
+            drop(state);
+            self.persist_collaboration_state().await?;
+            info!(
                 assignment_id,
                 worker_id,
                 worker_session_id,
-                error = %error,
-                "worker workspace report persistence failed"
+                work_unit_id = %work_unit_after_report.id,
+                report_id = %report.id,
+                parse_result = ?report.parse_result,
+                needs_supervisor_review = report.needs_supervisor_review,
+                disposition = ?report.disposition,
+                stale_proposal_count = stale_proposals.len(),
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                "recorded assignment turn outcome"
             );
-        }
-
-        if let Some(workspace_operation_contract) = assignment_for_parse
-            .communication_seed
-            .as_ref()
-            .and_then(|seed| seed.workspace_operation.as_ref())
-        {
-            match workspace_operation_contract.kind {
-                TrackedThreadWorkspaceOperationKind::PruneWorkspace => {
-                    let prune_workspace_result = parsed_report
-                        .envelope
-                        .as_ref()
-                        .and_then(|envelope| envelope.prune_workspace_result.as_ref());
-                    let prune_workspace_result_status =
-                        prune_workspace_result.map(|result| result.status);
-                    let target_worktree_path = prune_workspace_result
-                        .map(|result| result.worktree_path.clone())
-                        .or_else(|| {
-                            Some(workspace_operation_contract.workspace.worktree_path.clone())
-                        });
-                    let target_branch_name = prune_workspace_result
-                        .and_then(|result| result.branch_name.clone())
-                        .or_else(|| {
-                            Some(workspace_operation_contract.workspace.branch_name.clone())
-                        });
-                    let worktree_removed =
-                        prune_workspace_result.and_then(|result| result.worktree_removed);
-                    let branch_removed =
-                        prune_workspace_result.and_then(|result| result.branch_removed);
-                    let refusal_reason =
-                        prune_workspace_result.and_then(|result| result.refusal_reason.clone());
-                    let failure_reason =
-                        prune_workspace_result.and_then(|result| result.failure_reason.clone());
-                    let prune_notes =
-                        prune_workspace_result.and_then(|result| result.notes.clone());
-                    let successful_prune = parsed_report.validation.parse_result
-                        != ReportParseResult::Invalid
-                        && workspace_report.is_some()
-                        && prune_workspace_result.is_some()
-                        && matches!(
-                            prune_workspace_result_status,
-                            Some(TrackedThreadPruneWorkspaceResultStatus::Succeeded)
-                        )
-                        && parsed_report.disposition == ReportDisposition::Completed;
-                    if successful_prune {
-                        self.mark_workspace_operation_completed(
-                            assignment_id,
-                            Some(report_id.clone()),
-                            Some(parsed_report.disposition),
-                            Some(parsed_report.summary.clone()),
-                            prune_workspace_result_status,
-                            target_worktree_path,
-                            target_branch_name,
-                            worktree_removed,
-                            branch_removed,
-                            refusal_reason,
-                            failure_reason,
-                            prune_notes,
-                        )
-                        .await?;
-                    } else {
-                        self.mark_workspace_operation_failed(
-                            assignment_id,
-                            Some(report_id.clone()),
-                            Some(parsed_report.summary.clone()),
-                            prune_workspace_result_status,
-                            target_worktree_path,
-                            target_branch_name,
-                            worktree_removed,
-                            branch_removed,
-                            refusal_reason,
-                            failure_reason,
-                            prune_notes,
-                        )
-                        .await?;
-                    }
-                }
-                _ => {
-                    if parsed_report.validation.parse_result != ReportParseResult::Invalid
-                        && workspace_report.is_some()
-                        && parsed_report.disposition == ReportDisposition::Completed
-                    {
-                        self.mark_workspace_operation_completed(
-                            assignment_id,
-                            Some(report_id.clone()),
-                            Some(parsed_report.disposition),
-                            Some(parsed_report.summary.clone()),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await?;
-                    } else {
-                        self.mark_workspace_operation_failed(
-                            assignment_id,
-                            Some(report_id.clone()),
-                            Some(parsed_report.summary.clone()),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await?;
-                    }
-                }
-            }
-        } else if assignment_for_parse
-            .communication_seed
-            .as_ref()
-            .and_then(|seed| seed.landing_execution.as_ref())
-            .is_some()
-        {
-            let landing_execution_result = parsed_report
-                .envelope
-                .as_ref()
-                .and_then(|envelope| envelope.landing_execution_result.as_ref());
-            let execution_result_status = landing_execution_result.map(|result| result.status);
-            let attempted_head_commit =
-                landing_execution_result.map(|result| result.attempted_head_commit.clone());
-            let landed_commit =
-                landing_execution_result.and_then(|result| result.landed_commit.clone());
-            let landing_ref_updated =
-                landing_execution_result.and_then(|result| result.landing_ref_updated);
-            let failure_reason =
-                landing_execution_result.and_then(|result| result.failure_reason.clone());
-            let notes = landing_execution_result.and_then(|result| result.notes.clone());
-            let authorization_id = assignment_for_parse
-                .communication_seed
-                .as_ref()
-                .and_then(|seed| seed.landing_execution.as_ref())
-                .map(|contract| contract.landing_authorization_id.clone());
-            let authorized = matches!(
-                execution_result_status,
-                Some(TrackedThreadLandingExecutionResultStatus::Succeeded)
-            );
-            if parsed_report.validation.parse_result == ReportParseResult::Parsed
-                && workspace_report.is_some()
-                && landing_execution_result.is_some()
-                && authorized
-                && parsed_report.disposition == ReportDisposition::Completed
-            {
-                self.mark_landing_execution_completed(
-                    assignment_id,
-                    Some(report_id.clone()),
-                    Some(parsed_report.disposition),
-                    Some(parsed_report.summary.clone()),
-                    execution_result_status,
-                    attempted_head_commit,
-                    landed_commit,
-                    landing_ref_updated,
-                    failure_reason,
-                    notes,
-                )
-                .await?;
-                if let Some(authorization_id) = authorization_id {
-                    self.mark_landing_authorization_completed(
-                        &authorization_id,
-                        Some(parsed_report.summary.clone()),
-                    )
-                    .await?;
-                }
-            } else {
-                self.mark_landing_execution_failed(
-                    assignment_id,
-                    Some(report_id.clone()),
-                    Some(parsed_report.disposition),
-                    Some(parsed_report.summary.clone()),
-                    execution_result_status,
-                    attempted_head_commit,
-                    landed_commit,
-                    landing_ref_updated,
-                    failure_reason,
-                    notes,
-                )
-                .await?;
-                if let Some(authorization_id) = authorization_id {
-                    self.mark_landing_authorization_failed(
-                        &authorization_id,
-                        Some(parsed_report.summary.clone()),
-                    )
-                    .await?;
-                }
-            }
-        }
-
-        let mut state = self.state.write().await;
-        let stale_proposals =
-            Self::refresh_stale_proposals_for_work_unit(&mut state.collaboration, &work_unit_id);
-        Self::refresh_workstream_statuses(&mut state.collaboration);
-        let assignment_after_report = state
-            .collaboration
-            .assignments
-            .get(assignment_id)
-            .cloned()
-            .ok_or_else(|| OrcasError::Protocol(format!("unknown assignment `{assignment_id}`")))?;
-        let work_unit_after_report = state
-            .collaboration
-            .work_units
-            .get(&work_unit_id)
-            .cloned()
-            .ok_or_else(|| OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`")))?;
-        drop(state);
-        self.persist_collaboration_state().await?;
-        info!(
-            assignment_id,
-            worker_id,
-            worker_session_id,
-            work_unit_id = %work_unit_after_report.id,
-            report_id = %report.id,
-            parse_result = ?report.parse_result,
-            needs_supervisor_review = report.needs_supervisor_review,
-            disposition = ?report.disposition,
-            stale_proposal_count = stale_proposals.len(),
-            duration_ms = started_at.elapsed().as_millis() as u64,
-            "recorded assignment turn outcome"
-        );
-        Ok((
-            report,
-            assignment_after_report,
-            work_unit_after_report,
-            stale_proposals,
-        ))
+            Ok((
+                report,
+                assignment_after_report,
+                work_unit_after_report,
+                stale_proposals,
+            ))
         })
         .await
     }
@@ -5882,58 +5927,58 @@ impl OrcasDaemonService {
         raw_output: String,
     ) -> OrcasResult<(Report, Assignment, WorkUnit)> {
         Box::pin(async move {
-        info!(
-            assignment_id = %assignment_id,
-            worker_id = %worker_id,
-            worker_session_id = %worker_session_id,
-            "ingesting assignment turn outcome"
-        );
-        let (report, assignment_after_report, work_unit_after_report, stale_proposals) =
-            Box::pin(self.record_assignment_turn_outcome(
-                assignment_id,
-                worker_id,
-                worker_session_id,
-                turn_state,
-                raw_output,
-            ))
-            .await?;
-        info!(
-            assignment_id = %assignment_id,
-            worker_id = %worker_id,
-            worker_session_id = %worker_session_id,
-            report_id = %report.id,
-            "assignment turn outcome recorded"
-        );
-        self.persist_collaboration_state().await?;
-        self.emit_report_recorded(&report).await;
-        let assignment_event_action = match assignment_after_report.status {
-            AssignmentStatus::Interrupted => ipc::AssignmentLifecycleAction::Interrupted,
-            AssignmentStatus::Failed | AssignmentStatus::Lost => {
-                ipc::AssignmentLifecycleAction::Failed
-            }
-            AssignmentStatus::AwaitingDecision => ipc::AssignmentLifecycleAction::Reported,
-            _ => ipc::AssignmentLifecycleAction::Reported,
-        };
-        self.emit_assignment_lifecycle(assignment_event_action, &assignment_after_report)
-            .await;
-        self.emit_work_unit_lifecycle(
-            ipc::CollaborationLifecycleAction::Updated,
-            &work_unit_after_report,
-        )
-        .await;
-        for proposal in &stale_proposals {
-            self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+            info!(
+                assignment_id = %assignment_id,
+                worker_id = %worker_id,
+                worker_session_id = %worker_session_id,
+                "ingesting assignment turn outcome"
+            );
+            let (report, assignment_after_report, work_unit_after_report, stale_proposals) =
+                Box::pin(self.record_assignment_turn_outcome(
+                    assignment_id,
+                    worker_id,
+                    worker_session_id,
+                    turn_state,
+                    raw_output,
+                ))
+                .await?;
+            info!(
+                assignment_id = %assignment_id,
+                worker_id = %worker_id,
+                worker_session_id = %worker_session_id,
+                report_id = %report.id,
+                "assignment turn outcome recorded"
+            );
+            self.persist_collaboration_state().await?;
+            self.emit_report_recorded(&report).await;
+            let assignment_event_action = match assignment_after_report.status {
+                AssignmentStatus::Interrupted => ipc::AssignmentLifecycleAction::Interrupted,
+                AssignmentStatus::Failed | AssignmentStatus::Lost => {
+                    ipc::AssignmentLifecycleAction::Failed
+                }
+                AssignmentStatus::AwaitingDecision => ipc::AssignmentLifecycleAction::Reported,
+                _ => ipc::AssignmentLifecycleAction::Reported,
+            };
+            self.emit_assignment_lifecycle(assignment_event_action, &assignment_after_report)
                 .await;
-        }
-        self.maybe_auto_create_proposal_for_report(&report).await;
-        info!(
-            assignment_id = %assignment_id,
-            worker_id = %worker_id,
-            worker_session_id = %worker_session_id,
-            report_id = %report.id,
-            "assignment turn outcome ingestion complete"
-        );
-        Ok((report, assignment_after_report, work_unit_after_report))
+            self.emit_work_unit_lifecycle(
+                ipc::CollaborationLifecycleAction::Updated,
+                &work_unit_after_report,
+            )
+            .await;
+            for proposal in &stale_proposals {
+                self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                    .await;
+            }
+            self.maybe_auto_create_proposal_for_report(&report).await;
+            info!(
+                assignment_id = %assignment_id,
+                worker_id = %worker_id,
+                worker_session_id = %worker_session_id,
+                report_id = %report.id,
+                "assignment turn outcome ingestion complete"
+            );
+            Ok((report, assignment_after_report, work_unit_after_report))
         })
         .await
     }
@@ -14673,6 +14718,720 @@ mod tests {
                 .to_string()
                 .contains("summary cannot declare research as requested")
         );
+    }
+
+    fn sample_planning_session_summary(
+        objective: &str,
+        ready_for_review: bool,
+    ) -> orcas_core::collaboration::PlanningSessionStructuredSummary {
+        orcas_core::collaboration::PlanningSessionStructuredSummary {
+            objective: objective.to_string(),
+            requirements: vec!["Keep it bounded.".to_string()],
+            constraints: vec!["No broad refactor.".to_string()],
+            non_goals: vec!["Do not widen scope.".to_string()],
+            open_questions: vec!["Is this still bounded?".to_string()],
+            research_status: orcas_core::collaboration::PlanningSessionResearchStatus::NotRequested,
+            draft_plan_summary: Some("A narrow planning pass.".to_string()),
+            ready_for_review,
+        }
+    }
+
+    fn sample_bare_workstream(id: &str) -> Workstream {
+        let now = Utc::now();
+        Workstream {
+            id: id.to_string(),
+            title: format!("Planning {id}"),
+            objective: "Plan one bounded change.".to_string(),
+            status: WorkstreamStatus::Active,
+            priority: "high".to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    async fn insert_bare_workstream(
+        service: &Arc<OrcasDaemonService>,
+        workstream: Workstream,
+    ) -> Workstream {
+        {
+            let mut state = service.state.write().await;
+            state
+                .collaboration
+                .workstreams
+                .insert(workstream.id.clone(), workstream.clone());
+        }
+        workstream
+    }
+
+    async fn create_planning_session_for_workstream(
+        service: &Arc<OrcasDaemonService>,
+        workstream_id: &str,
+        objective: &str,
+    ) -> orcas_core::collaboration::PlanningSession {
+        service
+            .planning_session_create(ipc::PlanningSessionCreateRequest {
+                workstream_id: workstream_id.to_string(),
+                planning_thread_id: None,
+                initial_objective: objective.to_string(),
+                research_status:
+                    orcas_core::collaboration::PlanningSessionResearchStatus::NotRequested,
+                requirements: vec!["Keep it bounded.".to_string()],
+                constraints: vec!["No broad refactor.".to_string()],
+                non_goals: vec!["Do not widen scope.".to_string()],
+                open_questions: vec!["Is this still bounded?".to_string()],
+                draft_plan_summary: Some("A narrow planning pass.".to_string()),
+                created_by: Some("tester".to_string()),
+                request_note: None,
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("planning session create")
+            .session
+    }
+
+    #[tokio::test]
+    async fn planning_session_create_bootstraps_bare_workstream_without_active_plan() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            sample_runtime_report_output_template(),
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = insert_bare_workstream(&service, sample_bare_workstream("ws-bare")).await;
+
+        let session = create_planning_session_for_workstream(
+            &service,
+            workstream.id.as_ref(),
+            "Plan one bounded change.",
+        )
+        .await;
+
+        let state = service.state.read().await;
+        let active_plan = state
+            .collaboration
+            .planning
+            .active_plan(&workstream.id)
+            .cloned()
+            .expect("active plan");
+        assert_eq!(
+            session.status,
+            orcas_core::collaboration::PlanningSessionStatus::Chatting
+        );
+        assert_eq!(session.base_plan_id.as_ref(), Some(&active_plan.plan_id));
+        assert_eq!(session.base_plan_version, Some(active_plan.version));
+        assert_eq!(active_plan.workstream_id, workstream.id);
+        assert_eq!(active_plan.status, orcas_core::planning::PlanStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn planning_session_create_uses_existing_active_plan_without_mutating_it() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            sample_runtime_report_output_template(),
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Planning active".to_string(),
+                objective: "Plan one bounded change.".to_string(),
+                priority: Some("high".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let active_plan_before = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+
+        let session = create_planning_session_for_workstream(
+            &service,
+            workstream.id.as_str(),
+            "Plan one bounded change.",
+        )
+        .await;
+
+        let active_plan_after = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+        assert_eq!(
+            session.status,
+            orcas_core::collaboration::PlanningSessionStatus::Chatting
+        );
+        assert_eq!(
+            session.base_plan_id.as_ref(),
+            Some(&active_plan_before.plan_id)
+        );
+        assert_eq!(session.base_plan_version, Some(active_plan_before.version));
+        assert_eq!(
+            active_plan_before.plan_id.clone(),
+            active_plan_after.plan_id.clone()
+        );
+        assert_eq!(active_plan_before.version, active_plan_after.version);
+        assert_eq!(
+            active_plan_before.status,
+            orcas_core::planning::PlanStatus::Active
+        );
+        assert_eq!(
+            active_plan_after.status,
+            orcas_core::planning::PlanStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn planning_session_update_summary_is_descriptive_and_leaves_canonical_plan_unchanged() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Planning summary".to_string(),
+                objective: "Plan one bounded change.".to_string(),
+                priority: Some("high".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let session = create_planning_session_for_workstream(
+            &service,
+            workstream.id.as_ref(),
+            "Plan one bounded change.",
+        )
+        .await;
+        let active_plan_before = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+
+        let updated = service
+            .planning_session_update_summary(ipc::PlanningSessionUpdateSummaryRequest {
+                session_id: session.session_id.clone(),
+                summary: sample_planning_session_summary(
+                    "Refined objective for the next planning pass.",
+                    false,
+                ),
+                updated_by: Some("tester".to_string()),
+                note: Some("keep the session descriptive".to_string()),
+            })
+            .await
+            .expect("update summary")
+            .session;
+
+        let active_plan_after = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+        assert_eq!(
+            updated.status,
+            orcas_core::collaboration::PlanningSessionStatus::Chatting
+        );
+        assert_eq!(
+            updated.latest_structured_summary.objective,
+            "Refined objective for the next planning pass."
+        );
+        assert_eq!(
+            active_plan_before.plan_id.clone(),
+            active_plan_after.plan_id.clone()
+        );
+        assert_eq!(active_plan_before.version, active_plan_after.version);
+        assert_eq!(active_plan_before.title, active_plan_after.title);
+
+        let readiness_error = service
+            .planning_session_update_summary(ipc::PlanningSessionUpdateSummaryRequest {
+                session_id: updated.session_id.clone(),
+                summary: sample_planning_session_summary(
+                    "Refined objective for the next planning pass.",
+                    true,
+                ),
+                updated_by: Some("tester".to_string()),
+                note: None,
+            })
+            .await
+            .expect_err("ready-for-review should be explicit");
+        assert!(readiness_error.to_string().contains("ready for review"));
+    }
+
+    #[tokio::test]
+    async fn planning_session_request_research_is_bounded_and_links_report_to_session() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let origin_node_id = service.authority_store.origin_node_id().expect("origin");
+        let workstream = service
+            .authority_workstream_create(ipc::AuthorityWorkstreamCreateRequest {
+                command: orcas_core::authority::CreateWorkstream {
+                    metadata: orcas_core::authority::CommandMetadata {
+                        command_id: orcas_core::authority::CommandId::new(),
+                        issued_at: Utc::now(),
+                        origin_node_id,
+                        actor: orcas_core::authority::CommandActor::parse("planning_test")
+                            .expect("command actor"),
+                        correlation_id: Some(
+                            orcas_core::authority::CorrelationId::parse("corr-planning-research")
+                                .expect("correlation id"),
+                        ),
+                    },
+                    workstream_id: orcas_core::authority::WorkstreamId::parse("planning-research")
+                        .expect("workstream id"),
+                    title: "Planning research".to_string(),
+                    objective: "Plan one bounded change.".to_string(),
+                    status: WorkstreamStatus::Active,
+                    priority: "high".to_string(),
+                },
+            })
+            .await
+            .expect("authority workstream")
+            .workstream;
+        let session = create_planning_session_for_workstream(
+            &service,
+            workstream.id.as_str(),
+            "Plan one bounded change.",
+        )
+        .await;
+
+        let response = service
+            .planning_session_request_research(ipc::PlanningSessionRequestResearchRequest {
+                session_id: session.session_id.clone(),
+                worker_id: "worker-research".to_string(),
+                requested_by: Some("tester".to_string()),
+                request_note: Some("Need one bounded research turn".to_string()),
+                worker_kind: Some("codex".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("request research");
+
+        assert_eq!(
+            response.session.status,
+            orcas_core::collaboration::PlanningSessionStatus::Chatting
+        );
+        assert_eq!(
+            response.session.research_assignment_id.as_deref(),
+            Some(response.assignment.id.as_str())
+        );
+        assert_eq!(
+            response.session.research_report_id.as_deref(),
+            Some(response.report.id.as_str())
+        );
+        assert_eq!(
+            response.assignment.work_unit_id,
+            response.report.work_unit_id
+        );
+        assert_eq!(response.report.assignment_id, response.assignment.id);
+        assert_ne!(
+            response.session.latest_structured_summary.research_status,
+            orcas_core::collaboration::PlanningSessionResearchStatus::NotRequested
+        );
+
+        let second_error = service
+            .planning_session_request_research(ipc::PlanningSessionRequestResearchRequest {
+                session_id: response.session.session_id.clone(),
+                worker_id: "worker-research-2".to_string(),
+                requested_by: Some("tester".to_string()),
+                request_note: Some("Should be rejected".to_string()),
+                worker_kind: Some("codex".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect_err("second research request should fail");
+        assert!(
+            second_error
+                .to_string()
+                .contains("already used its bounded research turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn planning_session_approve_stages_a_revision_proposal_without_applying_the_plan() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Planning approval".to_string(),
+                objective: "Plan one bounded change.".to_string(),
+                priority: Some("high".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let session = create_planning_session_for_workstream(
+            &service,
+            &workstream.id,
+            "Plan one bounded change.",
+        )
+        .await;
+        let active_plan_before = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+
+        service
+            .planning_session_mark_ready_for_review(ipc::PlanningSessionMarkReadyForReviewRequest {
+                session_id: session.session_id.clone(),
+                updated_by: Some("tester".to_string()),
+                note: Some("ready for approval".to_string()),
+            })
+            .await
+            .expect("mark ready");
+
+        let approval = service
+            .planning_session_approve(ipc::PlanningSessionApproveRequest {
+                session_id: session.session_id.clone(),
+                approved_by: Some("tester".to_string()),
+                review_note: Some("stage the revision".to_string()),
+            })
+            .await
+            .expect("approve session");
+
+        let revision_proposal = approval
+            .revision_proposal
+            .expect("staged revision proposal");
+        assert_eq!(
+            approval.session.approved_plan_id.as_ref(),
+            Some(&active_plan_before.plan_id)
+        );
+        assert_eq!(
+            approval.session.approved_plan_version,
+            Some(active_plan_before.version)
+        );
+        assert_eq!(
+            revision_proposal.base_plan_id,
+            active_plan_before.plan_id.clone()
+        );
+        assert_eq!(
+            revision_proposal.base_plan_version,
+            active_plan_before.version
+        );
+        assert_eq!(
+            revision_proposal.status,
+            orcas_core::planning::PlanRevisionProposalStatus::Pending
+        );
+
+        let active_plan_after = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+        assert_eq!(
+            active_plan_before.plan_id.clone(),
+            active_plan_after.plan_id.clone()
+        );
+        assert_eq!(active_plan_before.version, active_plan_after.version);
+        assert_eq!(active_plan_before.status, active_plan_after.status);
+        assert_eq!(
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .revision_proposals
+                .get(revision_proposal.proposal_id.as_str())
+                .expect("stored revision")
+                .status,
+            orcas_core::planning::PlanRevisionProposalStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn planning_session_reject_keeps_canonical_plan_unchanged() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Planning reject".to_string(),
+                objective: "Plan one bounded change.".to_string(),
+                priority: Some("high".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let session = create_planning_session_for_workstream(
+            &service,
+            &workstream.id,
+            "Plan one bounded change.",
+        )
+        .await;
+        let active_plan_before = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+
+        let rejected = service
+            .planning_session_reject(ipc::PlanningSessionRejectRequest {
+                session_id: session.session_id.clone(),
+                rejected_by: Some("tester".to_string()),
+                review_note: Some("reject the session".to_string()),
+            })
+            .await
+            .expect("reject session")
+            .session;
+        assert_eq!(
+            rejected.status,
+            orcas_core::collaboration::PlanningSessionStatus::Rejected
+        );
+
+        let active_plan_after = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+        assert_eq!(
+            active_plan_before.plan_id.clone(),
+            active_plan_after.plan_id.clone()
+        );
+        assert_eq!(active_plan_before.version, active_plan_after.version);
+
+        let update_error = service
+            .planning_session_update_summary(ipc::PlanningSessionUpdateSummaryRequest {
+                session_id: rejected.session_id.clone(),
+                summary: sample_planning_session_summary("Should be rejected", false),
+                updated_by: Some("tester".to_string()),
+                note: None,
+            })
+            .await
+            .expect_err("rejected session should be closed");
+        assert!(update_error.to_string().contains("already closed"));
+    }
+
+    #[tokio::test]
+    async fn planning_session_abort_keeps_canonical_plan_unchanged() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Planning abort".to_string(),
+                objective: "Plan one bounded change.".to_string(),
+                priority: Some("high".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let session = create_planning_session_for_workstream(
+            &service,
+            &workstream.id,
+            "Plan one bounded change.",
+        )
+        .await;
+        let active_plan_before = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+
+        let aborted = service
+            .planning_session_abort(ipc::PlanningSessionAbortRequest {
+                session_id: session.session_id.clone(),
+                updated_by: Some("tester".to_string()),
+                note: Some("abort the session".to_string()),
+            })
+            .await
+            .expect("abort session")
+            .session;
+        assert_eq!(
+            aborted.status,
+            orcas_core::collaboration::PlanningSessionStatus::Aborted
+        );
+
+        let active_plan_after = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+        assert_eq!(
+            active_plan_before.plan_id.clone(),
+            active_plan_after.plan_id.clone()
+        );
+        assert_eq!(active_plan_before.version, active_plan_after.version);
+
+        let approve_error = service
+            .planning_session_approve(ipc::PlanningSessionApproveRequest {
+                session_id: aborted.session_id.clone(),
+                approved_by: Some("tester".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("aborted session should be closed");
+        assert!(approve_error.to_string().contains("already closed"));
+    }
+
+    #[tokio::test]
+    async fn planning_session_supersede_keeps_canonical_plan_unchanged() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Planning supersede".to_string(),
+                objective: "Plan one bounded change.".to_string(),
+                priority: Some("high".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let session = create_planning_session_for_workstream(
+            &service,
+            &workstream.id,
+            "Plan one bounded change.",
+        )
+        .await;
+        let active_plan_before = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+
+        let superseded = service
+            .planning_session_supersede(ipc::PlanningSessionSupersedeRequest {
+                session_id: session.session_id.clone(),
+                superseded_by_session_id: Some("planning-session-next".to_string()),
+                updated_by: Some("tester".to_string()),
+                note: Some("supersede the session".to_string()),
+            })
+            .await
+            .expect("supersede session")
+            .session;
+        assert_eq!(
+            superseded.status,
+            orcas_core::collaboration::PlanningSessionStatus::Superseded
+        );
+
+        let active_plan_after = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+        assert_eq!(
+            active_plan_before.plan_id.clone(),
+            active_plan_after.plan_id.clone()
+        );
+        assert_eq!(active_plan_before.version, active_plan_after.version);
+
+        let research_error = service
+            .planning_session_request_research(ipc::PlanningSessionRequestResearchRequest {
+                session_id: superseded.session_id.clone(),
+                worker_id: "worker-research".to_string(),
+                requested_by: Some("tester".to_string()),
+                request_note: None,
+                worker_kind: Some("codex".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect_err("superseded session should be closed");
+        assert!(research_error.to_string().contains("already closed"));
     }
 
     #[derive(Debug)]
