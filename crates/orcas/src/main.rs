@@ -39,6 +39,12 @@ struct GlobalOptions {
     #[arg(
         long,
         global = true,
+        help = "Enable inbox mirroring to a server URL"
+    )]
+    inbox_mirror_server_url: Option<String>,
+    #[arg(
+        long,
+        global = true,
         help = "Override the default working directory for this command"
     )]
     cwd: Option<PathBuf>,
@@ -1175,6 +1181,7 @@ async fn main() -> Result<()> {
     let overrides = RuntimeOverrides {
         codex_bin: cli.global.codex_bin,
         listen_url: cli.global.listen_url,
+        inbox_mirror_server_url: cli.global.inbox_mirror_server_url,
         cwd: cli.global.cwd,
         model: cli.global.model,
         connect_only: cli.global.connect_only,

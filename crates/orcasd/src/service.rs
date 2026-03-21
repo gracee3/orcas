@@ -74,6 +74,7 @@ use crate::assignment_comm::policy::validate_assignment_packet;
 use crate::assignment_comm::render::build_assignment_communication_record;
 use crate::assignment_comm::stable_fingerprint;
 use crate::authority_store::{AuthorityMutationResult, AuthoritySqliteStore};
+use crate::inbox_mirror::OperatorInboxMirrorHttpClient;
 use crate::landing_authorization::landing_authorization_is_current;
 use crate::landing_execution::landing_execution_matches_authorization_basis;
 use crate::merge_prep::assess_merge_prep;
@@ -110,6 +111,15 @@ struct DaemonState {
     collaboration: CollaborationState,
     operator_inbox: ipc::OperatorInboxState,
     operator_inbox_mirrors: BTreeMap<String, ipc::OperatorInboxMirrorCheckpoint>,
+}
+
+#[derive(Debug)]
+enum MirrorLoopProgress {
+    Waiting { after_sequence: u64 },
+    Mirrored {
+        applied_changes: usize,
+        checkpoint: ipc::OperatorInboxCheckpoint,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -330,6 +340,7 @@ impl OrcasDaemonService {
         }
 
         info!(socket = %self.paths.socket_file.display(), "orcasd listening");
+        self.clone().spawn_operator_inbox_mirror_loop();
 
         loop {
             tokio::select! {
@@ -676,6 +687,109 @@ impl OrcasDaemonService {
                 }
             }
         });
+    }
+
+    fn spawn_operator_inbox_mirror_loop(self: Arc<Self>) {
+        let Some(server_url) = self.config.inbox_mirror.server_url.clone() else {
+            return;
+        };
+        let service = Arc::clone(&self);
+        tokio::spawn(async move {
+            let client = OperatorInboxMirrorHttpClient::new(server_url);
+            if let Err(error) = service.run_operator_inbox_mirror_loop(client).await {
+                warn!(%error, "operator inbox mirror loop stopped");
+            }
+        });
+    }
+
+    async fn run_operator_inbox_mirror_loop(
+        self: Arc<Self>,
+        client: OperatorInboxMirrorHttpClient,
+    ) -> OrcasResult<()> {
+        let origin_node_id = self.authority_store.origin_node_id()?.to_string();
+        let peer_id = format!("orcas-server::{origin_node_id}");
+        loop {
+            tokio::select! {
+                _ = self.shutdown.notified() => break,
+                result = self.mirror_operator_inbox_once(&client, &origin_node_id, &peer_id) => {
+                    match result {
+                        Ok(MirrorLoopProgress::Mirrored { .. }) => continue,
+                        Ok(MirrorLoopProgress::Waiting { after_sequence }) => {
+                            let wait_future = self.operator_inbox_wait_for_checkpoint(
+                                ipc::OperatorInboxWaitRequest {
+                                    after_sequence,
+                                    timeout_ms: Some(30_000),
+                                },
+                            );
+                            tokio::select! {
+                                wait = wait_future => {
+                                    let wait = wait?;
+                                    if wait.timed_out {
+                                        continue;
+                                    }
+                                }
+                                _ = self.shutdown.notified() => break,
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, "operator inbox mirror loop iteration failed");
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn mirror_operator_inbox_once(
+        &self,
+        client: &OperatorInboxMirrorHttpClient,
+        origin_node_id: &str,
+        peer_id: &str,
+    ) -> OrcasResult<MirrorLoopProgress> {
+        let server_checkpoint = client.checkpoint(origin_node_id).await?.checkpoint;
+        let local_checkpoint = self
+            .operator_inbox_checkpoint(ipc::OperatorInboxCheckpointRequest::default())
+            .await?
+            .checkpoint;
+        if local_checkpoint.current_sequence <= server_checkpoint.current_sequence {
+            return Ok(MirrorLoopProgress::Waiting {
+                after_sequence: server_checkpoint.current_sequence,
+            });
+        }
+
+        let export = self
+            .operator_inbox_export(ipc::OperatorInboxExportRequest {
+                peer_id: peer_id.to_string(),
+                after_sequence: Some(server_checkpoint.current_sequence),
+                limit: Some(256),
+            })
+            .await?;
+        if export.changes.is_empty() {
+            return Ok(MirrorLoopProgress::Waiting {
+                after_sequence: server_checkpoint.current_sequence,
+            });
+        }
+
+        let apply = client
+            .apply(&ipc::OperatorInboxMirrorApplyRequest {
+                origin_node_id: origin_node_id.to_string(),
+                checkpoint: export.checkpoint.clone(),
+                changes: export.changes.clone(),
+            })
+            .await?;
+        let _ = self
+            .operator_inbox_ack(ipc::OperatorInboxAckRequest {
+                peer_id: peer_id.to_string(),
+                through_sequence: apply.mirror_checkpoint.last_exported_sequence,
+            })
+            .await?;
+
+        Ok(MirrorLoopProgress::Mirrored {
+            applied_changes: apply.applied_changes,
+            checkpoint: apply.checkpoint,
+        })
     }
 
     async fn handle_client(self: Arc<Self>, stream: UnixStream) {
@@ -3718,21 +3832,25 @@ impl OrcasDaemonService {
         &self,
         params: ipc::OperatorInboxExportRequest,
     ) -> OrcasResult<ipc::OperatorInboxExportResponse> {
-        let mut state = self.state.write().await;
-        let checkpoint = operator_inbox_checkpoint(&state.operator_inbox);
-        let changes = operator_inbox_changes_after(
-            &state.operator_inbox,
-            params.after_sequence.unwrap_or_default(),
-            params.limit,
-        );
-        let mirror_checkpoint = update_operator_inbox_export_checkpoint(
-            &mut state.operator_inbox_mirrors,
-            &params.peer_id,
-            &checkpoint,
-            params.after_sequence.unwrap_or_default(),
-            &changes,
-        )
-        .map_err(OrcasError::Protocol)?;
+        let (checkpoint, changes, mirror_checkpoint) = {
+            let mut state = self.state.write().await;
+            let checkpoint = operator_inbox_checkpoint(&state.operator_inbox);
+            let changes = operator_inbox_changes_after(
+                &state.operator_inbox,
+                params.after_sequence.unwrap_or_default(),
+                params.limit,
+            );
+            let mirror_checkpoint = update_operator_inbox_export_checkpoint(
+                &mut state.operator_inbox_mirrors,
+                &params.peer_id,
+                &checkpoint,
+                params.after_sequence.unwrap_or_default(),
+                &changes,
+            )
+            .map_err(OrcasError::Protocol)?;
+            (checkpoint, changes, mirror_checkpoint)
+        };
+        self.persist_state_snapshot().await?;
         Ok(ipc::OperatorInboxExportResponse {
             checkpoint,
             mirror_checkpoint,
@@ -3744,13 +3862,16 @@ impl OrcasDaemonService {
         &self,
         params: ipc::OperatorInboxAckRequest,
     ) -> OrcasResult<ipc::OperatorInboxAckResponse> {
-        let mut state = self.state.write().await;
-        let mirror_checkpoint = update_operator_inbox_ack_checkpoint(
-            &mut state.operator_inbox_mirrors,
-            &params.peer_id,
-            params.through_sequence,
-        )
-        .map_err(OrcasError::Protocol)?;
+        let mirror_checkpoint = {
+            let mut state = self.state.write().await;
+            update_operator_inbox_ack_checkpoint(
+                &mut state.operator_inbox_mirrors,
+                &params.peer_id,
+                params.through_sequence,
+            )
+            .map_err(OrcasError::Protocol)?
+        };
+        self.persist_state_snapshot().await?;
         Ok(ipc::OperatorInboxAckResponse { mirror_checkpoint })
     }
 
@@ -14868,6 +14989,7 @@ mod tests {
 
     use super::{CodexConnectionMode, CodexDaemonLaunch, OrcasDaemonService};
     use super::{DaemonState, TurnKey};
+    use crate::inbox_mirror::OperatorInboxMirrorHttpClient;
     use crate::assignment_comm::parse::{parse_worker_report, parse_worker_report_for_turn};
     use crate::assignment_comm::render::{build_assignment_communication_record, render_prompt};
     use crate::authority_store::AuthoritySqliteStore;
@@ -14875,6 +14997,7 @@ mod tests {
         SupervisorReasoner, SupervisorReasonerFailure, SupervisorReasonerResult,
         render_supervisor_prompt, render_supervisor_response_artifact,
     };
+    use orcas_server::{InboxMirrorServer, InboxMirrorStore};
     use orcas_codex::{
         CodexClient, CodexDaemonManager, CodexTransport, DaemonLaunch, DaemonStatus,
         LocalCodexDaemonManager, RejectingApprovalRouter, WebSocketTransport, methods,
@@ -26846,5 +26969,240 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             loaded.upstream_thread_id.as_deref(),
             Some("upstream-service-thread")
         );
+    }
+
+    async fn start_inbox_mirror_server() -> (String, tokio::task::JoinHandle<()>) {
+        let base = std::env::temp_dir().join(format!("orcas-server-test-{}", Uuid::new_v4()));
+        let db_path = base.join("server.db");
+        std::fs::create_dir_all(&base).expect("server base");
+        let store = InboxMirrorStore::open(&db_path).expect("mirror store");
+        let server = InboxMirrorServer::new(store);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind server");
+        let server_url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener addr")
+        );
+        let handle = tokio::spawn(async move {
+            server
+                .serve_with_listener(listener)
+                .await
+                .expect("mirror server");
+        });
+        (server_url, handle)
+    }
+
+    async fn inbox_mirror_test_service(
+        base: PathBuf,
+        server_url: Option<String>,
+    ) -> Arc<OrcasDaemonService> {
+        let mut config = AppConfig::default();
+        config.inbox_mirror.server_url = server_url;
+        test_service_at_with_reasoner_and_config(
+            base,
+            Arc::new(StaticSupervisorReasoner::default()),
+            config,
+        )
+        .await
+    }
+
+    async fn seed_open_planning_session_fixture(
+        service: &Arc<OrcasDaemonService>,
+    ) -> (String, String) {
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Inbox mirror stream".to_string(),
+                objective: "Exercise inbox mirroring".to_string(),
+                priority: Some("normal".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let session = service
+            .planning_session_create(ipc::PlanningSessionCreateRequest {
+                workstream_id: workstream.id.clone(),
+                planning_thread_id: None,
+                initial_objective: "Create a mirrored inbox item".to_string(),
+                research_status: orcas_core::PlanningSessionResearchStatus::NotRequested,
+                requirements: Vec::new(),
+                constraints: Vec::new(),
+                non_goals: Vec::new(),
+                open_questions: Vec::new(),
+                draft_plan_summary: Some("Draft summary".to_string()),
+                created_by: Some("test".to_string()),
+                request_note: Some("mirror bootstrap".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("planning session create")
+            .session;
+        let session = service
+            .planning_session_mark_ready_for_review(ipc::PlanningSessionMarkReadyForReviewRequest {
+                session_id: session.session_id.clone(),
+                updated_by: Some("test".to_string()),
+                note: Some("ready for review".to_string()),
+            })
+            .await
+            .expect("mark ready for review")
+            .session;
+        (workstream.id, session.session_id)
+    }
+
+    #[tokio::test]
+    async fn operator_inbox_mirror_bootstrap_and_incremental_catch_up_match_server_view() {
+        let base = std::env::temp_dir().join(format!("orcas-mirror-test-{}", Uuid::new_v4()));
+        let (server_url, server_handle) = start_inbox_mirror_server().await;
+        let service = inbox_mirror_test_service(base.clone(), Some(server_url.clone())).await;
+        let origin_node_id = service
+            .authority_store
+            .origin_node_id()
+            .expect("origin node id")
+            .to_string();
+        let peer_id = format!("orcas-server::{origin_node_id}");
+        let client = OperatorInboxMirrorHttpClient::new(server_url.clone());
+
+        let (_workstream_id, session_id) =
+            seed_open_planning_session_fixture(&service).await;
+
+        let bootstrap = service
+            .mirror_operator_inbox_once(&client, &origin_node_id, &peer_id)
+            .await
+            .expect("bootstrap mirror");
+        match bootstrap {
+            super::MirrorLoopProgress::Mirrored { applied_changes, .. } => {
+                assert!(applied_changes > 0);
+            }
+            other => panic!("expected mirrored bootstrap, got {other:?}"),
+        }
+
+        let server_list = client.list(&origin_node_id).await.expect("server list");
+        let local_replay = service
+            .operator_inbox_replay(ipc::OperatorInboxReplayRequest::default())
+            .await
+            .expect("local replay");
+        assert_eq!(server_list.items.len(), local_replay.items.len());
+        assert_eq!(server_list.items[0].id, local_replay.items[0].id);
+        assert_eq!(server_list.items[0].status, local_replay.items[0].status);
+        assert_eq!(
+            server_list.checkpoint.current_sequence,
+            local_replay.checkpoint.current_sequence
+        );
+
+        let approved = service
+            .planning_session_approve(ipc::PlanningSessionApproveRequest {
+                session_id: session_id.clone(),
+                approved_by: Some("test".to_string()),
+                review_note: Some("approved".to_string()),
+            })
+            .await
+            .expect("approve planning session");
+        assert_eq!(approved.session.status, orcas_core::PlanningSessionStatus::Approved);
+
+        let incremental = service
+            .mirror_operator_inbox_once(&client, &origin_node_id, &peer_id)
+            .await
+            .expect("incremental mirror");
+        match incremental {
+            super::MirrorLoopProgress::Mirrored { applied_changes, .. } => {
+                assert!(applied_changes > 0);
+            }
+            other => panic!("expected mirrored incremental update, got {other:?}"),
+        }
+
+        let server_list = client.list(&origin_node_id).await.expect("server list");
+        let local_replay = service
+            .operator_inbox_replay(ipc::OperatorInboxReplayRequest::default())
+            .await
+            .expect("local replay");
+        assert_eq!(server_list.items.len(), local_replay.items.len());
+        assert_eq!(server_list.items[0].id, local_replay.items[0].id);
+        assert_eq!(server_list.items[0].status, local_replay.items[0].status);
+        assert_eq!(
+            server_list.checkpoint.current_sequence,
+            local_replay.checkpoint.current_sequence
+        );
+        assert_eq!(server_list.items[0].status, ipc::OperatorInboxItemStatus::Resolved);
+
+        let passive_workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Passive workstream".to_string(),
+                objective: "Should not affect the inbox mirror".to_string(),
+                priority: Some("low".to_string()),
+            })
+            .await
+            .expect("passive workstream")
+            .workstream;
+        assert!(!passive_workstream.id.is_empty());
+
+        let checkpoint_before = service
+            .operator_inbox_checkpoint(ipc::OperatorInboxCheckpointRequest::default())
+            .await
+            .expect("checkpoint before");
+        let passive = service
+            .mirror_operator_inbox_once(&client, &origin_node_id, &peer_id)
+            .await
+            .expect("passive mirror");
+        match passive {
+            super::MirrorLoopProgress::Waiting { after_sequence } => {
+                assert_eq!(after_sequence, checkpoint_before.checkpoint.current_sequence);
+            }
+            other => panic!("expected passive wait, got {other:?}"),
+        }
+
+        let server_list_after_passive = client.list(&origin_node_id).await.expect("server list");
+        assert_eq!(server_list_after_passive.items.len(), local_replay.items.len());
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn operator_inbox_mirror_checkpoint_survives_restart() {
+        let base = std::env::temp_dir().join(format!("orcas-mirror-restart-{}", Uuid::new_v4()));
+        let (server_url, server_handle) = start_inbox_mirror_server().await;
+        let service = inbox_mirror_test_service(base.clone(), Some(server_url.clone())).await;
+        let origin_node_id = service
+            .authority_store
+            .origin_node_id()
+            .expect("origin node id")
+            .to_string();
+        let peer_id = format!("orcas-server::{origin_node_id}");
+        let client = OperatorInboxMirrorHttpClient::new(server_url.clone());
+        let (_workstream_id, _session_id) = seed_open_planning_session_fixture(&service).await;
+
+        let _ = service
+            .mirror_operator_inbox_once(&client, &origin_node_id, &peer_id)
+            .await
+            .expect("bootstrap mirror");
+        let before_restart = service
+            .operator_inbox_mirror_checkpoint(ipc::OperatorInboxMirrorCheckpointRequest {
+                peer_id: peer_id.clone(),
+            })
+            .await
+            .expect("mirror checkpoint before restart")
+            .mirror_checkpoint;
+
+        drop(service);
+        let restarted = inbox_mirror_test_service(base, Some(server_url.clone())).await;
+        let after_restart = restarted
+            .operator_inbox_mirror_checkpoint(ipc::OperatorInboxMirrorCheckpointRequest {
+                peer_id: peer_id.clone(),
+            })
+            .await
+            .expect("mirror checkpoint after restart")
+            .mirror_checkpoint;
+        assert_eq!(before_restart, after_restart);
+
+        let passive = restarted
+            .mirror_operator_inbox_once(&client, &origin_node_id, &peer_id)
+            .await
+            .expect("post-restart mirror");
+        match passive {
+            super::MirrorLoopProgress::Waiting { .. } => {}
+            other => panic!("expected post-restart wait, got {other:?}"),
+        }
+
+        server_handle.abort();
     }
 }

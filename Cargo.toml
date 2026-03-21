@@ -4,6 +4,7 @@ members = [
     "crates/orcas-codex",
     "crates/orcasd",
     "crates/orcas",
+    "crates/orcas-server",
     "crates/orcas-tui",
 ]
 resolver = "2"

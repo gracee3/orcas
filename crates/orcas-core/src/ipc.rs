@@ -556,6 +556,60 @@ pub struct OperatorInboxMirrorCheckpointResponse {
     pub mirror_checkpoint: OperatorInboxMirrorCheckpoint,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorCheckpointQueryRequest {
+    pub origin_node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorCheckpointQueryResponse {
+    pub origin_node_id: String,
+    pub checkpoint: OperatorInboxCheckpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorApplyRequest {
+    pub origin_node_id: String,
+    pub checkpoint: OperatorInboxCheckpoint,
+    #[serde(default)]
+    pub changes: Vec<OperatorInboxChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorApplyResponse {
+    pub origin_node_id: String,
+    pub checkpoint: OperatorInboxCheckpoint,
+    pub mirror_checkpoint: OperatorInboxMirrorCheckpoint,
+    pub applied_changes: usize,
+    pub skipped_changes: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorListRequest {
+    pub origin_node_id: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorListResponse {
+    pub origin_node_id: String,
+    pub checkpoint: OperatorInboxCheckpoint,
+    pub items: Vec<OperatorInboxItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorGetRequest {
+    pub origin_node_id: String,
+    pub item_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorGetResponse {
+    pub origin_node_id: String,
+    pub item: Option<OperatorInboxItem>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorInboxActionRouteRequest {
     pub item_id: String,

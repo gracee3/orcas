@@ -32,11 +32,13 @@ pub const ENV_DEFAULT_MODEL: &str = "ORCAS_DEFAULT_MODEL";
 pub const ENV_CONNECTION_MODE: &str = "ORCAS_CONNECTION_MODE";
 pub const ENV_DAEMON_BINARY_PATH: &str = "ORCAS_DAEMON_BINARY_PATH";
 pub const ENV_DAEMON_BUILD_FINGERPRINT: &str = "ORCAS_DAEMON_BUILD_FINGERPRINT";
+pub const ENV_INBOX_MIRROR_SERVER_URL: &str = "ORCAS_INBOX_MIRROR_SERVER_URL";
 
 #[derive(Debug, Clone, Default)]
 pub struct OrcasRuntimeOverrides {
     pub codex_bin: Option<PathBuf>,
     pub listen_url: Option<String>,
+    pub inbox_mirror_server_url: Option<String>,
     pub cwd: Option<PathBuf>,
     pub model: Option<String>,
     pub connect_only: bool,
@@ -50,12 +52,14 @@ impl OrcasRuntimeOverrides {
     pub fn from_env() -> Self {
         let codex_bin = std::env::var_os(ENV_CODEX_BIN).map(PathBuf::from);
         let listen_url = std::env::var(ENV_CODEX_LISTEN_URL).ok();
+        let inbox_mirror_server_url = std::env::var(ENV_INBOX_MIRROR_SERVER_URL).ok();
         let cwd = std::env::var_os(ENV_DEFAULT_CWD).map(PathBuf::from);
         let model = std::env::var(ENV_DEFAULT_MODEL).ok();
         let mode = std::env::var(ENV_CONNECTION_MODE).ok();
         Self {
             codex_bin,
             listen_url,
+            inbox_mirror_server_url,
             cwd,
             model,
             connect_only: mode.as_deref() == Some("connect_only"),
@@ -69,6 +73,9 @@ impl OrcasRuntimeOverrides {
         }
         if let Some(listen_url) = &overrides.listen_url {
             self.listen_url = Some(listen_url.clone());
+        }
+        if let Some(inbox_mirror_server_url) = &overrides.inbox_mirror_server_url {
+            self.inbox_mirror_server_url = Some(inbox_mirror_server_url.clone());
         }
         if let Some(cwd) = &overrides.cwd {
             self.cwd = Some(cwd.clone());
@@ -127,6 +134,9 @@ pub fn apply_runtime_overrides(config: &mut AppConfig, overrides: &OrcasRuntimeO
     }
     if let Some(listen_url) = &overrides.listen_url {
         config.codex.listen_url = listen_url.clone();
+    }
+    if let Some(server_url) = &overrides.inbox_mirror_server_url {
+        config.inbox_mirror.server_url = Some(server_url.clone());
     }
     if let Some(cwd) = &overrides.cwd {
         config.defaults.cwd = Some(cwd.clone());

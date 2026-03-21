@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub supervisor: SupervisorConfig,
     #[serde(default)]
     pub defaults: DefaultsConfig,
+    #[serde(default)]
+    pub inbox_mirror: InboxMirrorConfig,
 }
 
 impl Default for AppConfig {
@@ -20,6 +22,7 @@ impl Default for AppConfig {
             codex: CodexDaemonConfig::default(),
             supervisor: SupervisorConfig::default(),
             defaults: DefaultsConfig::default(),
+            inbox_mirror: InboxMirrorConfig::default(),
         }
     }
 }
@@ -114,6 +117,17 @@ impl Default for DefaultsConfig {
             cwd: None,
             model: Some("gpt-5".to_string()),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxMirrorConfig {
+    pub server_url: Option<String>,
+}
+
+impl Default for InboxMirrorConfig {
+    fn default() -> Self {
+        Self { server_url: None }
     }
 }
 
