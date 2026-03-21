@@ -11,6 +11,10 @@ use orcas_core::ipc::{
     OperatorInboxMirrorApplyRequest, OperatorInboxMirrorApplyResponse,
     OperatorInboxMirrorCheckpointQueryRequest, OperatorInboxMirrorCheckpointQueryResponse,
     OperatorInboxMirrorGetResponse, OperatorInboxMirrorListResponse,
+    OperatorNotificationAckRequest, OperatorNotificationAckResponse,
+    OperatorNotificationGetRequest, OperatorNotificationGetResponse,
+    OperatorNotificationListRequest, OperatorNotificationListResponse,
+    OperatorNotificationSuppressRequest, OperatorNotificationSuppressResponse,
 };
 use orcas_core::{AppPaths, OrcasResult};
 
@@ -39,10 +43,7 @@ impl InboxMirrorServer {
         self.serve_with_listener(listener).await
     }
 
-    pub async fn serve_with_listener(
-        self,
-        listener: tokio::net::TcpListener,
-    ) -> OrcasResult<()> {
+    pub async fn serve_with_listener(self, listener: tokio::net::TcpListener) -> OrcasResult<()> {
         let app = Router::new()
             .route("/operator-inbox/mirror/apply", post(apply))
             .route(
@@ -53,6 +54,22 @@ impl InboxMirrorServer {
             .route(
                 "/operator-inbox/{origin_node_id}/items/{item_id}",
                 get(get_item),
+            )
+            .route(
+                "/operator-notifications/list",
+                post(list_notification_candidates),
+            )
+            .route(
+                "/operator-notifications/get",
+                post(get_notification_candidate),
+            )
+            .route(
+                "/operator-notifications/ack",
+                post(ack_notification_candidate),
+            )
+            .route(
+                "/operator-notifications/suppress",
+                post(suppress_notification_candidate),
             )
             .with_state(self.store);
         let bind_addr = listener.local_addr()?;
@@ -114,7 +131,53 @@ async fn get_item(
     let item = store
         .get(origin_node_id.as_str(), item_id.as_str())
         .map_err(|error| error.to_string())?;
-    Ok(Json(OperatorInboxMirrorGetResponse { origin_node_id, item }))
+    Ok(Json(OperatorInboxMirrorGetResponse {
+        origin_node_id,
+        item,
+    }))
+}
+
+async fn list_notification_candidates(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<OperatorNotificationListRequest>,
+) -> Result<Json<OperatorNotificationListResponse>, String> {
+    let response = store
+        .notification_candidates(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn get_notification_candidate(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<OperatorNotificationGetRequest>,
+) -> Result<Json<OperatorNotificationGetResponse>, String> {
+    let candidate = store
+        .notification_candidate(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(OperatorNotificationGetResponse {
+        origin_node_id: request.origin_node_id,
+        candidate,
+    }))
+}
+
+async fn ack_notification_candidate(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<OperatorNotificationAckRequest>,
+) -> Result<Json<OperatorNotificationAckResponse>, String> {
+    let response = store
+        .acknowledge_notification_candidate(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn suppress_notification_candidate(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<OperatorNotificationSuppressRequest>,
+) -> Result<Json<OperatorNotificationSuppressResponse>, String> {
+    let response = store
+        .suppress_notification_candidate(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
 }
 
 pub fn app(store: InboxMirrorStore) -> Router {
@@ -128,6 +191,22 @@ pub fn app(store: InboxMirrorStore) -> Router {
         .route(
             "/operator-inbox/{origin_node_id}/items/{item_id}",
             get(get_item),
+        )
+        .route(
+            "/operator-notifications/list",
+            post(list_notification_candidates),
+        )
+        .route(
+            "/operator-notifications/get",
+            post(get_notification_candidate),
+        )
+        .route(
+            "/operator-notifications/ack",
+            post(ack_notification_candidate),
+        )
+        .route(
+            "/operator-notifications/suppress",
+            post(suppress_notification_candidate),
         )
         .with_state(Arc::new(store))
 }

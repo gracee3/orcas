@@ -80,10 +80,10 @@ use crate::landing_execution::landing_execution_matches_authorization_basis;
 use crate::merge_prep::assess_merge_prep;
 use crate::operator_inbox::{
     build_operator_inbox_state, get_operator_inbox_item, list_operator_inbox_items,
-    operator_inbox_changes_after, operator_inbox_checkpoint, rebuild_operator_inbox_state,
-    operator_inbox_replay_items, resolve_operator_inbox_action_route,
-    wait_for_operator_inbox_checkpoint,
+    operator_inbox_changes_after, operator_inbox_checkpoint, operator_inbox_replay_items,
+    rebuild_operator_inbox_state, resolve_operator_inbox_action_route,
     update_operator_inbox_ack_checkpoint, update_operator_inbox_export_checkpoint,
+    wait_for_operator_inbox_checkpoint,
 };
 use crate::planning_session::{
     build_planning_revision_proposal, build_research_work_unit,
@@ -115,7 +115,9 @@ struct DaemonState {
 
 #[derive(Debug)]
 enum MirrorLoopProgress {
-    Waiting { after_sequence: u64 },
+    Waiting {
+        after_sequence: u64,
+    },
     Mirrored {
         applied_changes: usize,
         checkpoint: ipc::OperatorInboxCheckpoint,
@@ -3810,10 +3812,14 @@ impl OrcasDaemonService {
         &self,
         params: ipc::OperatorInboxGetRequest,
     ) -> OrcasResult<ipc::OperatorInboxGetResponse> {
-        let item = get_operator_inbox_item(&self.state.read().await.operator_inbox, &params.item_id)
-            .ok_or_else(|| {
-                OrcasError::Protocol(format!("unknown operator inbox item `{}`", params.item_id))
-        })?;
+        let item =
+            get_operator_inbox_item(&self.state.read().await.operator_inbox, &params.item_id)
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!(
+                        "unknown operator inbox item `{}`",
+                        params.item_id
+                    ))
+                })?;
         Ok(ipc::OperatorInboxGetResponse { item })
     }
 
@@ -3919,7 +3925,8 @@ impl OrcasDaemonService {
         }
 
         let rx = self.operator_inbox_checkpoint_tx.subscribe();
-        match wait_for_operator_inbox_checkpoint(rx, params.after_sequence, params.timeout_ms).await {
+        match wait_for_operator_inbox_checkpoint(rx, params.after_sequence, params.timeout_ms).await
+        {
             Ok(checkpoint) => Ok(ipc::OperatorInboxWaitResponse {
                 advanced: checkpoint.current_sequence > params.after_sequence,
                 timed_out: false,
@@ -3947,7 +3954,10 @@ impl OrcasDaemonService {
             params.after_sequence,
             params.limit,
         );
-        Ok(ipc::OperatorInboxChangesResponse { checkpoint, changes })
+        Ok(ipc::OperatorInboxChangesResponse {
+            checkpoint,
+            changes,
+        })
     }
 
     async fn operator_inbox_action_route(
@@ -14989,15 +14999,14 @@ mod tests {
 
     use super::{CodexConnectionMode, CodexDaemonLaunch, OrcasDaemonService};
     use super::{DaemonState, TurnKey};
-    use crate::inbox_mirror::OperatorInboxMirrorHttpClient;
     use crate::assignment_comm::parse::{parse_worker_report, parse_worker_report_for_turn};
     use crate::assignment_comm::render::{build_assignment_communication_record, render_prompt};
     use crate::authority_store::AuthoritySqliteStore;
+    use crate::inbox_mirror::OperatorInboxMirrorHttpClient;
     use crate::supervisor::{
         SupervisorReasoner, SupervisorReasonerFailure, SupervisorReasonerResult,
         render_supervisor_prompt, render_supervisor_response_artifact,
     };
-    use orcas_server::{InboxMirrorServer, InboxMirrorStore};
     use orcas_codex::{
         CodexClient, CodexDaemonManager, CodexTransport, DaemonLaunch, DaemonStatus,
         LocalCodexDaemonManager, RejectingApprovalRouter, WebSocketTransport, methods,
@@ -15016,6 +15025,7 @@ mod tests {
         WorkUnit, WorkUnitStatus, WorkerSessionAttachability, WorkerSessionRuntimeStatus,
         WorkerStatus, Workstream, WorkstreamStatus, ipc,
     };
+    use orcas_server::{InboxMirrorServer, InboxMirrorStore};
 
     #[test]
     fn upstream_connect_never_forces_spawn_always_restarts() {
@@ -26971,7 +26981,7 @@ Boundedness note: Stay within the legacy compatibility boundary."#
         );
     }
 
-    async fn start_inbox_mirror_server() -> (String, tokio::task::JoinHandle<()>) {
+    async fn start_inbox_mirror_server() -> (String, PathBuf, tokio::task::JoinHandle<()>) {
         let base = std::env::temp_dir().join(format!("orcas-server-test-{}", Uuid::new_v4()));
         let db_path = base.join("server.db");
         std::fs::create_dir_all(&base).expect("server base");
@@ -26980,17 +26990,14 @@ Boundedness note: Stay within the legacy compatibility boundary."#
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind server");
-        let server_url = format!(
-            "http://{}",
-            listener.local_addr().expect("listener addr")
-        );
+        let server_url = format!("http://{}", listener.local_addr().expect("listener addr"));
         let handle = tokio::spawn(async move {
             server
                 .serve_with_listener(listener)
                 .await
                 .expect("mirror server");
         });
-        (server_url, handle)
+        (server_url, db_path, handle)
     }
 
     async fn inbox_mirror_test_service(
@@ -27053,7 +27060,7 @@ Boundedness note: Stay within the legacy compatibility boundary."#
     #[tokio::test]
     async fn operator_inbox_mirror_bootstrap_and_incremental_catch_up_match_server_view() {
         let base = std::env::temp_dir().join(format!("orcas-mirror-test-{}", Uuid::new_v4()));
-        let (server_url, server_handle) = start_inbox_mirror_server().await;
+        let (server_url, server_db_path, server_handle) = start_inbox_mirror_server().await;
         let service = inbox_mirror_test_service(base.clone(), Some(server_url.clone())).await;
         let origin_node_id = service
             .authority_store
@@ -27063,15 +27070,16 @@ Boundedness note: Stay within the legacy compatibility boundary."#
         let peer_id = format!("orcas-server::{origin_node_id}");
         let client = OperatorInboxMirrorHttpClient::new(server_url.clone());
 
-        let (_workstream_id, session_id) =
-            seed_open_planning_session_fixture(&service).await;
+        let (_workstream_id, session_id) = seed_open_planning_session_fixture(&service).await;
 
         let bootstrap = service
             .mirror_operator_inbox_once(&client, &origin_node_id, &peer_id)
             .await
             .expect("bootstrap mirror");
         match bootstrap {
-            super::MirrorLoopProgress::Mirrored { applied_changes, .. } => {
+            super::MirrorLoopProgress::Mirrored {
+                applied_changes, ..
+            } => {
                 assert!(applied_changes > 0);
             }
             other => panic!("expected mirrored bootstrap, got {other:?}"),
@@ -27089,6 +27097,22 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             server_list.checkpoint.current_sequence,
             local_replay.checkpoint.current_sequence
         );
+        let server_store = InboxMirrorStore::open(&server_db_path).expect("server store reopen");
+        let pending_notifications = server_store
+            .notification_candidates(&orcas_core::ipc::OperatorNotificationListRequest {
+                origin_node_id: origin_node_id.clone(),
+                pending_only: true,
+                actionable_only: true,
+                ..Default::default()
+            })
+            .expect("pending notifications");
+        assert!(
+            pending_notifications
+                .candidates
+                .iter()
+                .any(|candidate| candidate.status
+                    == orcas_core::ipc::OperatorNotificationCandidateStatus::Pending)
+        );
 
         let approved = service
             .planning_session_approve(ipc::PlanningSessionApproveRequest {
@@ -27098,14 +27122,19 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             })
             .await
             .expect("approve planning session");
-        assert_eq!(approved.session.status, orcas_core::PlanningSessionStatus::Approved);
+        assert_eq!(
+            approved.session.status,
+            orcas_core::PlanningSessionStatus::Approved
+        );
 
         let incremental = service
             .mirror_operator_inbox_once(&client, &origin_node_id, &peer_id)
             .await
             .expect("incremental mirror");
         match incremental {
-            super::MirrorLoopProgress::Mirrored { applied_changes, .. } => {
+            super::MirrorLoopProgress::Mirrored {
+                applied_changes, ..
+            } => {
                 assert!(applied_changes > 0);
             }
             other => panic!("expected mirrored incremental update, got {other:?}"),
@@ -27123,7 +27152,26 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             server_list.checkpoint.current_sequence,
             local_replay.checkpoint.current_sequence
         );
-        assert_eq!(server_list.items[0].status, ipc::OperatorInboxItemStatus::Resolved);
+        assert_eq!(
+            server_list.items[0].status,
+            ipc::OperatorInboxItemStatus::Resolved
+        );
+        let notifications_after_resolve = InboxMirrorStore::open(&server_db_path)
+            .expect("server store reopen")
+            .notification_candidates(&orcas_core::ipc::OperatorNotificationListRequest {
+                origin_node_id: origin_node_id.clone(),
+                pending_only: false,
+                actionable_only: false,
+                ..Default::default()
+            })
+            .expect("notifications after resolve");
+        assert!(
+            notifications_after_resolve
+                .candidates
+                .iter()
+                .any(|candidate| candidate.status
+                    == orcas_core::ipc::OperatorNotificationCandidateStatus::Obsolete)
+        );
 
         let passive_workstream = service
             .workstream_create(ipc::WorkstreamCreateRequest {
@@ -27146,13 +27194,19 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             .expect("passive mirror");
         match passive {
             super::MirrorLoopProgress::Waiting { after_sequence } => {
-                assert_eq!(after_sequence, checkpoint_before.checkpoint.current_sequence);
+                assert_eq!(
+                    after_sequence,
+                    checkpoint_before.checkpoint.current_sequence
+                );
             }
             other => panic!("expected passive wait, got {other:?}"),
         }
 
         let server_list_after_passive = client.list(&origin_node_id).await.expect("server list");
-        assert_eq!(server_list_after_passive.items.len(), local_replay.items.len());
+        assert_eq!(
+            server_list_after_passive.items.len(),
+            local_replay.items.len()
+        );
 
         server_handle.abort();
     }
@@ -27160,7 +27214,7 @@ Boundedness note: Stay within the legacy compatibility boundary."#
     #[tokio::test]
     async fn operator_inbox_mirror_checkpoint_survives_restart() {
         let base = std::env::temp_dir().join(format!("orcas-mirror-restart-{}", Uuid::new_v4()));
-        let (server_url, server_handle) = start_inbox_mirror_server().await;
+        let (server_url, _server_db_path, server_handle) = start_inbox_mirror_server().await;
         let service = inbox_mirror_test_service(base.clone(), Some(server_url.clone())).await;
         let origin_node_id = service
             .authority_store

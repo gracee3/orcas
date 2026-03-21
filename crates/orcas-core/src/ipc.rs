@@ -15,9 +15,9 @@
 //! `collaboration.rs` for the daemon-owned execution/runtime model.
 
 use chrono::{DateTime, Utc};
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::authority;
 use crate::collaboration::{
@@ -100,6 +100,10 @@ pub mod methods {
     pub const OPERATOR_INBOX_EXPORT: &str = "operator_inbox/export";
     pub const OPERATOR_INBOX_ACK: &str = "operator_inbox/ack";
     pub const OPERATOR_INBOX_MIRROR_CHECKPOINT: &str = "operator_inbox/mirror_checkpoint";
+    pub const OPERATOR_NOTIFICATION_LIST: &str = "operator_notification/list";
+    pub const OPERATOR_NOTIFICATION_GET: &str = "operator_notification/get";
+    pub const OPERATOR_NOTIFICATION_ACK: &str = "operator_notification/ack";
+    pub const OPERATOR_NOTIFICATION_SUPPRESS: &str = "operator_notification/suppress";
     pub const WORKSTREAM_PLAN_GET: &str = "workstream_plan/get";
     pub const WORKSTREAM_PLAN_LIST: &str = "workstream_plan/list";
     pub const PLAN_ASSESSMENT_LIST: &str = "plan_assessment/list";
@@ -608,6 +612,102 @@ pub struct OperatorInboxMirrorGetRequest {
 pub struct OperatorInboxMirrorGetResponse {
     pub origin_node_id: String,
     pub item: Option<OperatorInboxItem>,
+}
+
+/// Server-side notification readiness status derived from mirrored inbox state.
+///
+/// This is not workflow truth and it does not replace the inbox projection. It
+/// only tracks whether a mirrored inbox item has already been surfaced, seen,
+/// dismissed, or rendered obsolete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorNotificationCandidateStatus {
+    /// The mirrored inbox item is currently actionable and has not been
+    /// acknowledged or suppressed yet.
+    #[default]
+    Pending,
+    /// The operator has seen the candidate.
+    Acknowledged,
+    /// The candidate was intentionally dismissed or muted.
+    Suppressed,
+    /// The mirrored inbox item is no longer actionable or has disappeared.
+    Obsolete,
+}
+
+/// A derived server-side notification-readiness candidate.
+///
+/// The candidate is keyed by origin and inbox item identity so a future server
+/// can mirror, acknowledge, and suppress actionable review work without
+/// inventing a new source of workflow truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorNotificationCandidate {
+    pub candidate_id: String,
+    pub origin_node_id: String,
+    pub item_id: String,
+    pub trigger_sequence: u64,
+    pub status: OperatorNotificationCandidateStatus,
+    pub item: OperatorInboxItem,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub acknowledged_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub suppressed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorNotificationListRequest {
+    pub origin_node_id: String,
+    #[serde(default)]
+    pub status: Option<OperatorNotificationCandidateStatus>,
+    #[serde(default)]
+    pub pending_only: bool,
+    #[serde(default)]
+    pub actionable_only: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationListResponse {
+    pub origin_node_id: String,
+    pub candidates: Vec<OperatorNotificationCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationGetRequest {
+    pub origin_node_id: String,
+    pub candidate_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationGetResponse {
+    pub origin_node_id: String,
+    pub candidate: Option<OperatorNotificationCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationAckRequest {
+    pub origin_node_id: String,
+    pub candidate_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationAckResponse {
+    pub candidate: OperatorNotificationCandidate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationSuppressRequest {
+    pub origin_node_id: String,
+    pub candidate_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationSuppressResponse {
+    pub candidate: OperatorNotificationCandidate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
