@@ -23,6 +23,8 @@ struct DaemonRuntimeArgs {
     codex_bin: Option<std::path::PathBuf>,
     #[arg(long, help = "Override the upstream Codex app-server WebSocket URL")]
     listen_url: Option<String>,
+    #[arg(long, help = "Enable inbox mirroring to a server URL")]
+    inbox_mirror_server_url: Option<String>,
     #[arg(long, help = "Override the default working directory for spawned work")]
     cwd: Option<std::path::PathBuf>,
     #[arg(long, help = "Override the default model for spawned work")]
@@ -62,6 +64,7 @@ async fn async_main() -> Result<()> {
         OrcasRuntimeOverrides::from_env().overlay(&OrcasRuntimeOverrides {
             codex_bin: cli.runtime.codex_bin,
             listen_url: cli.runtime.listen_url,
+            inbox_mirror_server_url: cli.runtime.inbox_mirror_server_url,
             cwd: cli.runtime.cwd,
             model: cli.runtime.model,
             connect_only: cli.runtime.connect_only,
@@ -101,6 +104,7 @@ mod tests {
             cli.runtime.listen_url.as_deref(),
             Some("ws://127.0.0.1:4510")
         );
+        assert!(cli.runtime.inbox_mirror_server_url.is_none());
         assert_eq!(
             cli.runtime.cwd.as_deref(),
             Some(std::path::Path::new("/tmp/work"))

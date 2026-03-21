@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::CollaborationState;
 use crate::config::AppConfig;
 use crate::error::OrcasResult;
-use crate::ipc::{ThreadView, TurnStateView};
+use crate::ipc::{OperatorInboxMirrorCheckpoint, OperatorInboxState, ThreadView, TurnStateView};
 use crate::paths::AppPaths;
 use crate::session::{ThreadMetadata, ThreadRegistry};
 
@@ -19,6 +19,10 @@ pub struct StoredState {
     pub turn_states: BTreeMap<String, TurnStateView>,
     #[serde(default)]
     pub collaboration: CollaborationState,
+    #[serde(default)]
+    pub operator_inbox: OperatorInboxState,
+    #[serde(default)]
+    pub operator_inbox_mirrors: BTreeMap<String, OperatorInboxMirrorCheckpoint>,
 }
 
 #[async_trait]

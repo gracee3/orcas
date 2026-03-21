@@ -116,6 +116,84 @@ impl OrcasIpcClient {
             .await
     }
 
+    pub async fn operator_inbox_list(
+        &self,
+        params: &ipc::OperatorInboxListRequest,
+    ) -> OrcasResult<ipc::OperatorInboxListResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_LIST, params)
+            .await
+    }
+
+    pub async fn operator_inbox_get(
+        &self,
+        params: &ipc::OperatorInboxGetRequest,
+    ) -> OrcasResult<ipc::OperatorInboxGetResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_GET, params).await
+    }
+
+    pub async fn operator_inbox_checkpoint(
+        &self,
+        params: &ipc::OperatorInboxCheckpointRequest,
+    ) -> OrcasResult<ipc::OperatorInboxCheckpointResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_CHECKPOINT, params)
+            .await
+    }
+
+    pub async fn operator_inbox_changes(
+        &self,
+        params: &ipc::OperatorInboxChangesRequest,
+    ) -> OrcasResult<ipc::OperatorInboxChangesResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_CHANGES, params)
+            .await
+    }
+
+    pub async fn operator_inbox_action_route(
+        &self,
+        params: &ipc::OperatorInboxActionRouteRequest,
+    ) -> OrcasResult<ipc::OperatorInboxActionRouteResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_ACTION_ROUTE, params)
+            .await
+    }
+
+    pub async fn operator_inbox_wait_for_checkpoint(
+        &self,
+        params: &ipc::OperatorInboxWaitRequest,
+    ) -> OrcasResult<ipc::OperatorInboxWaitResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_WAIT_FOR_CHECKPOINT, params)
+            .await
+    }
+
+    pub async fn operator_inbox_replay(
+        &self,
+        params: &ipc::OperatorInboxReplayRequest,
+    ) -> OrcasResult<ipc::OperatorInboxReplayResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_REPLAY, params)
+            .await
+    }
+
+    pub async fn operator_inbox_export(
+        &self,
+        params: &ipc::OperatorInboxExportRequest,
+    ) -> OrcasResult<ipc::OperatorInboxExportResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_EXPORT, params)
+            .await
+    }
+
+    pub async fn operator_inbox_ack(
+        &self,
+        params: &ipc::OperatorInboxAckRequest,
+    ) -> OrcasResult<ipc::OperatorInboxAckResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_ACK, params).await
+    }
+
+    pub async fn operator_inbox_mirror_checkpoint(
+        &self,
+        params: &ipc::OperatorInboxMirrorCheckpointRequest,
+    ) -> OrcasResult<ipc::OperatorInboxMirrorCheckpointResponse> {
+        self.request(ipc::methods::OPERATOR_INBOX_MIRROR_CHECKPOINT, params)
+            .await
+    }
+
     pub async fn session_get_active(&self) -> OrcasResult<ipc::SessionGetActiveResponse> {
         self.request(
             ipc::methods::SESSION_GET_ACTIVE,
@@ -557,6 +635,30 @@ impl OrcasIpcClient {
         params: &ipc::AuthorityTrackedThreadGetRequest,
     ) -> OrcasResult<ipc::AuthorityTrackedThreadGetResponse> {
         self.request(ipc::methods::AUTHORITY_TRACKED_THREAD_GET, params)
+            .await
+    }
+
+    pub async fn authority_events_export(
+        &self,
+        params: &ipc::AuthorityEventsExportRequest,
+    ) -> OrcasResult<ipc::AuthorityEventsExportResponse> {
+        self.request(ipc::methods::AUTHORITY_EVENTS_EXPORT, params)
+            .await
+    }
+
+    pub async fn authority_events_ack(
+        &self,
+        params: &ipc::AuthorityEventsAckRequest,
+    ) -> OrcasResult<ipc::AuthorityEventsAckResponse> {
+        self.request(ipc::methods::AUTHORITY_EVENTS_ACK, params)
+            .await
+    }
+
+    pub async fn authority_events_replay(
+        &self,
+        params: &ipc::AuthorityEventsReplayRequest,
+    ) -> OrcasResult<ipc::AuthorityEventsReplayResponse> {
+        self.request(ipc::methods::AUTHORITY_EVENTS_REPLAY, params)
             .await
     }
 
@@ -1239,6 +1341,7 @@ mod tests {
                 turns: Vec::new(),
             }),
             collaboration: CollaborationSnapshot::default(),
+            operator_inbox: ipc::OperatorInboxState::default(),
             recent_events: Vec::new(),
         }
     }

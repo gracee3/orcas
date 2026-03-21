@@ -1,22 +1,20 @@
 [package]
-name = "orcasd"
+name = "orcas-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "orcasd"
+name = "orcas-server"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
+axum = "0.8.6"
 chrono.workspace = true
 clap.workspace = true
-orcas-codex = { path = "../orcas-codex" }
 orcas-core = { path = "../orcas-core" }
-reqwest.workspace = true
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -25,10 +23,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-axum = "0.8.6"
-futures.workspace = true
-orcas-server = { path = "../orcas-server" }
-tokio-tungstenite.workspace = true
+tempfile = "3.23.0"
 
 [lints]
 workspace = true

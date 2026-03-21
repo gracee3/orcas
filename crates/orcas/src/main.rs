@@ -1,4 +1,5 @@
 mod service;
+mod remote;
 mod streaming;
 
 use std::path::PathBuf;
@@ -11,6 +12,7 @@ use orcas_core::{
 };
 use tracing::info;
 
+use remote::{RemoteCommand, run_remote};
 use service::{RuntimeOverrides, SupervisorService};
 
 #[derive(Debug, Parser)]
@@ -27,6 +29,20 @@ struct GlobalOptions {
     #[arg(
         long,
         global = true,
+        env = "ORCAS_SERVER_URL",
+        help = "Base URL for the operator server"
+    )]
+    server_url: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        env = "ORCAS_OPERATOR_API_TOKEN",
+        help = "Bearer token for operator-server APIs"
+    )]
+    operator_api_token: Option<String>,
+    #[arg(
+        long,
+        global = true,
         help = "Override the local Codex binary path for this command"
     )]
     codex_bin: Option<PathBuf>,
@@ -36,6 +52,8 @@ struct GlobalOptions {
         help = "Override the upstream Codex app-server WebSocket URL"
     )]
     listen_url: Option<String>,
+    #[arg(long, global = true, help = "Enable inbox mirroring to a server URL")]
+    inbox_mirror_server_url: Option<String>,
     #[arg(
         long,
         global = true,
@@ -74,6 +92,10 @@ enum TopCommand {
     },
     Tui,
     Doctor,
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
     Models {
         #[command(subcommand)]
         command: ModelsCommand,
@@ -193,16 +215,29 @@ enum TrackedThreadsCommand {
 #[derive(Debug, Subcommand)]
 #[command(about = "Supervisor-owned planning session orchestration")]
 enum PlanningSessionsCommand {
+    #[command(
+        about = "Create a draft planning session; readiness must be set later with mark-ready-for-review"
+    )]
     Create(PlanningSessionCreateArgs),
     Get(PlanningSessionRefArgs),
     List(PlanningSessionListArgs),
+    #[command(
+        about = "Update the descriptive planning summary only; use mark-ready-for-review for readiness"
+    )]
     UpdateSummary(PlanningSessionUpdateSummaryArgs),
+    #[command(about = "Request more supervisor context while the session is still chatting")]
     RequestSupervisorContext(PlanningSessionRequestSupervisorContextArgs),
+    #[command(about = "Request the bounded one-turn research assignment for this session")]
     RequestResearch(PlanningSessionRequestResearchArgs),
+    #[command(about = "Explicitly transition a chat session into awaiting-approval")]
     MarkReadyForReview(PlanningSessionMarkReadyForReviewArgs),
+    #[command(about = "Abort the planning session without mutating canonical plan state")]
     Abort(PlanningSessionAbortArgs),
+    #[command(about = "Stage a canonical plan revision proposal from the session summary")]
     Approve(PlanningSessionApproveArgs),
+    #[command(about = "Reject the planning session without mutating canonical plan state")]
     Reject(PlanningSessionRejectArgs),
+    #[command(about = "Supersede the planning session without mutating canonical plan state")]
     Supersede(PlanningSessionSupersedeArgs),
 }
 
@@ -468,7 +503,11 @@ struct PlanningSessionSummaryArgs {
     research_status: PlanningSessionResearchStatusArg,
     #[arg(long)]
     draft_plan_summary: Option<String>,
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Reserved for the explicit mark-ready-for-review transition; create/update should leave this false"
+    )]
     ready_for_review: bool,
 }
 
@@ -1174,16 +1213,23 @@ async fn main() -> Result<()> {
     info!("starting orcas process");
 
     let cli = Cli::parse();
+    let global = cli.global.clone();
     let overrides = RuntimeOverrides {
-        codex_bin: cli.global.codex_bin,
-        listen_url: cli.global.listen_url,
-        cwd: cli.global.cwd,
-        model: cli.global.model,
-        connect_only: cli.global.connect_only,
-        force_spawn: cli.global.force_spawn,
+        // Server-facing remote client commands use the dedicated `remote`
+        // subtree and do not depend on the local daemon surface.
+        codex_bin: global.codex_bin.clone(),
+        listen_url: global.listen_url.clone(),
+        inbox_mirror_server_url: global.inbox_mirror_server_url.clone(),
+        cwd: global.cwd.clone(),
+        model: global.model.clone(),
+        connect_only: global.connect_only,
+        force_spawn: global.force_spawn,
     };
     match cli.command {
         TopCommand::Tui => launch_tui()?,
+        TopCommand::Remote { command } => {
+            run_remote(&global, command).await?;
+        }
         TopCommand::Daemon { command } => {
             let service = SupervisorService::load(&overrides).await?;
             match command {
@@ -1295,6 +1341,7 @@ async fn main() -> Result<()> {
                             args.summary.non_goals,
                             args.summary.open_questions,
                             args.summary.draft_plan_summary,
+                            args.summary.ready_for_review,
                             args.created_by,
                             args.request_note,
                             args.model,

@@ -703,6 +703,7 @@ mod tests {
                     Vec::new()
                 },
             },
+            operator_inbox: ipc::OperatorInboxState::default(),
             threads: vec![ipc::ThreadSummary {
                 id: "thread-1".to_string(),
                 preview: "preview".to_string(),

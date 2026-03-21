@@ -17,6 +17,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::authority;
 use crate::collaboration::{
@@ -86,6 +87,38 @@ pub mod methods {
     pub const AUTHORITY_TRACKED_THREAD_DELETE: &str = "authority/tracked_thread/delete";
     pub const AUTHORITY_TRACKED_THREAD_LIST: &str = "authority/tracked_thread/list";
     pub const AUTHORITY_TRACKED_THREAD_GET: &str = "authority/tracked_thread/get";
+    pub const AUTHORITY_EVENTS_EXPORT: &str = "authority/events/export";
+    pub const AUTHORITY_EVENTS_ACK: &str = "authority/events/ack";
+    pub const AUTHORITY_EVENTS_REPLAY: &str = "authority/events/replay";
+    pub const OPERATOR_INBOX_LIST: &str = "operator_inbox/list";
+    pub const OPERATOR_INBOX_GET: &str = "operator_inbox/get";
+    pub const OPERATOR_INBOX_CHECKPOINT: &str = "operator_inbox/checkpoint";
+    pub const OPERATOR_INBOX_CHANGES: &str = "operator_inbox/changes";
+    pub const OPERATOR_INBOX_ACTION_ROUTE: &str = "operator_inbox/action_route";
+    pub const OPERATOR_INBOX_WAIT_FOR_CHECKPOINT: &str = "operator_inbox/wait_for_checkpoint";
+    pub const OPERATOR_INBOX_REPLAY: &str = "operator_inbox/replay";
+    pub const OPERATOR_INBOX_EXPORT: &str = "operator_inbox/export";
+    pub const OPERATOR_INBOX_ACK: &str = "operator_inbox/ack";
+    pub const OPERATOR_INBOX_MIRROR_CHECKPOINT: &str = "operator_inbox/mirror_checkpoint";
+    pub const OPERATOR_NOTIFICATION_LIST: &str = "operator_notification/list";
+    pub const OPERATOR_NOTIFICATION_GET: &str = "operator_notification/get";
+    pub const OPERATOR_NOTIFICATION_ACK: &str = "operator_notification/ack";
+    pub const OPERATOR_NOTIFICATION_SUPPRESS: &str = "operator_notification/suppress";
+    pub const OPERATOR_NOTIFICATION_RECIPIENT_UPSERT: &str =
+        "operator_notification/recipient/upsert";
+    pub const OPERATOR_NOTIFICATION_RECIPIENT_LIST: &str = "operator_notification/recipient/list";
+    pub const OPERATOR_NOTIFICATION_SUBSCRIPTION_UPSERT: &str =
+        "operator_notification/subscription/upsert";
+    pub const OPERATOR_NOTIFICATION_SUBSCRIPTION_LIST: &str =
+        "operator_notification/subscription/list";
+    pub const OPERATOR_NOTIFICATION_SUBSCRIPTION_SET_ENABLED: &str =
+        "operator_notification/subscription/set_enabled";
+    pub const OPERATOR_NOTIFICATION_DELIVERY_JOB_LIST: &str =
+        "operator_notification/delivery_job/list";
+    pub const OPERATOR_NOTIFICATION_DELIVERY_JOB_GET: &str =
+        "operator_notification/delivery_job/get";
+    pub const OPERATOR_NOTIFICATION_DELIVERY_RUN_PENDING: &str =
+        "operator_notification/delivery/run_pending";
     pub const WORKSTREAM_PLAN_GET: &str = "workstream_plan/get";
     pub const WORKSTREAM_PLAN_LIST: &str = "workstream_plan/list";
     pub const PLAN_ASSESSMENT_LIST: &str = "plan_assessment/list";
@@ -207,7 +240,9 @@ pub struct StateGetRequest {}
 /// Returns a merged daemon snapshot with collaboration-first state.
 ///
 /// This is useful for reconnect and operator inspection, but it is not the
-/// canonical authority planning hierarchy view.
+/// canonical authority planning hierarchy view. A future operator inbox should
+/// remain a derived server-side read model in the same spirit, not a new
+/// authority truth surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateGetResponse {
     pub snapshot: StateSnapshot,
@@ -242,7 +277,8 @@ pub struct EventsNotification {
 }
 
 /// A daemon snapshot combines runtime daemon/session/thread state with the
-/// collaboration snapshot used for recovery and operator inspection.
+/// collaboration snapshot used for recovery and operator inspection plus the
+/// derived operator inbox read model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateSnapshot {
     pub daemon: DaemonStatusResponse,
@@ -251,6 +287,8 @@ pub struct StateSnapshot {
     pub active_thread: Option<ThreadView>,
     #[serde(default)]
     pub collaboration: CollaborationSnapshot,
+    #[serde(default)]
+    pub operator_inbox: OperatorInboxState,
     #[serde(default)]
     pub recent_events: Vec<EventSummary>,
 }
@@ -272,6 +310,834 @@ pub struct CollaborationSnapshot {
     pub decisions: Vec<DecisionSummary>,
     #[serde(default)]
     pub planning: PlanningState,
+}
+
+/// Derived local read model for actionable operator review.
+///
+/// This is not canonical planning truth. It is a persisted projection over
+/// durable collaboration/runtime records so a future server or client can query
+/// review work without reinterpreting the source domains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorInboxSourceKind {
+    #[default]
+    SupervisorProposal,
+    SupervisorDecision,
+    PlanningSession,
+    PlanRevisionProposal,
+}
+
+/// Stable operator-facing status for a derived inbox item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorInboxItemStatus {
+    #[default]
+    Open,
+    Resolved,
+    Stale,
+    Superseded,
+}
+
+/// Available review actions for a derived inbox item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorInboxActionKind {
+    #[default]
+    Approve,
+    Reject,
+    ApproveAndSend,
+    RecordNoAction,
+    ManualRefresh,
+    Reconcile,
+    Retry,
+    Supersede,
+    MarkReadyForReview,
+}
+
+/// Kind of mutation route a derived inbox action resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorInboxChangeKind {
+    #[default]
+    Upsert,
+    Removed,
+}
+
+/// A single derived operator-actionable item.
+///
+/// The item id is stable and derived from the source record identity so the
+/// projection can be rebuilt or synced without inventing a new canonical key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorInboxItem {
+    pub id: String,
+    pub sequence: u64,
+    pub source_kind: OperatorInboxSourceKind,
+    pub actionable_object_id: String,
+    #[serde(default)]
+    pub workstream_id: Option<String>,
+    #[serde(default)]
+    pub work_unit_id: Option<String>,
+    pub title: String,
+    pub summary: String,
+    #[serde(default)]
+    pub status: OperatorInboxItemStatus,
+    #[serde(default)]
+    pub available_actions: Vec<OperatorInboxActionKind>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub resolved_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub provenance: Option<String>,
+}
+
+/// A durable checkpoint for the derived inbox read model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorInboxCheckpoint {
+    pub current_sequence: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Default for OperatorInboxCheckpoint {
+    fn default() -> Self {
+        Self {
+            current_sequence: 0,
+            updated_at: Utc::now(),
+        }
+    }
+}
+
+/// A durable incremental change for the inbox projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorInboxChange {
+    pub sequence: u64,
+    pub kind: OperatorInboxChangeKind,
+    pub item: OperatorInboxItem,
+    pub changed_at: DateTime<Utc>,
+}
+
+/// Persisted local state for the derived operator inbox projection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorInboxState {
+    #[serde(default)]
+    pub items: Vec<OperatorInboxItem>,
+    #[serde(default)]
+    pub checkpoint: OperatorInboxCheckpoint,
+    #[serde(default)]
+    pub changes: Vec<OperatorInboxChange>,
+}
+
+/// Peer-scoped mirror/export cursor for the derived inbox projection.
+///
+/// This is intentionally separate from authority replication state: it tracks
+/// how far a remote peer has exported or acknowledged the local inbox read
+/// model, not canonical planning truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorCheckpoint {
+    pub peer_id: String,
+    pub last_exported_sequence: u64,
+    pub last_acked_sequence: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Default for OperatorInboxMirrorCheckpoint {
+    fn default() -> Self {
+        Self {
+            peer_id: String::new(),
+            last_exported_sequence: 0,
+            last_acked_sequence: 0,
+            updated_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorState {
+    #[serde(default)]
+    pub peers: BTreeMap<String, OperatorInboxMirrorCheckpoint>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorInboxListRequest {
+    #[serde(default)]
+    pub workstream_id: Option<String>,
+    #[serde(default)]
+    pub work_unit_id: Option<String>,
+    #[serde(default)]
+    pub source_kind: Option<OperatorInboxSourceKind>,
+    #[serde(default)]
+    pub status: Option<OperatorInboxItemStatus>,
+    #[serde(default)]
+    pub include_closed: bool,
+    #[serde(default)]
+    pub actionable_only: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxListResponse {
+    pub items: Vec<OperatorInboxItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxGetRequest {
+    pub item_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxGetResponse {
+    pub item: OperatorInboxItem,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorInboxCheckpointRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxCheckpointResponse {
+    pub checkpoint: OperatorInboxCheckpoint,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorInboxWaitRequest {
+    #[serde(default)]
+    pub after_sequence: u64,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxWaitResponse {
+    pub checkpoint: OperatorInboxCheckpoint,
+    pub advanced: bool,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorInboxChangesRequest {
+    #[serde(default)]
+    pub after_sequence: u64,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxChangesResponse {
+    pub checkpoint: OperatorInboxCheckpoint,
+    pub changes: Vec<OperatorInboxChange>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorInboxReplayRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxReplayResponse {
+    pub checkpoint: OperatorInboxCheckpoint,
+    pub items: Vec<OperatorInboxItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxExportRequest {
+    pub peer_id: String,
+    #[serde(default)]
+    pub after_sequence: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxExportResponse {
+    pub checkpoint: OperatorInboxCheckpoint,
+    pub mirror_checkpoint: OperatorInboxMirrorCheckpoint,
+    pub changes: Vec<OperatorInboxChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxAckRequest {
+    pub peer_id: String,
+    pub through_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxAckResponse {
+    pub mirror_checkpoint: OperatorInboxMirrorCheckpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorCheckpointRequest {
+    pub peer_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorCheckpointResponse {
+    pub mirror_checkpoint: OperatorInboxMirrorCheckpoint,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorCheckpointQueryRequest {
+    pub origin_node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorCheckpointQueryResponse {
+    pub origin_node_id: String,
+    pub checkpoint: OperatorInboxCheckpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorApplyRequest {
+    pub origin_node_id: String,
+    pub checkpoint: OperatorInboxCheckpoint,
+    #[serde(default)]
+    pub changes: Vec<OperatorInboxChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorApplyResponse {
+    pub origin_node_id: String,
+    pub checkpoint: OperatorInboxCheckpoint,
+    pub mirror_checkpoint: OperatorInboxMirrorCheckpoint,
+    pub applied_changes: usize,
+    pub skipped_changes: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorListRequest {
+    pub origin_node_id: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorListResponse {
+    pub origin_node_id: String,
+    pub checkpoint: OperatorInboxCheckpoint,
+    pub items: Vec<OperatorInboxItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorGetRequest {
+    pub origin_node_id: String,
+    pub item_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxMirrorGetResponse {
+    pub origin_node_id: String,
+    pub item: Option<OperatorInboxItem>,
+}
+
+/// Server-side notification readiness status derived from mirrored inbox state.
+///
+/// This is not workflow truth and it does not replace the inbox projection. It
+/// only tracks whether a mirrored inbox item has already been surfaced, seen,
+/// dismissed, or rendered obsolete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorNotificationCandidateStatus {
+    /// The mirrored inbox item is currently actionable and has not been
+    /// acknowledged or suppressed yet.
+    #[default]
+    Pending,
+    /// The operator has seen the candidate.
+    Acknowledged,
+    /// The candidate was intentionally dismissed or muted.
+    Suppressed,
+    /// The mirrored inbox item is no longer actionable or has disappeared.
+    Obsolete,
+}
+
+/// A derived server-side notification-readiness candidate.
+///
+/// The candidate is keyed by origin and inbox item identity so a future server
+/// can mirror, acknowledge, and suppress actionable review work without
+/// inventing a new source of workflow truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorNotificationCandidate {
+    pub candidate_id: String,
+    pub origin_node_id: String,
+    pub item_id: String,
+    pub trigger_sequence: u64,
+    pub status: OperatorNotificationCandidateStatus,
+    pub item: OperatorInboxItem,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub acknowledged_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub suppressed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorNotificationListRequest {
+    pub origin_node_id: String,
+    #[serde(default)]
+    pub status: Option<OperatorNotificationCandidateStatus>,
+    #[serde(default)]
+    pub pending_only: bool,
+    #[serde(default)]
+    pub actionable_only: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationListResponse {
+    pub origin_node_id: String,
+    pub candidates: Vec<OperatorNotificationCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationGetRequest {
+    pub origin_node_id: String,
+    pub candidate_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationGetResponse {
+    pub origin_node_id: String,
+    pub candidate: Option<OperatorNotificationCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationAckRequest {
+    pub origin_node_id: String,
+    pub candidate_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationAckResponse {
+    pub candidate: OperatorNotificationCandidate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationSuppressRequest {
+    pub origin_node_id: String,
+    pub candidate_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNotificationSuppressResponse {
+    pub candidate: OperatorNotificationCandidate,
+}
+
+/// Control-plane intent for a remote operator action routed through the server.
+///
+/// This is not workflow truth. It is a durable queue entry that points back to
+/// the mirrored inbox item and later resolves through the daemon's existing
+/// source-domain mutation APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorRemoteActionRequestStatus {
+    #[default]
+    Pending,
+    Claimed,
+    Completed,
+    Failed,
+    Canceled,
+    Stale,
+}
+
+/// A durable remote action request derived from a mirrored inbox item.
+///
+/// The request carries the mirrored inbox snapshot needed for remote clients
+/// to understand what will be executed, but the daemon remains the execution
+/// point for the real source-domain mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorRemoteActionRequest {
+    pub request_id: String,
+    pub origin_node_id: String,
+    pub candidate_id: String,
+    pub item_id: String,
+    pub trigger_sequence: u64,
+    pub action_kind: OperatorInboxActionKind,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    pub item: OperatorInboxItem,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    #[serde(default)]
+    pub request_note: Option<String>,
+    pub status: OperatorRemoteActionRequestStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub claimed_by: Option<String>,
+    #[serde(default)]
+    pub claimed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub claimed_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub claim_token: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub failed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub canceled_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub stale_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub attempt_count: u64,
+    #[serde(default)]
+    pub result: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorRemoteActionCreateRequest {
+    pub origin_node_id: String,
+    pub item_id: String,
+    pub action_kind: OperatorInboxActionKind,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    #[serde(default)]
+    pub request_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionCreateResponse {
+    pub request: OperatorRemoteActionRequest,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorRemoteActionListRequest {
+    pub origin_node_id: String,
+    #[serde(default)]
+    pub candidate_id: Option<String>,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    #[serde(default)]
+    pub action_kind: Option<OperatorInboxActionKind>,
+    #[serde(default)]
+    pub status: Option<OperatorRemoteActionRequestStatus>,
+    #[serde(default)]
+    pub pending_only: bool,
+    #[serde(default)]
+    pub actionable_only: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorRemoteActionWaitRequest {
+    pub origin_node_id: String,
+    pub request_id: String,
+    #[serde(default)]
+    pub after_updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionWaitResponse {
+    pub origin_node_id: String,
+    pub request: Option<OperatorRemoteActionRequest>,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionListResponse {
+    pub origin_node_id: String,
+    pub requests: Vec<OperatorRemoteActionRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionGetRequest {
+    pub origin_node_id: String,
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionGetResponse {
+    pub origin_node_id: String,
+    pub request: Option<OperatorRemoteActionRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionClaimRequest {
+    pub origin_node_id: String,
+    pub worker_id: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub lease_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionClaimedRequest {
+    pub request: OperatorRemoteActionRequest,
+    pub claim_token: String,
+    pub claimed_until: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionClaimResponse {
+    pub origin_node_id: String,
+    pub requests: Vec<OperatorRemoteActionClaimedRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionCompleteRequest {
+    pub origin_node_id: String,
+    pub request_id: String,
+    pub claim_token: String,
+    #[serde(default)]
+    pub result: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionCompleteResponse {
+    pub origin_node_id: String,
+    pub request: OperatorRemoteActionRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionFailRequest {
+    pub origin_node_id: String,
+    pub request_id: String,
+    pub claim_token: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionFailResponse {
+    pub origin_node_id: String,
+    pub request: OperatorRemoteActionRequest,
+}
+
+/// Transport families available to notification delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationTransportKind {
+    #[default]
+    Log,
+    Mock,
+    Webhook,
+    Apns,
+    Fcm,
+    WebPush,
+}
+
+/// A durable recipient identity for notification delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationRecipient {
+    pub recipient_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationRecipientUpsertRequest {
+    pub recipient_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationRecipientUpsertResponse {
+    pub recipient: NotificationRecipient,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationRecipientListRequest {
+    #[serde(default)]
+    pub include_disabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationRecipientListResponse {
+    pub recipients: Vec<NotificationRecipient>,
+}
+
+/// A durable notification subscription bound to a recipient.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationSubscription {
+    pub subscription_id: String,
+    pub recipient_id: String,
+    pub transport_kind: NotificationTransportKind,
+    pub endpoint: Value,
+    #[serde(default)]
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationSubscriptionUpsertRequest {
+    pub subscription_id: String,
+    pub recipient_id: String,
+    pub transport_kind: NotificationTransportKind,
+    #[serde(default)]
+    pub endpoint: Value,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationSubscriptionUpsertResponse {
+    pub subscription: NotificationSubscription,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationSubscriptionListRequest {
+    #[serde(default)]
+    pub recipient_id: Option<String>,
+    #[serde(default)]
+    pub enabled_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationSubscriptionListResponse {
+    pub subscriptions: Vec<NotificationSubscription>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationSubscriptionSetEnabledRequest {
+    pub subscription_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationSubscriptionSetEnabledResponse {
+    pub subscription: NotificationSubscription,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeliveryJob {
+    pub job_id: String,
+    pub origin_node_id: String,
+    pub candidate_id: String,
+    pub trigger_sequence: u64,
+    pub recipient_id: String,
+    pub subscription_id: String,
+    pub transport_kind: NotificationTransportKind,
+    pub status: NotificationDeliveryJobStatus,
+    pub attempt_count: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub dispatched_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub delivered_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub failed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub suppressed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub skipped_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub obsolete_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub receipt: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDeliveryJobStatus {
+    #[default]
+    Pending,
+    Dispatched,
+    Delivered,
+    Failed,
+    Suppressed,
+    Skipped,
+    Obsolete,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationDeliveryJobListRequest {
+    #[serde(default)]
+    pub origin_node_id: Option<String>,
+    #[serde(default)]
+    pub candidate_id: Option<String>,
+    #[serde(default)]
+    pub subscription_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<NotificationDeliveryJobStatus>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeliveryJobListResponse {
+    pub jobs: Vec<NotificationDeliveryJob>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeliveryJobGetRequest {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeliveryJobGetResponse {
+    pub job: Option<NotificationDeliveryJob>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeliveryRunPendingRequest {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub transport_kind: Option<NotificationTransportKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationDeliveryRunPendingResponse {
+    pub jobs: Vec<NotificationDeliveryJob>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxActionRouteRequest {
+    pub item_id: String,
+    pub action_kind: OperatorInboxActionKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInboxActionRouteResponse {
+    pub route: OperatorInboxActionRoute,
+}
+
+/// Route metadata for a derived inbox action.
+///
+/// This is read-only guidance that points a remote client back to the existing
+/// proposal/decision/session APIs. It is not an inbox-owned mutation surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OperatorInboxActionRoute {
+    Proposal {
+        item_id: String,
+        proposal_id: String,
+        method: String,
+    },
+    SupervisorDecision {
+        item_id: String,
+        decision_id: String,
+        method: String,
+    },
+    PlanningSession {
+        item_id: String,
+        session_id: String,
+        method: String,
+    },
+    PlanRevisionProposal {
+        item_id: String,
+        proposal_id: String,
+        method: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1248,6 +2114,49 @@ pub struct AuthorityHierarchyGetRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorityHierarchyGetResponse {
     pub hierarchy: authority::HierarchySnapshot,
+}
+
+/// Stored authority events exported in sequence order for replication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityEventsExportRequest {
+    pub peer_id: String,
+    #[serde(default)]
+    pub after_sequence: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityEventsExportResponse {
+    pub events: Vec<authority::StoredAuthorityEvent>,
+    pub checkpoint: authority::AuthorityReplicationCheckpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityEventsAckRequest {
+    pub peer_id: String,
+    pub through_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityEventsAckResponse {
+    pub checkpoint: authority::AuthorityReplicationCheckpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityEventsReplayRequest {
+    /// Stored authority events to apply into an authority store/projection path.
+    ///
+    /// The current daemon uses its local authority store. A future server can
+    /// reuse the same shape against its own authority storage without turning
+    /// collaboration/runtime state into canonical truth.
+    pub events: Vec<authority::StoredAuthorityEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityEventsReplayResponse {
+    pub replayed_events: Vec<authority::StoredAuthorityEvent>,
+    pub projection_checkpoint: Option<authority::ProjectionCheckpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
