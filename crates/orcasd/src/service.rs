@@ -13478,7 +13478,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     status = %status,
                     "processing upstream turn completion event"
                 );
-                let (session, turn, thread, turn_state) = {
+                let (session, turn, thread) = {
                     let mut state = self.state.write().await;
                     let (turn, thread_summary, turn_state) = {
                         let thread = Self::ensure_thread_entry(&mut state, &thread_id);
@@ -13527,7 +13527,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     if state.session.active_turns.is_empty() {
                         state.session.active_thread_id = Some(thread_id.clone());
                     }
-                    (state.session.clone(), turn, thread_summary, turn_state)
+                    (state.session.clone(), turn, thread_summary)
                 };
                 let _ = (thread, session, turn);
                 info!(
