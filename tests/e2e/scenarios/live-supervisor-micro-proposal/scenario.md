@@ -9,7 +9,7 @@ Verify that Orcas can take one real live worker report, generate a bounded super
 1. A tiny git repository is materialized under the scenario worktree output root.
 2. The repository contains one C source file with the same small, obvious bug used by the live worker scenario.
 3. A shell-based test script and Makefile are present so the repository can prove the fix locally.
-4. The scenario writes a repo-local Orcas config that pins the supervisor model to an accessible value for this project.
+4. The scenario writes a repo-local Orcas config that can target a local vLLM Responses endpoint by default, while still allowing an explicit hosted API override.
 5. Orcas daemon state is started and a single workstream/work unit is created.
 6. A direct live worker assignment is started against the fixture repo.
 
@@ -61,7 +61,7 @@ Verify that Orcas can take one real live worker report, generate a bounded super
 
 - Live worker latency can vary.
 - Live proposal generation depends on the supervisor backend and network availability.
-- The scenario uses a repo-local config override so it does not depend on the default repo-wide supervisor model access.
+- The scenario uses a repo-local config override so it can run against either a local vLLM endpoint or an explicitly configured hosted API.
 - The daemon bootstrap may take a few seconds before the assignment starts.
 - The `assignment/start` CLI background job can outlive the scenario even when the daemon completes the turn; the scenario validates persisted state instead of depending on that RPC to exit cleanly.
 

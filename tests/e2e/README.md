@@ -76,6 +76,21 @@ tests/e2e/run_all.sh
 tests/e2e/run_scenario.sh tests/e2e/scenarios/hello
 ```
 
+### Local Supervisor Models
+
+The live supervisor scenario can use a local OpenAI-compatible Responses endpoint, such as vLLM.
+
+For [`live-supervisor-micro-proposal`](./scenarios/live-supervisor-micro-proposal), set:
+
+```bash
+export ORCAS_SUPERVISOR_BASE_URL="http://127.0.0.1:8000/v1"
+export ORCAS_SUPERVISOR_MODEL="gpt-oss-20b"
+export ORCAS_SUPERVISOR_API_KEY_ENV=""
+export ORCAS_SUPERVISOR_REASONING_EFFORT=""
+```
+
+The scenario runner writes those values into its repo-local config before the daemon starts. If you leave them unset, the scenario defaults to the local vLLM-shaped configuration shown above.
+
 ## Cleanup
 
 Remove all generated E2E output with:

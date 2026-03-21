@@ -20,6 +20,11 @@ short_xdg_config_home="$short_xdg_root/config"
 short_xdg_runtime_home="$short_xdg_root/runtime"
 listen_port="$((5600 + ($(printf '%s' "$E2E_RUN_ID" | cksum | awk '{print $1}') % 1000)))"
 listen_url="ws://127.0.0.1:$listen_port"
+supervisor_base_url="${ORCAS_SUPERVISOR_BASE_URL:-http://127.0.0.1:8000/v1}"
+supervisor_model="${ORCAS_SUPERVISOR_MODEL:-gpt-oss-20b}"
+supervisor_api_key_env="${ORCAS_SUPERVISOR_API_KEY_ENV:-}"
+supervisor_reasoning_effort="${ORCAS_SUPERVISOR_REASONING_EFFORT:-}"
+supervisor_max_output_tokens="${ORCAS_SUPERVISOR_MAX_OUTPUT_TOKENS:-4096}"
 
 rm -rf "$short_xdg_root"
 mkdir -p "$short_xdg_data_home/orcas" "$short_xdg_config_home/orcas" "$short_xdg_runtime_home/orcas"
@@ -38,11 +43,11 @@ max_delay_ms = 5000
 multiplier = 2.0
 
 [supervisor]
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-model = "o3-mini"
-reasoning_effort = "high"
-max_output_tokens = 2000
+base_url = "$supervisor_base_url"
+api_key_env = "$supervisor_api_key_env"
+model = "$supervisor_model"
+reasoning_effort = "$supervisor_reasoning_effort"
+max_output_tokens = $supervisor_max_output_tokens
 
 [supervisor.proposals]
 auto_create_on_report_recorded = false
@@ -158,7 +163,7 @@ proposal_create_output="$(
     --workunit "$workunit_id" \
     --report "$report_id" \
     --requested-by live-supervisor-micro-proposal \
-    --note "Generate one bounded next step from the real live report. Keep it small and reviewable." \
+    --note "Generate exactly one bounded follow-up assignment to add a regression test for the greeting fix. Prefer Continue, keep the scope to one tiny test change, do not mark the work complete, and do not escalate unless that follow-up is impossible." \
   | tee "$proposal_create_stdout"
 )"
 proposal_id="$(printf '%s\n' "$proposal_create_output" | awk -F': ' '/^proposal_id:/ {print $2; exit}')"

@@ -90,13 +90,21 @@ impl ResponsesApiReasoner {
         }
     }
 
-    fn api_key(&self) -> OrcasResult<String> {
-        std::env::var(&self.config.supervisor.api_key_env).map_err(|_| {
-            OrcasError::Config(format!(
-                "supervisor API key environment variable `{}` is not set",
-                self.config.supervisor.api_key_env
-            ))
-        })
+    fn api_key(&self) -> OrcasResult<Option<String>> {
+        let api_key_env = self.config.supervisor.api_key_env.trim();
+        if api_key_env.is_empty() {
+            return Ok(None);
+        }
+        match std::env::var(api_key_env) {
+            Ok(value) if value.trim().is_empty() => Ok(None),
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Err(OrcasError::Config(format!(
+                "supervisor API key environment variable `{api_key_env}` is not set",
+            ))),
+            Err(std::env::VarError::NotUnicode(_)) => Err(OrcasError::Config(format!(
+                "supervisor API key environment variable `{api_key_env}` is not valid unicode",
+            ))),
+        }
     }
 
     fn endpoint(&self) -> String {
@@ -110,13 +118,10 @@ impl ResponsesApiReasoner {
         &self,
         prompt_render: &SupervisorPromptRenderArtifact,
     ) -> OrcasResult<(Value, String)> {
-        let body = json!({
+        let mut body = json!({
             "model": self.config.supervisor.model,
             "store": false,
             "max_output_tokens": self.config.supervisor.max_output_tokens,
-            "reasoning": {
-                "effort": self.config.supervisor.reasoning_effort,
-            },
             "instructions": prompt_render.instructions_text,
             "input": [{
                 "role": "user",
@@ -134,6 +139,17 @@ impl ResponsesApiReasoner {
                 }
             }
         });
+        let reasoning_effort = self.config.supervisor.reasoning_effort.trim();
+        if !reasoning_effort.is_empty() {
+            body.as_object_mut()
+                .expect("request body must be an object")
+                .insert(
+                    "reasoning".to_string(),
+                    json!({
+                        "effort": reasoning_effort,
+                    }),
+                );
+        }
         let request_body_hash = json_fingerprint(&body)?;
         Ok((body, request_body_hash))
     }
@@ -233,31 +249,30 @@ impl SupervisorReasoner for ResponsesApiReasoner {
             request_body_hash: Some(request_body_hash),
             ..prompt_render
         };
-        let response = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| {
-                warn!(
-                    work_unit_id = %pack.primary_work_unit.id,
-                    source_report_id = %pack.source_report.id,
-                    stage = "send_request",
-                    duration_ms = started_at.elapsed().as_millis() as u64,
-                    error = %error,
-                    "supervisor proposal generation failed"
-                );
-                self.failure(
-                    SupervisorProposalFailureStage::Backend,
-                    format!("supervisor Responses API request failed: {error}"),
-                    None,
-                    None,
-                    Some(prompt_render.clone()),
-                    None,
-                )
-            })?;
+        let request = self.client.post(self.endpoint()).json(&body);
+        let request = if let Some(api_key) = api_key {
+            request.bearer_auth(api_key)
+        } else {
+            request
+        };
+        let response = request.send().await.map_err(|error| {
+            warn!(
+                work_unit_id = %pack.primary_work_unit.id,
+                source_report_id = %pack.source_report.id,
+                stage = "send_request",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                error = %error,
+                "supervisor proposal generation failed"
+            );
+            self.failure(
+                SupervisorProposalFailureStage::Backend,
+                format!("supervisor Responses API request failed: {error}"),
+                None,
+                None,
+                Some(prompt_render.clone()),
+                None,
+            )
+        })?;
         let captured_at = Utc::now();
 
         let status = response.status();
@@ -2786,6 +2801,25 @@ mod tests {
         assert!(first.user_content_text.contains(&first.context_pack_text));
         assert!(first.context_pack_text.contains("\"schema_version\""));
         assert!(!first.prompt_hash.is_empty());
+    }
+
+    #[test]
+    fn responses_api_reasoner_omits_auth_and_reasoning_for_local_models() {
+        let mut config = orcas_core::AppConfig::default();
+        config.supervisor.base_url = "http://127.0.0.1:8000/v1".to_string();
+        config.supervisor.api_key_env = String::new();
+        config.supervisor.model = "gpt-oss-20b".to_string();
+        config.supervisor.reasoning_effort = String::new();
+        let reasoner = super::ResponsesApiReasoner::new(config);
+
+        assert!(reasoner.api_key().expect("api key").is_none());
+
+        let pack = sample_pack(vec![DecisionType::Continue, DecisionType::Accept]);
+        let prompt = render_supervisor_prompt(&pack, fixed_now()).expect("render prompt");
+        let (body, _) = reasoner.request_body(&prompt).expect("request body");
+        assert_eq!(body["model"], "gpt-oss-20b");
+        assert!(body.get("reasoning").is_none());
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
     }
 
     #[test]
