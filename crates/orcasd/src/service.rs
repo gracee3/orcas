@@ -19717,7 +19717,7 @@ ORCAS_REPORT_END"#
             response.report.summary,
             "Execution was interrupted. Raw output was retained for supervisor review."
         );
-        assert_eq!(response.report.parse_result, ReportParseResult::Invalid);
+        assert_eq!(response.report.parse_result, ReportParseResult::Ambiguous);
         assert_eq!(response.report.confidence, ReportConfidence::Unknown);
         assert!(response.report.needs_supervisor_review);
         assert!(response.report.findings.is_empty());
@@ -26063,7 +26063,7 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             &record,
         );
         assert_eq!(parsed.disposition, ReportDisposition::Failed);
-        assert_eq!(parsed.validation.parse_result, ReportParseResult::Invalid);
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Ambiguous);
         assert!(parsed.validation.needs_supervisor_review);
         assert!(parsed.recommended_next_actions.is_empty());
     }
@@ -26395,7 +26395,7 @@ Boundedness note: Stay within the legacy compatibility boundary."#
 
         assert_eq!(assignment.status, AssignmentStatus::Interrupted);
         assert_eq!(report.disposition, ReportDisposition::Interrupted);
-        assert_eq!(report.parse_result, ReportParseResult::Invalid);
+        assert_eq!(report.parse_result, ReportParseResult::Ambiguous);
         assert!(report.needs_supervisor_review);
         assert_eq!(updated_work_unit.status, WorkUnitStatus::AwaitingDecision);
         assert_eq!(
