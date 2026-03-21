@@ -139,6 +139,11 @@ impl ResponsesApiReasoner {
                 }
             }
         });
+        if let Some(temperature) = self.config.supervisor.temperature {
+            body.as_object_mut()
+                .expect("request body must be an object")
+                .insert("temperature".to_string(), json!(temperature));
+        }
         let reasoning_effort = self.config.supervisor.reasoning_effort.trim();
         if !reasoning_effort.is_empty() {
             body.as_object_mut()
@@ -541,7 +546,7 @@ pub fn render_supervisor_prompt(
     rendered_at: DateTime<Utc>,
 ) -> OrcasResult<SupervisorPromptRenderArtifact> {
     let context_pack_text = serde_json::to_string_pretty(pack)?;
-    let instructions_text = "You are the Orcas supervisor reasoner. Orcas state in the provided packet is the only source of truth. Use the canonical workstream plan, current focus item, exploration policy, and recent alignment assessments when deciding what to do next. Choose exactly one allowed decision for the primary work unit. Never invent ids, hidden context, or extra work units. Do not silently change the canonical plan; structural changes must be proposed for operator approval. Every assignment must be tied to a plan item or a narrow special activity kind. If the decision is continue or redirect, return one bounded draft next assignment. Return JSON only, matching the requested schema.".to_string();
+    let instructions_text = "You are the Orcas supervisor reasoner. Orcas state in the provided packet is the only source of truth. Use the canonical workstream plan, current focus item, exploration policy, and recent alignment assessments when deciding what to do next. Choose exactly one allowed decision for the primary work unit. Never invent ids, hidden context, or extra work units. Do not silently change the canonical plan; structural changes must be proposed for operator approval. Every assignment must be tied to a plan item or a narrow special activity kind. Keep all prose terse. If the decision is continue or redirect, return one bounded draft next assignment with exactly 2 instructions, exactly 2 acceptance criteria, exactly 2 stop conditions, exactly 2 expected report fields, and a concise boundedness note. Set plan_assessment and plan_revision_proposal to null unless explicitly required. Return JSON only, matching the requested schema.".to_string();
     let user_content_text = format!(
         "Return a supervisor proposal JSON object for this Orcas decision point.\nThe packet already contains the allowed decision set and the canonical workstream state.\n\nSupervisorContextPack:\n{context_pack_text}"
     );
@@ -2793,6 +2798,9 @@ mod tests {
                 .instructions_text
                 .contains("You are the Orcas supervisor reasoner.")
         );
+        assert!(first.instructions_text.contains("exactly 2 acceptance criteria"));
+        assert!(first.instructions_text.contains("exactly 2 stop conditions"));
+        assert!(first.instructions_text.contains("exactly 2 expected report fields"));
         assert!(
             first
                 .user_content_text
