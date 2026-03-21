@@ -24,6 +24,12 @@ use orcas_core::ipc::{
     OperatorNotificationGetRequest, OperatorNotificationGetResponse,
     OperatorNotificationListRequest, OperatorNotificationListResponse,
     OperatorNotificationSuppressRequest, OperatorNotificationSuppressResponse,
+    OperatorRemoteActionClaimRequest, OperatorRemoteActionClaimResponse,
+    OperatorRemoteActionCompleteRequest, OperatorRemoteActionCompleteResponse,
+    OperatorRemoteActionCreateRequest, OperatorRemoteActionCreateResponse,
+    OperatorRemoteActionFailRequest, OperatorRemoteActionFailResponse,
+    OperatorRemoteActionGetRequest, OperatorRemoteActionGetResponse,
+    OperatorRemoteActionListRequest, OperatorRemoteActionListResponse,
 };
 use orcas_core::{AppPaths, OrcasResult};
 
@@ -112,6 +118,21 @@ impl InboxMirrorServer {
                 "/operator-notifications/delivery/run_pending",
                 post(run_pending_notification_delivery_jobs),
             )
+            .route(
+                "/operator-actions/request",
+                post(create_remote_action_request),
+            )
+            .route(
+                "/operator-actions/list",
+                post(list_remote_action_requests),
+            )
+            .route("/operator-actions/get", post(get_remote_action_request))
+            .route("/operator-actions/claim", post(claim_remote_action_requests))
+            .route(
+                "/operator-actions/complete",
+                post(complete_remote_action_request),
+            )
+            .route("/operator-actions/fail", post(fail_remote_action_request))
             .with_state(self.store);
         let bind_addr = listener.local_addr()?;
         info!(%bind_addr, "orcas-server listening");
@@ -320,6 +341,66 @@ async fn run_pending_notification_delivery_jobs(
     Ok(Json(response))
 }
 
+async fn create_remote_action_request(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<OperatorRemoteActionCreateRequest>,
+) -> Result<Json<OperatorRemoteActionCreateResponse>, String> {
+    let response = store
+        .create_remote_action_request(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn list_remote_action_requests(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<OperatorRemoteActionListRequest>,
+) -> Result<Json<OperatorRemoteActionListResponse>, String> {
+    let response = store
+        .list_remote_action_requests(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn get_remote_action_request(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<OperatorRemoteActionGetRequest>,
+) -> Result<Json<OperatorRemoteActionGetResponse>, String> {
+    let response = store
+        .get_remote_action_request(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn claim_remote_action_requests(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<OperatorRemoteActionClaimRequest>,
+) -> Result<Json<OperatorRemoteActionClaimResponse>, String> {
+    let response = store
+        .claim_remote_action_requests(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn complete_remote_action_request(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<OperatorRemoteActionCompleteRequest>,
+) -> Result<Json<OperatorRemoteActionCompleteResponse>, String> {
+    let response = store
+        .complete_remote_action_request(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn fail_remote_action_request(
+    State(store): State<Arc<InboxMirrorStore>>,
+    Json(request): Json<OperatorRemoteActionFailRequest>,
+) -> Result<Json<OperatorRemoteActionFailResponse>, String> {
+    let response = store
+        .fail_remote_action_request(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
 pub fn app(store: InboxMirrorStore) -> Router {
     Router::new()
         .route("/operator-inbox/mirror/apply", post(apply))
@@ -380,6 +461,12 @@ pub fn app(store: InboxMirrorStore) -> Router {
             "/operator-notifications/delivery/run_pending",
             post(run_pending_notification_delivery_jobs),
         )
+        .route("/operator-actions/request", post(create_remote_action_request))
+        .route("/operator-actions/list", post(list_remote_action_requests))
+        .route("/operator-actions/get", post(get_remote_action_request))
+        .route("/operator-actions/claim", post(claim_remote_action_requests))
+        .route("/operator-actions/complete", post(complete_remote_action_request))
+        .route("/operator-actions/fail", post(fail_remote_action_request))
         .with_state(Arc::new(store))
 }
 

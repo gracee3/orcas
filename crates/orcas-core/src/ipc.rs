@@ -725,6 +725,173 @@ pub struct OperatorNotificationSuppressResponse {
     pub candidate: OperatorNotificationCandidate,
 }
 
+/// Control-plane intent for a remote operator action routed through the server.
+///
+/// This is not workflow truth. It is a durable queue entry that points back to
+/// the mirrored inbox item and later resolves through the daemon's existing
+/// source-domain mutation APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorRemoteActionRequestStatus {
+    #[default]
+    Pending,
+    Claimed,
+    Completed,
+    Failed,
+    Canceled,
+    Stale,
+}
+
+/// A durable remote action request derived from a mirrored inbox item.
+///
+/// The request carries the mirrored inbox snapshot needed for remote clients
+/// to understand what will be executed, but the daemon remains the execution
+/// point for the real source-domain mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorRemoteActionRequest {
+    pub request_id: String,
+    pub origin_node_id: String,
+    pub candidate_id: String,
+    pub item_id: String,
+    pub trigger_sequence: u64,
+    pub action_kind: OperatorInboxActionKind,
+    pub item: OperatorInboxItem,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    #[serde(default)]
+    pub request_note: Option<String>,
+    pub status: OperatorRemoteActionRequestStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub claimed_by: Option<String>,
+    #[serde(default)]
+    pub claimed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub claimed_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub claim_token: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub failed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub canceled_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub stale_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub attempt_count: u64,
+    #[serde(default)]
+    pub result: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorRemoteActionCreateRequest {
+    pub origin_node_id: String,
+    pub item_id: String,
+    pub action_kind: OperatorInboxActionKind,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    #[serde(default)]
+    pub request_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionCreateResponse {
+    pub request: OperatorRemoteActionRequest,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorRemoteActionListRequest {
+    pub origin_node_id: String,
+    #[serde(default)]
+    pub candidate_id: Option<String>,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    #[serde(default)]
+    pub action_kind: Option<OperatorInboxActionKind>,
+    #[serde(default)]
+    pub status: Option<OperatorRemoteActionRequestStatus>,
+    #[serde(default)]
+    pub pending_only: bool,
+    #[serde(default)]
+    pub actionable_only: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionListResponse {
+    pub origin_node_id: String,
+    pub requests: Vec<OperatorRemoteActionRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionGetRequest {
+    pub origin_node_id: String,
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionGetResponse {
+    pub origin_node_id: String,
+    pub request: Option<OperatorRemoteActionRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionClaimRequest {
+    pub origin_node_id: String,
+    pub worker_id: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub lease_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionClaimedRequest {
+    pub request: OperatorRemoteActionRequest,
+    pub claim_token: String,
+    pub claimed_until: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionClaimResponse {
+    pub origin_node_id: String,
+    pub requests: Vec<OperatorRemoteActionClaimedRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionCompleteRequest {
+    pub origin_node_id: String,
+    pub request_id: String,
+    pub claim_token: String,
+    #[serde(default)]
+    pub result: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionCompleteResponse {
+    pub origin_node_id: String,
+    pub request: OperatorRemoteActionRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionFailRequest {
+    pub origin_node_id: String,
+    pub request_id: String,
+    pub claim_token: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRemoteActionFailResponse {
+    pub origin_node_id: String,
+    pub request: OperatorRemoteActionRequest,
+}
+
 /// Transport families available to notification delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

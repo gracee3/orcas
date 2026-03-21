@@ -18,10 +18,19 @@ use orcas_core::ipc::{
     OperatorNotificationCandidateStatus, OperatorNotificationGetRequest,
     OperatorNotificationListRequest, OperatorNotificationListResponse,
     OperatorNotificationSuppressRequest, OperatorNotificationSuppressResponse,
+    OperatorRemoteActionClaimRequest, OperatorRemoteActionClaimResponse,
+    OperatorRemoteActionClaimedRequest, OperatorRemoteActionCompleteRequest,
+    OperatorRemoteActionCompleteResponse, OperatorRemoteActionCreateRequest,
+    OperatorRemoteActionCreateResponse, OperatorRemoteActionFailRequest,
+    OperatorRemoteActionFailResponse, OperatorRemoteActionGetRequest,
+    OperatorRemoteActionGetResponse, OperatorRemoteActionListRequest,
+    OperatorRemoteActionListResponse, OperatorRemoteActionRequest,
+    OperatorRemoteActionRequestStatus,
 };
 use orcas_core::{OrcasError, OrcasResult};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::delivery::{NotificationDeliveryContext, NotificationDeliveryTransport};
 
@@ -117,6 +126,38 @@ create unique index if not exists notification_delivery_jobs_dedupe_idx
 
 create index if not exists notification_delivery_jobs_status_idx
   on notification_delivery_jobs(status, updated_at desc);
+
+create table if not exists remote_action_requests (
+  request_id text primary key,
+  origin_node_id text not null,
+  candidate_id text not null,
+  item_id text not null,
+  trigger_sequence integer not null,
+  action_kind text not null,
+  item_json text not null,
+  requested_by text,
+  request_note text,
+  request_status text not null,
+  created_at text not null,
+  updated_at text not null,
+  claimed_by text,
+  claimed_at text,
+  claimed_until text,
+  claim_token text,
+  completed_at text,
+  failed_at text,
+  canceled_at text,
+  stale_at text,
+  attempt_count integer not null,
+  result_json text,
+  error_text text
+);
+
+create index if not exists remote_action_requests_origin_idx
+  on remote_action_requests(origin_node_id, request_status, updated_at desc);
+
+create index if not exists remote_action_requests_candidate_idx
+  on remote_action_requests(candidate_id, action_kind);
 "#;
 
 fn db_error(error: rusqlite::Error) -> OrcasError {
@@ -676,6 +717,272 @@ impl InboxMirrorStore {
                 ).map_err(db_error)?;
             }
         }
+        Ok(())
+    }
+
+    fn remote_action_request_status_to_str(status: OperatorRemoteActionRequestStatus) -> &'static str {
+        match status {
+            OperatorRemoteActionRequestStatus::Pending => "pending",
+            OperatorRemoteActionRequestStatus::Claimed => "claimed",
+            OperatorRemoteActionRequestStatus::Completed => "completed",
+            OperatorRemoteActionRequestStatus::Failed => "failed",
+            OperatorRemoteActionRequestStatus::Canceled => "canceled",
+            OperatorRemoteActionRequestStatus::Stale => "stale",
+        }
+    }
+
+    fn remote_action_request_status_from_str(status: &str) -> OperatorRemoteActionRequestStatus {
+        match status {
+            "claimed" => OperatorRemoteActionRequestStatus::Claimed,
+            "completed" => OperatorRemoteActionRequestStatus::Completed,
+            "failed" => OperatorRemoteActionRequestStatus::Failed,
+            "canceled" => OperatorRemoteActionRequestStatus::Canceled,
+            "stale" => OperatorRemoteActionRequestStatus::Stale,
+            _ => OperatorRemoteActionRequestStatus::Pending,
+        }
+    }
+
+    fn remote_action_request_id(
+        origin_node_id: &str,
+        candidate_id: &str,
+        action_kind: orcas_core::ipc::OperatorInboxActionKind,
+    ) -> String {
+        format!(
+            "{origin_node_id}::{candidate_id}::{}",
+            Self::operator_inbox_action_kind_to_str(action_kind)
+        )
+    }
+
+    fn operator_inbox_action_kind_to_str(
+        action_kind: orcas_core::ipc::OperatorInboxActionKind,
+    ) -> &'static str {
+        match action_kind {
+            orcas_core::ipc::OperatorInboxActionKind::Approve => "approve",
+            orcas_core::ipc::OperatorInboxActionKind::Reject => "reject",
+            orcas_core::ipc::OperatorInboxActionKind::ApproveAndSend => "approve_and_send",
+            orcas_core::ipc::OperatorInboxActionKind::RecordNoAction => "record_no_action",
+            orcas_core::ipc::OperatorInboxActionKind::ManualRefresh => "manual_refresh",
+            orcas_core::ipc::OperatorInboxActionKind::Reconcile => "reconcile",
+            orcas_core::ipc::OperatorInboxActionKind::Retry => "retry",
+            orcas_core::ipc::OperatorInboxActionKind::Supersede => "supersede",
+            orcas_core::ipc::OperatorInboxActionKind::MarkReadyForReview => {
+                "mark_ready_for_review"
+            }
+        }
+    }
+
+    fn operator_inbox_action_kind_from_str(
+        action_kind: &str,
+    ) -> orcas_core::ipc::OperatorInboxActionKind {
+        match action_kind {
+            "reject" => orcas_core::ipc::OperatorInboxActionKind::Reject,
+            "approve_and_send" => orcas_core::ipc::OperatorInboxActionKind::ApproveAndSend,
+            "record_no_action" => orcas_core::ipc::OperatorInboxActionKind::RecordNoAction,
+            "manual_refresh" => orcas_core::ipc::OperatorInboxActionKind::ManualRefresh,
+            "reconcile" => orcas_core::ipc::OperatorInboxActionKind::Reconcile,
+            "retry" => orcas_core::ipc::OperatorInboxActionKind::Retry,
+            "supersede" => orcas_core::ipc::OperatorInboxActionKind::Supersede,
+            "mark_ready_for_review" => orcas_core::ipc::OperatorInboxActionKind::MarkReadyForReview,
+            _ => orcas_core::ipc::OperatorInboxActionKind::Approve,
+        }
+    }
+
+    fn remote_action_request_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> Result<OperatorRemoteActionRequest, rusqlite::Error> {
+        let column_count = row.as_ref().column_count();
+        let parse_ts = |index: usize| -> Result<DateTime<Utc>, rusqlite::Error> {
+            DateTime::parse_from_rfc3339(&row.get::<_, String>(index)?)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        index,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+        };
+        let parse_opt_ts = |index: usize| -> Result<Option<DateTime<Utc>>, rusqlite::Error> {
+            row.get::<_, Option<String>>(index)?
+                .map(|value| {
+                    DateTime::parse_from_rfc3339(&value)
+                        .map(|value| value.with_timezone(&Utc))
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                index,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                })
+                .transpose()
+        };
+        let (claim_token, completed_at_index, failed_at_index, canceled_at_index, stale_at_index, attempt_count_index, result_index, error_index) =
+            if column_count == 22 {
+                (None, 15, 16, 17, 18, 19, 20, 21)
+            } else {
+                (
+                    row.get::<_, Option<String>>(15)?,
+                    16,
+                    17,
+                    18,
+                    19,
+                    20,
+                    21,
+                    22,
+                )
+            };
+        Ok(OperatorRemoteActionRequest {
+            request_id: row.get::<_, String>(0)?,
+            origin_node_id: row.get::<_, String>(1)?,
+            candidate_id: row.get::<_, String>(2)?,
+            item_id: row.get::<_, String>(3)?,
+            trigger_sequence: row.get::<_, i64>(4)? as u64,
+            action_kind: Self::operator_inbox_action_kind_from_str(&row.get::<_, String>(5)?),
+            item: serde_json::from_str(&row.get::<_, String>(6)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+            requested_by: row.get::<_, Option<String>>(7)?,
+            request_note: row.get::<_, Option<String>>(8)?,
+            status: Self::remote_action_request_status_from_str(&row.get::<_, String>(9)?),
+            created_at: parse_ts(10)?,
+            updated_at: parse_ts(11)?,
+            claimed_by: row.get::<_, Option<String>>(12)?,
+            claimed_at: parse_opt_ts(13)?,
+            claimed_until: parse_opt_ts(14)?,
+            claim_token,
+            completed_at: parse_opt_ts(completed_at_index)?,
+            failed_at: parse_opt_ts(failed_at_index)?,
+            canceled_at: parse_opt_ts(canceled_at_index)?,
+            stale_at: parse_opt_ts(stale_at_index)?,
+            attempt_count: row.get::<_, i64>(attempt_count_index)? as u64,
+            result: row
+                .get::<_, Option<String>>(result_index)?
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        result_index,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            error: row.get::<_, Option<String>>(error_index)?,
+        })
+    }
+
+    fn remote_action_item_is_actionable(item: &OperatorInboxItem) -> bool {
+        item.status == orcas_core::ipc::OperatorInboxItemStatus::Open
+            && !item.available_actions.is_empty()
+    }
+
+    fn load_remote_action_request_tx(
+        transaction: &rusqlite::Transaction<'_>,
+        request_id: &str,
+    ) -> OrcasResult<Option<OperatorRemoteActionRequest>> {
+        let mut statement = transaction
+            .prepare(
+                "select request_id, origin_node_id, candidate_id, item_id, trigger_sequence, action_kind, item_json, requested_by, request_note, request_status, created_at, updated_at, claimed_by, claimed_at, claimed_until, completed_at, failed_at, canceled_at, stale_at, attempt_count, result_json, error_text
+                 from remote_action_requests where request_id = ?1",
+            )
+            .map_err(db_error)?;
+        let request = statement
+            .query_row(params![request_id], |row| Self::remote_action_request_from_row(row))
+            .optional()
+            .map_err(db_error)?;
+        Ok(request)
+    }
+
+    fn update_remote_action_request_status_tx(
+        transaction: &rusqlite::Transaction<'_>,
+        request_id: &str,
+        status: OperatorRemoteActionRequestStatus,
+        updated_at: DateTime<Utc>,
+        attempt_count_delta: i64,
+        claimed_by: Option<&str>,
+        claimed_at: Option<DateTime<Utc>>,
+        claimed_until: Option<DateTime<Utc>>,
+        claim_token: Option<&str>,
+        completed_at: Option<DateTime<Utc>>,
+        failed_at: Option<DateTime<Utc>>,
+        canceled_at: Option<DateTime<Utc>>,
+        stale_at: Option<DateTime<Utc>>,
+        result: Option<Value>,
+        error: Option<String>,
+    ) -> OrcasResult<()> {
+        transaction
+            .execute(
+                "update remote_action_requests
+                 set request_status = ?2,
+                     updated_at = ?3,
+                     attempt_count = attempt_count + ?4,
+                     claimed_by = coalesce(?5, claimed_by),
+                     claimed_at = coalesce(?6, claimed_at),
+                     claimed_until = coalesce(?7, claimed_until),
+                     claim_token = coalesce(?8, claim_token),
+                     completed_at = coalesce(?9, completed_at),
+                     failed_at = coalesce(?10, failed_at),
+                     canceled_at = coalesce(?11, canceled_at),
+                     stale_at = coalesce(?12, stale_at),
+                     result_json = coalesce(?13, result_json),
+                     error_text = coalesce(?14, error_text)
+                 where request_id = ?1",
+                params![
+                    request_id,
+                    Self::remote_action_request_status_to_str(status),
+                    updated_at.to_rfc3339(),
+                    attempt_count_delta,
+                    claimed_by,
+                    claimed_at.map(|value| value.to_rfc3339()),
+                    claimed_until.map(|value| value.to_rfc3339()),
+                    claim_token,
+                    completed_at.map(|value| value.to_rfc3339()),
+                    failed_at.map(|value| value.to_rfc3339()),
+                    canceled_at.map(|value| value.to_rfc3339()),
+                    stale_at.map(|value| value.to_rfc3339()),
+                    result.map(|value| value.to_string()),
+                    error,
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    fn mark_remote_action_requests_for_candidate_status_tx(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        candidate_id: &str,
+        status: OperatorRemoteActionRequestStatus,
+        now: DateTime<Utc>,
+    ) -> OrcasResult<()> {
+        if status != OperatorRemoteActionRequestStatus::Stale {
+            return Ok(());
+        }
+        transaction
+            .execute(
+                "update remote_action_requests
+                 set request_status = ?2,
+                     updated_at = ?3,
+                     stale_at = coalesce(stale_at, ?3)
+                 where candidate_id = ?1
+                   and request_status in (?4, ?5)",
+                params![
+                    candidate_id,
+                    Self::remote_action_request_status_to_str(status),
+                    now.to_rfc3339(),
+                    Self::remote_action_request_status_to_str(
+                        OperatorRemoteActionRequestStatus::Pending
+                    ),
+                    Self::remote_action_request_status_to_str(
+                        OperatorRemoteActionRequestStatus::Claimed
+                    ),
+                ],
+            )
+            .map_err(db_error)?;
         Ok(())
     }
 
@@ -1257,6 +1564,410 @@ impl InboxMirrorStore {
         )?;
         transaction.commit().map_err(db_error)?;
         Ok(OperatorNotificationSuppressResponse { candidate: next })
+    }
+
+    pub fn create_remote_action_request(
+        &self,
+        request: &OperatorRemoteActionCreateRequest,
+    ) -> OrcasResult<OperatorRemoteActionCreateResponse> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        let window = Self::load_notification_window_tx(
+            &transaction,
+            request.origin_node_id.as_str(),
+            request.item_id.as_str(),
+        )?
+        .ok_or_else(|| {
+            OrcasError::Store("no actionable notification window found for item".to_string())
+        })?;
+        let candidate = Self::load_notification_candidate_tx(
+            &transaction,
+            request.origin_node_id.as_str(),
+            window.0.as_str(),
+        )?
+        .ok_or_else(|| OrcasError::Store("notification candidate not found".to_string()))?;
+        if candidate.item.id != request.item_id {
+            return Err(OrcasError::Store(
+                "notification candidate does not match the requested item".to_string(),
+            ));
+        }
+        if !candidate.item.available_actions.contains(&request.action_kind) {
+            return Err(OrcasError::Store(format!(
+                "action `{:?}` is not available for mirrored inbox item `{}`",
+                request.action_kind, request.item_id
+            )));
+        }
+        if !Self::remote_action_item_is_actionable(&candidate.item) {
+            return Err(OrcasError::Store(format!(
+                "mirrored inbox item `{}` is not actionable",
+                request.item_id
+            )));
+        }
+
+        let request_id = Self::remote_action_request_id(
+            request.origin_node_id.as_str(),
+            candidate.candidate_id.as_str(),
+            request.action_kind,
+        );
+        if let Some(existing) =
+            Self::load_remote_action_request_tx(&transaction, request_id.as_str())?
+        {
+            transaction.commit().map_err(db_error)?;
+            return Ok(OperatorRemoteActionCreateResponse { request: existing });
+        }
+
+        let now = Utc::now();
+        let item_json = serde_json::to_string(&candidate.item)?;
+        transaction
+            .execute(
+                "insert into remote_action_requests(request_id, origin_node_id, candidate_id, item_id, trigger_sequence, action_kind, item_json, requested_by, request_note, request_status, created_at, updated_at, claimed_by, claimed_at, claimed_until, claim_token, completed_at, failed_at, canceled_at, stale_at, attempt_count, result_json, error_text)
+                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, null, null, null, null, null, null, null, null, 0, null, null)",
+                params![
+                    request_id,
+                    request.origin_node_id.as_str(),
+                    candidate.candidate_id.as_str(),
+                    request.item_id.as_str(),
+                    candidate.trigger_sequence as i64,
+                    Self::operator_inbox_action_kind_to_str(request.action_kind),
+                    item_json,
+                    request.requested_by.as_deref(),
+                    request.request_note.as_deref(),
+                    Self::remote_action_request_status_to_str(
+                        OperatorRemoteActionRequestStatus::Pending
+                    ),
+                    now.to_rfc3339(),
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(db_error)?;
+        let request = Self::load_remote_action_request_tx(&transaction, request_id.as_str())?
+            .ok_or_else(|| OrcasError::Store("remote action request disappeared after insert".to_string()))?;
+        transaction.commit().map_err(db_error)?;
+        Ok(OperatorRemoteActionCreateResponse { request })
+    }
+
+    pub fn list_remote_action_requests(
+        &self,
+        request: &OperatorRemoteActionListRequest,
+    ) -> OrcasResult<OperatorRemoteActionListResponse> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let mut statement = connection
+            .prepare(
+                "select request_id, origin_node_id, candidate_id, item_id, trigger_sequence, action_kind, item_json, requested_by, request_note, request_status, created_at, updated_at, claimed_by, claimed_at, claimed_until, claim_token, completed_at, failed_at, canceled_at, stale_at, attempt_count, result_json, error_text
+                 from remote_action_requests where origin_node_id = ?1 order by created_at asc, request_id asc",
+            )
+            .map_err(db_error)?;
+        let mut rows = statement.query(params![request.origin_node_id.as_str()]).map_err(db_error)?;
+        let mut requests = Vec::new();
+        while let Some(row) = rows.next().map_err(db_error)? {
+            let remote_request = Self::remote_action_request_from_row(row).map_err(db_error)?;
+            if let Some(candidate_id) = request.candidate_id.as_ref()
+                && &remote_request.candidate_id != candidate_id
+            {
+                continue;
+            }
+            if let Some(item_id) = request.item_id.as_ref() && &remote_request.item_id != item_id {
+                continue;
+            }
+            if let Some(action_kind) = request.action_kind
+                && remote_request.action_kind != action_kind
+            {
+                continue;
+            }
+            if let Some(status) = request.status
+                && remote_request.status != status
+            {
+                continue;
+            }
+            if request.pending_only && remote_request.status != OperatorRemoteActionRequestStatus::Pending
+            {
+                continue;
+            }
+            if request.actionable_only && !Self::remote_action_item_is_actionable(&remote_request.item)
+            {
+                continue;
+            }
+            requests.push(remote_request);
+            if let Some(limit) = request.limit && requests.len() >= limit {
+                break;
+            }
+        }
+        Ok(OperatorRemoteActionListResponse {
+            origin_node_id: request.origin_node_id.clone(),
+            requests,
+        })
+    }
+
+    pub fn get_remote_action_request(
+        &self,
+        request: &OperatorRemoteActionGetRequest,
+    ) -> OrcasResult<OperatorRemoteActionGetResponse> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let mut statement = connection
+            .prepare(
+                "select request_id, origin_node_id, candidate_id, item_id, trigger_sequence, action_kind, item_json, requested_by, request_note, request_status, created_at, updated_at, claimed_by, claimed_at, claimed_until, claim_token, completed_at, failed_at, canceled_at, stale_at, attempt_count, result_json, error_text
+                 from remote_action_requests where request_id = ?1",
+            )
+            .map_err(db_error)?;
+        let request_row = statement
+            .query_row(params![request.request_id.as_str()], |row| {
+                Self::remote_action_request_from_row(row)
+            })
+            .optional()
+            .map_err(db_error)?;
+        let origin_node_id = request.origin_node_id.clone();
+        let request = request_row.filter(|row| row.origin_node_id == origin_node_id);
+        Ok(OperatorRemoteActionGetResponse {
+            origin_node_id,
+            request,
+        })
+    }
+
+    pub fn claim_remote_action_requests(
+        &self,
+        request: &OperatorRemoteActionClaimRequest,
+    ) -> OrcasResult<OperatorRemoteActionClaimResponse> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        let now = Utc::now();
+        let lease_until = now
+            + chrono::Duration::milliseconds(
+                request.lease_ms.unwrap_or(30_000).max(1) as i64,
+            );
+        let limit = request.limit.unwrap_or(1).max(1);
+        let mut requests = Vec::new();
+        {
+            let mut statement = transaction
+                .prepare(
+                    "select request_id, origin_node_id, candidate_id, item_id, trigger_sequence, action_kind, item_json, requested_by, request_note, request_status, created_at, updated_at, claimed_by, claimed_at, claimed_until, claim_token, completed_at, failed_at, canceled_at, stale_at, attempt_count, result_json, error_text
+                 from remote_action_requests where origin_node_id = ?1 order by created_at asc, request_id asc",
+                )
+                .map_err(db_error)?;
+            let mut rows = statement
+                .query(params![request.origin_node_id.as_str()])
+                .map_err(db_error)?;
+            while let Some(row) = rows.next().map_err(db_error)? {
+                if requests.len() >= limit {
+                    break;
+                }
+                let candidate_request = Self::remote_action_request_from_row(row).map_err(db_error)?;
+                let claimable = match candidate_request.status {
+                    OperatorRemoteActionRequestStatus::Pending => true,
+                    OperatorRemoteActionRequestStatus::Claimed => candidate_request
+                        .claimed_until
+                        .is_none_or(|until| until <= now),
+                    _ => false,
+                };
+                if !claimable {
+                    continue;
+                }
+                let candidate = Self::load_notification_candidate_tx(
+                    &transaction,
+                    request.origin_node_id.as_str(),
+                    candidate_request.candidate_id.as_str(),
+                )?;
+                if candidate
+                    .as_ref()
+                    .is_none_or(|candidate| !Self::remote_action_item_is_actionable(&candidate.item))
+                {
+                    Self::update_remote_action_request_status_tx(
+                        &transaction,
+                        candidate_request.request_id.as_str(),
+                        OperatorRemoteActionRequestStatus::Stale,
+                        now,
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(now),
+                        None,
+                        Some("mirrored inbox item is no longer actionable".to_string()),
+                    )?;
+                    continue;
+                }
+                let claim_token = Uuid::new_v4().to_string();
+                Self::update_remote_action_request_status_tx(
+                    &transaction,
+                    candidate_request.request_id.as_str(),
+                    OperatorRemoteActionRequestStatus::Claimed,
+                    now,
+                    1,
+                    Some(request.worker_id.as_str()),
+                    Some(now),
+                    Some(lease_until),
+                    Some(claim_token.as_str()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+                let request_row = Self::load_remote_action_request_tx(
+                    &transaction,
+                    candidate_request.request_id.as_str(),
+                )?
+                .ok_or_else(|| {
+                    OrcasError::Store("remote action request disappeared during claim".to_string())
+                })?;
+                requests.push(OperatorRemoteActionClaimedRequest {
+                    request: request_row,
+                    claim_token,
+                    claimed_until: lease_until,
+                });
+            }
+        }
+        transaction.commit().map_err(db_error)?;
+        Ok(OperatorRemoteActionClaimResponse {
+            origin_node_id: request.origin_node_id.clone(),
+            requests,
+        })
+    }
+
+    pub fn complete_remote_action_request(
+        &self,
+        request: &OperatorRemoteActionCompleteRequest,
+    ) -> OrcasResult<OperatorRemoteActionCompleteResponse> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        let existing = Self::load_remote_action_request_tx(&transaction, request.request_id.as_str())?
+            .ok_or_else(|| OrcasError::Store("remote action request not found".to_string()))?;
+        if existing.origin_node_id != request.origin_node_id {
+            return Err(OrcasError::Store(
+                "remote action request origin mismatch".to_string(),
+            ));
+        }
+        if existing
+            .claim_token
+            .as_deref()
+            .is_some_and(|token| token != request.claim_token.as_str())
+        {
+            return Err(OrcasError::Store(
+                "remote action request claim token mismatch".to_string(),
+            ));
+        }
+        if matches!(
+            existing.status,
+            OperatorRemoteActionRequestStatus::Completed
+                | OperatorRemoteActionRequestStatus::Failed
+                | OperatorRemoteActionRequestStatus::Canceled
+                | OperatorRemoteActionRequestStatus::Stale
+        ) {
+            transaction.commit().map_err(db_error)?;
+            return Ok(OperatorRemoteActionCompleteResponse {
+                origin_node_id: request.origin_node_id.clone(),
+                request: existing,
+            });
+        }
+        let now = Utc::now();
+        Self::update_remote_action_request_status_tx(
+            &transaction,
+            request.request_id.as_str(),
+            OperatorRemoteActionRequestStatus::Completed,
+            now,
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some(now),
+            None,
+            None,
+            None,
+            Some(request.result.clone()),
+            None,
+        )?;
+        let updated = Self::load_remote_action_request_tx(&transaction, request.request_id.as_str())?
+            .ok_or_else(|| OrcasError::Store("remote action request disappeared during completion".to_string()))?;
+        transaction.commit().map_err(db_error)?;
+        Ok(OperatorRemoteActionCompleteResponse {
+            origin_node_id: request.origin_node_id.clone(),
+            request: updated,
+        })
+    }
+
+    pub fn fail_remote_action_request(
+        &self,
+        request: &OperatorRemoteActionFailRequest,
+    ) -> OrcasResult<OperatorRemoteActionFailResponse> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OrcasError::Store("mirror store connection lock poisoned".to_string()))?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        let existing = Self::load_remote_action_request_tx(&transaction, request.request_id.as_str())?
+            .ok_or_else(|| OrcasError::Store("remote action request not found".to_string()))?;
+        if existing.origin_node_id != request.origin_node_id {
+            return Err(OrcasError::Store(
+                "remote action request origin mismatch".to_string(),
+            ));
+        }
+        if existing
+            .claim_token
+            .as_deref()
+            .is_some_and(|token| token != request.claim_token.as_str())
+        {
+            return Err(OrcasError::Store(
+                "remote action request claim token mismatch".to_string(),
+            ));
+        }
+        if matches!(
+            existing.status,
+            OperatorRemoteActionRequestStatus::Completed
+                | OperatorRemoteActionRequestStatus::Failed
+                | OperatorRemoteActionRequestStatus::Canceled
+                | OperatorRemoteActionRequestStatus::Stale
+        ) {
+            transaction.commit().map_err(db_error)?;
+            return Ok(OperatorRemoteActionFailResponse {
+                origin_node_id: request.origin_node_id.clone(),
+                request: existing,
+            });
+        }
+        let now = Utc::now();
+        Self::update_remote_action_request_status_tx(
+            &transaction,
+            request.request_id.as_str(),
+            OperatorRemoteActionRequestStatus::Failed,
+            now,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(now),
+            None,
+            None,
+            None,
+            Some(request.error.clone()),
+        )?;
+        let updated = Self::load_remote_action_request_tx(&transaction, request.request_id.as_str())?
+            .ok_or_else(|| OrcasError::Store("remote action request disappeared during failure".to_string()))?;
+        transaction.commit().map_err(db_error)?;
+        Ok(OperatorRemoteActionFailResponse {
+            origin_node_id: request.origin_node_id.clone(),
+            request: updated,
+        })
     }
 
     pub fn upsert_notification_recipient(
@@ -2017,6 +2728,12 @@ impl InboxMirrorStore {
             NotificationDeliveryJobStatus::Obsolete,
             changed_at,
         )?;
+        self.mark_remote_action_requests_for_candidate_status_tx(
+            transaction,
+            candidate_id.as_str(),
+            OperatorRemoteActionRequestStatus::Stale,
+            changed_at,
+        )?;
         transaction.execute(
             "delete from mirrored_notification_windows where origin_node_id = ?1 and item_id = ?2",
             params![origin_node_id, item_id],
@@ -2082,7 +2799,10 @@ mod tests {
         NotificationRecipientUpsertRequest, NotificationSubscriptionUpsertRequest,
         NotificationTransportKind, OperatorInboxActionKind, OperatorInboxChange,
         OperatorInboxChangeKind, OperatorInboxItem, OperatorInboxItemStatus,
-        OperatorInboxSourceKind,
+        OperatorInboxSourceKind, OperatorRemoteActionClaimRequest,
+        OperatorRemoteActionCompleteRequest, OperatorRemoteActionCreateRequest,
+        OperatorRemoteActionFailRequest, OperatorRemoteActionGetRequest,
+        OperatorRemoteActionListRequest, OperatorRemoteActionRequestStatus,
     };
 
     fn ts(offset: i64) -> chrono::DateTime<Utc> {
@@ -2176,6 +2896,82 @@ mod tests {
             subscription_id: None,
             status: None,
             limit: None,
+        }
+    }
+
+    fn remote_action_create_request(
+        origin_node_id: &str,
+        item_id: &str,
+        action_kind: OperatorInboxActionKind,
+    ) -> OperatorRemoteActionCreateRequest {
+        OperatorRemoteActionCreateRequest {
+            origin_node_id: origin_node_id.to_string(),
+            item_id: item_id.to_string(),
+            action_kind,
+            requested_by: Some("remote-operator".to_string()),
+            request_note: Some("please execute".to_string()),
+        }
+    }
+
+    fn remote_action_list_request(origin_node_id: &str) -> OperatorRemoteActionListRequest {
+        OperatorRemoteActionListRequest {
+            origin_node_id: origin_node_id.to_string(),
+            candidate_id: None,
+            item_id: None,
+            action_kind: None,
+            status: None,
+            pending_only: false,
+            actionable_only: false,
+            limit: None,
+        }
+    }
+
+    fn remote_action_get_request(
+        origin_node_id: &str,
+        request_id: &str,
+    ) -> OperatorRemoteActionGetRequest {
+        OperatorRemoteActionGetRequest {
+            origin_node_id: origin_node_id.to_string(),
+            request_id: request_id.to_string(),
+        }
+    }
+
+    fn remote_action_claim_request(
+        origin_node_id: &str,
+        worker_id: &str,
+    ) -> OperatorRemoteActionClaimRequest {
+        OperatorRemoteActionClaimRequest {
+            origin_node_id: origin_node_id.to_string(),
+            worker_id: worker_id.to_string(),
+            limit: Some(8),
+            lease_ms: Some(60_000),
+        }
+    }
+
+    fn remote_action_complete_request(
+        origin_node_id: &str,
+        request_id: &str,
+        claim_token: &str,
+    ) -> OperatorRemoteActionCompleteRequest {
+        OperatorRemoteActionCompleteRequest {
+            origin_node_id: origin_node_id.to_string(),
+            request_id: request_id.to_string(),
+            claim_token: claim_token.to_string(),
+            result: json!({"status": "ok"}),
+        }
+    }
+
+    fn remote_action_fail_request(
+        origin_node_id: &str,
+        request_id: &str,
+        claim_token: &str,
+        error: &str,
+    ) -> OperatorRemoteActionFailRequest {
+        OperatorRemoteActionFailRequest {
+            origin_node_id: origin_node_id.to_string(),
+            request_id: request_id.to_string(),
+            claim_token: claim_token.to_string(),
+            error: error.to_string(),
         }
     }
 
@@ -2472,6 +3268,239 @@ mod tests {
             .notification_candidates(&open_notification_request(origin))
             .expect("candidates");
         assert!(candidates.candidates.is_empty());
+    }
+
+    #[test]
+    fn non_actionable_items_do_not_create_remote_action_requests() {
+        let dir = tempdir().expect("tempdir");
+        let store = InboxMirrorStore::open(dir.path().join("server.db")).expect("store");
+        let origin = "origin-a";
+        let passive = OperatorInboxItem {
+            available_actions: Vec::new(),
+            status: OperatorInboxItemStatus::Resolved,
+            ..item("proposal-1", 1, "one", ts(1))
+        };
+        store
+            .apply_batch(
+                origin,
+                OperatorInboxCheckpoint::default(),
+                &[change(1, OperatorInboxChangeKind::Upsert, passive)],
+            )
+            .expect("apply");
+        let error = store
+            .create_remote_action_request(&remote_action_create_request(
+                origin,
+                "proposal-1",
+                OperatorInboxActionKind::Approve,
+            ))
+            .expect_err("create should fail");
+        let error = error.to_string();
+        assert!(
+            error.contains("not actionable") || error.contains("no actionable notification window")
+        );
+    }
+
+    #[test]
+    fn remote_action_request_creation_is_idempotent_for_the_same_window() {
+        let dir = tempdir().expect("tempdir");
+        let store = InboxMirrorStore::open(dir.path().join("server.db")).expect("store");
+        let origin = "origin-a";
+        store
+            .apply_batch(
+                origin,
+                OperatorInboxCheckpoint::default(),
+                &[change(
+                    1,
+                    OperatorInboxChangeKind::Upsert,
+                    item("proposal-1", 1, "one", ts(1)),
+                )],
+            )
+            .expect("apply");
+
+        let first = store
+            .create_remote_action_request(&remote_action_create_request(
+                origin,
+                "proposal-1",
+                OperatorInboxActionKind::Approve,
+            ))
+            .expect("create");
+        let second = store
+            .create_remote_action_request(&remote_action_create_request(
+                origin,
+                "proposal-1",
+                OperatorInboxActionKind::Approve,
+            ))
+            .expect("create duplicate");
+
+        assert_eq!(first.request.request_id, second.request.request_id);
+        assert_eq!(first.request.status, OperatorRemoteActionRequestStatus::Pending);
+        assert_eq!(store.list_remote_action_requests(&remote_action_list_request(origin)).expect("list").requests.len(), 1);
+    }
+
+    #[test]
+    fn remote_action_claim_complete_survives_restart() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("server.db");
+        let origin = "origin-a";
+        let store = InboxMirrorStore::open(&path).expect("store");
+        store
+            .apply_batch(
+                origin,
+                OperatorInboxCheckpoint::default(),
+                &[change(
+                    1,
+                    OperatorInboxChangeKind::Upsert,
+                    item("proposal-1", 1, "one", ts(1)),
+                )],
+            )
+            .expect("apply");
+        let created = store
+            .create_remote_action_request(&remote_action_create_request(
+                origin,
+                "proposal-1",
+                OperatorInboxActionKind::Approve,
+            ))
+            .expect("create");
+        let claimed = store
+            .claim_remote_action_requests(&remote_action_claim_request(origin, "worker-1"))
+            .expect("claim");
+        assert_eq!(claimed.requests.len(), 1);
+        let claim = &claimed.requests[0];
+        assert_eq!(claim.request.request_id, created.request.request_id);
+        assert_eq!(claim.request.status, OperatorRemoteActionRequestStatus::Claimed);
+
+        store
+            .complete_remote_action_request(&remote_action_complete_request(
+                origin,
+                claim.request.request_id.as_str(),
+                claim.claim_token.as_str(),
+            ))
+            .expect("complete");
+        drop(store);
+
+        let reopened = InboxMirrorStore::open(&path).expect("reopen");
+        let request = reopened
+            .get_remote_action_request(&remote_action_get_request(
+                origin,
+                created.request.request_id.as_str(),
+            ))
+            .expect("get")
+            .request
+            .expect("request");
+        assert_eq!(request.status, OperatorRemoteActionRequestStatus::Completed);
+        assert_eq!(request.result, Some(json!({"status": "ok"})));
+    }
+
+    #[test]
+    fn obsolete_candidates_mark_pending_remote_action_requests_stale() {
+        let dir = tempdir().expect("tempdir");
+        let store = InboxMirrorStore::open(dir.path().join("server.db")).expect("store");
+        let origin = "origin-a";
+        store
+            .apply_batch(
+                origin,
+                OperatorInboxCheckpoint::default(),
+                &[change(
+                    1,
+                    OperatorInboxChangeKind::Upsert,
+                    item("proposal-1", 1, "one", ts(1)),
+                )],
+            )
+            .expect("apply open");
+        let created = store
+            .create_remote_action_request(&remote_action_create_request(
+                origin,
+                "proposal-1",
+                OperatorInboxActionKind::Approve,
+            ))
+            .expect("create");
+        store
+            .apply_batch(
+                origin,
+                store.checkpoint(origin).expect("checkpoint"),
+                &[change(
+                    2,
+                    OperatorInboxChangeKind::Upsert,
+                    resolved_item("proposal-1", 2, "one", ts(2)),
+                )],
+            )
+            .expect("close");
+
+        let request = store
+            .get_remote_action_request(&remote_action_get_request(
+                origin,
+                created.request.request_id.as_str(),
+            ))
+            .expect("get")
+            .request
+            .expect("request");
+        assert_eq!(request.status, OperatorRemoteActionRequestStatus::Stale);
+        assert!(store
+            .claim_remote_action_requests(&remote_action_claim_request(origin, "worker-1"))
+            .expect("claim")
+            .requests
+            .is_empty());
+    }
+
+    #[test]
+    fn reopened_items_create_new_remote_action_windows() {
+        let dir = tempdir().expect("tempdir");
+        let store = InboxMirrorStore::open(dir.path().join("server.db")).expect("store");
+        let origin = "origin-a";
+        store
+            .apply_batch(
+                origin,
+                OperatorInboxCheckpoint::default(),
+                &[change(
+                    1,
+                    OperatorInboxChangeKind::Upsert,
+                    item("proposal-1", 1, "one", ts(1)),
+                )],
+            )
+            .expect("apply open");
+        let first = store
+            .create_remote_action_request(&remote_action_create_request(
+                origin,
+                "proposal-1",
+                OperatorInboxActionKind::Approve,
+            ))
+            .expect("create first");
+        store
+            .apply_batch(
+                origin,
+                store.checkpoint(origin).expect("checkpoint"),
+                &[change(
+                    2,
+                    OperatorInboxChangeKind::Upsert,
+                    resolved_item("proposal-1", 2, "one", ts(2)),
+                )],
+            )
+            .expect("close");
+        store
+            .apply_batch(
+                origin,
+                store.checkpoint(origin).expect("checkpoint reopen"),
+                &[change(
+                    3,
+                    OperatorInboxChangeKind::Upsert,
+                    item("proposal-1", 3, "reopened", ts(3)),
+                )],
+            )
+            .expect("reopen");
+        let second = store
+            .create_remote_action_request(&remote_action_create_request(
+                origin,
+                "proposal-1",
+                OperatorInboxActionKind::Approve,
+            ))
+            .expect("create second");
+
+        assert_ne!(first.request.request_id, second.request.request_id);
+        let requests = store
+            .list_remote_action_requests(&remote_action_list_request(origin))
+            .expect("list")
+            .requests;
+        assert_eq!(requests.len(), 2);
     }
 
     #[test]

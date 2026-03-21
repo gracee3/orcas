@@ -85,6 +85,7 @@ use crate::operator_inbox::{
     update_operator_inbox_ack_checkpoint, update_operator_inbox_export_checkpoint,
     wait_for_operator_inbox_checkpoint,
 };
+use crate::remote_action::RemoteActionHttpClient;
 use crate::planning_session::{
     build_planning_revision_proposal, build_research_work_unit,
     planning_session_status_is_terminal, planning_session_thread_prompt,
@@ -122,6 +123,12 @@ enum MirrorLoopProgress {
         applied_changes: usize,
         checkpoint: ipc::OperatorInboxCheckpoint,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteActionLoopProgress {
+    Idle,
+    Claimed { count: usize },
 }
 
 #[derive(Debug, Default)]
@@ -343,6 +350,7 @@ impl OrcasDaemonService {
 
         info!(socket = %self.paths.socket_file.display(), "orcasd listening");
         self.clone().spawn_operator_inbox_mirror_loop();
+        self.clone().spawn_remote_action_loop();
 
         loop {
             tokio::select! {
@@ -704,6 +712,19 @@ impl OrcasDaemonService {
         });
     }
 
+    fn spawn_remote_action_loop(self: Arc<Self>) {
+        let Some(server_url) = self.config.inbox_mirror.server_url.clone() else {
+            return;
+        };
+        let service = Arc::clone(&self);
+        tokio::spawn(async move {
+            let client = RemoteActionHttpClient::new(server_url);
+            if let Err(error) = service.run_remote_action_loop(client).await {
+                warn!(%error, "remote action loop stopped");
+            }
+        });
+    }
+
     async fn run_operator_inbox_mirror_loop(
         self: Arc<Self>,
         client: OperatorInboxMirrorHttpClient,
@@ -742,6 +763,250 @@ impl OrcasDaemonService {
             }
         }
         Ok(())
+    }
+
+    async fn run_remote_action_loop(
+        self: Arc<Self>,
+        client: RemoteActionHttpClient,
+    ) -> OrcasResult<()> {
+        let origin_node_id = self.authority_store.origin_node_id()?.to_string();
+        let worker_id = format!("orcasd::{origin_node_id}");
+        loop {
+            tokio::select! {
+                _ = self.shutdown.notified() => break,
+                result = self.remote_action_once(&client, &origin_node_id, &worker_id) => {
+                    match result {
+                        Ok(RemoteActionLoopProgress::Claimed { count }) => {
+                            debug!(count, "remote action batch claimed");
+                            continue;
+                        }
+                        Ok(RemoteActionLoopProgress::Idle) => {
+                            tokio::select! {
+                                _ = sleep(Duration::from_secs(5)) => {}
+                                _ = self.shutdown.notified() => break,
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, "remote action loop iteration failed");
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn remote_action_once(
+        &self,
+        client: &RemoteActionHttpClient,
+        origin_node_id: &str,
+        worker_id: &str,
+    ) -> OrcasResult<RemoteActionLoopProgress> {
+        let claim = client
+            .claim(&ipc::OperatorRemoteActionClaimRequest {
+                origin_node_id: origin_node_id.to_string(),
+                worker_id: worker_id.to_string(),
+                limit: Some(8),
+                lease_ms: Some(120_000),
+            })
+            .await?;
+        if claim.requests.is_empty() {
+            return Ok(RemoteActionLoopProgress::Idle);
+        }
+
+        for claimed in &claim.requests {
+            let result = self.execute_remote_action_request(&claimed.request).await;
+            match result {
+                Ok(result) => {
+                    client
+                        .complete(&ipc::OperatorRemoteActionCompleteRequest {
+                            origin_node_id: origin_node_id.to_string(),
+                            request_id: claimed.request.request_id.clone(),
+                            claim_token: claimed.claim_token.clone(),
+                            result,
+                        })
+                        .await?;
+                }
+                Err(error) => {
+                    client
+                        .fail(&ipc::OperatorRemoteActionFailRequest {
+                            origin_node_id: origin_node_id.to_string(),
+                            request_id: claimed.request.request_id.clone(),
+                            claim_token: claimed.claim_token.clone(),
+                            error: error.to_string(),
+                        })
+                        .await?;
+                }
+            }
+        }
+
+        Ok(RemoteActionLoopProgress::Claimed {
+            count: claim.requests.len(),
+        })
+    }
+
+    async fn execute_remote_action_request(
+        &self,
+        request: &ipc::OperatorRemoteActionRequest,
+    ) -> OrcasResult<Value> {
+        let item = {
+            let state = self.state.read().await;
+            get_operator_inbox_item(&state.operator_inbox, request.item_id.as_str()).ok_or_else(
+                || {
+                    OrcasError::Protocol(format!(
+                        "unknown operator inbox item `{}` for remote action request `{}`",
+                        request.item_id, request.request_id
+                    ))
+                },
+            )?
+        };
+        let route = resolve_operator_inbox_action_route(&item, request.action_kind)
+            .map_err(OrcasError::Protocol)?;
+        match route {
+            ipc::OperatorInboxActionRoute::Proposal { proposal_id, method, .. }
+            | ipc::OperatorInboxActionRoute::PlanRevisionProposal {
+                proposal_id,
+                method,
+                ..
+            } => match method.as_str() {
+                ipc::methods::PROPOSAL_APPROVE => Ok(serde_json::to_value(
+                    self.proposal_approve(ipc::ProposalApproveRequest {
+                        proposal_id,
+                        reviewed_by: request.requested_by.clone(),
+                        review_note: request.request_note.clone(),
+                        edits: Default::default(),
+                    })
+                    .await?,
+                )?),
+                ipc::methods::PROPOSAL_REJECT => Ok(serde_json::to_value(
+                    self.proposal_reject(ipc::ProposalRejectRequest {
+                        proposal_id,
+                        reviewed_by: request.requested_by.clone(),
+                        review_note: request.request_note.clone(),
+                    })
+                    .await?,
+                )?),
+                ipc::methods::PROPOSAL_RECONCILE => Ok(serde_json::to_value(
+                    self.proposal_reconcile(ipc::ProposalReconcileRequest {
+                        proposal_id,
+                        reviewed_by: request.requested_by.clone(),
+                        review_note: request.request_note.clone(),
+                    })
+                    .await?,
+                )?),
+                other => Err(OrcasError::Protocol(format!(
+                    "proposal remote action method `{other}` is not supported"
+                ))),
+            },
+            ipc::OperatorInboxActionRoute::SupervisorDecision {
+                decision_id,
+                method,
+                ..
+            } => match method.as_str() {
+                ipc::methods::SUPERVISOR_DECISION_APPROVE_AND_SEND => Ok(serde_json::to_value(
+                    self.supervisor_decision_approve_and_send(
+                        ipc::SupervisorDecisionApproveAndSendRequest {
+                            decision_id,
+                            reviewed_by: request.requested_by.clone(),
+                            review_note: request.request_note.clone(),
+                        },
+                    )
+                    .await?,
+                )?),
+                ipc::methods::SUPERVISOR_DECISION_REJECT => Ok(serde_json::to_value(
+                    self.supervisor_decision_reject(ipc::SupervisorDecisionRejectRequest {
+                        decision_id,
+                        reviewed_by: request.requested_by.clone(),
+                        review_note: request.request_note.clone(),
+                    })
+                    .await?,
+                )?),
+                ipc::methods::SUPERVISOR_DECISION_RECORD_NO_ACTION => Ok(serde_json::to_value(
+                    self.supervisor_decision_record_no_action(
+                        ipc::SupervisorDecisionRecordNoActionRequest {
+                            decision_id,
+                            reviewed_by: request.requested_by.clone(),
+                            review_note: request.request_note.clone(),
+                        },
+                    )
+                    .await?,
+                )?),
+                ipc::methods::SUPERVISOR_DECISION_MANUAL_REFRESH => Ok(serde_json::to_value(
+                    {
+                        let assignment_id = {
+                            let state = self.state.read().await;
+                            state
+                                .collaboration
+                                .supervisor_turn_decisions
+                                .get(&decision_id)
+                                .map(|decision| decision.assignment_id.clone())
+                                .ok_or_else(|| {
+                                    OrcasError::Protocol(format!(
+                                        "unknown supervisor decision `{decision_id}` for remote action request `{}`",
+                                        request.request_id
+                                    ))
+                                })?
+                        };
+                        self.supervisor_decision_manual_refresh(
+                            ipc::SupervisorDecisionManualRefreshRequest {
+                                assignment_id,
+                                requested_by: request.requested_by.clone(),
+                                rationale_note: request.request_note.clone(),
+                            },
+                        )
+                        .await?
+                    },
+                )?),
+                other => Err(OrcasError::Protocol(format!(
+                    "supervisor decision remote action method `{other}` is not supported"
+                ))),
+            },
+            ipc::OperatorInboxActionRoute::PlanningSession {
+                session_id,
+                method,
+                ..
+            } => match method.as_str() {
+                ipc::methods::PLANNING_SESSION_APPROVE => Ok(serde_json::to_value(
+                    self.planning_session_approve(ipc::PlanningSessionApproveRequest {
+                        session_id,
+                        approved_by: request.requested_by.clone(),
+                        review_note: request.request_note.clone(),
+                    })
+                    .await?,
+                )?),
+                ipc::methods::PLANNING_SESSION_REJECT => Ok(serde_json::to_value(
+                    self.planning_session_reject(ipc::PlanningSessionRejectRequest {
+                        session_id,
+                        rejected_by: request.requested_by.clone(),
+                        review_note: request.request_note.clone(),
+                    })
+                    .await?,
+                )?),
+                ipc::methods::PLANNING_SESSION_SUPERSEDE => Ok(serde_json::to_value(
+                    self.planning_session_supersede(ipc::PlanningSessionSupersedeRequest {
+                        session_id,
+                        superseded_by_session_id: None,
+                        updated_by: request.requested_by.clone(),
+                        note: request.request_note.clone(),
+                    })
+                    .await?,
+                )?),
+                ipc::methods::PLANNING_SESSION_MARK_READY_FOR_REVIEW => Ok(serde_json::to_value(
+                    self.planning_session_mark_ready_for_review(
+                        ipc::PlanningSessionMarkReadyForReviewRequest {
+                            session_id,
+                            updated_by: request.requested_by.clone(),
+                            note: request.request_note.clone(),
+                        },
+                    )
+                    .await?,
+                )?),
+                other => Err(OrcasError::Protocol(format!(
+                    "planning session remote action method `{other}` is not supported"
+                ))),
+            },
+        }
     }
 
     async fn mirror_operator_inbox_once(
@@ -15003,6 +15268,7 @@ mod tests {
     use crate::assignment_comm::render::{build_assignment_communication_record, render_prompt};
     use crate::authority_store::AuthoritySqliteStore;
     use crate::inbox_mirror::OperatorInboxMirrorHttpClient;
+    use crate::remote_action::RemoteActionHttpClient;
     use crate::supervisor::{
         SupervisorReasoner, SupervisorReasonerFailure, SupervisorReasonerResult,
         render_supervisor_prompt, render_supervisor_response_artifact,
@@ -27257,6 +27523,308 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             other => panic!("expected post-restart wait, got {other:?}"),
         }
 
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_action_request_executes_through_local_source_domain_apis() {
+        let base = std::env::temp_dir().join(format!("orcas-remote-action-{}", Uuid::new_v4()));
+        let (server_url, server_db_path, server_handle) = start_inbox_mirror_server().await;
+        let service = inbox_mirror_test_service(base.clone(), Some(server_url.clone())).await;
+        let origin_node_id = service
+            .authority_store
+            .origin_node_id()
+            .expect("origin node id")
+            .to_string();
+        let authority_peer_id = format!("orcas-server::{origin_node_id}");
+        let client = OperatorInboxMirrorHttpClient::new(server_url.clone());
+        let remote_client = RemoteActionHttpClient::new(server_url.clone());
+
+        let authority_before = service
+            .authority_store
+            .load_replication_checkpoint(&authority_peer_id)
+            .await
+            .expect("authority checkpoint before");
+
+        let (_workstream_id, session_id) = seed_open_planning_session_fixture(&service).await;
+        let bootstrap = service
+            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
+            .await
+            .expect("bootstrap mirror");
+        match bootstrap {
+            super::MirrorLoopProgress::Mirrored { .. } => {}
+            other => panic!("expected mirrored bootstrap, got {other:?}"),
+        }
+
+        let local_items = service
+            .operator_inbox_list(ipc::OperatorInboxListRequest {
+                source_kind: Some(orcas_core::ipc::OperatorInboxSourceKind::PlanningSession),
+                actionable_only: true,
+                ..Default::default()
+            })
+            .await
+            .expect("operator inbox list")
+            .items;
+        let item = local_items
+            .into_iter()
+            .find(|item| item.actionable_object_id == session_id)
+            .expect("planning session inbox item");
+
+        let created = remote_client
+            .create(&orcas_core::ipc::OperatorRemoteActionCreateRequest {
+                origin_node_id: origin_node_id.clone(),
+                item_id: item.id.clone(),
+                action_kind: orcas_core::ipc::OperatorInboxActionKind::Approve,
+                requested_by: Some("remote-client".to_string()),
+                request_note: Some("approve session".to_string()),
+            })
+            .await
+            .expect("create remote action request");
+        assert_eq!(created.request.status, orcas_core::ipc::OperatorRemoteActionRequestStatus::Pending);
+
+        let worker_progress = service
+            .remote_action_once(&remote_client, &origin_node_id, "remote-worker")
+            .await
+            .expect("remote action worker");
+        match worker_progress {
+            super::RemoteActionLoopProgress::Claimed { .. } => {}
+            other => panic!("expected claimed progress, got {other:?}"),
+        }
+
+        let completed = remote_client
+            .get(&orcas_core::ipc::OperatorRemoteActionGetRequest {
+                origin_node_id: origin_node_id.clone(),
+                request_id: created.request.request_id.clone(),
+            })
+            .await
+            .expect("get remote action request")
+            .request
+            .expect("request present");
+        assert_eq!(
+            completed.status,
+            orcas_core::ipc::OperatorRemoteActionRequestStatus::Completed
+        );
+
+        let incremental = service
+            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
+            .await
+            .expect("mirror after remote action");
+        match incremental {
+            super::MirrorLoopProgress::Mirrored { .. } => {}
+            other => panic!("expected mirrored incremental update, got {other:?}"),
+        }
+
+        let server_list = client.list(&origin_node_id).await.expect("server list");
+        assert!(server_list
+            .items
+            .iter()
+            .any(|item| item.id == created.request.item_id && item.status == ipc::OperatorInboxItemStatus::Resolved));
+
+        let authority_after = service
+            .authority_store
+            .load_replication_checkpoint(&authority_peer_id)
+            .await
+            .expect("authority checkpoint after");
+        assert_eq!(authority_before, authority_after);
+
+        std::fs::remove_file(server_db_path).ok();
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_action_request_executes_proposal_approval_through_local_source_domain_apis() {
+        let (server_url, server_db_path, server_handle) = start_inbox_mirror_server().await;
+        let reasoner = Arc::new(StaticSupervisorReasoner::default());
+        let service = test_service_with_reasoner_and_config(reasoner.clone(), {
+            let mut config = AppConfig::default();
+            config.inbox_mirror.server_url = Some(server_url.clone());
+            config
+        })
+        .await;
+        let origin_node_id = service
+            .authority_store
+            .origin_node_id()
+            .expect("origin node id")
+            .to_string();
+        let authority_peer_id = format!("orcas-server::{origin_node_id}");
+        let client = OperatorInboxMirrorHttpClient::new(server_url.clone());
+        let remote_client = RemoteActionHttpClient::new(server_url.clone());
+
+        let (_workstream, work_unit, assignment, report) =
+            seed_awaiting_decision_fixture(&service, "remote-proposal").await;
+        let proposal = create_default_proposal(&service, &reasoner, &work_unit, &assignment, &report)
+            .await
+            .proposal;
+
+        let _ = service
+            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
+            .await
+            .expect("bootstrap mirror");
+        let item = service
+            .operator_inbox_list(ipc::OperatorInboxListRequest {
+                source_kind: Some(orcas_core::ipc::OperatorInboxSourceKind::SupervisorProposal),
+                actionable_only: true,
+                ..Default::default()
+            })
+            .await
+            .expect("operator inbox list")
+            .items
+            .into_iter()
+            .find(|item| item.actionable_object_id == proposal.id)
+            .expect("proposal inbox item");
+
+        let created = remote_client
+            .create(&orcas_core::ipc::OperatorRemoteActionCreateRequest {
+                origin_node_id: origin_node_id.clone(),
+                item_id: item.id.clone(),
+                action_kind: orcas_core::ipc::OperatorInboxActionKind::Approve,
+                requested_by: Some("remote-client".to_string()),
+                request_note: Some("approve proposal".to_string()),
+            })
+            .await
+            .expect("create proposal action");
+
+        let worker_progress = service
+            .remote_action_once(&remote_client, &origin_node_id, "remote-worker")
+            .await
+            .expect("remote action worker");
+        match worker_progress {
+            super::RemoteActionLoopProgress::Claimed { .. } => {}
+            other => panic!("expected claimed progress, got {other:?}"),
+        }
+
+        let completed = remote_client
+            .get(&orcas_core::ipc::OperatorRemoteActionGetRequest {
+                origin_node_id: origin_node_id.clone(),
+                request_id: created.request.request_id.clone(),
+            })
+            .await
+            .expect("get remote action request")
+            .request
+            .expect("request present");
+        assert_eq!(
+            completed.status,
+            orcas_core::ipc::OperatorRemoteActionRequestStatus::Completed
+        );
+
+        let _ = service
+            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
+            .await
+            .expect("mirror after remote action");
+        let server_list = client.list(&origin_node_id).await.expect("server list");
+        assert!(server_list.items.iter().any(|item| {
+            item.id == created.request.item_id
+                && item.status == ipc::OperatorInboxItemStatus::Resolved
+        }));
+
+        std::fs::remove_file(server_db_path).ok();
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_action_request_executes_supervisor_decision_through_local_source_domain_apis()
+    {
+        let base = std::env::temp_dir().join(format!("orcas-remote-decision-{}", Uuid::new_v4()));
+        let (server_url, server_db_path, server_handle) = start_inbox_mirror_server().await;
+        let service = inbox_mirror_test_service(base.clone(), Some(server_url.clone())).await;
+        let origin_node_id = service
+            .authority_store
+            .origin_node_id()
+            .expect("origin node id")
+            .to_string();
+        let authority_peer_id = format!("orcas-server::{origin_node_id}");
+        let client = OperatorInboxMirrorHttpClient::new(server_url.clone());
+        let remote_client = RemoteActionHttpClient::new(server_url.clone());
+
+        let thread = sample_active_thread("remote-decision-thread", "live_observed", 200, "turn-live");
+        let (workstream, work_unit) =
+            seed_codex_thread_assignment_fixture(&service, thread.clone()).await;
+        let assignment = service
+            .codex_assignment_create(ipc::CodexAssignmentCreateRequest {
+                codex_thread_id: thread.summary.id.clone(),
+                workstream_id: workstream.id,
+                work_unit_id: work_unit.id,
+                supervisor_id: "supervisor-a".to_string(),
+                assigned_by: "tester".to_string(),
+                send_policy: None,
+                notes: None,
+            })
+            .await
+            .expect("assignment create")
+            .assignment;
+        let decision = service
+            .supervisor_decision_propose_steer(ipc::SupervisorDecisionProposeSteerRequest {
+                assignment_id: assignment.assignment_id.clone(),
+                requested_by: Some("remote-client".to_string()),
+                proposed_text: Some("steer toward a remote action test".to_string()),
+                rationale_note: Some("remote action test".to_string()),
+            })
+            .await
+            .expect("propose steer")
+            .decision;
+
+        let _ = service
+            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
+            .await
+            .expect("bootstrap mirror");
+        let item = service
+            .operator_inbox_list(ipc::OperatorInboxListRequest {
+                source_kind: Some(orcas_core::ipc::OperatorInboxSourceKind::SupervisorDecision),
+                actionable_only: true,
+                ..Default::default()
+            })
+            .await
+            .expect("operator inbox list")
+            .items
+            .into_iter()
+            .find(|item| item.actionable_object_id == decision.decision_id)
+            .expect("decision inbox item");
+
+        let created = remote_client
+            .create(&orcas_core::ipc::OperatorRemoteActionCreateRequest {
+                origin_node_id: origin_node_id.clone(),
+                item_id: item.id.clone(),
+                action_kind: orcas_core::ipc::OperatorInboxActionKind::Reject,
+                requested_by: Some("remote-client".to_string()),
+                request_note: Some("reject decision".to_string()),
+            })
+            .await
+            .expect("create decision action");
+
+        let worker_progress = service
+            .remote_action_once(&remote_client, &origin_node_id, "remote-worker")
+            .await
+            .expect("remote action worker");
+        match worker_progress {
+            super::RemoteActionLoopProgress::Claimed { .. } => {}
+            other => panic!("expected claimed progress, got {other:?}"),
+        }
+
+        let completed = remote_client
+            .get(&orcas_core::ipc::OperatorRemoteActionGetRequest {
+                origin_node_id: origin_node_id.clone(),
+                request_id: created.request.request_id.clone(),
+            })
+            .await
+            .expect("get remote action request")
+            .request
+            .expect("request present");
+        assert_eq!(
+            completed.status,
+            orcas_core::ipc::OperatorRemoteActionRequestStatus::Completed
+        );
+
+        let _ = service
+            .mirror_operator_inbox_once(&client, &origin_node_id, &authority_peer_id)
+            .await
+            .expect("mirror after remote action");
+        let server_list = client.list(&origin_node_id).await.expect("server list");
+        assert!(server_list.items.iter().any(|item| {
+            item.id == created.request.item_id
+                && item.status == ipc::OperatorInboxItemStatus::Resolved
+        }));
+
+        std::fs::remove_file(server_db_path).ok();
         server_handle.abort();
     }
 }
