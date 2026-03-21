@@ -1488,7 +1488,11 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn tracked_thread_prepare_workspace(&self, tracked_thread_id: &str) -> Result<()> {
+    pub async fn tracked_thread_prepare_workspace(
+        &self,
+        tracked_thread_id: &str,
+        request_note: Option<String>,
+    ) -> Result<()> {
         let client = self.daemon_state_client().await?;
         let tracked_thread = client
             .authority_tracked_thread_get(&ipc::AuthorityTrackedThreadGetRequest {
@@ -1507,7 +1511,7 @@ impl SupervisorService {
                 &ipc::AuthorityTrackedThreadPrepareWorkspaceRequest {
                     tracked_thread_id: tracked_thread.id.clone(),
                     requested_by: Some(SUPERVISOR_CLI_OPERATOR.to_string()),
-                    request_note: None,
+                    request_note,
                     model: tracked_thread.preferred_model.clone(),
                     cwd: Some(workspace.repository_root.clone()),
                 },
@@ -1547,7 +1551,11 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn tracked_thread_refresh_workspace(&self, tracked_thread_id: &str) -> Result<()> {
+    pub async fn tracked_thread_refresh_workspace(
+        &self,
+        tracked_thread_id: &str,
+        request_note: Option<String>,
+    ) -> Result<()> {
         let client = self.daemon_state_client().await?;
         let tracked_thread = client
             .authority_tracked_thread_get(&ipc::AuthorityTrackedThreadGetRequest {
@@ -1566,7 +1574,7 @@ impl SupervisorService {
                 &ipc::AuthorityTrackedThreadRefreshWorkspaceRequest {
                     tracked_thread_id: tracked_thread.id.clone(),
                     requested_by: Some(SUPERVISOR_CLI_OPERATOR.to_string()),
-                    request_note: None,
+                    request_note,
                     model: tracked_thread.preferred_model.clone(),
                     cwd: Some(workspace.repository_root.clone()),
                 },
@@ -1606,7 +1614,11 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn tracked_thread_prune_workspace(&self, tracked_thread_id: &str) -> Result<()> {
+    pub async fn tracked_thread_prune_workspace(
+        &self,
+        tracked_thread_id: &str,
+        request_note: Option<String>,
+    ) -> Result<()> {
         let client = self.daemon_state_client().await?;
         let tracked_thread = client
             .authority_tracked_thread_get(&ipc::AuthorityTrackedThreadGetRequest {
@@ -1625,7 +1637,7 @@ impl SupervisorService {
                 &ipc::AuthorityTrackedThreadPruneWorkspaceRequest {
                     tracked_thread_id: tracked_thread.id.clone(),
                     requested_by: Some(SUPERVISOR_CLI_OPERATOR.to_string()),
-                    request_note: None,
+                    request_note,
                     model: tracked_thread.preferred_model.clone(),
                     cwd: Some(workspace.repository_root.clone()),
                 },
@@ -1970,7 +1982,11 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn tracked_thread_merge_prep(&self, tracked_thread_id: &str) -> Result<()> {
+    pub async fn tracked_thread_merge_prep(
+        &self,
+        tracked_thread_id: &str,
+        request_note: Option<String>,
+    ) -> Result<()> {
         let client = self.daemon_state_client().await?;
         let tracked_thread = client
             .authority_tracked_thread_get(&ipc::AuthorityTrackedThreadGetRequest {
@@ -1988,7 +2004,7 @@ impl SupervisorService {
             .authority_tracked_thread_merge_prep(&ipc::AuthorityTrackedThreadMergePrepRequest {
                 tracked_thread_id: tracked_thread.id.clone(),
                 requested_by: Some(SUPERVISOR_CLI_OPERATOR.to_string()),
-                request_note: None,
+                request_note,
                 model: tracked_thread.preferred_model.clone(),
                 cwd: Some(workspace.repository_root.clone()),
             })
@@ -2030,7 +2046,11 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn tracked_thread_authorize_merge(&self, tracked_thread_id: &str) -> Result<()> {
+    pub async fn tracked_thread_authorize_merge(
+        &self,
+        tracked_thread_id: &str,
+        request_note: Option<String>,
+    ) -> Result<()> {
         let client = self.daemon_state_client().await?;
         let tracked_thread = client
             .authority_tracked_thread_get(&ipc::AuthorityTrackedThreadGetRequest {
@@ -2045,7 +2065,7 @@ impl SupervisorService {
                 &ipc::AuthorityTrackedThreadAuthorizeMergeRequest {
                     tracked_thread_id: tracked_thread.id.clone(),
                     authorized_by: Some(SUPERVISOR_CLI_OPERATOR.to_string()),
-                    request_note: None,
+                    request_note,
                 },
             )
             .await?;
@@ -2076,7 +2096,11 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn tracked_thread_execute_landing(&self, tracked_thread_id: &str) -> Result<()> {
+    pub async fn tracked_thread_execute_landing(
+        &self,
+        tracked_thread_id: &str,
+        request_note: Option<String>,
+    ) -> Result<()> {
         let client = self.daemon_state_client().await?;
         let tracked_thread = client
             .authority_tracked_thread_get(&ipc::AuthorityTrackedThreadGetRequest {
@@ -2091,7 +2115,7 @@ impl SupervisorService {
                 &ipc::AuthorityTrackedThreadExecuteLandingRequest {
                     tracked_thread_id: tracked_thread.id.clone(),
                     authorized_by: Some(SUPERVISOR_CLI_OPERATOR.to_string()),
-                    request_note: None,
+                    request_note,
                     model: tracked_thread.preferred_model.clone(),
                     cwd: tracked_thread
                         .workspace

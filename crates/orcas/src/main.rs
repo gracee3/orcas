@@ -368,6 +368,8 @@ struct TrackedThreadListArgs {
 struct TrackedThreadRefArgs {
     #[arg(long = "tracked-thread")]
     tracked_thread: String,
+    #[arg(long)]
+    request_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1434,32 +1436,32 @@ async fn main() -> Result<()> {
                 }
                 TrackedThreadsCommand::PrepareWorkspace(args) => {
                     service
-                        .tracked_thread_prepare_workspace(&args.tracked_thread)
+                        .tracked_thread_prepare_workspace(&args.tracked_thread, args.request_note)
                         .await?;
                 }
                 TrackedThreadsCommand::RefreshWorkspace(args) => {
                     service
-                        .tracked_thread_refresh_workspace(&args.tracked_thread)
+                        .tracked_thread_refresh_workspace(&args.tracked_thread, args.request_note)
                         .await?;
                 }
                 TrackedThreadsCommand::MergePrep(args) => {
                     service
-                        .tracked_thread_merge_prep(&args.tracked_thread)
+                        .tracked_thread_merge_prep(&args.tracked_thread, args.request_note)
                         .await?;
                 }
                 TrackedThreadsCommand::AuthorizeMerge(args) => {
                     service
-                        .tracked_thread_authorize_merge(&args.tracked_thread)
+                        .tracked_thread_authorize_merge(&args.tracked_thread, args.request_note)
                         .await?;
                 }
                 TrackedThreadsCommand::ExecuteLanding(args) => {
                     service
-                        .tracked_thread_execute_landing(&args.tracked_thread)
+                        .tracked_thread_execute_landing(&args.tracked_thread, args.request_note)
                         .await?;
                 }
                 TrackedThreadsCommand::PruneWorkspace(args) => {
                     service
-                        .tracked_thread_prune_workspace(&args.tracked_thread)
+                        .tracked_thread_prune_workspace(&args.tracked_thread, args.request_note)
                         .await?;
                 }
             }
