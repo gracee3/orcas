@@ -1,4 +1,5 @@
 mod service;
+mod remote;
 mod streaming;
 
 use std::path::PathBuf;
@@ -11,6 +12,7 @@ use orcas_core::{
 };
 use tracing::info;
 
+use remote::{RemoteCommand, run_remote};
 use service::{RuntimeOverrides, SupervisorService};
 
 #[derive(Debug, Parser)]
@@ -24,6 +26,20 @@ struct Cli {
 
 #[derive(Debug, Clone, Args, Default)]
 struct GlobalOptions {
+    #[arg(
+        long,
+        global = true,
+        env = "ORCAS_SERVER_URL",
+        help = "Base URL for the operator server"
+    )]
+    server_url: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        env = "ORCAS_OPERATOR_API_TOKEN",
+        help = "Bearer token for operator-server APIs"
+    )]
+    operator_api_token: Option<String>,
     #[arg(
         long,
         global = true,
@@ -76,6 +92,10 @@ enum TopCommand {
     },
     Tui,
     Doctor,
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
     Models {
         #[command(subcommand)]
         command: ModelsCommand,
@@ -1174,17 +1194,23 @@ async fn main() -> Result<()> {
     info!("starting orcas process");
 
     let cli = Cli::parse();
+    let global = cli.global.clone();
     let overrides = RuntimeOverrides {
-        codex_bin: cli.global.codex_bin,
-        listen_url: cli.global.listen_url,
-        inbox_mirror_server_url: cli.global.inbox_mirror_server_url,
-        cwd: cli.global.cwd,
-        model: cli.global.model,
-        connect_only: cli.global.connect_only,
-        force_spawn: cli.global.force_spawn,
+        // Server-facing remote client commands use the dedicated `remote`
+        // subtree and do not depend on the local daemon surface.
+        codex_bin: global.codex_bin.clone(),
+        listen_url: global.listen_url.clone(),
+        inbox_mirror_server_url: global.inbox_mirror_server_url.clone(),
+        cwd: global.cwd.clone(),
+        model: global.model.clone(),
+        connect_only: global.connect_only,
+        force_spawn: global.force_spawn,
     };
     match cli.command {
         TopCommand::Tui => launch_tui()?,
+        TopCommand::Remote { command } => {
+            run_remote(&global, command).await?;
+        }
         TopCommand::Daemon { command } => {
             let service = SupervisorService::load(&overrides).await?;
             match command {

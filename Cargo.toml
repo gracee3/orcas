@@ -3,6 +3,7 @@ members = [
     "crates/orcas-core",
     "crates/orcas-codex",
     "crates/orcasd",
+    "crates/orcas-server-client",
     "crates/orcas",
     "crates/orcas-server",
     "crates/orcas-tui",

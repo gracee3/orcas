@@ -1213,6 +1213,7 @@ dependencies = [
  "futures",
  "orcas-codex",
  "orcas-core",
+ "orcas-server-client",
  "orcasd",
  "serde",
  "serde_json",
@@ -1265,6 +1266,23 @@ dependencies = [
  "clap",
  "orcas-core",
  "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "orcas-server-client"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "orcas-core",
+ "orcas-server",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
