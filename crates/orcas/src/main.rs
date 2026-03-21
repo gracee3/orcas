@@ -364,6 +364,8 @@ struct TrackedThreadCreateArgs {
     upstream_thread: Option<String>,
     #[arg(long)]
     model: Option<String>,
+    #[command(flatten)]
+    workspace: TrackedThreadWorkspaceArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -382,6 +384,36 @@ struct TrackedThreadEditArgs {
     binding_state: Option<TrackedThreadBindingStateArg>,
     #[arg(long)]
     model: Option<String>,
+    #[command(flatten)]
+    workspace: TrackedThreadWorkspaceArgs,
+}
+
+#[derive(Debug, Clone, Args, Default)]
+struct TrackedThreadWorkspaceArgs {
+    #[arg(long = "workspace-repository-root")]
+    repository_root: Option<String>,
+    #[arg(long = "workspace-worktree-path")]
+    worktree_path: Option<String>,
+    #[arg(long = "workspace-branch-name")]
+    branch_name: Option<String>,
+    #[arg(long = "workspace-base-ref")]
+    base_ref: Option<String>,
+    #[arg(long = "workspace-base-commit")]
+    base_commit: Option<String>,
+    #[arg(long = "workspace-landing-target")]
+    landing_target: Option<String>,
+    #[arg(long = "workspace-strategy", value_enum)]
+    strategy: Option<TrackedThreadWorkspaceStrategyArg>,
+    #[arg(long = "workspace-landing-policy", value_enum)]
+    landing_policy: Option<TrackedThreadWorkspaceLandingPolicyArg>,
+    #[arg(long = "workspace-sync-policy", value_enum)]
+    sync_policy: Option<TrackedThreadWorkspaceSyncPolicyArg>,
+    #[arg(long = "workspace-cleanup-policy", value_enum)]
+    cleanup_policy: Option<TrackedThreadWorkspaceCleanupPolicyArg>,
+    #[arg(long = "workspace-status", value_enum)]
+    status: Option<TrackedThreadWorkspaceStatusArg>,
+    #[arg(long = "workspace-last-reported-head-commit")]
+    last_reported_head_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -641,6 +673,48 @@ enum TrackedThreadBindingStateArg {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TrackedThreadWorkspaceStrategyArg {
+    Shared,
+    DedicatedThreadWorktree,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TrackedThreadWorkspaceLandingPolicyArg {
+    MergeToMain,
+    MergeToCampaign,
+    CherryPickOnly,
+    Parked,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TrackedThreadWorkspaceSyncPolicyArg {
+    Manual,
+    RebaseBeforeCompletion,
+    RebaseBeforeEachAssignment,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TrackedThreadWorkspaceCleanupPolicyArg {
+    KeepUntilCampaignClosed,
+    PruneAfterMerge,
+    KeepForAudit,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TrackedThreadWorkspaceStatusArg {
+    Requested,
+    Ready,
+    Dirty,
+    Ahead,
+    Behind,
+    Conflicted,
+    Merged,
+    Abandoned,
+    Pruned,
+}
+
 impl From<WorkstreamStatusArg> for WorkstreamStatus {
     fn from(value: WorkstreamStatusArg) -> Self {
         match value {
@@ -675,6 +749,158 @@ impl From<TrackedThreadBindingStateArg> for authority::TrackedThreadBindingState
             }
             TrackedThreadBindingStateArg::Missing => authority::TrackedThreadBindingState::Missing,
         }
+    }
+}
+
+impl From<TrackedThreadWorkspaceStrategyArg> for authority::TrackedThreadWorkspaceStrategy {
+    fn from(value: TrackedThreadWorkspaceStrategyArg) -> Self {
+        match value {
+            TrackedThreadWorkspaceStrategyArg::Shared => Self::Shared,
+            TrackedThreadWorkspaceStrategyArg::DedicatedThreadWorktree => {
+                Self::DedicatedThreadWorktree
+            }
+            TrackedThreadWorkspaceStrategyArg::Ephemeral => Self::Ephemeral,
+        }
+    }
+}
+
+impl From<TrackedThreadWorkspaceLandingPolicyArg>
+    for authority::TrackedThreadWorkspaceLandingPolicy
+{
+    fn from(value: TrackedThreadWorkspaceLandingPolicyArg) -> Self {
+        match value {
+            TrackedThreadWorkspaceLandingPolicyArg::MergeToMain => Self::MergeToMain,
+            TrackedThreadWorkspaceLandingPolicyArg::MergeToCampaign => Self::MergeToCampaign,
+            TrackedThreadWorkspaceLandingPolicyArg::CherryPickOnly => Self::CherryPickOnly,
+            TrackedThreadWorkspaceLandingPolicyArg::Parked => Self::Parked,
+        }
+    }
+}
+
+impl From<TrackedThreadWorkspaceSyncPolicyArg> for authority::TrackedThreadWorkspaceSyncPolicy {
+    fn from(value: TrackedThreadWorkspaceSyncPolicyArg) -> Self {
+        match value {
+            TrackedThreadWorkspaceSyncPolicyArg::Manual => Self::Manual,
+            TrackedThreadWorkspaceSyncPolicyArg::RebaseBeforeCompletion => {
+                Self::RebaseBeforeCompletion
+            }
+            TrackedThreadWorkspaceSyncPolicyArg::RebaseBeforeEachAssignment => {
+                Self::RebaseBeforeEachAssignment
+            }
+        }
+    }
+}
+
+impl From<TrackedThreadWorkspaceCleanupPolicyArg>
+    for authority::TrackedThreadWorkspaceCleanupPolicy
+{
+    fn from(value: TrackedThreadWorkspaceCleanupPolicyArg) -> Self {
+        match value {
+            TrackedThreadWorkspaceCleanupPolicyArg::KeepUntilCampaignClosed => {
+                Self::KeepUntilCampaignClosed
+            }
+            TrackedThreadWorkspaceCleanupPolicyArg::PruneAfterMerge => Self::PruneAfterMerge,
+            TrackedThreadWorkspaceCleanupPolicyArg::KeepForAudit => Self::KeepForAudit,
+        }
+    }
+}
+
+impl From<TrackedThreadWorkspaceStatusArg> for authority::TrackedThreadWorkspaceStatus {
+    fn from(value: TrackedThreadWorkspaceStatusArg) -> Self {
+        match value {
+            TrackedThreadWorkspaceStatusArg::Requested => Self::Requested,
+            TrackedThreadWorkspaceStatusArg::Ready => Self::Ready,
+            TrackedThreadWorkspaceStatusArg::Dirty => Self::Dirty,
+            TrackedThreadWorkspaceStatusArg::Ahead => Self::Ahead,
+            TrackedThreadWorkspaceStatusArg::Behind => Self::Behind,
+            TrackedThreadWorkspaceStatusArg::Conflicted => Self::Conflicted,
+            TrackedThreadWorkspaceStatusArg::Merged => Self::Merged,
+            TrackedThreadWorkspaceStatusArg::Abandoned => Self::Abandoned,
+            TrackedThreadWorkspaceStatusArg::Pruned => Self::Pruned,
+        }
+    }
+}
+
+impl TrackedThreadWorkspaceArgs {
+    fn is_empty(&self) -> bool {
+        self.repository_root.is_none()
+            && self.worktree_path.is_none()
+            && self.branch_name.is_none()
+            && self.base_ref.is_none()
+            && self.base_commit.is_none()
+            && self.landing_target.is_none()
+            && self.strategy.is_none()
+            && self.landing_policy.is_none()
+            && self.sync_policy.is_none()
+            && self.cleanup_policy.is_none()
+            && self.status.is_none()
+            && self.last_reported_head_commit.is_none()
+    }
+
+    fn try_into_workspace(
+        self,
+        owner_tracked_thread_id: authority::TrackedThreadId,
+    ) -> Result<Option<authority::TrackedThreadWorkspace>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+
+        let repository_root = self
+            .repository_root
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--workspace-repository-root is required when declaring a tracked-thread workspace"
+                )
+            })?;
+        let worktree_path = self
+            .worktree_path
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--workspace-worktree-path is required when declaring a tracked-thread workspace"
+                )
+            })?;
+        let branch_name = self
+            .branch_name
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--workspace-branch-name is required when declaring a tracked-thread workspace"
+                )
+            })?;
+        let base_ref = self
+            .base_ref
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--workspace-base-ref is required when declaring a tracked-thread workspace"
+                )
+            })?;
+        let landing_target = self
+            .landing_target
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--workspace-landing-target is required when declaring a tracked-thread workspace"
+                )
+            })?;
+        let strategy = self.strategy.unwrap_or(TrackedThreadWorkspaceStrategyArg::DedicatedThreadWorktree);
+        let landing_policy = self.landing_policy.unwrap_or(TrackedThreadWorkspaceLandingPolicyArg::MergeToMain);
+        let sync_policy = self.sync_policy.unwrap_or(TrackedThreadWorkspaceSyncPolicyArg::Manual);
+        let cleanup_policy = self.cleanup_policy.unwrap_or(TrackedThreadWorkspaceCleanupPolicyArg::KeepUntilCampaignClosed);
+        let status = self.status.unwrap_or(TrackedThreadWorkspaceStatusArg::Requested);
+
+        Ok(Some(authority::TrackedThreadWorkspace {
+            repository_root,
+            owner_tracked_thread_id,
+            strategy: strategy.into(),
+            worktree_path,
+            branch_name,
+            base_ref,
+            base_commit: self.base_commit,
+            landing_target,
+            landing_policy: landing_policy.into(),
+            sync_policy: sync_policy.into(),
+            cleanup_policy: cleanup_policy.into(),
+            last_reported_head_commit: self.last_reported_head_commit,
+            status: status.into(),
+        }))
     }
 }
 
@@ -874,6 +1100,8 @@ async fn main() -> Result<()> {
             let service = SupervisorService::load(&overrides).await?;
             match command {
                 TrackedThreadsCommand::Create(args) => {
+                    let tracked_thread_id = authority::TrackedThreadId::new();
+                    let workspace = args.workspace.try_into_workspace(tracked_thread_id.clone())?;
                     service
                         .tracked_thread_create(
                             &args.workunit,
@@ -882,10 +1110,16 @@ async fn main() -> Result<()> {
                             args.notes,
                             args.upstream_thread,
                             args.model,
+                            tracked_thread_id,
+                            workspace,
                         )
                         .await?;
                 }
                 TrackedThreadsCommand::Edit(args) => {
+                    let tracked_thread_id = authority::TrackedThreadId::parse(
+                        args.tracked_thread.clone(),
+                    )?;
+                    let workspace = args.workspace.try_into_workspace(tracked_thread_id.clone())?;
                     service
                         .tracked_thread_edit(
                             &args.tracked_thread,
@@ -895,6 +1129,7 @@ async fn main() -> Result<()> {
                             args.upstream_thread,
                             args.binding_state.map(Into::into),
                             args.model,
+                            workspace,
                         )
                         .await?;
                 }
@@ -1181,7 +1416,8 @@ async fn main() -> Result<()> {
         }
         TopCommand::Prompt(args) => {
             let service = SupervisorService::load(&overrides).await?;
-            let _ = service.prompt(&args.thread, &args.text).await?;
+            let prompt = service.prompt(&args.thread, &args.text).await?;
+            println!("{prompt}");
         }
         TopCommand::Quickstart(args) => {
             let service = SupervisorService::load(&overrides).await?;
@@ -1347,6 +1583,16 @@ mod tests {
             "/tmp/orcas",
             "--model",
             "gpt-5.4",
+            "--workspace-repository-root",
+            "/tmp/orcas",
+            "--workspace-worktree-path",
+            "/tmp/orcas/worktrees/thread-1",
+            "--workspace-branch-name",
+            "orcas/thread-1",
+            "--workspace-base-ref",
+            "main",
+            "--workspace-landing-target",
+            "main",
         ]);
 
         match cli.command {
@@ -1357,6 +1603,14 @@ mod tests {
                 assert_eq!(args.title, "Thread record");
                 assert_eq!(args.root_dir, "/tmp/orcas");
                 assert_eq!(args.model.as_deref(), Some("gpt-5.4"));
+                assert_eq!(
+                    args.workspace.repository_root.as_deref(),
+                    Some("/tmp/orcas")
+                );
+                assert_eq!(
+                    args.workspace.worktree_path.as_deref(),
+                    Some("/tmp/orcas/worktrees/thread-1")
+                );
             }
             other => panic!("unexpected command parse: {other:?}"),
         }

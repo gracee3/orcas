@@ -1009,13 +1009,15 @@ impl SupervisorService {
         notes: Option<String>,
         upstream_thread_id: Option<String>,
         preferred_model: Option<String>,
+        tracked_thread_id: authority::TrackedThreadId,
+        workspace: Option<authority::TrackedThreadWorkspace>,
     ) -> Result<()> {
         let client = self.daemon_state_client().await?;
         let response = client
             .authority_tracked_thread_create(&ipc::AuthorityTrackedThreadCreateRequest {
                 command: authority::CreateTrackedThread {
                     metadata: Self::authority_command_metadata(),
-                    tracked_thread_id: authority::TrackedThreadId::new(),
+                    tracked_thread_id,
                     work_unit_id: authority::WorkUnitId::parse(work_unit_id.to_string())?,
                     title,
                     notes,
@@ -1023,7 +1025,7 @@ impl SupervisorService {
                     upstream_thread_id,
                     preferred_cwd: Some(root_dir),
                     preferred_model,
-                    workspace: None,
+                    workspace,
                 },
             })
             .await?;
@@ -1043,6 +1045,7 @@ impl SupervisorService {
         upstream_thread_id: Option<String>,
         binding_state: Option<authority::TrackedThreadBindingState>,
         preferred_model: Option<String>,
+        workspace: Option<authority::TrackedThreadWorkspace>,
     ) -> Result<()> {
         let client = self.daemon_state_client().await?;
         let existing = client
@@ -1061,7 +1064,7 @@ impl SupervisorService {
             preferred_cwd: root_dir.map(Some),
             preferred_model: preferred_model.map(Some),
             last_seen_turn_id: None,
-            workspace: None,
+            workspace: workspace.map(Some),
         };
         if patch.is_empty() {
             bail!("supply at least one tracked-thread field to edit");
@@ -1718,7 +1721,7 @@ impl SupervisorService {
                 plan_id: None,
                 plan_version: None,
                 plan_item_id: None,
-                execution_kind: Default::default(),
+                execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
                 alignment_rationale: None,
             })
             .await?;
