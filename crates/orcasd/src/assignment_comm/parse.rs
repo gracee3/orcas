@@ -184,14 +184,12 @@ pub fn parse_worker_report(
         "worker report envelope extracted"
     );
 
-    let Some(envelope) =
-        parse_worker_report_envelope(
-            &json_payload,
-            assignment,
-            record,
-            extraction.surrounding_text,
-        )
-    else {
+    let Some(envelope) = parse_worker_report_envelope(
+        &json_payload,
+        assignment,
+        record,
+        extraction.surrounding_text,
+    ) else {
         warn!(
             assignment_id = %assignment.id,
             packet_id = %record.packet.packet_id,
@@ -321,11 +319,7 @@ fn repair_worker_report_envelope_payload(
     let mut repaired = json_payload.to_string();
     let mut changed = false;
     changed |= repair_json_string_field(&mut repaired, "assignment_id", &assignment.id);
-    changed |= repair_json_string_field(
-        &mut repaired,
-        "packet_id",
-        &record.packet.packet_id,
-    );
+    changed |= repair_json_string_field(&mut repaired, "packet_id", &record.packet.packet_id);
     changed |= repair_json_string_field(
         &mut repaired,
         "schema_version",
@@ -719,11 +713,7 @@ mod tests {
         assert_eq!(parsed.disposition, ReportDisposition::Completed);
         assert_eq!(parsed.summary, "Completed the bounded change.");
         assert_eq!(
-            parsed
-                .envelope
-                .as_ref()
-                .expect("envelope")
-                .assignment_id,
+            parsed.envelope.as_ref().expect("envelope").assignment_id,
             assignment.id
         );
     }
