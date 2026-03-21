@@ -193,6 +193,9 @@ enum TrackedThreadsCommand {
 #[derive(Debug, Subcommand)]
 #[command(about = "Supervisor-owned planning session orchestration")]
 enum PlanningSessionsCommand {
+    #[command(
+        about = "Create a draft planning session; readiness must be set later with mark-ready-for-review"
+    )]
     Create(PlanningSessionCreateArgs),
     Get(PlanningSessionRefArgs),
     List(PlanningSessionListArgs),

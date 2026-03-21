@@ -1738,7 +1738,7 @@ impl SupervisorService {
         .await?;
         print_planning_session(&response.session);
         println!(
-            "planning_session_update_effect: descriptive_summary_only; use mark-ready-for-review for explicit readiness transition"
+            "planning_session_create_effect: draft_session_started; readiness must be set later with mark-ready-for-review"
         );
         Ok(())
     }

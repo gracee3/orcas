@@ -71,6 +71,13 @@ struct FakePlanningSessionDaemon {
     stop: Arc<AtomicBool>,
 }
 
+#[derive(Default)]
+struct FakePlanningSessionState {
+    request_counts: HashMap<String, usize>,
+    sessions: HashMap<String, orcas_core::PlanningSession>,
+    next_session_seq: usize,
+}
+
 impl FakePlanningSessionDaemon {
     async fn spawn(test_name: &str) -> Self {
         let root = std::env::temp_dir().join(format!("orcas-cli-{test_name}-{}", Uuid::new_v4()));
@@ -86,7 +93,7 @@ impl FakePlanningSessionDaemon {
         listener
             .set_nonblocking(true)
             .expect("set fake daemon socket nonblocking");
-        let request_counts = Arc::new(std::sync::Mutex::new(HashMap::<String, usize>::new()));
+        let state = Arc::new(std::sync::Mutex::new(FakePlanningSessionState::default()));
         let socket_path = paths.socket_file.clone();
         let metadata_path = paths.daemon_metadata_file.clone();
         let root_for_task = root.clone();
@@ -99,13 +106,13 @@ impl FakePlanningSessionDaemon {
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let request_counts = Arc::clone(&request_counts);
+                        let state = Arc::clone(&state);
                         let socket_path = socket_path.clone();
                         let metadata_path = metadata_path.clone();
                         std::thread::spawn(move || {
                             serve_fake_planning_session_connection(
                                 stream,
-                                request_counts,
+                                state,
                                 socket_path,
                                 metadata_path,
                             )
@@ -306,7 +313,7 @@ fn create_cli_workstream(daemon: &TestDaemon, label: &str) -> String {
 
 fn serve_fake_planning_session_connection(
     stream: std::os::unix::net::UnixStream,
-    request_counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    state: Arc<std::sync::Mutex<FakePlanningSessionState>>,
     socket_path: PathBuf,
     metadata_path: PathBuf,
 ) {
@@ -363,6 +370,122 @@ fn serve_fake_planning_session_connection(
                 };
                 let _ = send_jsonrpc_response(&mut write_half, id, response);
             }
+            ipc::methods::PLANNING_SESSION_CREATE => {
+                let Some(params) = params else {
+                    let _ = send_jsonrpc_error(
+                        &mut write_half,
+                        id,
+                        -32602,
+                        "invalid planning session create request",
+                    );
+                    continue;
+                };
+                let Ok(params) =
+                    serde_json::from_value::<ipc::PlanningSessionCreateRequest>(params)
+                else {
+                    let _ = send_jsonrpc_error(
+                        &mut write_half,
+                        id,
+                        -32602,
+                        "invalid planning session create request",
+                    );
+                    continue;
+                };
+                let mut state = state.lock().expect("lock fake planning daemon state");
+                state.next_session_seq += 1;
+                let session_id = format!("planning-session-{}", state.next_session_seq);
+                let now = Utc::now();
+                let session = orcas_core::PlanningSession {
+                    session_id: session_id.clone(),
+                    workstream_id: params.workstream_id.clone(),
+                    status: orcas_core::PlanningSessionStatus::Chatting,
+                    planning_thread_id: params
+                        .planning_thread_id
+                        .unwrap_or_else(|| format!("planning-thread-{session_id}")),
+                    base_plan_id: Some(
+                        orcas_core::planning::PlanId::parse(format!(
+                            "plan-{}",
+                            params.workstream_id
+                        ))
+                        .expect("plan id"),
+                    ),
+                    base_plan_version: Some(1),
+                    research_assignment_id: None,
+                    research_report_id: None,
+                    draft_revision_proposal_id: None,
+                    approved_plan_id: None,
+                    approved_plan_version: None,
+                    latest_structured_summary: orcas_core::PlanningSessionStructuredSummary {
+                        objective: params.initial_objective,
+                        research_status: params.research_status,
+                        requirements: params.requirements,
+                        constraints: params.constraints,
+                        non_goals: params.non_goals,
+                        open_questions: params.open_questions,
+                        draft_plan_summary: params.draft_plan_summary,
+                        ready_for_review: false,
+                    },
+                    created_at: now,
+                    created_by: params
+                        .created_by
+                        .clone()
+                        .unwrap_or_else(|| "cli_operator".to_string()),
+                    updated_at: now,
+                    updated_by: params
+                        .created_by
+                        .clone()
+                        .unwrap_or_else(|| "cli_operator".to_string()),
+                    request_note: params.request_note.clone(),
+                    reviewed_at: None,
+                    reviewed_by: None,
+                    review_note: None,
+                    superseded_by_session_id: None,
+                };
+                state.sessions.insert(session_id.clone(), session.clone());
+                let _ = send_jsonrpc_response(
+                    &mut write_half,
+                    id,
+                    ipc::PlanningSessionCreateResponse { session },
+                );
+            }
+            ipc::methods::PLANNING_SESSION_LIST => {
+                let Some(params) = params else {
+                    let _ = send_jsonrpc_error(
+                        &mut write_half,
+                        id,
+                        -32602,
+                        "invalid planning session list request",
+                    );
+                    continue;
+                };
+                let Ok(params) = serde_json::from_value::<ipc::PlanningSessionListRequest>(params)
+                else {
+                    let _ = send_jsonrpc_error(
+                        &mut write_half,
+                        id,
+                        -32602,
+                        "invalid planning session list request",
+                    );
+                    continue;
+                };
+                let state = state.lock().expect("lock fake planning daemon state");
+                let sessions = state
+                    .sessions
+                    .values()
+                    .filter(|session| {
+                        match params.workstream_id.as_ref() {
+                            None => true,
+                            Some(workstream_id) => &session.workstream_id == workstream_id,
+                        }
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let _ = send_jsonrpc_response(
+                    &mut write_half,
+                    id,
+                    ipc::PlanningSessionListResponse { sessions },
+                );
+            }
             ipc::methods::PLANNING_SESSION_REQUEST_RESEARCH => {
                 let Some(params) = params else {
                     let _ = send_jsonrpc_error(
@@ -384,10 +507,8 @@ fn serve_fake_planning_session_connection(
                     );
                     continue;
                 };
-                let mut counts = request_counts
-                    .lock()
-                    .expect("lock fake planning daemon request counts");
-                let entry = counts.entry(params.session_id.clone()).or_insert(0);
+                let mut state = state.lock().expect("lock fake planning daemon state");
+                let entry = state.request_counts.entry(params.session_id.clone()).or_insert(0);
                 *entry += 1;
                 if *entry > 1 {
                     let _ = send_jsonrpc_error(
@@ -1549,6 +1670,100 @@ async fn real_cli_planning_session_approve_stages_revision_proposal_without_appl
 }
 
 #[tokio::test]
+async fn real_cli_planning_session_create_rejects_ready_for_review_shortcut_and_keeps_draft_create_working()
+{
+    let _guard = planning_session_cli_test_lock().lock().await;
+    let daemon = spawn_fake_planning_session_cli_daemon("cli-planning-create").await;
+    let workstream_id = "planning-workstream-cli-create";
+    let envs = daemon.xdg_env();
+
+    let invalid_create = run_orcas_with_env(
+        &[
+            "planning-sessions",
+            "create",
+            "--workstream",
+            workstream_id,
+            "--objective",
+            "Try to smuggle readiness into create",
+            "--ready-for-review",
+            "--created-by",
+            "cli_operator",
+            "--request-note",
+            "Should be rejected",
+        ],
+        &envs,
+    );
+    assert!(!invalid_create.status.success());
+    assert!(stdout(&invalid_create).is_empty());
+    assert!(
+        stderr(&invalid_create).contains(
+            "planning session create cannot mark a session ready for review; use planning-sessions mark-ready-for-review after creation"
+        ),
+        "stderr: {}",
+        stderr(&invalid_create)
+    );
+
+    let empty_list = run_orcas_with_env(
+        &[
+            "planning-sessions",
+            "list",
+            "--workstream",
+            workstream_id,
+        ],
+        &envs,
+    );
+    assert!(empty_list.status.success(), "stderr: {}", stderr(&empty_list));
+    assert!(stdout(&empty_list).contains("no planning sessions"));
+
+    let valid_create = run_orcas_with_env(
+        &[
+            "planning-sessions",
+            "create",
+            "--workstream",
+            workstream_id,
+            "--objective",
+            "Create a draft planning session",
+            "--requirement",
+            "Keep it bounded",
+            "--constraint",
+            "No broad refactor",
+            "--non-goal",
+            "Do not widen scope",
+            "--open-question",
+            "Is readiness explicit?",
+            "--draft-plan-summary",
+            "A draft planning session",
+            "--created-by",
+            "cli_operator",
+            "--request-note",
+            "Start in the draft/chatting phase",
+        ],
+        &envs,
+    );
+    assert!(valid_create.status.success(), "stderr: {}", stderr(&valid_create));
+    let valid_stdout = stdout(&valid_create);
+    assert!(valid_stdout.contains("surface: planning_session"));
+    assert!(valid_stdout.contains("planning_session_status: Chatting"));
+    assert!(valid_stdout.contains("planning_session_summary_ready_for_review: false"));
+    assert!(valid_stdout.contains(
+        "planning_session_create_effect: draft_session_started; readiness must be set later with mark-ready-for-review"
+    ));
+
+    let created_session_id =
+        field_value(&valid_stdout, "planning_session_id").expect("create should print session id");
+    let created_list = run_orcas_with_env(
+        &["planning-sessions", "list", "--workstream", workstream_id],
+        &envs,
+    );
+    assert!(created_list.status.success(), "stderr: {}", stderr(&created_list));
+    let created_list_stdout = stdout(&created_list);
+    assert!(created_list_stdout.contains(created_session_id));
+    assert!(created_list_stdout.contains(workstream_id));
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn real_cli_planning_session_request_research_succeeds_once_and_rejects_repeat() {
     let _guard = planning_session_cli_test_lock().lock().await;
     let daemon = spawn_fake_planning_session_cli_daemon("cli-planning-research").await;
@@ -1785,9 +2000,17 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
     let root_stdout = stdout(&root_help);
     assert!(root_stdout.contains("Supervisor-owned planning session orchestration"));
     assert!(root_stdout.contains("approve"));
+    assert!(root_stdout.contains("create"));
     assert!(root_stdout.contains("request-research"));
     assert!(root_stdout.contains("update-summary"));
     assert!(root_stdout.contains("mark-ready-for-review"));
+
+    let create_help = run_orcas(&daemon, &["planning-sessions", "create", "--help"]);
+    assert!(create_help.status.success(), "stderr: {}", stderr(&create_help));
+    let create_stdout = stdout(&create_help);
+    assert!(create_stdout.contains(
+        "Create a draft planning session; readiness must be set later with mark-ready-for-review"
+    ));
 
     let approve_help = run_orcas(&daemon, &["planning-sessions", "approve", "--help"]);
     assert!(
