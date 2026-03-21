@@ -112,5 +112,6 @@ That removes `target/e2e/` and nothing else.
 - `live-worker-direct-patch`
 - `live-supervisor-micro-proposal`
 - `live-reject-redirect`
+- `live-restart-resume`
 
-The current migration keeps the existing behavior first, then grows the live lane through worker execution, supervisor approval, and governed redirect flows.
+The current migration keeps the existing behavior first, then grows the live lane through worker execution, supervisor approval, governed redirect flows, and restart/recovery behavior.

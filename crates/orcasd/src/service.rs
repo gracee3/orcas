@@ -13475,6 +13475,36 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                         "detached turn reconciliation: persisting terminal snapshot"
                     );
                     let _ = self.persist_turn_state_view(&turn).await;
+                    if let Some((assignment_id, worker_id, worker_session_id)) =
+                        self.assignment_for_terminal_turn(thread_id, turn_id).await
+                    {
+                        let report_exists = {
+                            let state = self.state.read().await;
+                            state
+                                .collaboration
+                                .reports
+                                .values()
+                                .any(|report| report.assignment_id == assignment_id)
+                        };
+                        if !report_exists {
+                            info!(
+                                thread_id = %thread_id,
+                                turn_id = %turn_id,
+                                assignment_id = %assignment_id,
+                                "detached turn reconciliation: ingesting recovered terminal outcome"
+                            );
+                            let raw_output = turn.recent_output.clone().unwrap_or_default();
+                            let _ = self
+                                .ingest_assignment_turn_outcome(
+                                    &assignment_id,
+                                    &worker_id,
+                                    &worker_session_id,
+                                    turn.clone(),
+                                    raw_output,
+                                )
+                                .await;
+                        }
+                    }
                 }
                 return Ok(Some(turn));
             }
@@ -13490,6 +13520,37 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         }
 
         Ok(registry_turn)
+    }
+
+    async fn assignment_for_terminal_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Option<(String, String, String)> {
+        let state = self.state.read().await;
+        state
+            .collaboration
+            .assignments
+            .values()
+            .filter_map(|assignment| {
+                let session = state
+                    .collaboration
+                    .worker_sessions
+                    .get(&assignment.worker_session_id)?;
+                let matches_thread = session.thread_id.as_deref() == Some(thread_id);
+                let matches_turn = session.active_turn_id.as_deref() == Some(turn_id);
+                let matches_running = matches!(assignment.status, AssignmentStatus::Running);
+                if matches_thread && matches_turn && matches_running {
+                    Some((
+                        assignment.id.clone(),
+                        assignment.worker_id.clone(),
+                        assignment.worker_session_id.clone(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .max_by(|left, right| left.0.cmp(&right.0))
     }
 
     async fn known_thread_summaries(&self) -> Vec<ipc::ThreadSummary> {
@@ -20798,6 +20859,205 @@ ORCAS_REPORT_END"#
             .expect("persisted turn");
         assert_eq!(persisted.lifecycle, ipc::TurnLifecycleState::Completed);
         assert!(persisted.terminal);
+    }
+
+    #[tokio::test]
+    async fn resolve_turn_state_reconciles_detached_terminal_turn_and_recovers_report() {
+        let config = auto_proposal_config(false);
+        let (service, fake_runtime_state) = test_service_with_fake_codex_runtime_capture(
+            config,
+            Arc::new(StaticSupervisorReasoner::default()),
+            sample_runtime_report_output_template(),
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Recovery stream".to_string(),
+                objective: "Exercise detached turn recovery".to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: "Recovery unit".to_string(),
+                task_statement: "Recover one detached turn cleanly.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-recovery".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Recover the detached turn and report honestly.".to_string()),
+                model: None,
+                cwd: None,
+                ..Default::default()
+            })
+            .await
+            .expect("prepare assignment");
+        let turn_id = "turn-recovery".to_string();
+        let thread_id = "thread-recovery".to_string();
+        let packet_id = {
+            let state = service.state.read().await;
+            state
+                .collaboration
+                .assignment_communications
+                .get(&prepared.assignment.id)
+                .expect("assignment communication")
+                .packet
+                .packet_id
+                .clone()
+        };
+
+        {
+            let mut state = service.state.write().await;
+            state.threads.insert(
+                thread_id.clone(),
+                sample_active_thread(&thread_id, "live_observed", 200, &turn_id),
+            );
+            state.turns.insert(
+                TurnKey::new(&thread_id, &turn_id),
+                ipc::TurnStateView {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    lifecycle: ipc::TurnLifecycleState::Active,
+                    status: "in_progress".to_string(),
+                    attachable: false,
+                    live_stream: false,
+                    terminal: false,
+                    recent_output: Some("partial output".to_string()),
+                    recent_event: Some("transport disconnected".to_string()),
+                    updated_at: Utc::now(),
+                    error_message: None,
+                },
+            );
+            let assignment = state
+                .collaboration
+                .assignments
+                .get_mut(&prepared.assignment.id)
+                .expect("assignment");
+            assignment.status = AssignmentStatus::Running;
+            assignment.updated_at = Utc::now();
+            let work_unit = state
+                .collaboration
+                .work_units
+                .get_mut(&prepared.assignment.work_unit_id)
+                .expect("work unit");
+            work_unit.status = WorkUnitStatus::Running;
+            work_unit.current_assignment_id = Some(prepared.assignment.id.clone());
+            work_unit.updated_at = Utc::now();
+            let worker = state
+                .collaboration
+                .workers
+                .get_mut(&prepared.assignment.worker_id)
+                .expect("worker");
+            worker.status = WorkerStatus::Busy;
+            worker.current_assignment_id = Some(prepared.assignment.id.clone());
+            let session = state
+                .collaboration
+                .worker_sessions
+                .get_mut(&prepared.assignment.worker_session_id)
+                .expect("worker session");
+            session.thread_id = Some(thread_id.clone());
+            session.active_turn_id = Some(turn_id.clone());
+            session.runtime_status = WorkerSessionRuntimeStatus::Running;
+            session.attachability = WorkerSessionAttachability::Attachable;
+            session.updated_at = Utc::now();
+        }
+
+        {
+            let mut runtime = fake_runtime_state.lock().await;
+            runtime.threads.insert(
+                thread_id.clone(),
+                types::Thread {
+                    id: thread_id.clone(),
+                    preview: "preview".to_string(),
+                    ephemeral: false,
+                    model_provider: "openai".to_string(),
+                    created_at: Utc::now().timestamp(),
+                    updated_at: Utc::now().timestamp(),
+                    status: types::ThreadStatus::Idle,
+                    path: None,
+                    cwd: "/tmp/orcas".to_string(),
+                    cli_version: "test".to_string(),
+                    source: None,
+                    name: None,
+                    turns: vec![types::Turn {
+                        id: turn_id.clone(),
+                        items: vec![{
+                            let mut extra = Map::new();
+                            extra.insert(
+                                "text".to_string(),
+                                Value::String(sample_runtime_report_output_for(
+                                    &prepared.assignment.id,
+                                    &packet_id,
+                                )),
+                            );
+                            types::ThreadItem {
+                                id: "item-recovery".to_string(),
+                                item_type: "agent_message".to_string(),
+                                extra,
+                            }
+                        }],
+                        status: types::TurnStatus::Completed,
+                        error: None,
+                    }],
+                    extra: Map::new(),
+                },
+            );
+        }
+
+        let resolved = service
+            .resolve_turn_state(&thread_id, &turn_id)
+            .await
+            .expect("resolve turn")
+            .expect("turn");
+
+        assert_eq!(resolved.lifecycle, ipc::TurnLifecycleState::Completed);
+        assert!(resolved.terminal);
+
+        let assignment_get = service
+            .assignment_get(ipc::AssignmentGetRequest {
+                assignment_id: prepared.assignment.id.clone(),
+            })
+            .await
+            .expect("assignment get");
+        assert_eq!(
+            assignment_get.assignment.status,
+            AssignmentStatus::AwaitingDecision
+        );
+        assert!(assignment_get.report.is_some());
+        assert_eq!(
+            assignment_get
+                .report
+                .as_ref()
+                .expect("report")
+                .assignment_id,
+            prepared.assignment.id
+        );
+
+        let work_unit = service
+            .workunit_get(ipc::WorkunitGetRequest {
+                work_unit_id: prepared.assignment.work_unit_id.clone(),
+            })
+            .await
+            .expect("work unit");
+        assert_eq!(work_unit.work_unit.status, WorkUnitStatus::AwaitingDecision);
+        assert_eq!(
+            work_unit.work_unit.latest_report_id,
+            assignment_get
+                .report
+                .as_ref()
+                .map(|report| report.id.clone())
+        );
     }
 
     #[tokio::test]
