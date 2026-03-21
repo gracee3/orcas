@@ -1782,6 +1782,8 @@ fn proposal_json_schema() -> Value {
             "summary",
             "proposed_decision",
             "draft_next_assignment",
+            "plan_assessment",
+            "plan_revision_proposal",
             "confidence",
             "warnings",
             "open_questions"
@@ -2026,7 +2028,9 @@ fn proposal_json_schema() -> Value {
                         "type": "array",
                         "items": {
                             "type": "object",
-                            "additionalProperties": false
+                            "additionalProperties": false,
+                            "properties": {},
+                            "required": []
                         }
                     },
                     "status": {
@@ -2040,7 +2044,17 @@ fn proposal_json_schema() -> Value {
                         ]
                     },
                     "created_at": { "type": ["string", "null"] },
-                    "created_by": { "type": ["string", "null"] }
+                    "created_by": { "type": ["string", "null"] },
+                    "reviewed_at": { "type": ["string", "null"] },
+                    "reviewed_by": { "type": ["string", "null"] },
+                    "review_note": { "type": ["string", "null"] },
+                    "apply_started_at": { "type": ["string", "null"] },
+                    "apply_finished_at": { "type": ["string", "null"] },
+                    "apply_error": { "type": ["string", "null"] },
+                    "recovery": plan_revision_recovery_schema(),
+                    "applied_plan_id": { "type": ["string", "null"] },
+                    "applied_plan_version": { "type": ["integer", "null"] },
+                    "source_supervisor_proposal_id": { "type": ["string", "null"] }
                 }
             },
             "confidence": {
@@ -2056,6 +2070,385 @@ fn proposal_json_schema() -> Value {
                 "items": { "type": "string" }
             }
         }
+    })
+}
+
+fn plan_revision_op_add_goal_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "goal"],
+        "properties": {
+            "kind": { "type": "string", "const": "add_goal" },
+            "goal": plan_goal_schema(),
+        },
+    })
+}
+
+fn plan_revision_op_update_goal_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "goal_id", "patch"],
+        "properties": {
+            "kind": { "type": "string", "const": "update_goal" },
+            "goal_id": { "type": "string" },
+            "patch": plan_goal_patch_schema(),
+        },
+    })
+}
+
+fn plan_revision_op_remove_goal_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "goal_id"],
+        "properties": {
+            "kind": { "type": "string", "const": "remove_goal" },
+            "goal_id": { "type": "string" },
+        },
+    })
+}
+
+fn plan_revision_op_add_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "item"],
+        "properties": {
+            "kind": { "type": "string", "const": "add_item" },
+            "item": plan_item_schema(),
+        },
+    })
+}
+
+fn plan_revision_op_update_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "item_id", "patch"],
+        "properties": {
+            "kind": { "type": "string", "const": "update_item" },
+            "item_id": { "type": "string" },
+            "patch": plan_item_patch_schema(),
+        },
+    })
+}
+
+fn plan_revision_op_move_item_before_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "item_id", "before_item_id"],
+        "properties": {
+            "kind": { "type": "string", "const": "move_item_before" },
+            "item_id": { "type": "string" },
+            "before_item_id": { "type": ["string", "null"] },
+        },
+    })
+}
+
+fn plan_revision_op_remove_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "item_id"],
+        "properties": {
+            "kind": { "type": "string", "const": "remove_item" },
+            "item_id": { "type": "string" },
+        },
+    })
+}
+
+fn plan_revision_op_set_current_focus_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "item_id"],
+        "properties": {
+            "kind": { "type": "string", "const": "set_current_focus" },
+            "item_id": { "type": ["string", "null"] },
+        },
+    })
+}
+
+fn plan_revision_op_update_success_criteria_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "success_criteria"],
+        "properties": {
+            "kind": { "type": "string", "const": "update_success_criteria" },
+            "success_criteria": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+        },
+    })
+}
+
+fn plan_revision_op_update_constraints_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "constraints"],
+        "properties": {
+            "kind": { "type": "string", "const": "update_constraints" },
+            "constraints": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+        },
+    })
+}
+
+fn plan_revision_op_update_exploration_policy_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "exploration_policy"],
+        "properties": {
+            "kind": { "type": "string", "const": "update_exploration_policy" },
+            "exploration_policy": exploration_policy_schema(),
+        },
+    })
+}
+
+fn plan_revision_op_split_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "source_item_id", "new_items"],
+        "properties": {
+            "kind": { "type": "string", "const": "split_item" },
+            "source_item_id": { "type": "string" },
+            "new_items": {
+                "type": "array",
+                "items": plan_item_schema(),
+            },
+        },
+    })
+}
+
+fn plan_revision_op_merge_items_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "source_item_ids", "merged_item"],
+        "properties": {
+            "kind": { "type": "string", "const": "merge_items" },
+            "source_item_ids": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "merged_item": plan_item_schema(),
+        },
+    })
+}
+
+fn plan_goal_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["goal_id", "title", "description", "priority", "status"],
+        "properties": {
+            "goal_id": { "type": "string" },
+            "title": { "type": "string" },
+            "description": { "type": ["string", "null"] },
+            "priority": { "type": "string" },
+            "status": {
+                "type": "string",
+                "enum": ["pending", "in_progress", "complete", "dropped"]
+            },
+        },
+    })
+}
+
+fn plan_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "item_id",
+            "goal_id",
+            "title",
+            "purpose",
+            "priority",
+            "status",
+            "acceptance_criteria",
+            "dependency_item_ids",
+            "notes",
+            "linked_work_unit_id",
+            "linked_assignment_ids",
+            "evidence_refs"
+        ],
+        "properties": {
+            "item_id": { "type": "string" },
+            "goal_id": { "type": "string" },
+            "title": { "type": "string" },
+            "purpose": { "type": ["string", "null"] },
+            "priority": { "type": "string" },
+            "status": {
+                "type": "string",
+                "enum": ["pending", "in_progress", "blocked", "done", "dropped"]
+            },
+            "acceptance_criteria": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "dependency_item_ids": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "notes": { "type": ["string", "null"] },
+            "linked_work_unit_id": { "type": ["string", "null"] },
+            "linked_assignment_ids": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "evidence_refs": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+        },
+    })
+}
+
+fn plan_goal_patch_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "description", "priority", "status"],
+        "properties": {
+            "title": { "type": ["string", "null"] },
+            "description": { "type": ["string", "null"] },
+            "priority": { "type": ["string", "null"] },
+            "status": { "type": ["string", "null"] },
+        },
+    })
+}
+
+fn plan_item_patch_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "title",
+            "purpose",
+            "priority",
+            "status",
+            "acceptance_criteria",
+            "dependency_item_ids",
+            "notes",
+            "linked_work_unit_id",
+            "linked_assignment_ids",
+            "evidence_refs"
+        ],
+        "properties": {
+            "title": { "type": ["string", "null"] },
+            "purpose": { "type": ["string", "null"] },
+            "priority": { "type": ["string", "null"] },
+            "status": { "type": ["string", "null"] },
+            "acceptance_criteria": {
+                "type": ["array", "null"],
+                "items": { "type": "string" }
+            },
+            "dependency_item_ids": {
+                "type": ["array", "null"],
+                "items": { "type": "string" }
+            },
+            "notes": { "type": ["string", "null"] },
+            "linked_work_unit_id": { "type": ["string", "null"] },
+            "linked_assignment_ids": {
+                "type": ["array", "null"],
+                "items": { "type": "string" }
+            },
+            "evidence_refs": {
+                "type": ["array", "null"],
+                "items": { "type": "string" }
+            },
+        },
+    })
+}
+
+fn exploration_policy_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "mode",
+            "max_branch_depth",
+            "allow_blocker_investigations",
+            "allow_speculative_side_paths",
+            "checkpoint_interval",
+            "drift_alert_threshold"
+        ],
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["strict", "balanced", "exploratory"]
+            },
+            "max_branch_depth": { "type": ["integer", "null"] },
+            "allow_blocker_investigations": { "type": "boolean" },
+            "allow_speculative_side_paths": { "type": "boolean" },
+            "checkpoint_interval": { "type": ["integer", "null"] },
+            "drift_alert_threshold": { "type": ["string", "null"] },
+        },
+    })
+}
+
+fn plan_revision_recovery_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "phase",
+            "failure_kind",
+            "downstream_apply_started",
+            "downstream_apply_completed",
+            "retry_safe",
+            "reconcile_available",
+            "operator_intervention_required",
+            "failure_message",
+            "downstream_decision_id",
+            "downstream_assignment_id"
+        ],
+        "properties": {
+            "phase": {
+                "type": "string",
+                "enum": [
+                    "not_started",
+                    "downstream_applying",
+                    "awaiting_finalization",
+                    "applied",
+                    "failed_before_downstream",
+                    "failed_during_downstream",
+                    "failed_after_downstream",
+                    "rejected",
+                    "superseded"
+                ]
+            },
+            "failure_kind": {
+                "type": ["string", "null"],
+                "enum": [
+                    "retryable_infrastructure",
+                    "validation_failure",
+                    "stale_base_plan",
+                    "downstream_unknown",
+                    "finalization_failure",
+                    "operator_required",
+                    null
+                ]
+            },
+            "downstream_apply_started": { "type": "boolean" },
+            "downstream_apply_completed": { "type": "boolean" },
+            "retry_safe": { "type": "boolean" },
+            "reconcile_available": { "type": "boolean" },
+            "operator_intervention_required": { "type": "boolean" },
+            "failure_message": { "type": ["string", "null"] },
+            "downstream_decision_id": { "type": ["string", "null"] },
+            "downstream_assignment_id": { "type": ["string", "null"] }
+        },
     })
 }
 
@@ -2583,6 +2976,16 @@ mod tests {
                 "plan_revision_proposal schema must require {field}"
             );
         }
+    }
+
+    #[test]
+    fn proposal_schema_includes_structured_plan_revision_ops_object_shape() {
+        let schema = super::proposal_json_schema();
+        let ops_items =
+            &schema["properties"]["plan_revision_proposal"]["properties"]["ops"]["items"];
+        assert_eq!(ops_items["type"].as_str(), Some("object"));
+        assert!(ops_items["properties"].is_object());
+        assert!(ops_items["required"].is_array());
     }
 
     #[test]

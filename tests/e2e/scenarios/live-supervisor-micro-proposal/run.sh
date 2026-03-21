@@ -25,6 +25,29 @@ rm -rf "$short_xdg_root"
 mkdir -p "$short_xdg_data_home/orcas" "$short_xdg_config_home/orcas" "$short_xdg_runtime_home/orcas"
 chmod 700 "$short_xdg_runtime_home" || true
 
+cat >"$short_xdg_config_home/orcas/config.toml" <<EOF
+[codex]
+binary_path = "/home/emmy/git/codex/codex-rs/target/debug/codex"
+listen_url = "$listen_url"
+connection_mode = "spawn_if_needed"
+config_overrides = []
+
+[codex.reconnect]
+initial_delay_ms = 150
+max_delay_ms = 5000
+multiplier = 2.0
+
+[supervisor]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "o3-mini"
+reasoning_effort = "high"
+max_output_tokens = 2000
+
+[supervisor.proposals]
+auto_create_on_report_recorded = false
+EOF
+
 export E2E_SCENARIO_XDG_DIR="$short_xdg_root"
 export E2E_SCENARIO_XDG_DATA_HOME="$short_xdg_data_home"
 export E2E_SCENARIO_XDG_CONFIG_HOME="$short_xdg_config_home"

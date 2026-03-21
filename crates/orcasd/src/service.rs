@@ -1466,6 +1466,13 @@ impl OrcasDaemonService {
             }
         }
 
+        self.thread_get_fresh(params).await
+    }
+
+    async fn thread_get_fresh(
+        &self,
+        params: ipc::ThreadGetRequest,
+    ) -> OrcasResult<ipc::ThreadGetResponse> {
         self.connect_upstream().await?;
         let response = self
             .codex_client
@@ -13403,13 +13410,53 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             return Ok(Some(turn.clone()));
         }
 
-        let remote_turn = if let Some(thread) = self.thread_from_state(thread_id).await
+        let remote_turn = if needs_remote_reconciliation {
+            info!(
+                thread_id = %thread_id,
+                turn_id = %turn_id,
+                "detached turn reconciliation: fetching upstream snapshot"
+            );
+            match self
+                .thread_get_fresh(ipc::ThreadGetRequest {
+                    thread_id: thread_id.to_string(),
+                })
+                .await
+            {
+                Ok(response) => {
+                    let turn = Self::turn_state_from_thread_view(&response.thread, turn_id);
+                    if let Some(turn) = turn.as_ref() {
+                        info!(
+                            thread_id = %thread_id,
+                            turn_id = %turn_id,
+                            terminal = turn.terminal,
+                            "detached turn reconciliation: evaluated upstream turn"
+                        );
+                    } else {
+                        info!(
+                            thread_id = %thread_id,
+                            turn_id = %turn_id,
+                            "detached turn reconciliation: upstream snapshot did not include the turn"
+                        );
+                    }
+                    turn
+                }
+                Err(error) => {
+                    info!(
+                        thread_id = %thread_id,
+                        turn_id = %turn_id,
+                        error = %error,
+                        "detached turn reconciliation: upstream fetch failed"
+                    );
+                    None
+                }
+            }
+        } else if let Some(thread) = self.thread_from_state(thread_id).await
             && let Some(turn) = Self::turn_state_from_thread_view(&thread, turn_id)
         {
             Some(turn)
         } else {
             match self
-                .thread_get(ipc::ThreadGetRequest {
+                .thread_get_fresh(ipc::ThreadGetRequest {
                     thread_id: thread_id.to_string(),
                 })
                 .await
@@ -13422,11 +13469,21 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         if let Some(turn) = remote_turn {
             if turn.terminal {
                 if needs_remote_reconciliation {
+                    info!(
+                        thread_id = %thread_id,
+                        turn_id = %turn_id,
+                        "detached turn reconciliation: persisting terminal snapshot"
+                    );
                     let _ = self.persist_turn_state_view(&turn).await;
                 }
                 return Ok(Some(turn));
             }
             if needs_remote_reconciliation {
+                info!(
+                    thread_id = %thread_id,
+                    turn_id = %turn_id,
+                    "detached turn reconciliation: upstream turn was not terminal"
+                );
                 return Ok(registry_turn);
             }
             return Ok(Some(turn));
@@ -20741,6 +20798,121 @@ ORCAS_REPORT_END"#
             .expect("persisted turn");
         assert_eq!(persisted.lifecycle, ipc::TurnLifecycleState::Completed);
         assert!(persisted.terminal);
+    }
+
+    #[tokio::test]
+    async fn resolve_turn_state_forces_fresh_upstream_read_for_detached_cached_turn() {
+        let config = auto_proposal_config(false);
+        let (service, fake_runtime_state) = test_service_with_fake_codex_runtime_capture(
+            config,
+            Arc::new(StaticSupervisorReasoner::default()),
+            "irrelevant",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+
+        let thread_id = "thread-detached-cache".to_string();
+        let turn_id = "turn-detached-cache".to_string();
+        {
+            let mut state = service.state.write().await;
+            let mut thread = sample_thread(&thread_id, "live_observed", 200);
+            thread.turns.push(ipc::TurnView {
+                id: turn_id.clone(),
+                status: "in_progress".to_string(),
+                error_message: None,
+                error_summary: None,
+                started_at: None,
+                completed_at: None,
+                latest_diff: None,
+                latest_plan_snapshot: None,
+                token_usage_snapshot: None,
+                items: vec![ipc::ItemView {
+                    id: "item-stale".to_string(),
+                    item_type: "agent_message".to_string(),
+                    status: Some("streaming".to_string()),
+                    text: Some("partial output".to_string()),
+                    summary: Some("partial output".to_string()),
+                    payload: None,
+                }],
+            });
+            state.threads.insert(thread_id.clone(), thread);
+            state.turns.insert(
+                TurnKey::new(&thread_id, &turn_id),
+                ipc::TurnStateView {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    lifecycle: ipc::TurnLifecycleState::Active,
+                    status: "in_progress".to_string(),
+                    attachable: false,
+                    live_stream: false,
+                    terminal: false,
+                    recent_output: Some("partial output".to_string()),
+                    recent_event: Some("transport disconnected".to_string()),
+                    updated_at: Utc::now(),
+                    error_message: None,
+                },
+            );
+        }
+
+        {
+            let mut runtime = fake_runtime_state.lock().await;
+            runtime.threads.insert(
+                thread_id.clone(),
+                types::Thread {
+                    id: thread_id.clone(),
+                    preview: "preview".to_string(),
+                    ephemeral: false,
+                    model_provider: "openai".to_string(),
+                    created_at: Utc::now().timestamp(),
+                    updated_at: Utc::now().timestamp(),
+                    status: types::ThreadStatus::Idle,
+                    path: None,
+                    cwd: "/tmp/orcas".to_string(),
+                    cli_version: "test".to_string(),
+                    source: None,
+                    name: None,
+                    turns: vec![types::Turn {
+                        id: turn_id.clone(),
+                        items: vec![{
+                            let mut extra = Map::new();
+                            extra.insert("text".to_string(), Value::String("hello world".into()));
+                            types::ThreadItem {
+                                id: "item-fresh".to_string(),
+                                item_type: "agent_message".to_string(),
+                                extra,
+                            }
+                        }],
+                        status: types::TurnStatus::Completed,
+                        error: None,
+                    }],
+                    extra: Map::new(),
+                },
+            );
+        }
+
+        let resolved = service
+            .resolve_turn_state(&thread_id, &turn_id)
+            .await
+            .expect("resolve turn")
+            .expect("turn");
+
+        assert_eq!(resolved.lifecycle, ipc::TurnLifecycleState::Completed);
+        assert!(resolved.terminal);
+        assert_eq!(resolved.status, "completed");
+        assert_eq!(resolved.recent_output.as_deref(), Some("hello world"));
+
+        let persisted = service
+            .turn_get(ipc::TurnGetRequest {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+            })
+            .await
+            .expect("turn get")
+            .turn
+            .expect("persisted turn");
+        assert_eq!(persisted.lifecycle, ipc::TurnLifecycleState::Completed);
+        assert!(persisted.terminal);
+        assert_eq!(persisted.recent_output.as_deref(), Some("hello world"));
     }
 
     #[test]

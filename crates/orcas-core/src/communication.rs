@@ -465,6 +465,7 @@ pub struct WorkerReportEnvelope {
     pub touched_files: Vec<TouchedFile>,
     #[serde(default, deserialize_with = "deserialize_stringish_vec")]
     pub commands_run: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_stringish_vec")]
     pub artifacts: Vec<String>,
     pub blockers: Vec<String>,
     pub questions: Vec<String>,
@@ -1015,7 +1016,13 @@ mod tests {
                     "exit_code": 0
                 }
             ],
-            "artifacts": [],
+            "artifacts": [
+                {
+                    "name": "patch",
+                    "mime": "text/x-diff",
+                    "content": "*** Begin Patch"
+                }
+            ],
             "blockers": [],
             "questions": [],
             "recommended_next_actions": [],
@@ -1045,6 +1052,13 @@ mod tests {
         assert_eq!(
             envelope.commands_run,
             vec!["make test -j1 V=1 (exit 0)".to_string()]
+        );
+        assert_eq!(
+            envelope.artifacts,
+            vec![
+                "{\"content\":\"*** Begin Patch\",\"mime\":\"text/x-diff\",\"name\":\"patch\"}"
+                    .to_string()
+            ]
         );
     }
 

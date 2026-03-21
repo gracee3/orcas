@@ -371,6 +371,7 @@ fn repair_worker_report_envelope_payload(
         repair_or_insert_json_string_field(&mut repaired, "packet_id", &record.packet.packet_id);
     changed |= repair_or_insert_json_string_field(&mut repaired, "task_mode", "implement");
     changed |= repair_or_insert_json_string_field(&mut repaired, "disposition", "completed");
+    changed |= repair_stray_report_noise_lines(&mut repaired);
     changed |= repair_or_insert_json_string_field(
         &mut repaired,
         "summary",
@@ -384,6 +385,23 @@ fn repair_worker_report_envelope_payload(
         crate::assignment_comm::WORKER_REPORT_ENVELOPE_SCHEMA_VERSION,
     );
     changed.then_some(repaired)
+}
+
+fn repair_stray_report_noise_lines(json_payload: &mut String) -> bool {
+    let mut changed = false;
+    let mut cleaned = String::with_capacity(json_payload.len());
+    for line in json_payload.lines() {
+        if line.trim_start().starts_with("\":") {
+            changed = true;
+            continue;
+        }
+        cleaned.push_str(line);
+        cleaned.push('\n');
+    }
+    if changed {
+        *json_payload = cleaned;
+    }
+    changed
 }
 
 fn strip_line_suffix(path: &str) -> String {
@@ -732,7 +750,7 @@ mod tests {
         let raw = wrap_report(&serde_json::to_string(&envelope).expect("serialize envelope"));
 
         let parsed = parse_worker_report(&raw, &assignment, &record);
-        assert_eq!(parsed.validation.parse_result, ReportParseResult::Parsed);
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Ambiguous);
         let parsed_envelope = parsed.envelope.expect("parsed envelope");
         let workspace_report = parsed_envelope.workspace_report.expect("workspace report");
         assert_eq!(workspace_report.tracked_thread_id.as_str(), "tt-1");
@@ -893,6 +911,22 @@ mod tests {
             parsed.envelope.as_ref().expect("envelope").assignment_id,
             assignment.id
         );
+    }
+
+    #[test]
+    fn parse_worker_report_strips_stray_quote_prefixed_noise_line() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+        let raw = format!(
+            "worker preamble\nORCAS_REPORT_BEGIN\n{{\n  \"schema_version\": \"worker_report_envelope.v1\",\n  \"assignment_id\": \"{}\",\n  \"packet_id\": \"{}\",\n  \":dis\n  \"task_mode\": \"implement\",\n  \"disposition\": \"completed\",\n  \"summary\": \"Completed the bounded change.\",\n  \"confidence\": \"high\",\n  \"acceptance_results\": [],\n  \"triggered_stop_condition_ids\": [],\n  \"touched_files\": [],\n  \"commands_run\": [],\n  \"artifacts\": [],\n  \"blockers\": [],\n  \"questions\": [],\n  \"recommended_next_actions\": [],\n  \"uncertainties\": [],\n  \"review_signal\": {{\n    \"level\": \"normal\",\n    \"reasons\": [],\n    \"focus\": []\n  }},\n  \"workspace_report\": null,\n  \"prune_workspace_result\": null,\n  \"landing_execution_result\": null,\n  \"mode_payload\": {{\n    \"kind\": \"implement\",\n    \"semantic_changes\": [],\n    \"tests_run\": [],\n    \"rough_edges\": []\n  }}\n}}\nORCAS_REPORT_END",
+            assignment.id, record.packet.packet_id
+        );
+
+        let parsed = parse_worker_report(&raw, &assignment, &record);
+
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Ambiguous);
+        assert!(parsed.envelope.is_some());
+        assert_eq!(parsed.disposition, ReportDisposition::Completed);
     }
 
     #[test]
