@@ -78,6 +78,9 @@ pub fn build_planning_revision_proposal(
     created_by: &str,
     now: DateTime<Utc>,
 ) -> OrcasResult<PlanRevisionProposal> {
+    // This only stages a canonical plan revision proposal.
+    // Actual plan mutation still flows through the existing plan revision
+    // approval/apply path.
     let summary = &session.latest_structured_summary;
     let mut ops = Vec::new();
     if !summary.requirements.is_empty() {

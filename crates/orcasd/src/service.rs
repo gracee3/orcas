@@ -4326,16 +4326,10 @@ impl OrcasDaemonService {
                 .open_questions
                 .push(format!("Supervisor note: {note}"));
         }
-        let status = if summary.ready_for_review {
-            PlanningSessionStatus::AwaitingApproval
-        } else {
-            PlanningSessionStatus::Chatting
-        };
-
         let session_preview = PlanningSession {
             session_id: session_id.clone(),
             workstream_id: workstream.id.clone(),
-            status,
+            status: PlanningSessionStatus::Chatting,
             planning_thread_id: planning_thread_id.clone(),
             base_plan_id: Some(active_plan.plan_id.clone()),
             base_plan_version: Some(active_plan.version),
@@ -4452,18 +4446,26 @@ impl OrcasDaemonService {
                     session.session_id
                 )));
             }
+            if session.status != PlanningSessionStatus::Chatting {
+                return Err(OrcasError::Protocol(format!(
+                    "planning session `{}` can only be updated while chatting",
+                    session.session_id
+                )));
+            }
             if params.summary.research_status == PlanningSessionResearchStatus::Requested {
                 return Err(OrcasError::Protocol(format!(
                     "planning session `{}` summary cannot declare research as requested; use planning_session_request_research after creation",
                     session.session_id
                 )));
             }
+            if params.summary.ready_for_review {
+                return Err(OrcasError::Protocol(format!(
+                    "planning session `{}` summary cannot mark the session ready for review; use planning_session_mark_ready_for_review",
+                    session.session_id
+                )));
+            }
             session.latest_structured_summary = params.summary.clone();
-            session.status = if session.latest_structured_summary.ready_for_review {
-                PlanningSessionStatus::AwaitingApproval
-            } else {
-                PlanningSessionStatus::Chatting
-            };
+            session.status = PlanningSessionStatus::Chatting;
             session.updated_at = Utc::now();
             session.updated_by = updated_by.clone();
             if let Some(note) = params.note.as_ref().filter(|note| !note.trim().is_empty()) {
@@ -4498,6 +4500,12 @@ impl OrcasDaemonService {
             if planning_session_status_is_terminal(session.status) {
                 return Err(OrcasError::Protocol(format!(
                     "planning session `{}` is already closed",
+                    session.session_id
+                )));
+            }
+            if session.status != PlanningSessionStatus::Chatting {
+                return Err(OrcasError::Protocol(format!(
+                    "planning session `{}` can only request supervisor context while chatting",
                     session.session_id
                 )));
             }
@@ -4539,6 +4547,12 @@ impl OrcasDaemonService {
         if planning_session_status_is_terminal(session_snapshot.status) {
             return Err(OrcasError::Protocol(format!(
                 "planning session `{}` is already closed",
+                session_snapshot.session_id
+            )));
+        }
+        if session_snapshot.status != PlanningSessionStatus::Chatting {
+            return Err(OrcasError::Protocol(format!(
+                "planning session `{}` can only request research while chatting",
                 session_snapshot.session_id
             )));
         }
@@ -4644,6 +4658,20 @@ impl OrcasDaemonService {
                 return Err(error);
             }
         };
+        if assignment_response.assignment.work_unit_id != work_unit.id.to_string() {
+            return Err(OrcasError::Protocol(format!(
+                "planning session `{}` research assignment was linked to the wrong work unit",
+                session_snapshot.session_id
+            )));
+        }
+        if assignment_response.report.work_unit_id != work_unit.id.to_string()
+            || assignment_response.report.assignment_id != assignment_response.assignment.id
+        {
+            return Err(OrcasError::Protocol(format!(
+                "planning session `{}` research report was not linked to the research assignment",
+                session_snapshot.session_id
+            )));
+        }
         let completed_at = Utc::now();
 
         let session = {
@@ -4711,6 +4739,12 @@ impl OrcasDaemonService {
             if planning_session_status_is_terminal(session.status) {
                 return Err(OrcasError::Protocol(format!(
                     "planning session `{}` is already closed",
+                    session.session_id
+                )));
+            }
+            if session.status != PlanningSessionStatus::Chatting {
+                return Err(OrcasError::Protocol(format!(
+                    "planning session `{}` can only be marked ready while chatting",
                     session.session_id
                 )));
             }
@@ -4888,6 +4922,9 @@ impl OrcasDaemonService {
             session.clone()
         };
         self.persist_collaboration_state().await?;
+        // Session approval stages a canonical revision proposal only; the
+        // plan remains unchanged until the existing proposal approval/apply
+        // machinery runs on that staged revision.
         Ok(ipc::PlanningSessionApproveResponse {
             session,
             revision_proposal: Some(proposal),
@@ -14183,7 +14220,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     status = %status,
                     "processing upstream turn completion event"
                 );
-                let (session, turn, thread, turn_state) = {
+                let (session, turn, thread) = {
                     let mut state = self.state.write().await;
                     let (turn, thread_summary, turn_state) = {
                         let thread = Self::ensure_thread_entry(&mut state, &thread_id);
@@ -14232,7 +14269,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     if state.session.active_turns.is_empty() {
                         state.session.active_thread_id = Some(thread_id.clone());
                     }
-                    (state.session.clone(), turn, thread_summary, turn_state)
+                    (state.session.clone(), turn, thread_summary)
                 };
                 let _ = (thread, session, turn);
                 info!(
@@ -15426,6 +15463,720 @@ mod tests {
                 .to_string()
                 .contains("summary cannot declare research as requested")
         );
+    }
+
+    fn sample_planning_session_summary(
+        objective: &str,
+        ready_for_review: bool,
+    ) -> orcas_core::collaboration::PlanningSessionStructuredSummary {
+        orcas_core::collaboration::PlanningSessionStructuredSummary {
+            objective: objective.to_string(),
+            requirements: vec!["Keep it bounded.".to_string()],
+            constraints: vec!["No broad refactor.".to_string()],
+            non_goals: vec!["Do not widen scope.".to_string()],
+            open_questions: vec!["Is this still bounded?".to_string()],
+            research_status: orcas_core::collaboration::PlanningSessionResearchStatus::NotRequested,
+            draft_plan_summary: Some("A narrow planning pass.".to_string()),
+            ready_for_review,
+        }
+    }
+
+    fn sample_bare_workstream(id: &str) -> Workstream {
+        let now = Utc::now();
+        Workstream {
+            id: id.to_string(),
+            title: format!("Planning {id}"),
+            objective: "Plan one bounded change.".to_string(),
+            status: WorkstreamStatus::Active,
+            priority: "high".to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    async fn insert_bare_workstream(
+        service: &Arc<OrcasDaemonService>,
+        workstream: Workstream,
+    ) -> Workstream {
+        {
+            let mut state = service.state.write().await;
+            state
+                .collaboration
+                .workstreams
+                .insert(workstream.id.clone(), workstream.clone());
+        }
+        workstream
+    }
+
+    async fn create_planning_session_for_workstream(
+        service: &Arc<OrcasDaemonService>,
+        workstream_id: &str,
+        objective: &str,
+    ) -> orcas_core::collaboration::PlanningSession {
+        service
+            .planning_session_create(ipc::PlanningSessionCreateRequest {
+                workstream_id: workstream_id.to_string(),
+                planning_thread_id: None,
+                initial_objective: objective.to_string(),
+                research_status:
+                    orcas_core::collaboration::PlanningSessionResearchStatus::NotRequested,
+                requirements: vec!["Keep it bounded.".to_string()],
+                constraints: vec!["No broad refactor.".to_string()],
+                non_goals: vec!["Do not widen scope.".to_string()],
+                open_questions: vec!["Is this still bounded?".to_string()],
+                draft_plan_summary: Some("A narrow planning pass.".to_string()),
+                created_by: Some("tester".to_string()),
+                request_note: None,
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("planning session create")
+            .session
+    }
+
+    #[tokio::test]
+    async fn planning_session_create_bootstraps_bare_workstream_without_active_plan() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            sample_runtime_report_output_template(),
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = insert_bare_workstream(&service, sample_bare_workstream("ws-bare")).await;
+
+        let session = create_planning_session_for_workstream(
+            &service,
+            workstream.id.as_ref(),
+            "Plan one bounded change.",
+        )
+        .await;
+
+        let state = service.state.read().await;
+        let active_plan = state
+            .collaboration
+            .planning
+            .active_plan(&workstream.id)
+            .cloned()
+            .expect("active plan");
+        assert_eq!(
+            session.status,
+            orcas_core::collaboration::PlanningSessionStatus::Chatting
+        );
+        assert_eq!(session.base_plan_id.as_ref(), Some(&active_plan.plan_id));
+        assert_eq!(session.base_plan_version, Some(active_plan.version));
+        assert_eq!(active_plan.workstream_id, workstream.id);
+        assert_eq!(active_plan.status, orcas_core::planning::PlanStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn planning_session_create_uses_existing_active_plan_without_mutating_it() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            sample_runtime_report_output_template(),
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Planning active".to_string(),
+                objective: "Plan one bounded change.".to_string(),
+                priority: Some("high".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let active_plan_before = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+
+        let session = create_planning_session_for_workstream(
+            &service,
+            workstream.id.as_str(),
+            "Plan one bounded change.",
+        )
+        .await;
+
+        let active_plan_after = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+        assert_eq!(
+            session.status,
+            orcas_core::collaboration::PlanningSessionStatus::Chatting
+        );
+        assert_eq!(
+            session.base_plan_id.as_ref(),
+            Some(&active_plan_before.plan_id)
+        );
+        assert_eq!(session.base_plan_version, Some(active_plan_before.version));
+        assert_eq!(
+            active_plan_before.plan_id.clone(),
+            active_plan_after.plan_id.clone()
+        );
+        assert_eq!(active_plan_before.version, active_plan_after.version);
+        assert_eq!(
+            active_plan_before.status,
+            orcas_core::planning::PlanStatus::Active
+        );
+        assert_eq!(
+            active_plan_after.status,
+            orcas_core::planning::PlanStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn planning_session_update_summary_is_descriptive_and_leaves_canonical_plan_unchanged() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Planning summary".to_string(),
+                objective: "Plan one bounded change.".to_string(),
+                priority: Some("high".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let session = create_planning_session_for_workstream(
+            &service,
+            workstream.id.as_ref(),
+            "Plan one bounded change.",
+        )
+        .await;
+        let active_plan_before = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+
+        let updated = service
+            .planning_session_update_summary(ipc::PlanningSessionUpdateSummaryRequest {
+                session_id: session.session_id.clone(),
+                summary: sample_planning_session_summary(
+                    "Refined objective for the next planning pass.",
+                    false,
+                ),
+                updated_by: Some("tester".to_string()),
+                note: Some("keep the session descriptive".to_string()),
+            })
+            .await
+            .expect("update summary")
+            .session;
+
+        let active_plan_after = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+        assert_eq!(
+            updated.status,
+            orcas_core::collaboration::PlanningSessionStatus::Chatting
+        );
+        assert_eq!(
+            updated.latest_structured_summary.objective,
+            "Refined objective for the next planning pass."
+        );
+        assert_eq!(
+            active_plan_before.plan_id.clone(),
+            active_plan_after.plan_id.clone()
+        );
+        assert_eq!(active_plan_before.version, active_plan_after.version);
+        assert_eq!(active_plan_before.title, active_plan_after.title);
+
+        let readiness_error = service
+            .planning_session_update_summary(ipc::PlanningSessionUpdateSummaryRequest {
+                session_id: updated.session_id.clone(),
+                summary: sample_planning_session_summary(
+                    "Refined objective for the next planning pass.",
+                    true,
+                ),
+                updated_by: Some("tester".to_string()),
+                note: None,
+            })
+            .await
+            .expect_err("ready-for-review should be explicit");
+        assert!(readiness_error.to_string().contains("ready for review"));
+    }
+
+    #[tokio::test]
+    async fn planning_session_request_research_is_bounded_and_links_report_to_session() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let origin_node_id = service.authority_store.origin_node_id().expect("origin");
+        let workstream = service
+            .authority_workstream_create(ipc::AuthorityWorkstreamCreateRequest {
+                command: orcas_core::authority::CreateWorkstream {
+                    metadata: orcas_core::authority::CommandMetadata {
+                        command_id: orcas_core::authority::CommandId::new(),
+                        issued_at: Utc::now(),
+                        origin_node_id,
+                        actor: orcas_core::authority::CommandActor::parse("planning_test")
+                            .expect("command actor"),
+                        correlation_id: Some(
+                            orcas_core::authority::CorrelationId::parse("corr-planning-research")
+                                .expect("correlation id"),
+                        ),
+                    },
+                    workstream_id: orcas_core::authority::WorkstreamId::parse("planning-research")
+                        .expect("workstream id"),
+                    title: "Planning research".to_string(),
+                    objective: "Plan one bounded change.".to_string(),
+                    status: WorkstreamStatus::Active,
+                    priority: "high".to_string(),
+                },
+            })
+            .await
+            .expect("authority workstream")
+            .workstream;
+        let session = create_planning_session_for_workstream(
+            &service,
+            workstream.id.as_str(),
+            "Plan one bounded change.",
+        )
+        .await;
+
+        let response = service
+            .planning_session_request_research(ipc::PlanningSessionRequestResearchRequest {
+                session_id: session.session_id.clone(),
+                worker_id: "worker-research".to_string(),
+                requested_by: Some("tester".to_string()),
+                request_note: Some("Need one bounded research turn".to_string()),
+                worker_kind: Some("codex".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect("request research");
+
+        assert_eq!(
+            response.session.status,
+            orcas_core::collaboration::PlanningSessionStatus::Chatting
+        );
+        assert_eq!(
+            response.session.research_assignment_id.as_deref(),
+            Some(response.assignment.id.as_str())
+        );
+        assert_eq!(
+            response.session.research_report_id.as_deref(),
+            Some(response.report.id.as_str())
+        );
+        assert_eq!(
+            response.assignment.work_unit_id,
+            response.report.work_unit_id
+        );
+        assert_eq!(response.report.assignment_id, response.assignment.id);
+        assert_ne!(
+            response.session.latest_structured_summary.research_status,
+            orcas_core::collaboration::PlanningSessionResearchStatus::NotRequested
+        );
+
+        let second_error = service
+            .planning_session_request_research(ipc::PlanningSessionRequestResearchRequest {
+                session_id: response.session.session_id.clone(),
+                worker_id: "worker-research-2".to_string(),
+                requested_by: Some("tester".to_string()),
+                request_note: Some("Should be rejected".to_string()),
+                worker_kind: Some("codex".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect_err("second research request should fail");
+        assert!(
+            second_error
+                .to_string()
+                .contains("already used its bounded research turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn planning_session_approve_stages_a_revision_proposal_without_applying_the_plan() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Planning approval".to_string(),
+                objective: "Plan one bounded change.".to_string(),
+                priority: Some("high".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let session = create_planning_session_for_workstream(
+            &service,
+            &workstream.id,
+            "Plan one bounded change.",
+        )
+        .await;
+        let active_plan_before = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+
+        service
+            .planning_session_mark_ready_for_review(ipc::PlanningSessionMarkReadyForReviewRequest {
+                session_id: session.session_id.clone(),
+                updated_by: Some("tester".to_string()),
+                note: Some("ready for approval".to_string()),
+            })
+            .await
+            .expect("mark ready");
+
+        let approval = service
+            .planning_session_approve(ipc::PlanningSessionApproveRequest {
+                session_id: session.session_id.clone(),
+                approved_by: Some("tester".to_string()),
+                review_note: Some("stage the revision".to_string()),
+            })
+            .await
+            .expect("approve session");
+
+        let revision_proposal = approval
+            .revision_proposal
+            .expect("staged revision proposal");
+        assert_eq!(
+            approval.session.approved_plan_id.as_ref(),
+            Some(&active_plan_before.plan_id)
+        );
+        assert_eq!(
+            approval.session.approved_plan_version,
+            Some(active_plan_before.version)
+        );
+        assert_eq!(
+            revision_proposal.base_plan_id,
+            active_plan_before.plan_id.clone()
+        );
+        assert_eq!(
+            revision_proposal.base_plan_version,
+            active_plan_before.version
+        );
+        assert_eq!(
+            revision_proposal.status,
+            orcas_core::planning::PlanRevisionProposalStatus::Pending
+        );
+
+        let active_plan_after = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+        assert_eq!(
+            active_plan_before.plan_id.clone(),
+            active_plan_after.plan_id.clone()
+        );
+        assert_eq!(active_plan_before.version, active_plan_after.version);
+        assert_eq!(active_plan_before.status, active_plan_after.status);
+        assert_eq!(
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .revision_proposals
+                .get(revision_proposal.proposal_id.as_str())
+                .expect("stored revision")
+                .status,
+            orcas_core::planning::PlanRevisionProposalStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn planning_session_reject_keeps_canonical_plan_unchanged() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Planning reject".to_string(),
+                objective: "Plan one bounded change.".to_string(),
+                priority: Some("high".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let session = create_planning_session_for_workstream(
+            &service,
+            &workstream.id,
+            "Plan one bounded change.",
+        )
+        .await;
+        let active_plan_before = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+
+        let rejected = service
+            .planning_session_reject(ipc::PlanningSessionRejectRequest {
+                session_id: session.session_id.clone(),
+                rejected_by: Some("tester".to_string()),
+                review_note: Some("reject the session".to_string()),
+            })
+            .await
+            .expect("reject session")
+            .session;
+        assert_eq!(
+            rejected.status,
+            orcas_core::collaboration::PlanningSessionStatus::Rejected
+        );
+
+        let active_plan_after = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+        assert_eq!(
+            active_plan_before.plan_id.clone(),
+            active_plan_after.plan_id.clone()
+        );
+        assert_eq!(active_plan_before.version, active_plan_after.version);
+
+        let update_error = service
+            .planning_session_update_summary(ipc::PlanningSessionUpdateSummaryRequest {
+                session_id: rejected.session_id.clone(),
+                summary: sample_planning_session_summary("Should be rejected", false),
+                updated_by: Some("tester".to_string()),
+                note: None,
+            })
+            .await
+            .expect_err("rejected session should be closed");
+        assert!(update_error.to_string().contains("already closed"));
+    }
+
+    #[tokio::test]
+    async fn planning_session_abort_keeps_canonical_plan_unchanged() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Planning abort".to_string(),
+                objective: "Plan one bounded change.".to_string(),
+                priority: Some("high".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let session = create_planning_session_for_workstream(
+            &service,
+            &workstream.id,
+            "Plan one bounded change.",
+        )
+        .await;
+        let active_plan_before = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+
+        let aborted = service
+            .planning_session_abort(ipc::PlanningSessionAbortRequest {
+                session_id: session.session_id.clone(),
+                updated_by: Some("tester".to_string()),
+                note: Some("abort the session".to_string()),
+            })
+            .await
+            .expect("abort session")
+            .session;
+        assert_eq!(
+            aborted.status,
+            orcas_core::collaboration::PlanningSessionStatus::Aborted
+        );
+
+        let active_plan_after = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+        assert_eq!(
+            active_plan_before.plan_id.clone(),
+            active_plan_after.plan_id.clone()
+        );
+        assert_eq!(active_plan_before.version, active_plan_after.version);
+
+        let approve_error = service
+            .planning_session_approve(ipc::PlanningSessionApproveRequest {
+                session_id: aborted.session_id.clone(),
+                approved_by: Some("tester".to_string()),
+                review_note: None,
+            })
+            .await
+            .expect_err("aborted session should be closed");
+        assert!(approve_error.to_string().contains("already closed"));
+    }
+
+    #[tokio::test]
+    async fn planning_session_supersede_keeps_canonical_plan_unchanged() {
+        let (service, _runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Planning supersede".to_string(),
+                objective: "Plan one bounded change.".to_string(),
+                priority: Some("high".to_string()),
+            })
+            .await
+            .expect("workstream create")
+            .workstream;
+        let session = create_planning_session_for_workstream(
+            &service,
+            &workstream.id,
+            "Plan one bounded change.",
+        )
+        .await;
+        let active_plan_before = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+
+        let superseded = service
+            .planning_session_supersede(ipc::PlanningSessionSupersedeRequest {
+                session_id: session.session_id.clone(),
+                superseded_by_session_id: Some("planning-session-next".to_string()),
+                updated_by: Some("tester".to_string()),
+                note: Some("supersede the session".to_string()),
+            })
+            .await
+            .expect("supersede session")
+            .session;
+        assert_eq!(
+            superseded.status,
+            orcas_core::collaboration::PlanningSessionStatus::Superseded
+        );
+
+        let active_plan_after = {
+            service
+                .state
+                .read()
+                .await
+                .collaboration
+                .planning
+                .active_plan(&workstream.id)
+                .cloned()
+                .expect("active plan")
+        };
+        assert_eq!(
+            active_plan_before.plan_id.clone(),
+            active_plan_after.plan_id.clone()
+        );
+        assert_eq!(active_plan_before.version, active_plan_after.version);
+
+        let research_error = service
+            .planning_session_request_research(ipc::PlanningSessionRequestResearchRequest {
+                session_id: superseded.session_id.clone(),
+                worker_id: "worker-research".to_string(),
+                requested_by: Some("tester".to_string()),
+                request_note: None,
+                worker_kind: Some("codex".to_string()),
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect_err("superseded session should be closed");
+        assert!(research_error.to_string().contains("already closed"));
     }
 
     #[derive(Debug)]
@@ -21726,6 +22477,10 @@ ORCAS_REPORT_END"#
                 },
             ))
             .await;
+        service
+            .refresh_codex_supervisor_state_for_thread(&thread.summary.id)
+            .await
+            .expect("refresh supervisor state after idle");
 
         let decisions = service
             .supervisor_decision_list(ipc::SupervisorDecisionListRequest {
@@ -24432,6 +25187,10 @@ ORCAS_REPORT_END"#
                 },
             ))
             .await;
+        service
+            .refresh_codex_supervisor_state_for_thread(&thread.summary.id)
+            .await
+            .expect("refresh supervisor state after interrupt proposal");
 
         let stored = service
             .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
@@ -24483,6 +25242,10 @@ ORCAS_REPORT_END"#
                 },
             ))
             .await;
+        service
+            .refresh_codex_supervisor_state_for_thread(&thread.summary.id)
+            .await
+            .expect("refresh supervisor state after steer proposal");
 
         let stored = service
             .supervisor_decision_get(ipc::SupervisorDecisionGetRequest {
