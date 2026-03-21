@@ -320,6 +320,7 @@ impl OrcasDaemonProcessManager {
 
         let daemon_binary = self.resolve_daemon_binary(true).await?;
         let binary_summary = Self::binary_summary_from_path(&daemon_binary)?;
+        let repo_root = Self::repo_root();
         let mut command = Command::new("setsid");
         command.arg(&daemon_binary);
         info!(
@@ -329,6 +330,7 @@ impl OrcasDaemonProcessManager {
         );
         command
             .kill_on_drop(false)
+            .current_dir(&repo_root)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
