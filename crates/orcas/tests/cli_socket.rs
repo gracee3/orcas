@@ -187,7 +187,7 @@ async fn spawn_assignment_ready_daemon(
             plan_id: None,
             plan_version: None,
             plan_item_id: None,
-            execution_kind: Default::default(),
+            execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
             alignment_rationale: None,
         })
         .await
@@ -273,7 +273,7 @@ async fn spawn_proposal_ready_daemon(
             plan_id: None,
             plan_version: None,
             plan_item_id: None,
-            execution_kind: Default::default(),
+            execution_kind: orcas_core::planning::PlanExecutionKind::DirectExecution,
             alignment_rationale: None,
         })
         .await

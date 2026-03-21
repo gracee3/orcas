@@ -1,12 +1,12 @@
 use crate::app::{
     AppState, BannerLevel, CollaborationFocus, DaemonConnectionPhase, DaemonLifecycleState,
 };
+use orcas_core::SupervisorProposalRecord;
 use orcas_core::ipc;
 use orcas_core::planning::{
     PlanRevisionApplyFailureKind, PlanRevisionApplyPhase, PlanRevisionProposal,
     PlanRevisionProposalStatus,
 };
-use orcas_core::SupervisorProposalRecord;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelViewModel {
@@ -195,9 +195,7 @@ pub(crate) fn plan_revision_failure_kind_label(
     }
 }
 
-pub(crate) fn plan_revision_next_action_label(
-    revision: &PlanRevisionProposal,
-) -> &'static str {
+pub(crate) fn plan_revision_next_action_label(revision: &PlanRevisionProposal) -> &'static str {
     use PlanRevisionProposalStatus::*;
 
     match revision.status {
@@ -257,10 +255,7 @@ pub(crate) fn plan_revision_recovery_badge(revision: &PlanRevisionProposal) -> S
 
 pub(crate) fn plan_revision_recovery_lines(revision: &PlanRevisionProposal) -> Vec<String> {
     let mut lines = vec![
-        format!(
-            "status: {}",
-            plan_revision_status_label(revision.status)
-        ),
+        format!("status: {}", plan_revision_status_label(revision.status)),
         format!(
             "phase: {}",
             plan_revision_apply_phase_label(revision.recovery.phase)
@@ -282,21 +277,18 @@ pub(crate) fn plan_revision_recovery_lines(revision: &PlanRevisionProposal) -> V
             revision.recovery.downstream_apply_completed
         ),
         format!("retry_safe: {}", revision.recovery.can_retry()),
-        format!(
-            "reconcile_available: {}",
-            revision.recovery.can_reconcile()
-        ),
+        format!("reconcile_available: {}", revision.recovery.can_reconcile()),
         format!(
             "operator_intervention_required: {}",
             revision.recovery.operator_intervention_required
         ),
-        format!(
-            "next_action: {}",
-            plan_revision_next_action_label(revision)
-        ),
+        format!("next_action: {}", plan_revision_next_action_label(revision)),
     ];
     if let Some(error) = revision.apply_error.as_deref() {
-        lines.push(format!("apply_error: {}", abbreviate(&compact_line(error), 96)));
+        lines.push(format!(
+            "apply_error: {}",
+            abbreviate(&compact_line(error), 96)
+        ));
     }
     if let Some(error) = revision.recovery.failure_message.as_deref()
         && revision.apply_error.as_deref() != Some(error)

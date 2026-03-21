@@ -8,9 +8,9 @@ use orcas_core::{SupervisorPromptRenderArtifact, SupervisorResponseArtifact};
 
 use super::main::{MainStatusSegmentViewModel, ProgramTabViewModel};
 use super::shared::{
-    PanelViewModel, abbreviate, compact_line, connection_status, event_log, short_id,
-    plan_revision_next_action_label, plan_revision_recovery_badge,
-    plan_revision_recovery_lines, proposal_plan_revision, status_banner, timestamp_label,
+    PanelViewModel, abbreviate, compact_line, connection_status, event_log,
+    plan_revision_next_action_label, plan_revision_recovery_badge, plan_revision_recovery_lines,
+    proposal_plan_revision, short_id, status_banner, timestamp_label,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

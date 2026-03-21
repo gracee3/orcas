@@ -61,7 +61,7 @@ impl TestDaemon {
             .env("ORCAS_CONNECTION_MODE", "connect_only")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::inherit());
         for (key, value) in &self.extra_env {
             command.env(key, value);
         }

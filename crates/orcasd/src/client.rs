@@ -49,7 +49,8 @@ pub struct OrcasIpcClient {
 }
 
 impl OrcasIpcClient {
-    const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+    // Long-form live turns can exceed the default short request window.
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
     pub async fn connect(paths: &AppPaths) -> OrcasResult<Arc<Self>> {
         let start = Instant::now();

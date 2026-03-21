@@ -9,7 +9,7 @@ use orcas_core::{
 use super::shared::{
     PanelViewModel, abbreviate, compact_line, plan_revision_apply_phase_label,
     plan_revision_failure_kind_label, plan_revision_next_action_label,
-    plan_revision_recovery_lines, plan_revision_recovery_badge, proposal_plan_revision, short_id,
+    plan_revision_recovery_badge, plan_revision_recovery_lines, proposal_plan_revision, short_id,
     timestamp_label,
 };
 
@@ -654,10 +654,15 @@ pub fn collaboration_detail(state: &AppState) -> CollaborationDetailViewModel {
         lines.push("proposal: -".to_string());
     }
 
-    let latest_proposal_id = latest_proposal.as_ref().map(|proposal| proposal.latest_proposal_id.as_str());
+    let latest_proposal_id = latest_proposal
+        .as_ref()
+        .map(|proposal| proposal.latest_proposal_id.as_str());
     if let Some(detail) = state.work_unit_details.get(work_unit_id)
         && let Some(proposal_id) = latest_proposal_id
-        && let Some(proposal_record) = detail.proposals.iter().find(|proposal| proposal.id == proposal_id)
+        && let Some(proposal_record) = detail
+            .proposals
+            .iter()
+            .find(|proposal| proposal.id == proposal_id)
         && let Some(revision) = proposal_plan_revision(proposal_record)
     {
         lines.push("proposal_recovery:".to_string());

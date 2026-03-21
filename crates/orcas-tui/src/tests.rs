@@ -1026,7 +1026,9 @@ fn sample_workunit_detail(work_unit_id: &str) -> ipc::WorkunitGetResponse {
                     "rev-1",
                     orcas_core::planning::PlanRevisionProposalStatus::ApplyFailed,
                     orcas_core::planning::PlanRevisionApplyPhase::FailedBeforeDownstream,
-                    Some(orcas_core::planning::PlanRevisionApplyFailureKind::RetryableInfrastructure),
+                    Some(
+                        orcas_core::planning::PlanRevisionApplyFailureKind::RetryableInfrastructure,
+                    ),
                     true,
                     false,
                     false,
@@ -4909,10 +4911,14 @@ async fn plan_revision_retry_state_renders_recovery_detail_and_hint() {
 async fn plan_revision_reconcile_and_operator_review_states_render_distinct_hints() {
     let mut harness = AppHarness::new(sample_review_snapshot()).await.unwrap();
     let mut detail = sample_workunit_detail("wu-1");
-    if let Some(proposal) = detail.proposals.iter_mut().find(|proposal| proposal.id == "proposal-1")
-        && let Some(plan_revision) = proposal.proposal.as_mut().and_then(|proposal| {
-            proposal.plan_revision_proposal.as_mut()
-        })
+    if let Some(proposal) = detail
+        .proposals
+        .iter_mut()
+        .find(|proposal| proposal.id == "proposal-1")
+        && let Some(plan_revision) = proposal
+            .proposal
+            .as_mut()
+            .and_then(|proposal| proposal.plan_revision_proposal.as_mut())
     {
         *plan_revision = sample_plan_revision_proposal(
             "rev-1",
