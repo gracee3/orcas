@@ -63,11 +63,11 @@ use orcas_core::{
     TrackedThreadPruneWorkspaceContract, TrackedThreadPruneWorkspaceResultStatus,
     TrackedThreadWorkspaceOperationContract, TrackedThreadWorkspaceOperationKind,
     TrackedThreadWorkspaceOperationStatus, WorkUnit, WorkUnitStatus, Worker, WorkerSession,
-    WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, WorkspaceOperationRecord,
-    Workstream, WorkstreamStatus,
+    WorkerSessionAttachability, WorkerSessionRuntimeStatus, WorkerStatus, WorkerWorkspaceReport,
+    WorkspaceOperationRecord, Workstream, WorkstreamStatus,
 };
 
-use crate::assignment_comm::parse::parse_worker_report_for_turn;
+use crate::assignment_comm::parse::{ParsedWorkerReport, parse_worker_report_for_turn};
 use crate::assignment_comm::policy::validate_assignment_packet;
 use crate::assignment_comm::render::build_assignment_communication_record;
 use crate::assignment_comm::stable_fingerprint;
@@ -159,6 +159,31 @@ impl Default for DaemonState {
 struct PreparedAssignment {
     assignment: Assignment,
     created_new: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AssignmentTurnIngestionPlan {
+    assignment_id: String,
+    worker_id: String,
+    worker_session_id: String,
+    work_unit_id: String,
+    assignment_status: AssignmentStatus,
+    session_runtime_status: WorkerSessionRuntimeStatus,
+    session_attachability: WorkerSessionAttachability,
+    parsed_report: ParsedWorkerReport,
+    report: Report,
+    raw_output_hash: String,
+    workspace_report: Option<WorkerWorkspaceReport>,
+    workspace_operation_contract: Option<TrackedThreadWorkspaceOperationContract>,
+    landing_execution_contract: Option<TrackedThreadLandingExecutionContract>,
+}
+
+#[derive(Debug, Clone)]
+struct AssignmentTurnIngestionCoreOutcome {
+    report: Report,
+    assignment_after_report: Assignment,
+    work_unit_after_report: WorkUnit,
+    stale_proposals: Vec<SupervisorProposalRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -752,6 +777,21 @@ impl OrcasDaemonService {
     }
 
     async fn handle_request(
+        self: &Arc<Self>,
+        request: JsonRpcRequest,
+        outbound: mpsc::Sender<String>,
+        subscription_task: &mut Option<tokio::task::JoinHandle<()>>,
+    ) -> OrcasResult<()> {
+        debug!(
+            request_id = ?request.id,
+            method = request.method.as_str(),
+            "routing ipc request through boxed dispatcher"
+        );
+        Box::pin(self.handle_request_dispatch(request, outbound, subscription_task)).await
+    }
+
+    #[inline(never)]
+    async fn handle_request_dispatch(
         self: &Arc<Self>,
         request: JsonRpcRequest,
         outbound: mpsc::Sender<String>,
@@ -4527,8 +4567,8 @@ impl OrcasDaemonService {
         turn_state: ipc::TurnStateView,
         raw_output: String,
     ) -> OrcasResult<Report> {
-        let (report, _assignment_after_report, _work_unit_after_report) =
-            self.ingest_assignment_turn_outcome(
+        let (report, _assignment_after_report, _work_unit_after_report) = self
+            .ingest_assignment_turn_outcome(
                 assignment_id,
                 worker_id,
                 worker_session_id,
@@ -5373,7 +5413,6 @@ impl OrcasDaemonService {
         turn_state: ipc::TurnStateView,
         raw_output: String,
     ) -> OrcasResult<(Report, Assignment, WorkUnit, Vec<SupervisorProposalRecord>)> {
-        Box::pin(async move {
         let started_at = Instant::now();
         info!(
             assignment_id = %assignment_id,
@@ -5405,361 +5444,507 @@ impl OrcasDaemonService {
                 })?;
             (assignment, record)
         };
+        let plan = Self::derive_assignment_turn_ingestion_plan(
+            assignment_id,
+            worker_id,
+            worker_session_id,
+            &turn_state,
+            raw_output,
+            assignment_for_parse,
+            communication_record,
+        );
+        info!(
+            assignment_id = %assignment_id,
+            worker_id = %worker_id,
+            worker_session_id = %worker_session_id,
+            parse_result = ?plan.parsed_report.validation.parse_result,
+            disposition = ?plan.parsed_report.disposition,
+            "assignment turn outcome plan derived"
+        );
+        let core = self.persist_assignment_turn_ingestion_core(&plan).await?;
+        info!(
+            assignment_id = %assignment_id,
+            worker_id = %worker_id,
+            worker_session_id = %worker_session_id,
+            report_id = %core.report.id,
+            "assignment turn outcome state updated"
+        );
+        self.run_assignment_turn_record_effects(&plan, &core)
+            .await?;
+        info!(
+            assignment_id = %assignment_id,
+            worker_id = %worker_id,
+            worker_session_id = %worker_session_id,
+            report_id = %core.report.id,
+            "recorded assignment turn outcome"
+        );
+        info!(
+            assignment_id = %assignment_id,
+            worker_id = %worker_id,
+            worker_session_id = %worker_session_id,
+            work_unit_id = %core.work_unit_after_report.id,
+            report_id = %core.report.id,
+            parse_result = ?core.report.parse_result,
+            needs_supervisor_review = core.report.needs_supervisor_review,
+            disposition = ?core.report.disposition,
+            stale_proposal_count = core.stale_proposals.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "recorded assignment turn outcome"
+        );
+        Ok((
+            core.report,
+            core.assignment_after_report,
+            core.work_unit_after_report,
+            core.stale_proposals,
+        ))
+    }
+
+    fn derive_assignment_turn_ingestion_plan(
+        assignment_id: &str,
+        worker_id: &str,
+        worker_session_id: &str,
+        turn_state: &ipc::TurnStateView,
+        raw_output: String,
+        assignment_for_parse: Assignment,
+        communication_record: AssignmentCommunicationRecord,
+    ) -> AssignmentTurnIngestionPlan {
         let parsed_report = parse_worker_report_for_turn(
             &raw_output,
             turn_state.lifecycle,
             &assignment_for_parse,
             &communication_record,
         );
-        info!(
-            assignment_id = %assignment_id,
-            worker_id = %worker_id,
-            worker_session_id = %worker_session_id,
-            parse_result = ?parsed_report.validation.parse_result,
-            disposition = ?parsed_report.disposition,
-            "assignment turn outcome parsed"
-        );
         let workspace_report = parsed_report
             .envelope
             .as_ref()
             .and_then(|envelope| envelope.workspace_report.clone());
         let raw_output_hash = stable_fingerprint(&raw_output);
-        let now = Utc::now();
-        let mut state = self.state.write().await;
-        let assignment = state
-            .collaboration
-            .assignments
-            .get_mut(assignment_id)
-            .ok_or_else(|| OrcasError::Protocol(format!("unknown assignment `{assignment_id}`")))?;
-        let work_unit_id = assignment.work_unit_id.clone();
-        assignment.status = match turn_state.lifecycle {
+        let work_unit_id = assignment_for_parse.work_unit_id.clone();
+        let assignment_status = match turn_state.lifecycle {
             ipc::TurnLifecycleState::Interrupted => AssignmentStatus::Interrupted,
             ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
                 AssignmentStatus::Lost
             }
             _ => AssignmentStatus::AwaitingDecision,
         };
-        assignment.updated_at = now;
-
-        let report_id = Self::new_object_id("report");
-        let summary = parsed_report.summary.clone();
+        let session_runtime_status = match turn_state.lifecycle {
+            ipc::TurnLifecycleState::Interrupted => WorkerSessionRuntimeStatus::Interrupted,
+            ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
+                WorkerSessionRuntimeStatus::Lost
+            }
+            _ => WorkerSessionRuntimeStatus::Completed,
+        };
+        let session_attachability = if turn_state.attachable {
+            WorkerSessionAttachability::Attachable
+        } else {
+            WorkerSessionAttachability::NotAttachable
+        };
         let report = Report {
-            id: report_id.clone(),
+            id: Self::new_object_id("report"),
             work_unit_id: work_unit_id.clone(),
             assignment_id: assignment_id.to_string(),
             worker_id: worker_id.to_string(),
             disposition: parsed_report.disposition,
-            summary,
-            findings: parsed_report.findings,
-            blockers: parsed_report.blockers,
-            questions: parsed_report.questions,
-            recommended_next_actions: parsed_report.recommended_next_actions,
+            summary: parsed_report.summary.clone(),
+            findings: parsed_report.findings.clone(),
+            blockers: parsed_report.blockers.clone(),
+            questions: parsed_report.questions.clone(),
+            recommended_next_actions: parsed_report.recommended_next_actions.clone(),
             confidence: parsed_report.confidence,
             raw_output,
             parse_result: parsed_report.validation.parse_result,
             needs_supervisor_review: parsed_report.validation.needs_supervisor_review,
-            created_at: now,
+            created_at: Utc::now(),
         };
-        state
-            .collaboration
+        let workspace_operation_contract = assignment_for_parse
+            .communication_seed
+            .as_ref()
+            .and_then(|seed| seed.workspace_operation.clone());
+        let landing_execution_contract = assignment_for_parse
+            .communication_seed
+            .as_ref()
+            .and_then(|seed| seed.landing_execution.clone());
+        AssignmentTurnIngestionPlan {
+            assignment_id: assignment_id.to_string(),
+            worker_id: worker_id.to_string(),
+            worker_session_id: worker_session_id.to_string(),
+            work_unit_id,
+            assignment_status,
+            session_runtime_status,
+            session_attachability,
+            parsed_report,
+            report,
+            raw_output_hash,
+            workspace_report,
+            workspace_operation_contract,
+            landing_execution_contract,
+        }
+    }
+
+    async fn persist_assignment_turn_ingestion_core(
+        &self,
+        plan: &AssignmentTurnIngestionPlan,
+    ) -> OrcasResult<AssignmentTurnIngestionCoreOutcome> {
+        let started_at = Instant::now();
+        info!(
+            assignment_id = %plan.assignment_id,
+            worker_id = %plan.worker_id,
+            worker_session_id = %plan.worker_session_id,
+            "persisting assignment turn outcome core"
+        );
+        let now = Utc::now();
+        let (assignment_after_report, work_unit_after_report, stale_proposals) = {
+            let mut state = self.state.write().await;
+            Self::apply_assignment_turn_ingestion_state(&mut state.collaboration, plan, now)?
+        };
+        self.persist_collaboration_state().await?;
+        info!(
+            assignment_id = %plan.assignment_id,
+            worker_id = %plan.worker_id,
+            worker_session_id = %plan.worker_session_id,
+            report_id = %plan.report.id,
+            stale_proposal_count = stale_proposals.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "assignment turn outcome core persisted"
+        );
+        Ok(AssignmentTurnIngestionCoreOutcome {
+            report: plan.report.clone(),
+            assignment_after_report,
+            work_unit_after_report,
+            stale_proposals,
+        })
+    }
+
+    fn apply_assignment_turn_ingestion_state(
+        collaboration: &mut CollaborationState,
+        plan: &AssignmentTurnIngestionPlan,
+        now: chrono::DateTime<Utc>,
+    ) -> OrcasResult<(Assignment, WorkUnit, Vec<SupervisorProposalRecord>)> {
+        let assignment = collaboration
+            .assignments
+            .get_mut(&plan.assignment_id)
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown assignment `{}`", plan.assignment_id))
+            })?;
+        assignment.status = plan.assignment_status;
+        assignment.updated_at = now;
+
+        collaboration
             .reports
-            .insert(report.id.clone(), report.clone());
-        if let Some(record) = state
-            .collaboration
+            .insert(plan.report.id.clone(), plan.report.clone());
+        if let Some(record) = collaboration
             .assignment_communications
-            .get_mut(assignment_id)
+            .get_mut(&plan.assignment_id)
         {
-            record.response_envelope = parsed_report.envelope.clone();
-            record.validation = Some(parsed_report.validation.clone());
-            record.raw_output_hash = Some(raw_output_hash);
+            record.response_envelope = plan.parsed_report.envelope.clone();
+            record.validation = Some(plan.parsed_report.validation.clone());
+            record.raw_output_hash = Some(plan.raw_output_hash.clone());
         }
-        if let Some(work_unit) = state.collaboration.work_units.get_mut(&work_unit_id) {
+
+        if let Some(work_unit) = collaboration.work_units.get_mut(&plan.work_unit_id) {
             work_unit.status = WorkUnitStatus::AwaitingDecision;
-            work_unit.latest_report_id = Some(report.id.clone());
-            work_unit.current_assignment_id = Some(assignment_id.to_string());
+            work_unit.latest_report_id = Some(plan.report.id.clone());
+            work_unit.current_assignment_id = Some(plan.assignment_id.clone());
             work_unit.updated_at = now;
+        } else {
+            return Err(OrcasError::Protocol(format!(
+                "unknown work unit `{}`",
+                plan.work_unit_id
+            )));
         }
-        if let Some(worker) = state.collaboration.workers.get_mut(worker_id) {
+
+        if let Some(worker) = collaboration.workers.get_mut(&plan.worker_id) {
             worker.status = WorkerStatus::Idle;
             worker.current_assignment_id = None;
         }
-        if let Some(session) = state
-            .collaboration
+        if let Some(session) = collaboration
             .worker_sessions
-            .get_mut(worker_session_id)
+            .get_mut(&plan.worker_session_id)
         {
             session.active_turn_id = None;
-            session.runtime_status = match turn_state.lifecycle {
-                ipc::TurnLifecycleState::Interrupted => WorkerSessionRuntimeStatus::Interrupted,
-                ipc::TurnLifecycleState::Lost | ipc::TurnLifecycleState::Unknown => {
-                    WorkerSessionRuntimeStatus::Lost
-                }
-                _ => WorkerSessionRuntimeStatus::Completed,
-            };
-            session.attachability = if turn_state.attachable {
-                WorkerSessionAttachability::Attachable
-            } else {
-                WorkerSessionAttachability::NotAttachable
-            };
+            session.runtime_status = plan.session_runtime_status;
+            session.attachability = plan.session_attachability;
             session.updated_at = now;
         }
-        drop(state);
-        info!(
-            assignment_id = %assignment_id,
-            worker_id = %worker_id,
-            worker_session_id = %worker_session_id,
-            report_id = %report.id,
-            "assignment turn outcome state updated"
-        );
 
-        if parsed_report.validation.parse_result != ReportParseResult::Invalid
-            && let Some(workspace_report) = workspace_report.as_ref()
-            && let Err(error) = self
-                .record_worker_workspace_report(assignment_id, workspace_report)
-                .await
-        {
-            warn!(
-                assignment_id,
-                worker_id,
-                worker_session_id,
-                error = %error,
-                "worker workspace report persistence failed"
-            );
-        }
-
-        if let Some(workspace_operation_contract) = assignment_for_parse
-            .communication_seed
-            .as_ref()
-            .and_then(|seed| seed.workspace_operation.as_ref())
-        {
-            match workspace_operation_contract.kind {
-                TrackedThreadWorkspaceOperationKind::PruneWorkspace => {
-                    let prune_workspace_result = parsed_report
-                        .envelope
-                        .as_ref()
-                        .and_then(|envelope| envelope.prune_workspace_result.as_ref());
-                    let prune_workspace_result_status =
-                        prune_workspace_result.map(|result| result.status);
-                    let target_worktree_path = prune_workspace_result
-                        .map(|result| result.worktree_path.clone())
-                        .or_else(|| {
-                            Some(workspace_operation_contract.workspace.worktree_path.clone())
-                        });
-                    let target_branch_name = prune_workspace_result
-                        .and_then(|result| result.branch_name.clone())
-                        .or_else(|| {
-                            Some(workspace_operation_contract.workspace.branch_name.clone())
-                        });
-                    let worktree_removed =
-                        prune_workspace_result.and_then(|result| result.worktree_removed);
-                    let branch_removed =
-                        prune_workspace_result.and_then(|result| result.branch_removed);
-                    let refusal_reason =
-                        prune_workspace_result.and_then(|result| result.refusal_reason.clone());
-                    let failure_reason =
-                        prune_workspace_result.and_then(|result| result.failure_reason.clone());
-                    let prune_notes =
-                        prune_workspace_result.and_then(|result| result.notes.clone());
-                    let successful_prune = parsed_report.validation.parse_result
-                        != ReportParseResult::Invalid
-                        && workspace_report.is_some()
-                        && prune_workspace_result.is_some()
-                        && matches!(
-                            prune_workspace_result_status,
-                            Some(TrackedThreadPruneWorkspaceResultStatus::Succeeded)
-                        )
-                        && parsed_report.disposition == ReportDisposition::Completed;
-                    if successful_prune {
-                        self.mark_workspace_operation_completed(
-                            assignment_id,
-                            Some(report_id.clone()),
-                            Some(parsed_report.disposition),
-                            Some(parsed_report.summary.clone()),
-                            prune_workspace_result_status,
-                            target_worktree_path,
-                            target_branch_name,
-                            worktree_removed,
-                            branch_removed,
-                            refusal_reason,
-                            failure_reason,
-                            prune_notes,
-                        )
-                        .await?;
-                    } else {
-                        self.mark_workspace_operation_failed(
-                            assignment_id,
-                            Some(report_id.clone()),
-                            Some(parsed_report.summary.clone()),
-                            prune_workspace_result_status,
-                            target_worktree_path,
-                            target_branch_name,
-                            worktree_removed,
-                            branch_removed,
-                            refusal_reason,
-                            failure_reason,
-                            prune_notes,
-                        )
-                        .await?;
-                    }
-                }
-                _ => {
-                    if parsed_report.validation.parse_result != ReportParseResult::Invalid
-                        && workspace_report.is_some()
-                        && parsed_report.disposition == ReportDisposition::Completed
-                    {
-                        self.mark_workspace_operation_completed(
-                            assignment_id,
-                            Some(report_id.clone()),
-                            Some(parsed_report.disposition),
-                            Some(parsed_report.summary.clone()),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await?;
-                    } else {
-                        self.mark_workspace_operation_failed(
-                            assignment_id,
-                            Some(report_id.clone()),
-                            Some(parsed_report.summary.clone()),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await?;
-                    }
-                }
-            }
-        } else if assignment_for_parse
-            .communication_seed
-            .as_ref()
-            .and_then(|seed| seed.landing_execution.as_ref())
-            .is_some()
-        {
-            let landing_execution_result = parsed_report
-                .envelope
-                .as_ref()
-                .and_then(|envelope| envelope.landing_execution_result.as_ref());
-            let execution_result_status = landing_execution_result.map(|result| result.status);
-            let attempted_head_commit =
-                landing_execution_result.map(|result| result.attempted_head_commit.clone());
-            let landed_commit =
-                landing_execution_result.and_then(|result| result.landed_commit.clone());
-            let landing_ref_updated =
-                landing_execution_result.and_then(|result| result.landing_ref_updated);
-            let failure_reason =
-                landing_execution_result.and_then(|result| result.failure_reason.clone());
-            let notes = landing_execution_result.and_then(|result| result.notes.clone());
-            let authorization_id = assignment_for_parse
-                .communication_seed
-                .as_ref()
-                .and_then(|seed| seed.landing_execution.as_ref())
-                .map(|contract| contract.landing_authorization_id.clone());
-            let authorized = matches!(
-                execution_result_status,
-                Some(TrackedThreadLandingExecutionResultStatus::Succeeded)
-            );
-            if parsed_report.validation.parse_result == ReportParseResult::Parsed
-                && workspace_report.is_some()
-                && landing_execution_result.is_some()
-                && authorized
-                && parsed_report.disposition == ReportDisposition::Completed
-            {
-                self.mark_landing_execution_completed(
-                    assignment_id,
-                    Some(report_id.clone()),
-                    Some(parsed_report.disposition),
-                    Some(parsed_report.summary.clone()),
-                    execution_result_status,
-                    attempted_head_commit,
-                    landed_commit,
-                    landing_ref_updated,
-                    failure_reason,
-                    notes,
-                )
-                .await?;
-                if let Some(authorization_id) = authorization_id {
-                    self.mark_landing_authorization_completed(
-                        &authorization_id,
-                        Some(parsed_report.summary.clone()),
-                    )
-                    .await?;
-                }
-            } else {
-                self.mark_landing_execution_failed(
-                    assignment_id,
-                    Some(report_id.clone()),
-                    Some(parsed_report.disposition),
-                    Some(parsed_report.summary.clone()),
-                    execution_result_status,
-                    attempted_head_commit,
-                    landed_commit,
-                    landing_ref_updated,
-                    failure_reason,
-                    notes,
-                )
-                .await?;
-                if let Some(authorization_id) = authorization_id {
-                    self.mark_landing_authorization_failed(
-                        &authorization_id,
-                        Some(parsed_report.summary.clone()),
-                    )
-                    .await?;
-                }
-            }
-        }
-
-        let mut state = self.state.write().await;
         let stale_proposals =
-            Self::refresh_stale_proposals_for_work_unit(&mut state.collaboration, &work_unit_id);
-        Self::refresh_workstream_statuses(&mut state.collaboration);
-        let assignment_after_report = state
-            .collaboration
+            Self::refresh_stale_proposals_for_work_unit(collaboration, &plan.work_unit_id);
+        Self::refresh_workstream_statuses(collaboration);
+        let assignment_after_report = collaboration
             .assignments
-            .get(assignment_id)
+            .get(&plan.assignment_id)
             .cloned()
-            .ok_or_else(|| OrcasError::Protocol(format!("unknown assignment `{assignment_id}`")))?;
-        let work_unit_after_report = state
-            .collaboration
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown assignment `{}`", plan.assignment_id))
+            })?;
+        let work_unit_after_report = collaboration
             .work_units
-            .get(&work_unit_id)
+            .get(&plan.work_unit_id)
             .cloned()
-            .ok_or_else(|| OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`")))?;
-        drop(state);
-        self.persist_collaboration_state().await?;
-        info!(
-            assignment_id,
-            worker_id,
-            worker_session_id,
-            work_unit_id = %work_unit_after_report.id,
-            report_id = %report.id,
-            parse_result = ?report.parse_result,
-            needs_supervisor_review = report.needs_supervisor_review,
-            disposition = ?report.disposition,
-            stale_proposal_count = stale_proposals.len(),
-            duration_ms = started_at.elapsed().as_millis() as u64,
-            "recorded assignment turn outcome"
-        );
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown work unit `{}`", plan.work_unit_id))
+            })?;
         Ok((
-            report,
             assignment_after_report,
             work_unit_after_report,
             stale_proposals,
         ))
-        })
-        .await
     }
 
+    async fn emit_assignment_turn_ingestion_events(
+        &self,
+        core: &AssignmentTurnIngestionCoreOutcome,
+    ) {
+        self.emit_report_recorded(&core.report).await;
+        let assignment_event_action = match core.assignment_after_report.status {
+            AssignmentStatus::Interrupted => ipc::AssignmentLifecycleAction::Interrupted,
+            AssignmentStatus::Failed | AssignmentStatus::Lost => {
+                ipc::AssignmentLifecycleAction::Failed
+            }
+            AssignmentStatus::AwaitingDecision => ipc::AssignmentLifecycleAction::Reported,
+            _ => ipc::AssignmentLifecycleAction::Reported,
+        };
+        self.emit_assignment_lifecycle(assignment_event_action, &core.assignment_after_report)
+            .await;
+        self.emit_work_unit_lifecycle(
+            ipc::CollaborationLifecycleAction::Updated,
+            &core.work_unit_after_report,
+        )
+        .await;
+        for proposal in &core.stale_proposals {
+            self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
+                .await;
+        }
+    }
+
+    async fn apply_assignment_turn_workspace_operation_effects(
+        &self,
+        plan: &AssignmentTurnIngestionPlan,
+        core: &AssignmentTurnIngestionCoreOutcome,
+    ) -> OrcasResult<()> {
+        let Some(workspace_operation_contract) = plan.workspace_operation_contract.as_ref() else {
+            return Ok(());
+        };
+        match workspace_operation_contract.kind {
+            TrackedThreadWorkspaceOperationKind::PruneWorkspace => {
+                let prune_workspace_result = plan
+                    .parsed_report
+                    .envelope
+                    .as_ref()
+                    .and_then(|envelope| envelope.prune_workspace_result.as_ref());
+                let prune_workspace_result_status =
+                    prune_workspace_result.map(|result| result.status);
+                let target_worktree_path = prune_workspace_result
+                    .map(|result| result.worktree_path.clone())
+                    .or_else(|| Some(workspace_operation_contract.workspace.worktree_path.clone()));
+                let target_branch_name = prune_workspace_result
+                    .and_then(|result| result.branch_name.clone())
+                    .or_else(|| Some(workspace_operation_contract.workspace.branch_name.clone()));
+                let worktree_removed =
+                    prune_workspace_result.and_then(|result| result.worktree_removed);
+                let branch_removed =
+                    prune_workspace_result.and_then(|result| result.branch_removed);
+                let refusal_reason =
+                    prune_workspace_result.and_then(|result| result.refusal_reason.clone());
+                let failure_reason =
+                    prune_workspace_result.and_then(|result| result.failure_reason.clone());
+                let prune_notes = prune_workspace_result.and_then(|result| result.notes.clone());
+                let successful_prune = plan.parsed_report.validation.parse_result
+                    != ReportParseResult::Invalid
+                    && plan.workspace_report.is_some()
+                    && prune_workspace_result.is_some()
+                    && matches!(
+                        prune_workspace_result_status,
+                        Some(TrackedThreadPruneWorkspaceResultStatus::Succeeded)
+                    )
+                    && plan.parsed_report.disposition == ReportDisposition::Completed;
+                if successful_prune {
+                    self.mark_workspace_operation_completed(
+                        &plan.assignment_id,
+                        Some(core.report.id.clone()),
+                        Some(plan.parsed_report.disposition),
+                        Some(plan.parsed_report.summary.clone()),
+                        prune_workspace_result_status,
+                        target_worktree_path,
+                        target_branch_name,
+                        worktree_removed,
+                        branch_removed,
+                        refusal_reason,
+                        failure_reason,
+                        prune_notes,
+                    )
+                    .await?;
+                } else {
+                    self.mark_workspace_operation_failed(
+                        &plan.assignment_id,
+                        Some(core.report.id.clone()),
+                        Some(plan.parsed_report.summary.clone()),
+                        prune_workspace_result_status,
+                        target_worktree_path,
+                        target_branch_name,
+                        worktree_removed,
+                        branch_removed,
+                        refusal_reason,
+                        failure_reason,
+                        prune_notes,
+                    )
+                    .await?;
+                }
+            }
+            _ => {
+                if plan.parsed_report.validation.parse_result != ReportParseResult::Invalid
+                    && plan.workspace_report.is_some()
+                    && plan.parsed_report.disposition == ReportDisposition::Completed
+                {
+                    self.mark_workspace_operation_completed(
+                        &plan.assignment_id,
+                        Some(core.report.id.clone()),
+                        Some(plan.parsed_report.disposition),
+                        Some(plan.parsed_report.summary.clone()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                } else {
+                    self.mark_workspace_operation_failed(
+                        &plan.assignment_id,
+                        Some(core.report.id.clone()),
+                        Some(plan.parsed_report.summary.clone()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_assignment_turn_landing_execution_effects(
+        &self,
+        plan: &AssignmentTurnIngestionPlan,
+        core: &AssignmentTurnIngestionCoreOutcome,
+    ) -> OrcasResult<()> {
+        let Some(landing_execution_contract) = plan.landing_execution_contract.as_ref() else {
+            return Ok(());
+        };
+        let landing_execution_result = plan
+            .parsed_report
+            .envelope
+            .as_ref()
+            .and_then(|envelope| envelope.landing_execution_result.as_ref());
+        let execution_result_status = landing_execution_result.map(|result| result.status);
+        let attempted_head_commit =
+            landing_execution_result.map(|result| result.attempted_head_commit.clone());
+        let landed_commit =
+            landing_execution_result.and_then(|result| result.landed_commit.clone());
+        let landing_ref_updated =
+            landing_execution_result.and_then(|result| result.landing_ref_updated);
+        let failure_reason =
+            landing_execution_result.and_then(|result| result.failure_reason.clone());
+        let notes = landing_execution_result.and_then(|result| result.notes.clone());
+        let authorized = matches!(
+            execution_result_status,
+            Some(TrackedThreadLandingExecutionResultStatus::Succeeded)
+        );
+        if plan.parsed_report.validation.parse_result == ReportParseResult::Parsed
+            && plan.workspace_report.is_some()
+            && landing_execution_result.is_some()
+            && authorized
+            && plan.parsed_report.disposition == ReportDisposition::Completed
+        {
+            self.mark_landing_execution_completed(
+                &plan.assignment_id,
+                Some(core.report.id.clone()),
+                Some(plan.parsed_report.disposition),
+                Some(plan.parsed_report.summary.clone()),
+                execution_result_status,
+                attempted_head_commit,
+                landed_commit,
+                landing_ref_updated,
+                failure_reason,
+                notes,
+            )
+            .await?;
+            self.mark_landing_authorization_completed(
+                &landing_execution_contract.landing_authorization_id,
+                Some(plan.parsed_report.summary.clone()),
+            )
+            .await?;
+        } else {
+            self.mark_landing_execution_failed(
+                &plan.assignment_id,
+                Some(core.report.id.clone()),
+                Some(plan.parsed_report.disposition),
+                Some(plan.parsed_report.summary.clone()),
+                execution_result_status,
+                attempted_head_commit,
+                landed_commit,
+                landing_ref_updated,
+                failure_reason,
+                notes,
+            )
+            .await?;
+            self.mark_landing_authorization_failed(
+                &landing_execution_contract.landing_authorization_id,
+                Some(plan.parsed_report.summary.clone()),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn run_assignment_turn_record_effects(
+        &self,
+        plan: &AssignmentTurnIngestionPlan,
+        core: &AssignmentTurnIngestionCoreOutcome,
+    ) -> OrcasResult<()> {
+        let started_at = Instant::now();
+        info!(
+            assignment_id = %plan.assignment_id,
+            worker_id = %plan.worker_id,
+            worker_session_id = %plan.worker_session_id,
+            report_id = %core.report.id,
+            "running assignment turn record side effects"
+        );
+        if plan.parsed_report.validation.parse_result != ReportParseResult::Invalid
+            && let Some(workspace_report) = plan.workspace_report.as_ref()
+            && let Err(error) = self
+                .record_worker_workspace_report(&plan.assignment_id, workspace_report)
+                .await
+        {
+            warn!(
+                assignment_id = %plan.assignment_id,
+                worker_id = %plan.worker_id,
+                worker_session_id = %plan.worker_session_id,
+                error = %error,
+                "worker workspace report persistence failed"
+            );
+        }
+        Box::pin(self.apply_assignment_turn_workspace_operation_effects(plan, core)).await?;
+        Box::pin(self.apply_assignment_turn_landing_execution_effects(plan, core)).await?;
+        info!(
+            assignment_id = %plan.assignment_id,
+            worker_id = %plan.worker_id,
+            worker_session_id = %plan.worker_session_id,
+            report_id = %core.report.id,
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "assignment turn record side effects complete"
+        );
+        Ok(())
+    }
     async fn record_worker_workspace_report(
         &self,
         assignment_id: &str,
@@ -5881,21 +6066,20 @@ impl OrcasDaemonService {
         turn_state: ipc::TurnStateView,
         raw_output: String,
     ) -> OrcasResult<(Report, Assignment, WorkUnit)> {
-        Box::pin(async move {
         info!(
             assignment_id = %assignment_id,
             worker_id = %worker_id,
             worker_session_id = %worker_session_id,
             "ingesting assignment turn outcome"
         );
-        let (report, assignment_after_report, work_unit_after_report, stale_proposals) =
-            Box::pin(self.record_assignment_turn_outcome(
+        let (report, assignment_after_report, work_unit_after_report, stale_proposals) = self
+            .record_assignment_turn_outcome(
                 assignment_id,
                 worker_id,
                 worker_session_id,
                 turn_state,
                 raw_output,
-            ))
+            )
             .await?;
         info!(
             assignment_id = %assignment_id,
@@ -5904,27 +6088,13 @@ impl OrcasDaemonService {
             report_id = %report.id,
             "assignment turn outcome recorded"
         );
-        self.persist_collaboration_state().await?;
-        self.emit_report_recorded(&report).await;
-        let assignment_event_action = match assignment_after_report.status {
-            AssignmentStatus::Interrupted => ipc::AssignmentLifecycleAction::Interrupted,
-            AssignmentStatus::Failed | AssignmentStatus::Lost => {
-                ipc::AssignmentLifecycleAction::Failed
-            }
-            AssignmentStatus::AwaitingDecision => ipc::AssignmentLifecycleAction::Reported,
-            _ => ipc::AssignmentLifecycleAction::Reported,
+        let core = AssignmentTurnIngestionCoreOutcome {
+            report: report.clone(),
+            assignment_after_report: assignment_after_report.clone(),
+            work_unit_after_report: work_unit_after_report.clone(),
+            stale_proposals: stale_proposals.clone(),
         };
-        self.emit_assignment_lifecycle(assignment_event_action, &assignment_after_report)
-            .await;
-        self.emit_work_unit_lifecycle(
-            ipc::CollaborationLifecycleAction::Updated,
-            &work_unit_after_report,
-        )
-        .await;
-        for proposal in &stale_proposals {
-            self.emit_proposal_lifecycle(ipc::ProposalLifecycleAction::Stale, proposal)
-                .await;
-        }
+        self.emit_assignment_turn_ingestion_events(&core).await;
         self.maybe_auto_create_proposal_for_report(&report).await;
         info!(
             assignment_id = %assignment_id,
@@ -5934,8 +6104,6 @@ impl OrcasDaemonService {
             "assignment turn outcome ingestion complete"
         );
         Ok((report, assignment_after_report, work_unit_after_report))
-        })
-        .await
     }
 
     async fn assignment_get(
@@ -12263,153 +12431,11 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             let Some(thread) = state.threads.get(thread_id).cloned() else {
                 return Ok(());
             };
-
-            let (stale, mut updated_assignments) =
-                Self::stale_open_supervisor_decisions_for_thread_locked(
-                    &mut state.collaboration,
-                    &thread,
-                );
-            let mut created = Vec::new();
-
-            if thread.summary.active_turn_id.is_none() {
-                let assignment_ids = state
-                    .collaboration
-                    .codex_thread_assignments
-                    .values()
-                    .filter(|assignment| {
-                        assignment.codex_thread_id == thread.summary.id
-                            && Self::codex_assignment_supports_decisions(assignment.status)
-                    })
-                    .map(|assignment| assignment.assignment_id.clone())
-                    .collect::<Vec<_>>();
-
-                for assignment_id in assignment_ids {
-                    if Self::open_supervisor_decision_id_for_assignment(
-                        &state.collaboration,
-                        &assignment_id,
-                    )
-                    .is_some()
-                    {
-                        continue;
-                    }
-                    let Some(assignment_snapshot) = state
-                        .collaboration
-                        .codex_thread_assignments
-                        .get(&assignment_id)
-                        .cloned()
-                    else {
-                        continue;
-                    };
-                    let basis_turn_id = thread.summary.last_seen_turn_id.clone();
-                    if Self::latest_current_basis_recorded_no_action(
-                        &state.collaboration,
-                        &assignment_snapshot.assignment_id,
-                        basis_turn_id.as_deref(),
-                    )
-                    .is_some()
-                    {
-                        continue;
-                    }
-
-                    let proposal_kind = if assignment_snapshot.bootstrap_state
-                        == CodexThreadBootstrapState::Pending
-                    {
-                        SupervisorTurnProposalKind::Bootstrap
-                    } else {
-                        SupervisorTurnProposalKind::ContinueAfterTurn
-                    };
-                    let proposed_text = Some(match proposal_kind {
-                        SupervisorTurnProposalKind::Bootstrap => {
-                            Self::generate_bootstrap_turn_text(
-                                &assignment_snapshot,
-                                state
-                                    .collaboration
-                                    .workstreams
-                                    .get(&assignment_snapshot.workstream_id),
-                                state
-                                    .collaboration
-                                    .work_units
-                                    .get(&assignment_snapshot.work_unit_id),
-                            )
-                        }
-                        SupervisorTurnProposalKind::ContinueAfterTurn
-                        | SupervisorTurnProposalKind::ManualRefresh => {
-                            Self::generate_continue_turn_text(
-                                &assignment_snapshot,
-                                state
-                                    .collaboration
-                                    .workstreams
-                                    .get(&assignment_snapshot.workstream_id),
-                                state
-                                    .collaboration
-                                    .work_units
-                                    .get(&assignment_snapshot.work_unit_id),
-                                basis_turn_id.as_deref(),
-                            )
-                        }
-                        SupervisorTurnProposalKind::OperatorSteer => {
-                            unreachable!("operator steer proposals are only created explicitly")
-                        }
-                        SupervisorTurnProposalKind::OperatorInterrupt => {
-                            unreachable!("operator interrupt proposals are only created explicitly")
-                        }
-                    });
-                    let rationale_summary = match proposal_kind {
-                        SupervisorTurnProposalKind::Bootstrap => format!(
-                            "Assignment `{}` is active, the thread is idle, and the bootstrap proposal has not been sent yet.",
-                            assignment_snapshot.assignment_id
-                        ),
-                        SupervisorTurnProposalKind::ContinueAfterTurn
-                        | SupervisorTurnProposalKind::ManualRefresh => format!(
-                            "Assignment `{}` remains active and thread `{}` is idle after basis turn {:?}.",
-                            assignment_snapshot.assignment_id, thread.summary.id, basis_turn_id
-                        ),
-                        SupervisorTurnProposalKind::OperatorSteer => {
-                            unreachable!("operator steer proposals are only created explicitly")
-                        }
-                        SupervisorTurnProposalKind::OperatorInterrupt => {
-                            unreachable!("operator interrupt proposals are only created explicitly")
-                        }
-                    };
-                    let decision = SupervisorTurnDecision {
-                        decision_id: Self::new_object_id("std"),
-                        assignment_id: assignment_snapshot.assignment_id.clone(),
-                        codex_thread_id: assignment_snapshot.codex_thread_id.clone(),
-                        basis_turn_id: basis_turn_id.clone(),
-                        kind: SupervisorTurnDecisionKind::NextTurn,
-                        proposal_kind,
-                        proposed_text,
-                        rationale_summary,
-                        status: SupervisorTurnDecisionStatus::ProposedToHuman,
-                        created_at: now,
-                        approved_at: None,
-                        rejected_at: None,
-                        sent_at: None,
-                        superseded_by: None,
-                        sent_turn_id: None,
-                        notes: None,
-                    };
-                    state
-                        .collaboration
-                        .supervisor_turn_decisions
-                        .insert(decision.decision_id.clone(), decision.clone());
-                    if let Some(assignment) = state
-                        .collaboration
-                        .codex_thread_assignments
-                        .get_mut(&assignment_snapshot.assignment_id)
-                    {
-                        assignment.latest_decision_id = Some(decision.decision_id.clone());
-                        assignment.latest_basis_turn_id = basis_turn_id.clone();
-                        assignment.updated_at = now;
-                        if proposal_kind == SupervisorTurnProposalKind::Bootstrap {
-                            assignment.bootstrap_state = CodexThreadBootstrapState::Proposed;
-                        }
-                        updated_assignments.push(assignment.clone());
-                    }
-                    created.push(decision);
-                }
-            }
-            (created, stale, updated_assignments)
+            Self::refresh_codex_supervisor_state_for_thread_locked(
+                &mut state.collaboration,
+                &thread,
+                now,
+            )
         };
         if created.is_empty() && stale.is_empty() && updated_assignments.is_empty() {
             return Ok(());
@@ -12438,6 +12464,147 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         }
         info!(thread_id = %thread_id, "finished refreshing codex supervisor state for thread");
         Ok(())
+    }
+
+    fn refresh_codex_supervisor_state_for_thread_locked(
+        collaboration: &mut CollaborationState,
+        thread: &ipc::ThreadView,
+        now: chrono::DateTime<Utc>,
+    ) -> (
+        Vec<SupervisorTurnDecision>,
+        Vec<SupervisorTurnDecision>,
+        Vec<CodexThreadAssignment>,
+    ) {
+        let (stale, mut updated_assignments) =
+            Self::stale_open_supervisor_decisions_for_thread_locked(collaboration, thread);
+        let mut created = Vec::new();
+
+        if thread.summary.active_turn_id.is_none() {
+            let assignment_ids = collaboration
+                .codex_thread_assignments
+                .values()
+                .filter(|assignment| {
+                    assignment.codex_thread_id == thread.summary.id
+                        && Self::codex_assignment_supports_decisions(assignment.status)
+                })
+                .map(|assignment| assignment.assignment_id.clone())
+                .collect::<Vec<_>>();
+
+            for assignment_id in assignment_ids {
+                if Self::open_supervisor_decision_id_for_assignment(collaboration, &assignment_id)
+                    .is_some()
+                {
+                    continue;
+                }
+                let Some(assignment_snapshot) = collaboration
+                    .codex_thread_assignments
+                    .get(&assignment_id)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let basis_turn_id = thread.summary.last_seen_turn_id.clone();
+                if Self::latest_current_basis_recorded_no_action(
+                    collaboration,
+                    &assignment_snapshot.assignment_id,
+                    basis_turn_id.as_deref(),
+                )
+                .is_some()
+                {
+                    continue;
+                }
+
+                let proposal_kind =
+                    if assignment_snapshot.bootstrap_state == CodexThreadBootstrapState::Pending {
+                        SupervisorTurnProposalKind::Bootstrap
+                    } else {
+                        SupervisorTurnProposalKind::ContinueAfterTurn
+                    };
+                let proposed_text = Some(match proposal_kind {
+                    SupervisorTurnProposalKind::Bootstrap => Self::generate_bootstrap_turn_text(
+                        &assignment_snapshot,
+                        collaboration
+                            .workstreams
+                            .get(&assignment_snapshot.workstream_id),
+                        collaboration
+                            .work_units
+                            .get(&assignment_snapshot.work_unit_id),
+                    ),
+                    SupervisorTurnProposalKind::ContinueAfterTurn
+                    | SupervisorTurnProposalKind::ManualRefresh => {
+                        Self::generate_continue_turn_text(
+                            &assignment_snapshot,
+                            collaboration
+                                .workstreams
+                                .get(&assignment_snapshot.workstream_id),
+                            collaboration
+                                .work_units
+                                .get(&assignment_snapshot.work_unit_id),
+                            basis_turn_id.as_deref(),
+                        )
+                    }
+                    SupervisorTurnProposalKind::OperatorSteer => {
+                        unreachable!("operator steer proposals are only created explicitly")
+                    }
+                    SupervisorTurnProposalKind::OperatorInterrupt => {
+                        unreachable!("operator interrupt proposals are only created explicitly")
+                    }
+                });
+                let rationale_summary = match proposal_kind {
+                    SupervisorTurnProposalKind::Bootstrap => format!(
+                        "Assignment `{}` is active, the thread is idle, and the bootstrap proposal has not been sent yet.",
+                        assignment_snapshot.assignment_id
+                    ),
+                    SupervisorTurnProposalKind::ContinueAfterTurn
+                    | SupervisorTurnProposalKind::ManualRefresh => format!(
+                        "Assignment `{}` remains active and thread `{}` is idle after basis turn {:?}.",
+                        assignment_snapshot.assignment_id, thread.summary.id, basis_turn_id
+                    ),
+                    SupervisorTurnProposalKind::OperatorSteer => {
+                        unreachable!("operator steer proposals are only created explicitly")
+                    }
+                    SupervisorTurnProposalKind::OperatorInterrupt => {
+                        unreachable!("operator interrupt proposals are only created explicitly")
+                    }
+                };
+                let decision = SupervisorTurnDecision {
+                    decision_id: Self::new_object_id("std"),
+                    assignment_id: assignment_snapshot.assignment_id.clone(),
+                    codex_thread_id: assignment_snapshot.codex_thread_id.clone(),
+                    basis_turn_id: basis_turn_id.clone(),
+                    kind: SupervisorTurnDecisionKind::NextTurn,
+                    proposal_kind,
+                    proposed_text,
+                    rationale_summary,
+                    status: SupervisorTurnDecisionStatus::ProposedToHuman,
+                    created_at: now,
+                    approved_at: None,
+                    rejected_at: None,
+                    sent_at: None,
+                    superseded_by: None,
+                    sent_turn_id: None,
+                    notes: None,
+                };
+                collaboration
+                    .supervisor_turn_decisions
+                    .insert(decision.decision_id.clone(), decision.clone());
+                if let Some(assignment) = collaboration
+                    .codex_thread_assignments
+                    .get_mut(&assignment_snapshot.assignment_id)
+                {
+                    assignment.latest_decision_id = Some(decision.decision_id.clone());
+                    assignment.latest_basis_turn_id = basis_turn_id.clone();
+                    assignment.updated_at = now;
+                    if proposal_kind == SupervisorTurnProposalKind::Bootstrap {
+                        assignment.bootstrap_state = CodexThreadBootstrapState::Proposed;
+                    }
+                    updated_assignments.push(assignment.clone());
+                }
+                created.push(decision);
+            }
+        }
+
+        (created, stale, updated_assignments)
     }
 
     async fn mark_supervisor_decision_stale(
@@ -12499,7 +12666,6 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         .await;
         Ok(decision)
     }
-
     fn report_summary(report: &Report) -> ipc::ReportSummary {
         ipc::ReportSummary {
             id: report.id.clone(),
@@ -13328,169 +13494,282 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             .await;
     }
 
+    async fn apply_codex_connection_state_changed(&self, upstream: ConnectionState) {
+        let (maybe_session, threads_to_persist, turns_to_persist) = {
+            let mut state = self.state.write().await;
+            state.upstream = upstream.clone();
+            if upstream.status != "connected" {
+                Self::mark_turns_lost(&mut state);
+            }
+            Self::refresh_session_from_turns(&mut state);
+            (
+                state.session.clone(),
+                state.threads.values().cloned().collect::<Vec<_>>(),
+                state.turns.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        if upstream.status != "connected" {
+            for thread in &threads_to_persist {
+                let _ = self.persist_thread_view(thread).await;
+            }
+            for turn in &turns_to_persist {
+                let _ = self.persist_turn_state_view(turn).await;
+            }
+        }
+        self.emit(ipc::DaemonEvent::UpstreamStatusChanged { upstream })
+            .await;
+        self.emit(ipc::DaemonEvent::SessionChanged {
+            session: maybe_session,
+        })
+        .await;
+    }
+
+    async fn apply_codex_thread_started(&self, thread_id: String, preview: String) {
+        let maybe_thread = self.codex_client.snapshot_thread(&thread_id).await;
+        let summary = if let Some(thread) = maybe_thread {
+            let existing = self.thread_from_state(&thread_id).await;
+            let view =
+                Self::thread_view_from_codex(thread, existing.as_ref(), Some("live_observed"));
+            let _ = self.persist_thread_view(&view).await;
+            let mut state = self.state.write().await;
+            state.recent_thread_id = Some(view.summary.id.clone());
+            state.threads.insert(view.summary.id.clone(), view.clone());
+            view.summary
+        } else {
+            let mut state = self.state.write().await;
+            let summary = {
+                let thread = Self::ensure_thread_entry(&mut state, &thread_id);
+                thread.summary.preview = preview;
+                thread.summary.status = "started".to_string();
+                thread.summary.scope = Self::prefer_scope(&thread.summary.scope, "live_observed");
+                thread.summary.recent_event = Some("thread started".to_string());
+                Self::touch_thread(thread);
+                Self::refresh_thread_summary(thread);
+                thread.summary.clone()
+            };
+            state.recent_thread_id = Some(thread_id.clone());
+            summary
+        };
+        if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
+            let _ = self.persist_thread_view(thread_view).await;
+        }
+        self.emit(ipc::DaemonEvent::ThreadUpdated { thread: summary })
+            .await;
+    }
+
+    async fn apply_codex_thread_status_changed(&self, thread_id: String, status: String) {
+        let summary = {
+            let mut state = self.state.write().await;
+            let summary = {
+                let thread = Self::ensure_thread_entry(&mut state, &thread_id);
+                thread.summary.status = status;
+                thread.summary.loaded_status =
+                    Self::thread_loaded_status_from_label(&thread.summary.status);
+                thread.summary.recent_event = Some(format!("thread {}", thread.summary.status));
+                Self::touch_thread(thread);
+                Self::refresh_thread_summary(thread);
+                thread.summary.clone()
+            };
+            state.recent_thread_id = Some(thread_id.clone());
+            summary
+        };
+        if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
+            let _ = self.persist_thread_view(thread_view).await;
+        }
+        self.emit(ipc::DaemonEvent::ThreadUpdated { thread: summary })
+            .await;
+    }
+
+    async fn apply_codex_turn_completed(&self, thread_id: String, turn_id: String, status: String) {
+        info!(
+            thread_id = %thread_id,
+            turn_id = %turn_id,
+            status = %status,
+            "processing upstream turn completion event"
+        );
+        let (session, turn, thread, turn_state) = {
+            let mut state = self.state.write().await;
+            let (turn, thread_summary, turn_state) = {
+                let thread = Self::ensure_thread_entry(&mut state, &thread_id);
+                Self::touch_thread(thread);
+                thread.summary.recent_event = Some(format!("turn {status}"));
+                let turn = Self::upsert_turn(
+                    thread,
+                    ipc::TurnView {
+                        id: turn_id.clone(),
+                        status: status.clone(),
+                        error_message: None,
+                        error_summary: None,
+                        started_at: None,
+                        completed_at: Some(Utc::now()),
+                        latest_diff: None,
+                        latest_plan_snapshot: None,
+                        token_usage_snapshot: None,
+                        items: Vec::new(),
+                    },
+                );
+                Self::refresh_thread_summary(thread);
+                let recent_output =
+                    Self::turn_output(&turn).or_else(|| thread.summary.recent_output.clone());
+                let recent_event = Some(format!("turn {status}"));
+                (
+                    turn.clone(),
+                    thread.summary.clone(),
+                    ipc::TurnStateView {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        lifecycle: Self::turn_lifecycle_from_status(&status),
+                        status: status.clone(),
+                        attachable: false,
+                        live_stream: false,
+                        terminal: true,
+                        recent_output,
+                        recent_event,
+                        updated_at: Utc::now(),
+                        error_message: turn.error_message.clone(),
+                    },
+                )
+            };
+            Self::upsert_turn_state(&mut state, turn_state.clone());
+            Self::refresh_session_from_turns(&mut state);
+            state.recent_thread_id = Some(thread_id.clone());
+            if state.session.active_turns.is_empty() {
+                state.session.active_thread_id = Some(thread_id.clone());
+            }
+            (state.session.clone(), turn, thread_summary, turn_state)
+        };
+        let _ = (thread, session, turn);
+        info!(
+            thread_id = %thread_id,
+            turn_id = %turn_id,
+            status = %status,
+            "processed upstream turn completion event"
+        );
+        let _ = self
+            .refresh_codex_supervisor_state_for_thread(&thread_id)
+            .await;
+        let _ = turn_state;
+    }
+
+    async fn apply_codex_turn_started(&self, thread_id: String, turn_id: String) {
+        self.record_turn_started(&thread_id, &turn_id, "in_progress")
+            .await;
+    }
+
+    async fn apply_codex_item_started(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: String,
+    ) {
+        let item = self
+            .update_item_state(
+                &thread_id,
+                &turn_id,
+                &item_id,
+                &item_type,
+                Some("started"),
+                None,
+            )
+            .await;
+        if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
+            let _ = self.persist_thread_view(thread_view).await;
+        }
+        self.emit(ipc::DaemonEvent::ItemUpdated {
+            thread_id,
+            turn_id,
+            item,
+        })
+        .await;
+    }
+
+    async fn apply_codex_item_completed(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: String,
+    ) {
+        let item = self
+            .update_item_state(
+                &thread_id,
+                &turn_id,
+                &item_id,
+                &item_type,
+                Some("completed"),
+                None,
+            )
+            .await;
+        if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
+            let _ = self.persist_thread_view(thread_view).await;
+        }
+        self.emit(ipc::DaemonEvent::ItemUpdated {
+            thread_id,
+            turn_id,
+            item,
+        })
+        .await;
+    }
+
+    async fn apply_codex_agent_message_delta(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        delta: String,
+    ) {
+        let _ = self
+            .update_item_state(
+                &thread_id,
+                &turn_id,
+                &item_id,
+                "agent_message",
+                Some("streaming"),
+                Some(delta.clone()),
+            )
+            .await;
+        self.emit(ipc::DaemonEvent::OutputDelta {
+            thread_id,
+            turn_id,
+            item_id,
+            delta,
+        })
+        .await;
+    }
+
+    async fn apply_codex_server_request(&self, method: String) {
+        self.emit(ipc::DaemonEvent::Warning {
+            message: format!("server request pending: {method}"),
+        })
+        .await;
+    }
+
+    async fn apply_codex_warning(&self, message: String) {
+        self.emit(ipc::DaemonEvent::Warning { message }).await;
+    }
+
     async fn apply_codex_event(&self, envelope: EventEnvelope) {
+        debug!(event = ?envelope.event, "processing codex event");
         match envelope.event {
             OrcasEvent::ConnectionStateChanged(upstream) => {
-                let (maybe_session, threads_to_persist, turns_to_persist) = {
-                    let mut state = self.state.write().await;
-                    state.upstream = upstream.clone();
-                    if upstream.status != "connected" {
-                        Self::mark_turns_lost(&mut state);
-                    }
-                    Self::refresh_session_from_turns(&mut state);
-                    (
-                        state.session.clone(),
-                        state.threads.values().cloned().collect::<Vec<_>>(),
-                        state.turns.values().cloned().collect::<Vec<_>>(),
-                    )
-                };
-                if upstream.status != "connected" {
-                    for thread in &threads_to_persist {
-                        let _ = self.persist_thread_view(thread).await;
-                    }
-                    for turn in &turns_to_persist {
-                        let _ = self.persist_turn_state_view(turn).await;
-                    }
-                }
-                self.emit(ipc::DaemonEvent::UpstreamStatusChanged { upstream })
-                    .await;
-                self.emit(ipc::DaemonEvent::SessionChanged {
-                    session: maybe_session,
-                })
-                .await;
+                Box::pin(self.apply_codex_connection_state_changed(upstream)).await;
             }
             OrcasEvent::ThreadStarted { thread_id, preview } => {
-                let maybe_thread = self.codex_client.snapshot_thread(&thread_id).await;
-                let summary = if let Some(thread) = maybe_thread {
-                    let existing = self.thread_from_state(&thread_id).await;
-                    let view = Self::thread_view_from_codex(
-                        thread,
-                        existing.as_ref(),
-                        Some("live_observed"),
-                    );
-                    let _ = self.persist_thread_view(&view).await;
-                    let mut state = self.state.write().await;
-                    state.recent_thread_id = Some(view.summary.id.clone());
-                    state.threads.insert(view.summary.id.clone(), view.clone());
-                    view.summary
-                } else {
-                    let mut state = self.state.write().await;
-                    let summary = {
-                        let thread = Self::ensure_thread_entry(&mut state, &thread_id);
-                        thread.summary.preview = preview;
-                        thread.summary.status = "started".to_string();
-                        thread.summary.scope =
-                            Self::prefer_scope(&thread.summary.scope, "live_observed");
-                        thread.summary.recent_event = Some("thread started".to_string());
-                        Self::touch_thread(thread);
-                        Self::refresh_thread_summary(thread);
-                        thread.summary.clone()
-                    };
-                    state.recent_thread_id = Some(thread_id.clone());
-                    summary
-                };
-                if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view).await;
-                }
-                self.emit(ipc::DaemonEvent::ThreadUpdated { thread: summary })
-                    .await;
+                Box::pin(self.apply_codex_thread_started(thread_id, preview)).await;
             }
             OrcasEvent::ThreadStatusChanged { thread_id, status } => {
-                let summary = {
-                    let mut state = self.state.write().await;
-                    let summary = {
-                        let thread = Self::ensure_thread_entry(&mut state, &thread_id);
-                        thread.summary.status = status;
-                        thread.summary.loaded_status =
-                            Self::thread_loaded_status_from_label(&thread.summary.status);
-                        thread.summary.recent_event =
-                            Some(format!("thread {}", thread.summary.status));
-                        Self::touch_thread(thread);
-                        Self::refresh_thread_summary(thread);
-                        thread.summary.clone()
-                    };
-                    state.recent_thread_id = Some(thread_id.clone());
-                    summary
-                };
-                if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view).await;
-                }
-                self.emit(ipc::DaemonEvent::ThreadUpdated { thread: summary })
-                    .await;
+                Box::pin(self.apply_codex_thread_status_changed(thread_id, status)).await;
             }
             OrcasEvent::TurnStarted { thread_id, turn_id } => {
-                self.record_turn_started(&thread_id, &turn_id, "in_progress")
-                    .await;
+                Box::pin(self.apply_codex_turn_started(thread_id, turn_id)).await;
             }
             OrcasEvent::TurnCompleted {
                 thread_id,
                 turn_id,
                 status,
             } => {
-                info!(
-                    thread_id = %thread_id,
-                    turn_id = %turn_id,
-                    status = %status,
-                    "processing upstream turn completion event"
-                );
-                let (session, turn, thread, turn_state) = {
-                    let mut state = self.state.write().await;
-                    let (turn, thread_summary, turn_state) = {
-                        let thread = Self::ensure_thread_entry(&mut state, &thread_id);
-                        Self::touch_thread(thread);
-                        thread.summary.recent_event = Some(format!("turn {status}"));
-                        let turn = Self::upsert_turn(
-                            thread,
-                            ipc::TurnView {
-                                id: turn_id.clone(),
-                                status: status.clone(),
-                                error_message: None,
-                                error_summary: None,
-                                started_at: None,
-                                completed_at: Some(Utc::now()),
-                                latest_diff: None,
-                                latest_plan_snapshot: None,
-                                token_usage_snapshot: None,
-                                items: Vec::new(),
-                            },
-                        );
-                        Self::refresh_thread_summary(thread);
-                        let recent_output = Self::turn_output(&turn)
-                            .or_else(|| thread.summary.recent_output.clone());
-                        let recent_event = Some(format!("turn {status}"));
-                        (
-                            turn.clone(),
-                            thread.summary.clone(),
-                            ipc::TurnStateView {
-                                thread_id: thread_id.clone(),
-                                turn_id: turn_id.clone(),
-                                lifecycle: Self::turn_lifecycle_from_status(&status),
-                                status: status.clone(),
-                                attachable: false,
-                                live_stream: false,
-                                terminal: true,
-                                recent_output,
-                                recent_event,
-                                updated_at: Utc::now(),
-                                error_message: turn.error_message.clone(),
-                            },
-                        )
-                    };
-                    Self::upsert_turn_state(&mut state, turn_state.clone());
-                    Self::refresh_session_from_turns(&mut state);
-                    state.recent_thread_id = Some(thread_id.clone());
-                    if state.session.active_turns.is_empty() {
-                        state.session.active_thread_id = Some(thread_id.clone());
-                    }
-                    (state.session.clone(), turn, thread_summary, turn_state)
-                };
-                let _ = (thread, session, turn);
-                info!(
-                    thread_id = %thread_id,
-                    turn_id = %turn_id,
-                    status = %status,
-                    "processed upstream turn completion event"
-                );
+                Box::pin(self.apply_codex_turn_completed(thread_id, turn_id, status)).await;
             }
             OrcasEvent::ItemStarted {
                 thread_id,
@@ -13498,25 +13777,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 item_id,
                 item_type,
             } => {
-                let item = self
-                    .update_item_state(
-                        &thread_id,
-                        &turn_id,
-                        &item_id,
-                        &item_type,
-                        Some("started"),
-                        None,
-                    )
+                Box::pin(self.apply_codex_item_started(thread_id, turn_id, item_id, item_type))
                     .await;
-                if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view).await;
-                }
-                self.emit(ipc::DaemonEvent::ItemUpdated {
-                    thread_id,
-                    turn_id,
-                    item,
-                })
-                .await;
             }
             OrcasEvent::ItemCompleted {
                 thread_id,
@@ -13524,25 +13786,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 item_id,
                 item_type,
             } => {
-                let item = self
-                    .update_item_state(
-                        &thread_id,
-                        &turn_id,
-                        &item_id,
-                        &item_type,
-                        Some("completed"),
-                        None,
-                    )
+                Box::pin(self.apply_codex_item_completed(thread_id, turn_id, item_id, item_type))
                     .await;
-                if let Some(thread_view) = self.thread_from_state(&thread_id).await.as_ref() {
-                    let _ = self.persist_thread_view(thread_view).await;
-                }
-                self.emit(ipc::DaemonEvent::ItemUpdated {
-                    thread_id,
-                    turn_id,
-                    item,
-                })
-                .await;
             }
             OrcasEvent::AgentMessageDelta {
                 thread_id,
@@ -13550,32 +13795,14 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 item_id,
                 delta,
             } => {
-                let _ = self
-                    .update_item_state(
-                        &thread_id,
-                        &turn_id,
-                        &item_id,
-                        "agent_message",
-                        Some("streaming"),
-                        Some(delta.clone()),
-                    )
+                Box::pin(self.apply_codex_agent_message_delta(thread_id, turn_id, item_id, delta))
                     .await;
-                self.emit(ipc::DaemonEvent::OutputDelta {
-                    thread_id,
-                    turn_id,
-                    item_id,
-                    delta,
-                })
-                .await;
             }
             OrcasEvent::ServerRequest { method } => {
-                self.emit(ipc::DaemonEvent::Warning {
-                    message: format!("server request pending: {method}"),
-                })
-                .await;
+                Box::pin(self.apply_codex_server_request(method)).await;
             }
             OrcasEvent::Warning { message } => {
-                self.emit(ipc::DaemonEvent::Warning { message }).await;
+                Box::pin(self.apply_codex_warning(message)).await;
             }
         }
     }
@@ -14516,7 +14743,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use serde_json::{Map, Value};
-    use tokio::sync::{Mutex, Notify, RwLock, broadcast};
+    use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc};
     use tokio::time::Duration;
     use uuid::Uuid;
 
@@ -14568,6 +14795,34 @@ mod tests {
             CodexDaemonLaunch::IfNeeded => {}
             other => panic!("expected IfNeeded, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn boxed_ipc_request_dispatch_handles_daemon_status() {
+        let service = test_service().await;
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        let request = orcas_core::jsonrpc::JsonRpcRequest::new(
+            orcas_core::RequestId::Integer(1),
+            ipc::methods::DAEMON_STATUS,
+            None,
+        );
+
+        let mut subscription_task = None;
+        service
+            .handle_request(request, outbound_tx, &mut subscription_task)
+            .await
+            .expect("daemon/status request");
+
+        let raw_response = outbound_rx.recv().await.expect("ipc response");
+        let response: orcas_core::jsonrpc::JsonRpcResponse =
+            serde_json::from_str(&raw_response).expect("parse response");
+        assert_eq!(response.id, orcas_core::RequestId::Integer(1));
+        let status: ipc::DaemonStatusResponse =
+            serde_json::from_value(response.result).expect("decode daemon status");
+        assert_eq!(
+            status.socket_path,
+            service.paths.socket_file.display().to_string()
+        );
     }
 
     #[tokio::test]
@@ -19258,6 +19513,81 @@ ORCAS_REPORT_END"#
         assert_eq!(
             state.collaboration.work_units[&work_unit.id].current_assignment_id,
             Some(assignment.id.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn assignment_turn_ingestion_core_persists_terminal_state_before_side_effects() {
+        let reasoner = Arc::new(PackDrivenSupervisorReasoner::new(DecisionType::Continue));
+        let service =
+            test_service_with_reasoner_and_config(reasoner.clone(), auto_proposal_config(false))
+                .await;
+        let (_workstream, work_unit, assignment, turn_state, raw_output) =
+            seed_running_assignment_fixture(&service, "ingest-core").await;
+        let (assignment_for_parse, communication_record) = {
+            let state = service.state.read().await;
+            (
+                state
+                    .collaboration
+                    .assignments
+                    .get(&assignment.id)
+                    .cloned()
+                    .expect("assignment"),
+                state
+                    .collaboration
+                    .assignment_communications
+                    .get(&assignment.id)
+                    .cloned()
+                    .expect("communication record"),
+            )
+        };
+        let plan = OrcasDaemonService::derive_assignment_turn_ingestion_plan(
+            &assignment.id,
+            &assignment.worker_id,
+            &assignment.worker_session_id,
+            &turn_state,
+            raw_output,
+            assignment_for_parse,
+            communication_record,
+        );
+
+        let core = service
+            .persist_assignment_turn_ingestion_core(&plan)
+            .await
+            .expect("persist core");
+
+        assert_eq!(core.report.work_unit_id, work_unit.id);
+        assert_eq!(
+            core.assignment_after_report.status,
+            AssignmentStatus::AwaitingDecision
+        );
+        assert_eq!(
+            core.work_unit_after_report.status,
+            WorkUnitStatus::AwaitingDecision
+        );
+        let state = service.state.read().await;
+        assert_eq!(
+            state
+                .collaboration
+                .reports
+                .get(&core.report.id)
+                .map(|report| &report.id),
+            Some(&core.report.id)
+        );
+        assert_eq!(
+            state.collaboration.work_units[&work_unit.id].latest_report_id,
+            Some(core.report.id.clone())
+        );
+        drop(state);
+        assert!(
+            service
+                .proposal_list_for_workunit(ipc::ProposalListForWorkunitRequest {
+                    work_unit_id: work_unit.id.clone(),
+                })
+                .await
+                .expect("proposal list")
+                .proposals
+                .is_empty()
         );
     }
 

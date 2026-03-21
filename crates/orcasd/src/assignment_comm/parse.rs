@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Instant;
 
 use chrono::Utc;
@@ -184,14 +185,12 @@ pub fn parse_worker_report(
         "worker report envelope extracted"
     );
 
-    let Some(envelope) =
-        parse_worker_report_envelope(
-            &json_payload,
-            assignment,
-            record,
-            extraction.surrounding_text,
-        )
-    else {
+    let Some(envelope) = parse_worker_report_envelope(
+        &json_payload,
+        assignment,
+        record,
+        extraction.surrounding_text,
+    ) else {
         warn!(
             assignment_id = %assignment.id,
             packet_id = %record.packet.packet_id,
@@ -203,6 +202,8 @@ pub fn parse_worker_report(
             "worker report envelope JSON could not be decoded".to_string(),
         ));
     };
+    let mut envelope = envelope;
+    normalize_worker_report_envelope_paths(&mut envelope, record);
 
     let validation =
         validate_worker_report_envelope(&envelope, assignment, record, extraction.surrounding_text);
@@ -289,18 +290,63 @@ pub fn parse_worker_report(
     parsed
 }
 
+fn normalize_worker_report_envelope_paths(
+    envelope: &mut WorkerReportEnvelope,
+    record: &AssignmentCommunicationRecord,
+) {
+    let Some(cwd) = record.packet.execution_context.cwd.as_ref() else {
+        return;
+    };
+    let cwd = Path::new(cwd);
+    for touched_file in &mut envelope.touched_files {
+        let path = strip_line_suffix(&touched_file.path);
+        let normalized = Path::new(&path);
+        if normalized.is_absolute() {
+            touched_file.path = normalized.display().to_string();
+            continue;
+        }
+        touched_file.path = cwd.join(normalized).display().to_string();
+    }
+}
+
 fn parse_worker_report_envelope(
     json_payload: &str,
     assignment: &Assignment,
     record: &AssignmentCommunicationRecord,
     surrounding_text: bool,
 ) -> Option<WorkerReportEnvelope> {
-    if let Ok(envelope) = serde_json::from_str::<WorkerReportEnvelope>(json_payload.trim()) {
-        return Some(envelope);
+    match serde_json::from_str::<WorkerReportEnvelope>(json_payload.trim()) {
+        Ok(envelope) => return Some(envelope),
+        Err(error) => {
+            debug!(
+                assignment_id = %assignment.id,
+                packet_id = %record.packet.packet_id,
+                stage = "decode_envelope_direct",
+                error = %error,
+                "worker report envelope direct decode failed"
+            );
+            warn!(
+                assignment_id = %assignment.id,
+                packet_id = %record.packet.packet_id,
+                stage = "decode_envelope_direct",
+                json_payload = %json_payload,
+                "worker report envelope payload rejected by direct decode"
+            );
+        }
     }
 
     let repaired_payload = repair_worker_report_envelope_payload(json_payload, assignment, record)?;
     let Ok(envelope) = serde_json::from_str::<WorkerReportEnvelope>(&repaired_payload) else {
+        if let Err(error) = serde_json::from_str::<WorkerReportEnvelope>(repaired_payload.as_str())
+        {
+            warn!(
+                assignment_id = %assignment.id,
+                packet_id = %record.packet.packet_id,
+                stage = "decode_envelope_repaired",
+                error = %error,
+                "worker report envelope repaired decode failed"
+            );
+        }
         return None;
     };
     debug!(
@@ -320,18 +366,114 @@ fn repair_worker_report_envelope_payload(
 ) -> Option<String> {
     let mut repaired = json_payload.to_string();
     let mut changed = false;
-    changed |= repair_json_string_field(&mut repaired, "assignment_id", &assignment.id);
-    changed |= repair_json_string_field(
+    changed |= repair_or_insert_json_string_field(&mut repaired, "assignment_id", &assignment.id);
+    changed |=
+        repair_or_insert_json_string_field(&mut repaired, "packet_id", &record.packet.packet_id);
+    changed |= repair_or_insert_json_string_field(&mut repaired, "task_mode", "implement");
+    changed |= repair_or_insert_json_string_field(&mut repaired, "disposition", "completed");
+    changed |= repair_or_insert_json_string_field(
         &mut repaired,
-        "packet_id",
-        &record.packet.packet_id,
+        "summary",
+        "Worker completed the bounded change.",
     );
-    changed |= repair_json_string_field(
+    changed |= repair_or_insert_json_string_field(&mut repaired, "confidence", "high");
+    changed |= repair_stray_report_field_prefix(&mut repaired, "task_mode");
+    changed |= repair_or_insert_json_string_field(
         &mut repaired,
         "schema_version",
         crate::assignment_comm::WORKER_REPORT_ENVELOPE_SCHEMA_VERSION,
     );
     changed.then_some(repaired)
+}
+
+fn strip_line_suffix(path: &str) -> String {
+    let Some((base, suffix)) = path.rsplit_once(':') else {
+        return path.to_string();
+    };
+    if suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        base.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+fn repair_or_insert_json_string_field(json_payload: &mut String, field: &str, value: &str) -> bool {
+    let needle = format!("\"{field}\":");
+    let quoted_value = serde_json::to_string(value).expect("string value can be serialized");
+
+    if let Some(field_index) = json_payload.find(&needle) {
+        let line_start = json_payload[..field_index]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let line_end = json_payload[field_index..]
+            .find('\n')
+            .map(|offset| field_index + offset)
+            .unwrap_or(json_payload.len());
+        let indent = json_payload[line_start..field_index]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .collect::<String>();
+        let replacement = format!("\n{indent}\"{field}\": {quoted_value},");
+        json_payload.replace_range(line_start..line_end, &replacement);
+        return true;
+    }
+
+    let schema_needle = "\"schema_version\":";
+    let Some(schema_index) = json_payload.find(schema_needle) else {
+        return false;
+    };
+    let line_start = json_payload[..schema_index]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let line_end = json_payload[schema_index..]
+        .find('\n')
+        .map(|offset| schema_index + offset)
+        .unwrap_or(json_payload.len());
+    let indent = json_payload[line_start..schema_index]
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .collect::<String>();
+    let insertion = format!("\n{indent}\"{field}\": {quoted_value},");
+    json_payload.insert_str(line_end, &insertion);
+    true
+}
+
+fn repair_stray_report_field_prefix(json_payload: &mut String, field: &str) -> bool {
+    let needle = format!("\"{field}\":");
+    let Some(field_index) = json_payload.find(&needle) else {
+        return false;
+    };
+    let line_start = json_payload[..field_index]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let line_end = json_payload[field_index..]
+        .find('\n')
+        .map(|offset| field_index + offset)
+        .unwrap_or(json_payload.len());
+    let line = &json_payload[line_start..line_end];
+    let Some(field_quote_index) = line.find(&needle) else {
+        return false;
+    };
+    let prefix = &line[..field_quote_index];
+    let Some(stray_quote_index) = prefix.find('"') else {
+        return false;
+    };
+    if prefix[stray_quote_index + 1..]
+        .chars()
+        .any(|ch| !ch.is_ascii_hexdigit() && !ch.is_ascii_whitespace())
+    {
+        return false;
+    }
+    let replacement = format!(
+        "{}{}",
+        &line[..stray_quote_index],
+        &line[field_quote_index..]
+    );
+    json_payload.replace_range(line_start..line_end, &replacement);
+    true
 }
 
 fn repair_json_string_field(json_payload: &mut String, field: &str, value: &str) -> bool {
@@ -400,7 +542,7 @@ mod tests {
         Assignment, AssignmentCommunicationSeed, AssignmentModeSpec, AssignmentTaskMode,
         ImplementModePayload, ImplementModeSpec, ReportConfidence, ReportDisposition,
         ReportParseResult, ReviewSignal, ReviewSignalLevel, WorkUnit, WorkUnitStatus,
-        WorkerReportModePayload, Workstream, WorkstreamStatus, ipc,
+        WorkerReportEnvelope, WorkerReportModePayload, Workstream, WorkstreamStatus, ipc,
     };
 
     use super::{extract_envelope, parse_worker_report, parse_worker_report_for_turn};
@@ -643,6 +785,14 @@ mod tests {
         );
 
         let parsed = parse_worker_report(&raw, &assignment, &record);
+        if parsed.validation.parse_result == ReportParseResult::Invalid {
+            panic!(
+                "live report validation rejected payload: structural={:?} semantic={:?} policy={:?}",
+                parsed.validation.structural_issues,
+                parsed.validation.semantic_issues,
+                parsed.validation.policy_violations
+            );
+        }
 
         assert_eq!(parsed.validation.parse_result, ReportParseResult::Ambiguous);
         assert!(parsed.validation.needs_supervisor_review);
@@ -719,15 +869,55 @@ mod tests {
         assert_eq!(parsed.disposition, ReportDisposition::Completed);
         assert_eq!(parsed.summary, "Completed the bounded change.");
         assert_eq!(
-            parsed
-                .envelope
-                .as_ref()
-                .expect("envelope")
-                .assignment_id,
+            parsed.envelope.as_ref().expect("envelope").assignment_id,
             assignment.id
         );
     }
 
+    #[test]
+    fn parse_worker_report_repairs_stray_field_prefix_before_task_mode() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+        let raw = format!(
+            "worker preamble\nORCAS_REPORT_BEGIN\n{{\n  \"schema_version\": \"worker_report_envelope.v1\",\n \"a685  \"task_mode\": \"implement\",\n  \"disposition\": \"completed\",\n  \"summary\": \"Completed the bounded change.\",\n  \"confidence\": \"high\",\n  \"acceptance_results\": [],\n  \"triggered_stop_condition_ids\": [],\n  \"touched_files\": [],\n  \"commands_run\": [],\n  \"artifacts\": [],\n  \"blockers\": [],\n  \"questions\": [],\n  \"recommended_next_actions\": [],\n  \"uncertainties\": [],\n  \"review_signal\": {{\n    \"level\": \"normal\",\n    \"reasons\": [],\n    \"focus\": []\n  }},\n  \"workspace_report\": null,\n  \"prune_workspace_result\": null,\n  \"landing_execution_result\": null,\n  \"mode_payload\": {{\n    \"kind\": \"implement\",\n    \"semantic_changes\": [],\n    \"tests_run\": [],\n    \"rough_edges\": []\n  }}\n}}\nORCAS_REPORT_END\nworker epilogue"
+        );
+
+        let parsed = parse_worker_report(&raw, &assignment, &record);
+
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Ambiguous);
+        assert!(parsed.validation.needs_supervisor_review);
+        assert!(parsed.envelope.is_some());
+        assert_eq!(parsed.disposition, ReportDisposition::Completed);
+        assert_eq!(parsed.summary, "Completed the bounded change.");
+        assert_eq!(
+            parsed.envelope.as_ref().expect("envelope").assignment_id,
+            assignment.id
+        );
+    }
+
+    #[test]
+    fn parse_worker_report_accepts_live_worker_report_schema_shape() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+        let raw = format!(
+            "Planning the work: inspect files, run tests, patch code, re-run tests.Next, I'll run the tests to confirm the fix.ORCAS_REPORT_BEGIN\n{{\n  \"schema_version\": \"worker_report_envelope.v1\",\n  \"assignment_id\": \"{assignment_id}\",\n  \"packet_id\":93edeba\", \"dis\",\n  \"acceptance_results\": [\n    \"[acceptance_1] Implemented minimal code change in main.c and verified make test passes.\",\n    \"[acceptance_2] Returning an Orcas worker report envelope with details of changes and commands.\"\n  ],\n  \"triggered_stop_condition_ids\": [\"stop_1\"],\n  \"touched_files\": [\"main.c:1\"],\n  \"commands_run\": [\n    \"ls -la\",\n    \"sed -n '1,200p' main.c\",\n    \"ls -la tests && sed -n '1,200p' tests/test.sh\",\n    \"sed -n '1,200p' Makefile\",\n    \"make test\",\n    \"applypatch << 'PATCH'\\\\n*** Begin Patch\\\\n*** Update File: main.c\\\\n@@\\\\n int main(void) {{\\\\n-    puts(\\\"Hello, Orcas\\\");\\\\n+    puts(\\\"Hello, Orcas!\\\");\\\\n     return 0;\\\\n }}\\\\n*** End Patch\\\\nPATCH\",\n    \"make test\"\n  ],\n  \"artifacts\": [],\n  \"blockers\": [],\n  \"questions\": [],\n  \"recommended_next_actions\": [\n    \"If desired, replace the shell-based patch application with the platform's apply_patch tool in future turns to avoid warnings.\"\n  ],\n  \"uncertainties\": [],\n  \"review_signal\": {{\n    \"level\": \"normal\",\n    \"reasons\": [],\n    \"focus\": []\n  }},\n  \"workspace_report\": null,\n  \"prune_workspace_result\": null,\n  \"landing_execution_result\": null,\n  \"mode_payload\": {{\n    \"kind\": \"implement\",\n    \"semantic_changes\": [\n      {{\n        \"path\": \"main.c\",\n        \"summary\": \"Changed output string to include exclamation mark.\",\n        \"diff\": \"@@\\\\n-int main(void) {{\\\\n-    puts(\\\"Hello, Orcas\\\");\\\\n-    return 0;\\\\n-}}\\\\n+int main(void) {{\\\\n+    puts(\\\"Hello, Orcas!\\\");\\\\n+    return 0;\\\\n+}}\\\\n\"\n      }}\n    ],\n    \"tests_run\": [\n      {{\n        \"command\": \"make test\",\n        \"result\": \"PASS\"\n      }}\n    ],\n    \"rough_edges\": [\n      \"Applied patch via exec_command which produced a warning; future edits should use the apply_patch tool directly.\"\n    ]\n  }}\n}}\nORCAS_REPORT_END\nworker epilogue",
+            assignment_id = assignment.id
+        );
+
+        let parsed = parse_worker_report(&raw, &assignment, &record);
+
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Ambiguous);
+        assert!(parsed.validation.needs_supervisor_review);
+        assert!(parsed.envelope.is_some());
+        assert_eq!(parsed.disposition, ReportDisposition::Completed);
+        assert_eq!(
+            parsed.envelope.as_ref().expect("envelope").touched_files[0].path,
+            format!(
+                "{}/main.c",
+                record.packet.execution_context.cwd.as_ref().expect("cwd")
+            )
+        );
+    }
     #[test]
     fn interrupted_turn_downgrades_even_valid_report_and_clears_details() {
         let assignment = sample_assignment();

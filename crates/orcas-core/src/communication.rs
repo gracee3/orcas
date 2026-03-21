@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as DeError};
+use serde_json::Value;
 
 use crate::authority;
 use crate::collaboration::{ReportConfidence, ReportDisposition, ReportParseResult};
@@ -66,8 +67,11 @@ pub enum TrackedThreadPruneWorkspaceResultStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcceptanceCriterionStatus {
+    #[serde(alias = "pass")]
     Met,
+    #[serde(alias = "partial", alias = "partially_met")]
     PartiallyMet,
+    #[serde(alias = "fail")]
     NotMet,
     NotAttempted,
 }
@@ -75,9 +79,13 @@ pub enum AcceptanceCriterionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileChangeKind {
+    #[serde(alias = "add")]
     Added,
+    #[serde(alias = "modify")]
     Modified,
+    #[serde(alias = "delete")]
     Deleted,
+    #[serde(alias = "rename")]
     Renamed,
 }
 
@@ -376,15 +384,17 @@ pub struct PromptRenderArtifact {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcceptanceResult {
+    #[serde(alias = "acceptance_id")]
     pub criterion_id: String,
     pub status: AcceptanceCriterionStatus,
-    #[serde(default)]
+    #[serde(default, alias = "details")]
     pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TouchedFile {
     pub path: String,
+    #[serde(alias = "change_type")]
     pub change_kind: FileChangeKind,
     pub summary: String,
 }
@@ -400,11 +410,11 @@ pub struct ReviewSignal {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImplementModePayload {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_stringish_vec")]
     pub semantic_changes: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_stringish_vec")]
     pub tests_run: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_stringish_vec")]
     pub rough_edges: Vec<String>,
 }
 
@@ -428,12 +438,30 @@ pub struct WorkerReportEnvelope {
     pub schema_version: String,
     pub assignment_id: String,
     pub packet_id: String,
+    #[serde(
+        default = "default_worker_report_task_mode",
+        deserialize_with = "deserialize_assignment_task_mode"
+    )]
     pub task_mode: AssignmentTaskMode,
+    #[serde(
+        default = "default_worker_report_disposition",
+        deserialize_with = "deserialize_report_disposition"
+    )]
     pub disposition: ReportDisposition,
+    #[serde(
+        default = "default_worker_report_summary",
+        deserialize_with = "deserialize_stringish_string"
+    )]
     pub summary: String,
+    #[serde(
+        default = "default_worker_report_confidence",
+        deserialize_with = "deserialize_report_confidence"
+    )]
     pub confidence: ReportConfidence,
+    #[serde(default, deserialize_with = "deserialize_acceptance_results")]
     pub acceptance_results: Vec<AcceptanceResult>,
     pub triggered_stop_condition_ids: Vec<String>,
+    #[serde(deserialize_with = "deserialize_touched_files")]
     pub touched_files: Vec<TouchedFile>,
     pub commands_run: Vec<String>,
     pub artifacts: Vec<String>,
@@ -449,6 +477,195 @@ pub struct WorkerReportEnvelope {
     #[serde(default)]
     pub landing_execution_result: Option<TrackedThreadLandingExecutionResult>,
     pub mode_payload: WorkerReportModePayload,
+}
+
+fn deserialize_stringish_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    Ok(values.into_iter().map(stringish_value_to_string).collect())
+}
+
+fn stringish_value_to_string(value: Value) -> String {
+    match value {
+        Value::String(value) => value,
+        Value::Object(map) => {
+            if let Some(summary) = map.get("summary").and_then(Value::as_str) {
+                summary.to_string()
+            } else if let (Some(name), Some(status)) = (
+                map.get("name").and_then(Value::as_str),
+                map.get("status").and_then(Value::as_str),
+            ) {
+                format!("{name}: {status}")
+            } else if let Some(path) = map.get("path").and_then(Value::as_str) {
+                path.to_string()
+            } else {
+                Value::Object(map).to_string()
+            }
+        }
+        value => value.to_string(),
+    }
+}
+
+fn deserialize_stringish_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(stringish_value_to_string(value))
+}
+
+fn deserialize_assignment_task_mode<'de, D>(deserializer: D) -> Result<AssignmentTaskMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(value) => match value.as_str() {
+            "implement" => Ok(AssignmentTaskMode::Implement),
+            "inspect" => Ok(AssignmentTaskMode::Inspect),
+            "debug" => Ok(AssignmentTaskMode::Debug),
+            "design" => Ok(AssignmentTaskMode::Design),
+            "test" => Ok(AssignmentTaskMode::Test),
+            _ => Ok(default_worker_report_task_mode()),
+        },
+        _ => Ok(default_worker_report_task_mode()),
+    }
+}
+
+fn deserialize_report_disposition<'de, D>(deserializer: D) -> Result<ReportDisposition, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(value) => match value.as_str() {
+            "completed" => Ok(ReportDisposition::Completed),
+            "partial" => Ok(ReportDisposition::Partial),
+            "blocked" => Ok(ReportDisposition::Blocked),
+            "failed" => Ok(ReportDisposition::Failed),
+            "interrupted" => Ok(ReportDisposition::Interrupted),
+            "unknown" => Ok(ReportDisposition::Unknown),
+            _ => Ok(default_worker_report_disposition()),
+        },
+        _ => Ok(default_worker_report_disposition()),
+    }
+}
+
+fn deserialize_report_confidence<'de, D>(deserializer: D) -> Result<ReportConfidence, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(value) => match value.as_str() {
+            "low" => Ok(ReportConfidence::Low),
+            "medium" => Ok(ReportConfidence::Medium),
+            "high" => Ok(ReportConfidence::High),
+            "unknown" => Ok(ReportConfidence::Unknown),
+            _ => Ok(default_worker_report_confidence()),
+        },
+        _ => Ok(default_worker_report_confidence()),
+    }
+}
+
+fn deserialize_acceptance_results<'de, D>(
+    deserializer: D,
+) -> Result<Vec<AcceptanceResult>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .map(|value| match value {
+            Value::String(value) => {
+                let criterion_id = acceptance_result_criterion_id_from_text(&value)
+                    .unwrap_or_else(|| value.clone());
+                let note = (!value.trim().is_empty()).then_some(value);
+                AcceptanceResult {
+                    criterion_id,
+                    status: AcceptanceCriterionStatus::NotAttempted,
+                    note,
+                }
+            }
+            value => serde_json::from_value::<AcceptanceResult>(value).unwrap_or_else(|_| {
+                AcceptanceResult {
+                    criterion_id: "acceptance_unknown".to_string(),
+                    status: AcceptanceCriterionStatus::NotAttempted,
+                    note: None,
+                }
+            }),
+        })
+        .collect())
+}
+
+fn acceptance_result_criterion_id_from_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix('[')
+        && let Some((criterion_id, _)) = rest.split_once(']')
+    {
+        let criterion_id = criterion_id.trim();
+        if !criterion_id.is_empty() {
+            return Some(criterion_id.to_string());
+        }
+    }
+    if let Some((criterion_id, _)) = text.split_once(':') {
+        let criterion_id = criterion_id.trim();
+        if !criterion_id.is_empty() {
+            return Some(criterion_id.to_string());
+        }
+    }
+    None
+}
+
+fn default_worker_report_task_mode() -> AssignmentTaskMode {
+    AssignmentTaskMode::Implement
+}
+
+fn default_worker_report_disposition() -> ReportDisposition {
+    ReportDisposition::Completed
+}
+
+fn default_worker_report_summary() -> String {
+    "Worker completed the bounded change.".to_string()
+}
+
+fn default_worker_report_confidence() -> ReportConfidence {
+    ReportConfidence::High
+}
+
+fn deserialize_touched_files<'de, D>(deserializer: D) -> Result<Vec<TouchedFile>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| match value {
+            Value::String(path) => {
+                let path = strip_line_suffix(&path);
+                Ok(TouchedFile {
+                    summary: path.clone(),
+                    path,
+                    change_kind: FileChangeKind::Modified,
+                })
+            }
+            value => serde_json::from_value::<TouchedFile>(value).map_err(DeError::custom),
+        })
+        .collect()
+}
+
+fn strip_line_suffix(path: &str) -> String {
+    let Some((base, suffix)) = path.rsplit_once(':') else {
+        return path.to_string();
+    };
+    if suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        base.to_string()
+    } else {
+        path.to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

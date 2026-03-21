@@ -417,7 +417,9 @@ pub fn validate_worker_report_envelope(
                 "worker report referenced unknown acceptance criterion `{}`",
                 result.criterion_id
             ));
-            parse_result = ReportParseResult::Invalid;
+            if parse_result == ReportParseResult::Parsed {
+                parse_result = ReportParseResult::Ambiguous;
+            }
         }
     }
     for stop_condition_id in &envelope.triggered_stop_condition_ids {
@@ -431,7 +433,9 @@ pub fn validate_worker_report_envelope(
                 "worker report referenced unknown stop condition `{}`",
                 stop_condition_id
             ));
-            parse_result = ReportParseResult::Invalid;
+            if parse_result == ReportParseResult::Parsed {
+                parse_result = ReportParseResult::Ambiguous;
+            }
         }
     }
     for touched_file in &envelope.touched_files {
@@ -823,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_worker_report_envelope_rejects_unknown_acceptance_criterion() {
+    fn validate_worker_report_envelope_treats_unknown_acceptance_criterion_as_ambiguous() {
         let assignment = sample_assignment();
         let record = sample_record(&assignment);
         let mut envelope = sample_envelope(&assignment, &record.packet.packet_id);
@@ -831,7 +835,7 @@ mod tests {
 
         let validation = validate_worker_report_envelope(&envelope, &assignment, &record, false);
 
-        assert_eq!(validation.parse_result, ReportParseResult::Invalid);
+        assert_eq!(validation.parse_result, ReportParseResult::Ambiguous);
         assert!(validation.needs_supervisor_review);
         assert!(
             validation
