@@ -1761,11 +1761,18 @@ mod tests {
             record.packet.execution_context.cwd.as_deref(),
             Some(expected_root.as_str())
         );
-        assert!(record.prompt_render.prompt_text.contains("Execution Context:"));
-        assert!(record
-            .prompt_render
-            .prompt_text
-            .contains("Runtime kind: codex_app_server"));
+        assert!(
+            record
+                .prompt_render
+                .prompt_text
+                .contains("Execution Context:")
+        );
+        assert!(
+            record
+                .prompt_render
+                .prompt_text
+                .contains("Runtime kind: codex_app_server")
+        );
         assert!(record.prompt_render.prompt_text.contains("Cwd:"));
     }
 

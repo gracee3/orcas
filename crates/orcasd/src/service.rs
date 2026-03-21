@@ -3520,6 +3520,12 @@ impl OrcasDaemonService {
                 "planning session create requires a workstream and initial objective".to_string(),
             ));
         }
+        if params.research_status == PlanningSessionResearchStatus::Requested {
+            return Err(OrcasError::Protocol(
+                "planning session create cannot declare research as requested; use planning_session_request_research after creation"
+                    .to_string(),
+            ));
+        }
 
         let (workstream, active_plan) = self
             .ensure_planning_workstream_available(&params.workstream_id)
@@ -3578,9 +3584,7 @@ impl OrcasDaemonService {
                 .open_questions
                 .push(format!("Supervisor note: {note}"));
         }
-        let status = if summary.research_status == PlanningSessionResearchStatus::Requested {
-            PlanningSessionStatus::ResearchRequested
-        } else if summary.ready_for_review {
+        let status = if summary.ready_for_review {
             PlanningSessionStatus::AwaitingApproval
         } else {
             PlanningSessionStatus::Chatting
@@ -3706,12 +3710,14 @@ impl OrcasDaemonService {
                     session.session_id
                 )));
             }
+            if params.summary.research_status == PlanningSessionResearchStatus::Requested {
+                return Err(OrcasError::Protocol(format!(
+                    "planning session `{}` summary cannot declare research as requested; use planning_session_request_research after creation",
+                    session.session_id
+                )));
+            }
             session.latest_structured_summary = params.summary.clone();
-            session.status = if session.latest_structured_summary.research_status
-                == PlanningSessionResearchStatus::Requested
-            {
-                PlanningSessionStatus::ResearchRequested
-            } else if session.latest_structured_summary.ready_for_review {
+            session.status = if session.latest_structured_summary.ready_for_review {
                 PlanningSessionStatus::AwaitingApproval
             } else {
                 PlanningSessionStatus::Chatting
@@ -3845,6 +3851,7 @@ impl OrcasDaemonService {
             .authority_workunit_create(create_request)
             .await?
             .work_unit;
+        let requested_at = Utc::now();
         {
             let mut state = self.state.write().await;
             let session = state
@@ -3860,11 +3867,11 @@ impl OrcasDaemonService {
             session.status = PlanningSessionStatus::ResearchRequested;
             session.latest_structured_summary.research_status =
                 PlanningSessionResearchStatus::Requested;
-            session.updated_at = Utc::now();
+            session.updated_at = requested_at;
             session.updated_by = requested_by.clone();
         }
         self.persist_collaboration_state().await?;
-        let assignment_response = self
+        let assignment_response = match self
             .assignment_start(ipc::AssignmentStartRequest {
                 work_unit_id: work_unit.id.to_string(),
                 worker_id: params.worker_id.clone(),
@@ -3874,7 +3881,28 @@ impl OrcasDaemonService {
                 cwd: params.cwd.clone(),
                 ..Default::default()
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let mut state = self.state.write().await;
+                if let Some(session) = state
+                    .collaboration
+                    .planning_sessions
+                    .get_mut(&params.session_id)
+                {
+                    session.status = session_snapshot.status;
+                    session.latest_structured_summary.research_status =
+                        session_snapshot.latest_structured_summary.research_status;
+                    session.updated_at = session_snapshot.updated_at;
+                    session.updated_by = session_snapshot.updated_by.clone();
+                }
+                drop(state);
+                let _ = self.persist_collaboration_state().await;
+                return Err(error);
+            }
+        };
+        let completed_at = Utc::now();
 
         let session = {
             let mut state = self.state.write().await;
@@ -3904,7 +3932,7 @@ impl OrcasDaemonService {
             } else {
                 PlanningSessionStatus::Chatting
             };
-            session.updated_at = Utc::now();
+            session.updated_at = completed_at;
             session.updated_by = requested_by;
             session.clone()
         };
@@ -12822,7 +12850,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             );
             return Ok(());
         }
-        let launch = Self::codex_launch_for_upstream_connect(self.config.codex.connection_mode.clone());
+        let launch =
+            Self::codex_launch_for_upstream_connect(self.config.codex.connection_mode.clone());
         self.codex_daemon.ensure_running(launch).await?;
         self.codex_client.connect().await?;
         let _ = self
@@ -14357,8 +14386,9 @@ mod tests {
 
     #[test]
     fn upstream_connect_never_forces_spawn_always_restarts() {
-        match OrcasDaemonService::codex_launch_for_upstream_connect(CodexConnectionMode::ConnectOnly)
-        {
+        match OrcasDaemonService::codex_launch_for_upstream_connect(
+            CodexConnectionMode::ConnectOnly,
+        ) {
             CodexDaemonLaunch::Never => {}
             other => panic!("expected Never, got {other:?}"),
         }
@@ -14368,11 +14398,117 @@ mod tests {
             CodexDaemonLaunch::IfNeeded => {}
             other => panic!("expected IfNeeded, got {other:?}"),
         }
-        match OrcasDaemonService::codex_launch_for_upstream_connect(CodexConnectionMode::SpawnAlways)
-        {
+        match OrcasDaemonService::codex_launch_for_upstream_connect(
+            CodexConnectionMode::SpawnAlways,
+        ) {
             CodexDaemonLaunch::IfNeeded => {}
             other => panic!("expected IfNeeded, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn planning_session_create_rejects_requested_research_status() {
+        let service = test_service().await;
+        let error = service
+            .planning_session_create(ipc::PlanningSessionCreateRequest {
+                workstream_id: "ws-test".to_string(),
+                planning_thread_id: None,
+                initial_objective: "Plan one bounded change.".to_string(),
+                research_status: orcas_core::PlanningSessionResearchStatus::Requested,
+                requirements: Vec::new(),
+                constraints: Vec::new(),
+                non_goals: Vec::new(),
+                open_questions: Vec::new(),
+                draft_plan_summary: None,
+                created_by: None,
+                request_note: None,
+                model: None,
+                cwd: None,
+            })
+            .await
+            .expect_err("requested research status should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot declare research as requested")
+        );
+    }
+
+    fn sample_planning_session(
+        session_id: &str,
+        workstream_id: &str,
+    ) -> orcas_core::collaboration::PlanningSession {
+        let now = Utc::now();
+        orcas_core::collaboration::PlanningSession {
+            session_id: session_id.to_string(),
+            workstream_id: workstream_id.to_string(),
+            status: orcas_core::collaboration::PlanningSessionStatus::Chatting,
+            planning_thread_id: "thread-test".to_string(),
+            base_plan_id: None,
+            base_plan_version: None,
+            research_assignment_id: None,
+            research_report_id: None,
+            draft_revision_proposal_id: None,
+            approved_plan_id: None,
+            approved_plan_version: None,
+            latest_structured_summary:
+                orcas_core::collaboration::PlanningSessionStructuredSummary {
+                    objective: "Plan one bounded change.".to_string(),
+                    requirements: vec!["Keep it bounded.".to_string()],
+                    constraints: Vec::new(),
+                    non_goals: Vec::new(),
+                    open_questions: Vec::new(),
+                    research_status:
+                        orcas_core::collaboration::PlanningSessionResearchStatus::NotRequested,
+                    draft_plan_summary: None,
+                    ready_for_review: false,
+                },
+            created_at: now,
+            created_by: "tester".to_string(),
+            updated_at: now,
+            updated_by: "tester".to_string(),
+            request_note: None,
+            reviewed_at: None,
+            reviewed_by: None,
+            review_note: None,
+            superseded_by_session_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn planning_session_update_summary_rejects_requested_research_status() {
+        let service = test_service().await;
+        {
+            let mut state = service.state.write().await;
+            state.collaboration.planning_sessions.insert(
+                "ps-test".to_string(),
+                sample_planning_session("ps-test", "ws-test"),
+            );
+        }
+
+        let error = service
+            .planning_session_update_summary(ipc::PlanningSessionUpdateSummaryRequest {
+                session_id: "ps-test".to_string(),
+                summary: orcas_core::PlanningSessionStructuredSummary {
+                    objective: "Plan one bounded change.".to_string(),
+                    requirements: Vec::new(),
+                    constraints: Vec::new(),
+                    non_goals: Vec::new(),
+                    open_questions: Vec::new(),
+                    research_status: orcas_core::PlanningSessionResearchStatus::Requested,
+                    draft_plan_summary: None,
+                    ready_for_review: false,
+                },
+                updated_by: None,
+                note: None,
+            })
+            .await
+            .expect_err("requested research status should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("summary cannot declare research as requested")
+        );
     }
 
     #[derive(Debug)]
