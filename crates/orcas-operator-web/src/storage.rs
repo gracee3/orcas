@@ -4,8 +4,11 @@ use orcas_operator_core::OperatorServerSettings;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::workspace::WorkspaceState;
+
 const STORAGE_KEY: &str = "orcas.operator.web.settings.v1";
 const BROWSER_PUSH_IDENTITY_KEY: &str = "orcas.operator.web.browser_push_identity.v1";
+const WORKSPACE_STATE_KEY: &str = "orcas.operator.web.workspace_state.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserPushIdentity {
@@ -93,4 +96,34 @@ pub fn browser_push_subscription_id(
         "browser::{origin_node_id}::{}::webpush",
         identity.browser_instance_id
     )
+}
+
+pub fn load_workspace_state() -> WorkspaceState {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(Some(storage)) = window.local_storage() {
+                if let Ok(Some(raw)) = storage.get_item(WORKSPACE_STATE_KEY) {
+                    if let Ok(state) = serde_json::from_str::<WorkspaceState>(&raw) {
+                        return state;
+                    }
+                }
+            }
+        }
+    }
+
+    WorkspaceState::default()
+}
+
+pub fn save_workspace_state(_state: &WorkspaceState) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Ok(Some(storage)) = window.local_storage() {
+                if let Ok(raw) = serde_json::to_string(_state) {
+                    let _ = storage.set_item(WORKSPACE_STATE_KEY, &raw);
+                }
+            }
+        }
+    }
 }

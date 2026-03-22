@@ -5,6 +5,7 @@ mod push;
 mod pwa;
 mod storage;
 mod watch;
+mod workspace;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +25,7 @@ use orcas_operator_core::{
     summarize_inbox_page_change, summarize_notification_page_change,
     summarize_remote_action_request_change,
 };
+use workspace::{WorkspaceFocus, WorkspaceSection, WorkspaceState};
 
 pub fn mount_app() {
     #[cfg(target_arch = "wasm32")]
@@ -37,10 +39,15 @@ pub fn mount_app() {
 #[component]
 pub fn App() -> impl IntoView {
     let settings = RwSignal::new(storage::load_settings());
+    let workspace = RwSignal::new(storage::load_workspace_state());
     provide_context(settings);
+    provide_context(workspace);
 
     Effect::new(move |_| {
         storage::save_settings(&settings.get());
+    });
+    Effect::new(move |_| {
+        storage::save_workspace_state(&workspace.get());
     });
 
     view! {
@@ -50,28 +57,132 @@ pub fn App() -> impl IntoView {
                     <div>
                         <p class="eyebrow">"Orcas operator web"</p>
                         <h1>"Mirrored operator control plane"</h1>
+                        <p class="settings-status">
+                            {move || {
+                                let state = workspace.get();
+                                let focus = state.focus.as_ref().map(|focus| {
+                                    format!("Current focus: {} · {}", focus.kind_label, focus.status_label)
+                                });
+                                focus.unwrap_or_else(|| {
+                                    format!("Active section: {}", state.active_section.label())
+                                })
+                            }}
+                        </p>
                     </div>
-                    <SettingsPanel />
                 </header>
-                <nav class="shell-nav">
-                    <A href="/inbox">"Inbox"</A>
-                    <A href="/notifications">"Notifications"</A>
-                    <A href="/deliveries">"Deliveries"</A>
-                    <A href="/actions">"Actions"</A>
-                </nav>
-                <main class="shell-main">
-                    <Routes fallback=|| view! { <NotFoundPage /> }>
-                        <Route path=path!("") view=InboxRoute />
-                        <Route path=path!("inbox") view=InboxRoute />
-                        <Route path=path!("inbox/:item_id") view=InboxDetailRoute />
-                        <Route path=path!("notifications") view=NotificationsRoute />
-                        <Route path=path!("deliveries") view=DeliveriesRoute />
-                        <Route path=path!("actions") view=ActionListRoute />
-                        <Route path=path!("actions/:request_id") view=ActionRoute />
-                    </Routes>
-                </main>
+                <div class="workspace-grid">
+                    <aside class="workspace-sidebar">
+                        <WorkspaceShell />
+                        <SettingsPanel />
+                    </aside>
+                    <main class="shell-main">
+                        <Routes fallback=|| view! { <NotFoundPage /> }>
+                            <Route path=path!("") view=InboxRoute />
+                            <Route path=path!("inbox") view=InboxRoute />
+                            <Route path=path!("inbox/:item_id") view=InboxDetailRoute />
+                            <Route path=path!("notifications") view=NotificationsRoute />
+                            <Route path=path!("deliveries") view=DeliveriesRoute />
+                            <Route path=path!("actions") view=ActionListRoute />
+                            <Route path=path!("actions/:request_id") view=ActionRoute />
+                        </Routes>
+                    </main>
+                </div>
             </div>
         </Router>
+    }
+}
+
+#[component]
+fn WorkspaceShell() -> impl IntoView {
+    let workspace =
+        use_context::<RwSignal<WorkspaceState>>().expect("workspace context should be provided");
+
+    view! {
+        <section class="workspace-panel">
+            <div class="workspace-panel-header">
+                <div>
+                    <p class="eyebrow">"Workspace"</p>
+                    <h2>"Navigation"</h2>
+                </div>
+                <p class="settings-status">
+                    {move || {
+                        let state = workspace.get();
+                        format!("Active section: {}", state.active_section.label())
+                    }}
+                </p>
+            </div>
+            <nav class="shell-nav shell-nav-vertical">
+                <A
+                    href=WorkspaceSection::Inbox.href()
+                    class:active=move || workspace.get().active_section == WorkspaceSection::Inbox
+                >
+                    "Inbox"
+                </A>
+                <A
+                    href=WorkspaceSection::Notifications.href()
+                    class:active=move || workspace.get().active_section == WorkspaceSection::Notifications
+                >
+                    "Notifications"
+                </A>
+                <A
+                    href=WorkspaceSection::Deliveries.href()
+                    class:active=move || workspace.get().active_section == WorkspaceSection::Deliveries
+                >
+                    "Deliveries"
+                </A>
+                <A
+                    href=WorkspaceSection::Actions.href()
+                    class:active=move || workspace.get().active_section == WorkspaceSection::Actions
+                >
+                    "Actions"
+                </A>
+            </nav>
+            <WorkspaceFocusPanel />
+        </section>
+    }
+}
+
+#[component]
+fn WorkspaceFocusPanel() -> impl IntoView {
+    let workspace =
+        use_context::<RwSignal<WorkspaceState>>().expect("workspace context should be provided");
+
+    view! {
+        <section class="workspace-focus-panel">
+            <p class="eyebrow">"Current focus"</p>
+            {move || {
+                let state = workspace.get();
+                match state.focus.as_ref() {
+                    Some(focus) => {
+                        let status_label = focus.status_label.clone();
+                        let kind_label = focus.kind_label.clone();
+                        let href = focus.href.clone();
+                        let title = focus.title.clone();
+                        let summary = focus.summary.clone();
+                        let section_label = focus.section.label();
+                        view! {
+                            <div class="workspace-focus-card">
+                                <div class="item-card-topline">
+                                    <span class="status-pill">{status_label}</span>
+                                    <span class="muted">{kind_label}</span>
+                                </div>
+                                <a class="item-title" href=href>{title}</a>
+                                <p class="item-summary">{summary}</p>
+                                <p class="item-meta">{format!("Focus section: {}", section_label)}</p>
+                            </div>
+                        }
+                        .into_any()
+                    }
+                    None => view! {
+                        <div class="empty-state workspace-empty-state">
+                            <h3>"No current focus"</h3>
+                            <p>"Select an inbox item or action request to pin it here while related views refresh."</p>
+                        </div>
+                    }
+                    .into_any(),
+                }
+            }}
+        </section>
     }
 }
 
@@ -297,6 +408,8 @@ fn PushRegistrationPanel() -> impl IntoView {
 fn InboxRoute() -> impl IntoView {
     let settings = use_context::<RwSignal<OperatorServerSettings>>()
         .expect("settings context should be provided");
+    let workspace =
+        use_context::<RwSignal<WorkspaceState>>().expect("workspace context should be provided");
     let refresh_epoch = RwSignal::new(0u64);
     let watch_error = RwSignal::new(None::<String>);
     let previous_page = RwSignal::new(None::<InboxPageView>);
@@ -312,7 +425,9 @@ fn InboxRoute() -> impl IntoView {
         let _settings = settings.clone();
         let _refresh_epoch = refresh_epoch.clone();
         let _watch_error = watch_error.clone();
+        let workspace = workspace.clone();
         move |_| {
+            workspace.update(|state| state.active_section = WorkspaceSection::Inbox);
             let alive = Arc::new(AtomicBool::new(true));
             on_cleanup({
                 let alive = alive.clone();
@@ -404,7 +519,10 @@ fn InboxRoute() -> impl IntoView {
             {move || match inbox.get() {
                 None => view! { <p class="muted">"Loading inbox…"</p> }.into_any(),
                 Some(Err(error)) => view! { <ErrorPanel error=error /> }.into_any(),
-                Some(Ok(page)) => render_inbox_page(page),
+                Some(Ok(page)) => {
+                    let workspace = workspace.get();
+                    render_inbox_page(page, &workspace)
+                }
             }}
         </PageFrame>
     }
@@ -414,12 +532,49 @@ fn InboxRoute() -> impl IntoView {
 fn InboxDetailRoute() -> impl IntoView {
     let settings = use_context::<RwSignal<OperatorServerSettings>>()
         .expect("settings context should be provided");
+    let workspace =
+        use_context::<RwSignal<WorkspaceState>>().expect("workspace context should be provided");
     let params = use_params_map();
     let item_id = move || params.with(|params| params.get("item_id").unwrap_or_default());
+    let item_id_value = item_id();
+    Effect::new({
+        let workspace = workspace.clone();
+        let item_id_value = item_id_value.clone();
+        move |_| {
+            workspace.update(|state| {
+                state.active_section = WorkspaceSection::Inbox;
+                state.focus = Some(WorkspaceFocus::inbox_item_placeholder(
+                    item_id_value.clone(),
+                ));
+            });
+        }
+    });
     let detail = LocalResource::new(move || {
         let settings = settings.get();
         let item_id = item_id();
         async move { api::load_inbox_item_detail(settings, item_id).await }
+    });
+    Effect::new({
+        let workspace = workspace.clone();
+        let detail = detail.clone();
+        let item_id_value = item_id_value.clone();
+        move |_| match detail.get() {
+            Some(Ok(page)) => {
+                workspace.update(|state| {
+                    state.focus = page
+                        .item
+                        .as_ref()
+                        .map(WorkspaceFocus::from_inbox_item)
+                        .or_else(|| {
+                            Some(WorkspaceFocus::inbox_item_placeholder(
+                                item_id_value.clone(),
+                            ))
+                        });
+                });
+            }
+            Some(Err(_)) => {}
+            None => {}
+        }
     });
     let navigator = use_navigate();
     let navigate = move |path: &str| navigator(path, Default::default());
@@ -429,7 +584,7 @@ fn InboxDetailRoute() -> impl IntoView {
             {move || match detail.get() {
                 None => view! { <p class="muted">"Loading item…"</p> }.into_any(),
                 Some(Err(error)) => view! { <ErrorPanel error=error /> }.into_any(),
-                Some(Ok(page)) => render_inbox_detail_page(page, navigate.clone()),
+                Some(Ok(page)) => render_inbox_detail_page(page, navigate.clone(), workspace.get()),
             }}
         </PageFrame>
     }
@@ -439,6 +594,8 @@ fn InboxDetailRoute() -> impl IntoView {
 fn NotificationsRoute() -> impl IntoView {
     let settings = use_context::<RwSignal<OperatorServerSettings>>()
         .expect("settings context should be provided");
+    let workspace =
+        use_context::<RwSignal<WorkspaceState>>().expect("workspace context should be provided");
     let refresh_epoch = RwSignal::new(0u64);
     let watch_error = RwSignal::new(None::<String>);
     let watch_started = RwSignal::new(false);
@@ -455,7 +612,9 @@ fn NotificationsRoute() -> impl IntoView {
         let refresh_epoch = refresh_epoch.clone();
         let watch_error = watch_error.clone();
         let watch_started = watch_started.clone();
+        let workspace = workspace.clone();
         move |_| {
+            workspace.update(|state| state.active_section = WorkspaceSection::Notifications);
             if watch_started.get_untracked() {
                 return;
             }
@@ -545,7 +704,10 @@ fn NotificationsRoute() -> impl IntoView {
             {move || match notifications.get() {
                 None => view! { <p class="muted">"Loading notifications…"</p> }.into_any(),
                 Some(Err(error)) => view! { <ErrorPanel error=error /> }.into_any(),
-                Some(Ok(page)) => render_notification_page(page),
+                Some(Ok(page)) => {
+                    let workspace = workspace.get();
+                    render_notification_page(page, workspace.clone())
+                }
             }}
         </PageFrame>
     }
@@ -555,6 +717,8 @@ fn NotificationsRoute() -> impl IntoView {
 fn DeliveriesRoute() -> impl IntoView {
     let settings = use_context::<RwSignal<OperatorServerSettings>>()
         .expect("settings context should be provided");
+    let workspace =
+        use_context::<RwSignal<WorkspaceState>>().expect("workspace context should be provided");
     let refresh_epoch = RwSignal::new(0u64);
     let watch_error = RwSignal::new(None::<String>);
     let watch_started = RwSignal::new(false);
@@ -571,7 +735,9 @@ fn DeliveriesRoute() -> impl IntoView {
         let refresh_epoch = refresh_epoch.clone();
         let watch_error = watch_error.clone();
         let watch_started = watch_started.clone();
+        let workspace = workspace.clone();
         move |_| {
+            workspace.update(|state| state.active_section = WorkspaceSection::Deliveries);
             if watch_started.get_untracked() {
                 return;
             }
@@ -659,7 +825,10 @@ fn DeliveriesRoute() -> impl IntoView {
             {move || match deliveries.get() {
                 None => view! { <p class="muted">"Loading deliveries…"</p> }.into_any(),
                 Some(Err(error)) => view! { <ErrorPanel error=error /> }.into_any(),
-                Some(Ok(page)) => render_delivery_page(page),
+                Some(Ok(page)) => {
+                    let workspace = workspace.get();
+                    render_delivery_page(page, workspace.clone())
+                }
             }}
         </PageFrame>
     }
@@ -669,6 +838,12 @@ fn DeliveriesRoute() -> impl IntoView {
 fn ActionListRoute() -> impl IntoView {
     let settings = use_context::<RwSignal<OperatorServerSettings>>()
         .expect("settings context should be provided");
+    let workspace =
+        use_context::<RwSignal<WorkspaceState>>().expect("workspace context should be provided");
+    Effect::new({
+        let workspace = workspace.clone();
+        move |_| workspace.update(|state| state.active_section = WorkspaceSection::Actions)
+    });
     let actions = LocalResource::new(move || {
         let settings = settings.get();
         async move { api::load_action_requests_page(settings).await }
@@ -680,7 +855,10 @@ fn ActionListRoute() -> impl IntoView {
             {move || match actions.get() {
                 None => view! { <p class="muted">"Loading action requests…"</p> }.into_any(),
                 Some(Err(error)) => view! { <ErrorPanel error=error /> }.into_any(),
-                Some(Ok(page)) => render_action_list_page(page),
+                Some(Ok(page)) => {
+                    let workspace = workspace.get();
+                    render_action_list_page(page, workspace.clone())
+                }
             }}
         </PageFrame>
     }
@@ -690,9 +868,24 @@ fn ActionListRoute() -> impl IntoView {
 fn ActionRoute() -> impl IntoView {
     let settings = use_context::<RwSignal<OperatorServerSettings>>()
         .expect("settings context should be provided");
+    let workspace =
+        use_context::<RwSignal<WorkspaceState>>().expect("workspace context should be provided");
     let params = use_params_map();
     let request_id = move || params.with(|params| params.get("request_id").unwrap_or_default());
     let push_context = push::current_push_open_context();
+    let request_id_value = request_id();
+    Effect::new({
+        let workspace = workspace.clone();
+        let request_id_value = request_id_value.clone();
+        move |_| {
+            workspace.update(|state| {
+                state.active_section = WorkspaceSection::Actions;
+                state.focus = Some(WorkspaceFocus::remote_action_request_placeholder(
+                    request_id_value.clone(),
+                ));
+            });
+        }
+    });
     let refresh_epoch = RwSignal::new(0u64);
     let watching = RwSignal::new(false);
     let watch_started = RwSignal::new(false);
@@ -720,6 +913,19 @@ fn ActionRoute() -> impl IntoView {
                 change_summary.set(change);
             }
             Some(Ok(None)) | Some(Err(_)) | None => change_summary.set(None),
+        }
+    });
+    Effect::new({
+        let workspace = workspace.clone();
+        let action_request = action_request.clone();
+        move |_| match action_request.get() {
+            Some(Ok(Some(request))) => {
+                workspace.update(|state| {
+                    state.focus = Some(WorkspaceFocus::from_remote_action_request(&request));
+                });
+            }
+            Some(Ok(None)) => {}
+            Some(Err(_)) | None => {}
         }
     });
 
@@ -817,7 +1023,10 @@ fn ActionRoute() -> impl IntoView {
                         <EmptyState title="Request not found" body={missing_remote_action_notice(push_context.is_some())} />
                     </div>
                 }.into_any(),
-                Some(Ok(Some(request))) => render_remote_action_page(request, move || watching.get()),
+                Some(Ok(Some(request))) => {
+                    let workspace = workspace.get();
+                    render_remote_action_page(request, move || watching.get(), workspace.clone())
+                }
             }}
         </PageFrame>
     }
@@ -921,7 +1130,7 @@ fn missing_remote_action_notice(push_context_present: bool) -> &'static str {
     }
 }
 
-fn render_inbox_page(page: InboxPageView) -> AnyView {
+fn render_inbox_page(page: InboxPageView, workspace: &WorkspaceState) -> AnyView {
     if page.empty_state {
         return view! {
             <EmptyState title="No mirrored inbox items" body="The server has not mirrored any actionable work yet." />
@@ -938,14 +1147,21 @@ fn render_inbox_page(page: InboxPageView) -> AnyView {
                 )}
             </p>
             <div class="section-grid">
-                {page.sections.into_iter().map(render_inbox_section).collect_view()}
+                {page
+                    .sections
+                    .into_iter()
+                    .map(|section| render_inbox_section(section, workspace))
+                    .collect_view()}
             </div>
         </div>
     }
     .into_any()
 }
 
-fn render_inbox_section(section: orcas_operator_core::InboxSectionView) -> AnyView {
+fn render_inbox_section(
+    section: orcas_operator_core::InboxSectionView,
+    workspace: &WorkspaceState,
+) -> AnyView {
     view! {
         <article class="card">
             <header class="card-header">
@@ -955,17 +1171,22 @@ fn render_inbox_section(section: orcas_operator_core::InboxSectionView) -> AnyVi
                 </div>
             </header>
             <ul class="item-list">
-                {section.items.into_iter().map(render_inbox_card).collect_view()}
+                {section
+                    .items
+                    .into_iter()
+                    .map(|item| render_inbox_card(item, workspace))
+                    .collect_view()}
             </ul>
         </article>
     }
     .into_any()
 }
 
-fn render_inbox_card(item: InboxItemCardView) -> AnyView {
+fn render_inbox_card(item: InboxItemCardView, workspace: &WorkspaceState) -> AnyView {
     let href = format!("/inbox/{}", item.id);
+    let selected = workspace.focus_matches_inbox_item(&item.id);
     view! {
-        <li class="item-card">
+        <li class=move || if selected { "item-card item-card-selected" } else { "item-card" }>
             <div class="item-card-main">
                 <div class="item-card-topline">
                     <span class="status-pill">{item.status_label}</span>
@@ -986,6 +1207,7 @@ fn render_inbox_card(item: InboxItemCardView) -> AnyView {
 fn render_inbox_detail_page(
     page: InboxDetailPageView,
     navigate: impl Fn(&str) + Clone + 'static,
+    workspace: WorkspaceState,
 ) -> AnyView {
     let navigate_action = navigate.clone();
     let item = page.item.clone();
@@ -1002,6 +1224,9 @@ fn render_inbox_detail_page(
         .map(|item| item.title.clone())
         .unwrap_or_else(|| "Missing inbox item".to_string());
     let item_id = item.as_ref().map(|item| item.id.clone());
+    let item_id_text = item_id
+        .clone()
+        .unwrap_or_else(|| "unknown item".to_string());
     let item_title = item.as_ref().map(|item| item.title.clone());
     let origin_node_id = page
         .notification_candidates
@@ -1034,12 +1259,27 @@ fn render_inbox_detail_page(
             )
         })
         .or_else(|| Some(missing_inbox_item_notice(push_context_present).to_string()));
+    let workspace_focus_note = match workspace.focus.as_ref() {
+        Some(focus) if focus.item_id.as_deref() == item_id.as_deref() => {
+            "This mirrored inbox item is pinned as the current focus.".to_string()
+        }
+        Some(focus) => format!(
+            "Pinned focus remains on {} · {}",
+            focus.kind_label, focus.status_label
+        ),
+        None => "No item is pinned in the workspace yet.".to_string(),
+    };
 
     view! {
         <div class="stack">
             {render_push_banner(push_context.clone(), item_title, item_state_note)}
+            <div class="info-panel">
+                <strong>"Workspace context"</strong>
+                <p>{format!("Active section: {}", workspace.active_section.label())}</p>
+                <p>{workspace_focus_note}</p>
+            </div>
             <article class="card">
-                <p class="eyebrow">{item_id.unwrap_or_else(|| "unknown item".to_string())}</p>
+                <p class="eyebrow">{item_id_text}</p>
                 <h3>{title}</h3>
                 <p class="item-summary">{summary}</p>
                 {move || match item.as_ref() {
@@ -1102,17 +1342,17 @@ fn render_inbox_detail_page(
 
             <article class="card">
                 <h3>"Related notification candidates"</h3>
-                {render_notification_candidates(page.notification_candidates)}
+                {render_notification_candidates(page.notification_candidates, workspace.clone())}
             </article>
 
             <article class="card">
                 <h3>"Related delivery jobs"</h3>
-                {render_delivery_jobs(page.delivery_jobs)}
+                {render_delivery_jobs(page.delivery_jobs, workspace.clone())}
             </article>
 
             <article class="card">
                 <h3>"Recent remote action requests"</h3>
-                {render_remote_action_requests(page.remote_action_requests, origin_node_id)}
+                {render_remote_action_requests(page.remote_action_requests, origin_node_id, workspace.clone())}
             </article>
         </div>
     }
@@ -1134,7 +1374,7 @@ fn render_item_details(item: &InboxItemCardView) -> AnyView {
     .into_any()
 }
 
-fn render_notification_page(page: NotificationPageView) -> AnyView {
+fn render_notification_page(page: NotificationPageView, workspace: WorkspaceState) -> AnyView {
     let push_context = push::current_push_open_context();
     if page.candidates.is_empty() {
         return view! {
@@ -1167,13 +1407,16 @@ fn render_notification_page(page: NotificationPageView) -> AnyView {
                 )),
             )}
             <p class="muted">{format!("{} candidates from origin `{}`", page.candidates.len(), page.origin_node_id)}</p>
-            {render_notification_candidates(page.candidates)}
+            {render_notification_candidates(page.candidates, workspace)}
         </div>
     }
     .into_any()
 }
 
-fn render_notification_candidates(candidates: Vec<NotificationCandidateView>) -> AnyView {
+fn render_notification_candidates(
+    candidates: Vec<NotificationCandidateView>,
+    workspace: WorkspaceState,
+) -> AnyView {
     if candidates.is_empty() {
         return view! { <p class="muted">"None."</p> }.into_any();
     }
@@ -1181,8 +1424,12 @@ fn render_notification_candidates(candidates: Vec<NotificationCandidateView>) ->
         <ul class="item-list">
             {candidates.into_iter().map(|candidate| {
                 let href = format!("/inbox/{}", candidate.item_id);
+                let selected = workspace.focus_matches_notification_candidate(
+                    candidate.candidate_id.as_str(),
+                    candidate.item_id.as_str(),
+                );
                 view! {
-                    <li class="item-card">
+                    <li class=move || if selected { "item-card item-card-selected" } else { "item-card" }>
                         <div class="item-card-main">
                             <div class="item-card-topline">
                                 <span class="status-pill">{candidate.status_label}</span>
@@ -1200,7 +1447,7 @@ fn render_notification_candidates(candidates: Vec<NotificationCandidateView>) ->
     .into_any()
 }
 
-fn render_delivery_page(page: DeliveryPageView) -> AnyView {
+fn render_delivery_page(page: DeliveryPageView, workspace: WorkspaceState) -> AnyView {
     let push_context = push::current_push_open_context();
     if page.jobs.is_empty() {
         return view! {
@@ -1225,21 +1472,25 @@ fn render_delivery_page(page: DeliveryPageView) -> AnyView {
                     page.jobs.len()
                 )),
             )}
-            {render_delivery_jobs(page.jobs)}
+            {render_delivery_jobs(page.jobs, workspace)}
         </div>
     }
     .into_any()
 }
 
-fn render_delivery_jobs(jobs: Vec<DeliveryJobView>) -> AnyView {
+fn render_delivery_jobs(jobs: Vec<DeliveryJobView>, workspace: WorkspaceState) -> AnyView {
     if jobs.is_empty() {
         return view! { <p class="muted">"None."</p> }.into_any();
     }
     view! {
         <ul class="item-list">
             {jobs.into_iter().map(|job| {
+                let selected = workspace.focus_matches_delivery_job(
+                    job.job_id.as_str(),
+                    job.candidate_id.as_str(),
+                );
                 view! {
-                    <li class="item-card">
+                    <li class=move || if selected { "item-card item-card-selected" } else { "item-card" }>
                         <div class="item-card-main">
                             <div class="item-card-topline">
                                 <span class="status-pill">{job.status_label}</span>
@@ -1260,7 +1511,7 @@ fn render_delivery_jobs(jobs: Vec<DeliveryJobView>) -> AnyView {
     .into_any()
 }
 
-fn render_action_list_page(page: RemoteActionPageView) -> AnyView {
+fn render_action_list_page(page: RemoteActionPageView, workspace: WorkspaceState) -> AnyView {
     if page.requests.is_empty() {
         return view! { <EmptyState title="No remote action requests" body="Create a remote action from an inbox item to populate this list." /> }
             .into_any();
@@ -1275,7 +1526,7 @@ fn render_action_list_page(page: RemoteActionPageView) -> AnyView {
     view! {
         <div class="stack">
             <p class="muted">{format!("{} requests", page.requests.len())}</p>
-            {render_remote_action_requests(page.requests, origin_node_id)}
+            {render_remote_action_requests(page.requests, origin_node_id, workspace)}
         </div>
     }
     .into_any()
@@ -1284,11 +1535,22 @@ fn render_action_list_page(page: RemoteActionPageView) -> AnyView {
 fn render_remote_action_page(
     request: RemoteActionRequestView,
     watching: impl Fn() -> bool + 'static,
+    workspace: WorkspaceState,
 ) -> AnyView {
     let status_label = remote_action_status_label(request.status);
     let status_hint = remote_action_status_hint(request.status);
     let is_active = watching();
     let push_context = push::current_push_open_context();
+    let workspace_focus_note = match workspace.focus.as_ref() {
+        Some(focus) if focus.request_id.as_deref() == Some(request.request_id.as_str()) => {
+            "This remote action request is pinned as the current focus.".to_string()
+        }
+        Some(focus) => format!(
+            "Pinned focus remains on {} · {}",
+            focus.kind_label, focus.status_label
+        ),
+        None => "No action request is pinned in the workspace yet.".to_string(),
+    };
     let terminal_panel: Option<(bool, &'static str, String)> = match request.status {
         OperatorRemoteActionRequestStatus::Completed => Some((
             false,
@@ -1321,6 +1583,11 @@ fn render_remote_action_page(
                 Some(format!("remote action request {}", request.request_id)),
                 Some(format!("Current mirrored status: {} · {}", request.status_label, status_hint)),
             )}
+            <div class="info-panel">
+                <strong>"Workspace context"</strong>
+                <p>{format!("Active section: {}", workspace.active_section.label())}</p>
+                <p>{workspace_focus_note.clone()}</p>
+            </div>
             {move || match terminal_panel.as_ref() {
                 Some((is_error, title, body)) if *is_error => view! {
                     <div class="error-panel">
@@ -1346,12 +1613,21 @@ fn render_remote_action_page(
                 <h3>{request.request_id.clone()}</h3>
                 <p class="item-summary">{request.summary.clone()}</p>
                 <p class="item-meta">{status_hint}</p>
+                <p class="item-meta">
+                    {format!(
+                        "Related mirrored inbox item: {}",
+                        request.item_id.clone()
+                    )}
+                </p>
                 <dl class="detail-grid">
                     <div><dt>"Status"</dt><dd>{status_label}</dd></div>
                     <div><dt>"Claimed by"</dt><dd>{request.claimed_by.clone().unwrap_or_else(|| "none".to_string())}</dd></div>
                     <div><dt>"Completed at"</dt><dd>{request.completed_at.map(|time| time.to_rfc3339()).unwrap_or_else(|| "none".to_string())}</dd></div>
                     <div><dt>"Failed at"</dt><dd>{request.failed_at.map(|time| time.to_rfc3339()).unwrap_or_else(|| "none".to_string())}</dd></div>
                 </dl>
+                <div class="toolbar">
+                    <A href={format!("/inbox/{}", request.item_id)}>"Open related inbox item"</A>
+                </div>
                 {move || match request.result.clone() {
                     Some(result) => view! {
                         <article class="card">
@@ -1386,6 +1662,7 @@ fn render_remote_action_page(
 fn render_remote_action_requests(
     requests: Vec<RemoteActionRequestView>,
     origin_node_id: String,
+    workspace: WorkspaceState,
 ) -> AnyView {
     if requests.is_empty() {
         return view! {
@@ -1400,8 +1677,11 @@ fn render_remote_action_requests(
         <ul class="item-list">
             {requests.into_iter().map(|request| {
                 let href = format!("/actions/{}", request.request_id);
+                let selected = workspace.focus_matches_remote_action_request(
+                    request.request_id.as_str(),
+                );
                 view! {
-                    <li class="item-card">
+                    <li class=move || if selected { "item-card item-card-selected" } else { "item-card" }>
                 <div class="item-card-main">
                     <div class="item-card-topline">
                         <span class="status-pill">{request.status_label}</span>

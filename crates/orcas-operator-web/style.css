@@ -36,7 +36,7 @@ a {
 }
 
 .app-shell {
-  max-width: 1200px;
+  max-width: 1440px;
   margin: 0 auto;
   padding: 1.25rem;
 }
@@ -61,18 +61,55 @@ a {
   margin: 0 0 0.35rem;
 }
 
-.shell-nav {
-  display: flex;
+.workspace-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
   gap: 1rem;
-  margin: 1rem 0;
-  flex-wrap: wrap;
+  align-items: start;
+  margin-top: 1rem;
+}
+
+.workspace-sidebar {
+  display: grid;
+  gap: 1rem;
+  position: sticky;
+  top: 1rem;
+}
+
+.workspace-panel,
+.workspace-focus-panel {
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: rgba(21, 29, 55, 0.88);
+  padding: 0.95rem;
+  display: grid;
+  gap: 0.85rem;
+}
+
+.workspace-panel-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+
+.shell-nav {
+  display: grid;
+  gap: 0.6rem;
 }
 
 .shell-nav a {
-  padding: 0.45rem 0.8rem;
-  border-radius: 999px;
+  padding: 0.7rem 0.9rem;
+  border-radius: 14px;
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.shell-nav a.active {
+  background: linear-gradient(135deg, rgba(125, 211, 252, 0.18), rgba(249, 168, 212, 0.12));
+  border-color: rgba(125, 211, 252, 0.28);
+  box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.1) inset;
 }
 
 .shell-main {
@@ -183,6 +220,12 @@ a {
   border: 1px solid var(--border);
 }
 
+.item-card-selected {
+  border-color: rgba(125, 211, 252, 0.5);
+  background: rgba(125, 211, 252, 0.08);
+  box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.12) inset;
+}
+
 .item-card-topline {
   display: flex;
   gap: 0.5rem;
@@ -231,6 +274,15 @@ a {
 
 .detail-grid dd {
   margin: 0.15rem 0 0;
+}
+
+.workspace-focus-card {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.workspace-empty-state {
+  background: rgba(255, 255, 255, 0.02);
 }
 
 .action-form {
@@ -282,7 +334,7 @@ button,
   border: 1px solid var(--border);
 }
 
-@media (max-width: 860px) {
+@media (max-width: 960px) {
   .shell-header {
     flex-direction: column;
   }
@@ -290,5 +342,13 @@ button,
   .settings-panel {
     min-width: 0;
     width: 100%;
+  }
+
+  .workspace-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .workspace-sidebar {
+    position: static;
   }
 }
