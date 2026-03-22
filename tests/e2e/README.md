@@ -139,5 +139,6 @@ That removes `target/e2e/` and nothing else.
 - `live-restart-resume`
 - `live-worktree-lifecycle`
 - `live-multi-phase-lane`
+- `live-concurrent-lanes`
 
-The current migration keeps the existing behavior first, then grows the live lane through worker execution, supervisor approval, governed redirect flows, restart/recovery behavior, tracked-thread worktree lifecycle transitions, and multi-phase lane continuity on the same tracked-thread/worktree path.
+The current migration keeps the existing behavior first, then grows the live lane through worker execution, supervisor approval, governed redirect flows, restart/recovery behavior, tracked-thread worktree lifecycle transitions, multi-phase lane continuity on the same tracked-thread/worktree path, and concurrent lane isolation across two live worktrees.
