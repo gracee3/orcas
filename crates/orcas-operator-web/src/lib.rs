@@ -1,9 +1,10 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_variables))]
 
 mod api;
-mod pwa;
 mod push;
+mod pwa;
 mod storage;
+mod watch;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -417,14 +418,89 @@ fn InboxDetailRoute() -> impl IntoView {
 fn NotificationsRoute() -> impl IntoView {
     let settings = use_context::<RwSignal<OperatorServerSettings>>()
         .expect("settings context should be provided");
+    let refresh_epoch = RwSignal::new(0u64);
+    let watch_error = RwSignal::new(None::<String>);
+    let watch_started = RwSignal::new(false);
     let notifications = LocalResource::new(move || {
         let settings = settings.get();
+        let _refresh_epoch = refresh_epoch.get();
         async move { api::load_notifications_page(settings).await }
+    });
+
+    Effect::new({
+        let settings = settings.clone();
+        let refresh_epoch = refresh_epoch.clone();
+        let watch_error = watch_error.clone();
+        let watch_started = watch_started.clone();
+        move |_| {
+            if watch_started.get_untracked() {
+                return;
+            }
+            let current_settings = settings.get_untracked();
+            if !storage::settings_ready(&current_settings) {
+                return;
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                watch_started.set(true);
+                let alive = Arc::new(AtomicBool::new(true));
+                on_cleanup({
+                    let alive = alive.clone();
+                    move || alive.store(false, Ordering::Release)
+                });
+                let refresh_epoch = refresh_epoch.clone();
+                let watch_error = watch_error.clone();
+                leptos::spawn_local(async move {
+                    let initial_checkpoint =
+                        match api::load_notification_checkpoint(current_settings.clone()).await {
+                            Ok(checkpoint) => checkpoint,
+                            Err(error) => {
+                                watch_error.set(Some(error));
+                                watch_started.set(false);
+                                return;
+                            }
+                        };
+                    let result = watch::run_change_watch_loop(
+                        alive,
+                        initial_checkpoint,
+                        move |after_updated_at, timeout_ms| {
+                            let current_settings = current_settings.clone();
+                            async move {
+                                api::wait_for_notification_checkpoint(
+                                    current_settings,
+                                    after_updated_at,
+                                    timeout_ms,
+                                )
+                                .await
+                                .map(|next| next.map(|checkpoint| (checkpoint, ())))
+                            }
+                        },
+                        move |_| {
+                            watch_error.set(None);
+                            refresh_epoch.update(|value| *value += 1);
+                            true
+                        },
+                    )
+                    .await;
+                    if let Err(error) = result {
+                        watch_error.set(Some(error));
+                    }
+                    watch_started.set(false);
+                });
+            }
+        }
     });
 
     view! {
         <PageFrame title="Notifications" subtitle="Server-side notification readiness">
-            <button class="refresh-button" on:click=move |_| notifications.refetch()>"Refresh"</button>
+            <div class="toolbar">
+                <button class="refresh-button" on:click=move |_| notifications.refetch()>"Refresh"</button>
+                <span class="muted">"Auto-refreshes on server notification checkpoint changes while this view is open."</span>
+            </div>
+            {move || match watch_error.get() {
+                Some(error) => view! { <ErrorPanel error=format!("Live refresh paused: {error}") /> }.into_any(),
+                None => view! {}.into_any(),
+            }}
             {move || match notifications.get() {
                 None => view! { <p class="muted">"Loading notifications…"</p> }.into_any(),
                 Some(Err(error)) => view! { <ErrorPanel error=error /> }.into_any(),
@@ -438,14 +514,89 @@ fn NotificationsRoute() -> impl IntoView {
 fn DeliveriesRoute() -> impl IntoView {
     let settings = use_context::<RwSignal<OperatorServerSettings>>()
         .expect("settings context should be provided");
+    let refresh_epoch = RwSignal::new(0u64);
+    let watch_error = RwSignal::new(None::<String>);
+    let watch_started = RwSignal::new(false);
     let deliveries = LocalResource::new(move || {
         let settings = settings.get();
+        let _refresh_epoch = refresh_epoch.get();
         async move { api::load_deliveries_page(settings).await }
+    });
+
+    Effect::new({
+        let settings = settings.clone();
+        let refresh_epoch = refresh_epoch.clone();
+        let watch_error = watch_error.clone();
+        let watch_started = watch_started.clone();
+        move |_| {
+            if watch_started.get_untracked() {
+                return;
+            }
+            let current_settings = settings.get_untracked();
+            if !storage::settings_ready(&current_settings) {
+                return;
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                watch_started.set(true);
+                let alive = Arc::new(AtomicBool::new(true));
+                on_cleanup({
+                    let alive = alive.clone();
+                    move || alive.store(false, Ordering::Release)
+                });
+                let refresh_epoch = refresh_epoch.clone();
+                let watch_error = watch_error.clone();
+                leptos::spawn_local(async move {
+                    let initial_checkpoint =
+                        match api::load_delivery_checkpoint(current_settings.clone()).await {
+                            Ok(checkpoint) => checkpoint,
+                            Err(error) => {
+                                watch_error.set(Some(error));
+                                watch_started.set(false);
+                                return;
+                            }
+                        };
+                    let result = watch::run_change_watch_loop(
+                        alive,
+                        initial_checkpoint,
+                        move |after_updated_at, timeout_ms| {
+                            let current_settings = current_settings.clone();
+                            async move {
+                                api::wait_for_delivery_checkpoint(
+                                    current_settings,
+                                    after_updated_at,
+                                    timeout_ms,
+                                )
+                                .await
+                                .map(|next| next.map(|checkpoint| (checkpoint, ())))
+                            }
+                        },
+                        move |_| {
+                            watch_error.set(None);
+                            refresh_epoch.update(|value| *value += 1);
+                            true
+                        },
+                    )
+                    .await;
+                    if let Err(error) = result {
+                        watch_error.set(Some(error));
+                    }
+                    watch_started.set(false);
+                });
+            }
+        }
     });
 
     view! {
         <PageFrame title="Deliveries" subtitle="Notification delivery jobs and outcomes">
-            <button class="refresh-button" on:click=move |_| deliveries.refetch()>"Refresh"</button>
+            <div class="toolbar">
+                <button class="refresh-button" on:click=move |_| deliveries.refetch()>"Refresh"</button>
+                <span class="muted">"Auto-refreshes on server delivery checkpoint changes while this view is open."</span>
+            </div>
+            {move || match watch_error.get() {
+                Some(error) => view! { <ErrorPanel error=format!("Live refresh paused: {error}") /> }.into_any(),
+                None => view! {}.into_any(),
+            }}
             {move || match deliveries.get() {
                 None => view! { <p class="muted">"Loading deliveries…"</p> }.into_any(),
                 Some(Err(error)) => view! { <ErrorPanel error=error /> }.into_any(),
@@ -485,6 +636,7 @@ fn ActionRoute() -> impl IntoView {
     let push_context = push::current_push_open_context();
     let refresh_epoch = RwSignal::new(0u64);
     let watching = RwSignal::new(false);
+    let watch_started = RwSignal::new(false);
     let watch_error = RwSignal::new(None::<String>);
     let action_request = LocalResource::new(move || {
         let settings = settings.get();
@@ -495,10 +647,10 @@ fn ActionRoute() -> impl IntoView {
 
     Effect::new(move |_| {
         let should_watch = watching.get();
-        let _settings_value = settings.get();
-        let _request_id_value = request_id();
+        let settings_value = settings.get_untracked();
+        let request_id_value = request_id();
         let current = action_request.get();
-        if !should_watch {
+        if !should_watch || watch_started.get_untracked() {
             return;
         }
         let Some(Ok(Some(request))) = current else {
@@ -513,46 +665,55 @@ fn ActionRoute() -> impl IntoView {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            if watching.get_untracked() {
-                let refresh_epoch = refresh_epoch.clone();
-                let watch_error = watch_error.clone();
-                let watching = watching.clone();
-                leptos::spawn_local(async move {
-                    let mut after_updated_at = Some(request.updated_at);
-                    loop {
-                        match api::wait_for_remote_action_update(
-                            settings_value.clone(),
-                            request_id_value.clone(),
-                            after_updated_at,
-                            Some(30_000),
-                        )
-                        .await
-                        {
-                            Ok(Some(updated)) => {
-                                after_updated_at = Some(updated.updated_at);
-                                refresh_epoch.update(|value| *value += 1);
-                                if !matches!(
-                                    updated.status,
-                                    OperatorRemoteActionRequestStatus::Pending
-                                        | OperatorRemoteActionRequestStatus::Claimed
-                                ) {
-                                    watching.set(false);
-                                    break;
-                                }
-                            }
-                            Ok(None) => {
-                                watching.set(false);
-                                break;
-                            }
-                            Err(error) => {
-                                watch_error.set(Some(error));
-                                watching.set(false);
-                                break;
-                            }
+            watch_started.set(true);
+            let alive = Arc::new(AtomicBool::new(true));
+            on_cleanup({
+                let alive = alive.clone();
+                move || alive.store(false, Ordering::Release)
+            });
+            let refresh_epoch = refresh_epoch.clone();
+            let watch_error = watch_error.clone();
+            let watching = watching.clone();
+            let watch_started = watch_started.clone();
+            leptos::spawn_local(async move {
+                let result = watch::run_change_watch_loop(
+                    alive,
+                    request.updated_at,
+                    move |after_updated_at, timeout_ms| {
+                        let settings_value = settings_value.clone();
+                        let request_id_value = request_id_value.clone();
+                        async move {
+                            api::wait_for_remote_action_update(
+                                settings_value,
+                                request_id_value,
+                                Some(after_updated_at),
+                                timeout_ms,
+                            )
+                            .await
+                            .map(|response| response.map(|updated| (updated.updated_at, updated)))
                         }
-                    }
-                });
-            }
+                    },
+                    move |updated| {
+                        refresh_epoch.update(|value| *value += 1);
+                        watch_error.set(None);
+                        let keep_watching = matches!(
+                            updated.status,
+                            OperatorRemoteActionRequestStatus::Pending
+                                | OperatorRemoteActionRequestStatus::Claimed
+                        );
+                        if !keep_watching {
+                            watching.set(false);
+                        }
+                        keep_watching
+                    },
+                )
+                .await;
+                if let Err(error) = result {
+                    watch_error.set(Some(error));
+                    watching.set(false);
+                }
+                watch_started.set(false);
+            });
         }
     });
 

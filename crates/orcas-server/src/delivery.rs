@@ -89,7 +89,9 @@ impl NotificationDeliveryTransport for LogNotificationDeliveryTransport {
     }
 }
 
-fn browser_push_payload(context: &NotificationDeliveryContext<'_>) -> BrowserPushNotificationPayload {
+fn browser_push_payload(
+    context: &NotificationDeliveryContext<'_>,
+) -> BrowserPushNotificationPayload {
     let item = &context.candidate.item;
     let body = item
         .rationale
@@ -343,7 +345,10 @@ mod tests {
         assert_eq!(payload.notification_id, "job-1");
         assert_eq!(payload.title, "Review proposal");
         assert_eq!(payload.body, "Please review");
-        assert_eq!(payload.source_kind, Some(OperatorInboxSourceKind::SupervisorProposal));
+        assert_eq!(
+            payload.source_kind,
+            Some(OperatorInboxSourceKind::SupervisorProposal)
+        );
         assert_eq!(
             payload.route_path(),
             "/inbox/item-1?origin_node_id=origin-1&candidate_id=candidate-1&notification_id=job-1&push=1"

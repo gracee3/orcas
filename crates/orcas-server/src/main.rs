@@ -54,6 +54,8 @@ async fn main() -> Result<()> {
         push_vapid_subject: cli.push_vapid_subject,
     };
     let bind_addr = config.bind_addr;
-    InboxMirrorServer::from_config(store, config).serve(bind_addr).await?;
+    InboxMirrorServer::from_config(store, config)
+        .serve(bind_addr)
+        .await?;
     Ok(())
 }

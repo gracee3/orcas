@@ -15351,7 +15351,10 @@ mod tests {
                 session_id: "ps-test".to_string(),
                 summary: orcas_core::PlanningSessionStructuredSummary {
                     objective: "Refined objective".to_string(),
-                    requirements: vec!["Keep it bounded.".to_string(), "Stay descriptive.".to_string()],
+                    requirements: vec![
+                        "Keep it bounded.".to_string(),
+                        "Stay descriptive.".to_string(),
+                    ],
                     constraints: vec!["No broad refactor.".to_string()],
                     non_goals: vec!["Do not widen scope.".to_string()],
                     open_questions: vec!["Is this still bounded?".to_string()],
@@ -15415,7 +15418,12 @@ mod tests {
             chat_response.session.status,
             orcas_core::collaboration::PlanningSessionStatus::AwaitingApproval
         );
-        assert!(chat_response.session.latest_structured_summary.ready_for_review);
+        assert!(
+            chat_response
+                .session
+                .latest_structured_summary
+                .ready_for_review
+        );
         assert_eq!(
             chat_response.session.review_note,
             Some("ready to hand off".to_string())

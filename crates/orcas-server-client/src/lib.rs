@@ -15,7 +15,9 @@ use orcas_core::ipc::{
     OperatorNotificationAckResponse, OperatorNotificationGetRequest,
     OperatorNotificationGetResponse, OperatorNotificationListRequest,
     OperatorNotificationListResponse, OperatorNotificationSuppressRequest,
-    OperatorNotificationSuppressResponse, OperatorRemoteActionClaimRequest,
+    OperatorNotificationSuppressResponse, OperatorReadModelCheckpointQueryRequest,
+    OperatorReadModelCheckpointQueryResponse, OperatorReadModelWaitForCheckpointRequest,
+    OperatorReadModelWaitForCheckpointResponse, OperatorRemoteActionClaimRequest,
     OperatorRemoteActionClaimResponse, OperatorRemoteActionCompleteRequest,
     OperatorRemoteActionCompleteResponse, OperatorRemoteActionCreateRequest,
     OperatorRemoteActionCreateResponse, OperatorRemoteActionFailRequest,
@@ -343,6 +345,41 @@ impl OrcasServerClient {
             .await
     }
 
+    pub async fn notification_checkpoint(
+        &self,
+        request: &OperatorReadModelCheckpointQueryRequest,
+    ) -> OrcasResult<OperatorReadModelCheckpointQueryResponse> {
+        self.post_json("operator-notifications/checkpoint", request)
+            .await
+    }
+
+    pub async fn notification_wait_for_checkpoint(
+        &self,
+        request: &OperatorReadModelWaitForCheckpointRequest,
+    ) -> OrcasResult<OperatorReadModelWaitForCheckpointResponse> {
+        self.post_json("operator-notifications/wait_for_checkpoint", request)
+            .await
+    }
+
+    pub async fn delivery_checkpoint(
+        &self,
+        request: &OperatorReadModelCheckpointQueryRequest,
+    ) -> OrcasResult<OperatorReadModelCheckpointQueryResponse> {
+        self.post_json("operator-notifications/delivery/checkpoint", request)
+            .await
+    }
+
+    pub async fn delivery_wait_for_checkpoint(
+        &self,
+        request: &OperatorReadModelWaitForCheckpointRequest,
+    ) -> OrcasResult<OperatorReadModelWaitForCheckpointResponse> {
+        self.post_json(
+            "operator-notifications/delivery/wait_for_checkpoint",
+            request,
+        )
+        .await
+    }
+
     pub async fn wait_for_remote_action_update(
         &self,
         request: &OperatorRemoteActionWaitRequest,
@@ -375,7 +412,8 @@ mod tests {
         NotificationSubscriptionUpsertRequest, NotificationTransportKind, OperatorInboxActionKind,
         OperatorInboxChange, OperatorInboxChangeKind, OperatorInboxCheckpoint, OperatorInboxItem,
         OperatorInboxItemStatus, OperatorInboxSourceKind, OperatorNotificationCandidateStatus,
-        OperatorNotificationListRequest, OperatorRemoteActionClaimRequest,
+        OperatorNotificationListRequest, OperatorReadModelCheckpointQueryRequest,
+        OperatorReadModelWaitForCheckpointRequest, OperatorRemoteActionClaimRequest,
         OperatorRemoteActionCompleteRequest, OperatorRemoteActionCreateRequest,
         OperatorRemoteActionGetRequest, OperatorRemoteActionListRequest,
         OperatorRemoteActionRequestStatus, OperatorRemoteActionWaitRequest,
@@ -593,6 +631,54 @@ mod tests {
             got.request.expect("request").request_id,
             create.request.request_id
         );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn read_model_checkpoints_round_trip_through_the_client() {
+        let (tempdir, server_url, token, handle) = start_server().await;
+        let origin_node_id = "origin-a";
+        let db_path = tempdir.path().join("server.db");
+        let store = InboxMirrorStore::open(&db_path).expect("reopen");
+        seed_delivery_subscription(&store);
+        seed_actionable_inbox(&store, origin_node_id);
+
+        let client = OrcasServerClient::with_operator_api_token(server_url.clone(), token);
+
+        let notification_checkpoint = client
+            .notification_checkpoint(&OperatorReadModelCheckpointQueryRequest {
+                origin_node_id: origin_node_id.to_string(),
+            })
+            .await
+            .expect("notification checkpoint");
+        assert!(notification_checkpoint.checkpoint.updated_at.is_some());
+        let notification_wait = client
+            .notification_wait_for_checkpoint(&OperatorReadModelWaitForCheckpointRequest {
+                origin_node_id: origin_node_id.to_string(),
+                after_updated_at: notification_checkpoint.checkpoint.updated_at,
+                timeout_ms: Some(1),
+            })
+            .await
+            .expect("notification wait");
+        assert!(notification_wait.timed_out);
+
+        let delivery_checkpoint = client
+            .delivery_checkpoint(&OperatorReadModelCheckpointQueryRequest {
+                origin_node_id: origin_node_id.to_string(),
+            })
+            .await
+            .expect("delivery checkpoint");
+        assert!(delivery_checkpoint.checkpoint.updated_at.is_some());
+        let delivery_wait = client
+            .delivery_wait_for_checkpoint(&OperatorReadModelWaitForCheckpointRequest {
+                origin_node_id: origin_node_id.to_string(),
+                after_updated_at: delivery_checkpoint.checkpoint.updated_at,
+                timeout_ms: Some(1),
+            })
+            .await
+            .expect("delivery wait");
+        assert!(delivery_wait.timed_out);
 
         handle.abort();
     }

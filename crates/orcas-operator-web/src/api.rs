@@ -5,7 +5,8 @@ use orcas_core::ipc::{
     NotificationSubscriptionListRequest, NotificationSubscriptionSetEnabledRequest,
     NotificationSubscriptionUpsertRequest, NotificationTransportKind,
     OperatorInboxWaitForCheckpointRequest, OperatorInboxWaitForCheckpointResponse,
-    OperatorNotificationListRequest, OperatorRemoteActionCreateRequest,
+    OperatorNotificationListRequest, OperatorReadModelCheckpointQueryRequest,
+    OperatorReadModelWaitForCheckpointRequest, OperatorRemoteActionCreateRequest,
     OperatorRemoteActionGetRequest, OperatorRemoteActionListRequest,
     OperatorRemoteActionWaitRequest,
 };
@@ -305,6 +306,42 @@ pub async fn load_notifications_page(
     ))
 }
 
+pub async fn load_notification_checkpoint(
+    settings: OperatorServerSettings,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let origin = configured_origin(&settings)?;
+    let client = client_from_settings(&settings)?;
+    let response = client
+        .notification_checkpoint(&OperatorReadModelCheckpointQueryRequest {
+            origin_node_id: origin.to_string(),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(response.checkpoint.updated_at)
+}
+
+pub async fn wait_for_notification_checkpoint(
+    settings: OperatorServerSettings,
+    after_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    timeout_ms: Option<u64>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let origin = configured_origin(&settings)?;
+    let client = client_from_settings(&settings)?;
+    let response = client
+        .notification_wait_for_checkpoint(&OperatorReadModelWaitForCheckpointRequest {
+            origin_node_id: origin.to_string(),
+            after_updated_at,
+            timeout_ms,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.timed_out {
+        Ok(None)
+    } else {
+        Ok(response.checkpoint.updated_at)
+    }
+}
+
 pub async fn load_deliveries_page(
     settings: OperatorServerSettings,
 ) -> Result<DeliveryPageView, String> {
@@ -318,6 +355,42 @@ pub async fn load_deliveries_page(
         .await
         .map_err(|error| error.to_string())?;
     Ok(build_delivery_page(&response.jobs))
+}
+
+pub async fn load_delivery_checkpoint(
+    settings: OperatorServerSettings,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let origin = configured_origin(&settings)?;
+    let client = client_from_settings(&settings)?;
+    let response = client
+        .delivery_checkpoint(&OperatorReadModelCheckpointQueryRequest {
+            origin_node_id: origin.to_string(),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(response.checkpoint.updated_at)
+}
+
+pub async fn wait_for_delivery_checkpoint(
+    settings: OperatorServerSettings,
+    after_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    timeout_ms: Option<u64>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let origin = configured_origin(&settings)?;
+    let client = client_from_settings(&settings)?;
+    let response = client
+        .delivery_wait_for_checkpoint(&OperatorReadModelWaitForCheckpointRequest {
+            origin_node_id: origin.to_string(),
+            after_updated_at,
+            timeout_ms,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.timed_out {
+        Ok(None)
+    } else {
+        Ok(response.checkpoint.updated_at)
+    }
 }
 
 pub async fn load_action_requests_page(
@@ -399,6 +472,17 @@ pub async fn wait_for_remote_action_update(
     Ok(response
         .request
         .map(orcas_operator_core::remote_action_request_view))
+}
+
+pub async fn wait_for_remote_action_checkpoint(
+    settings: OperatorServerSettings,
+    request_id: String,
+    after_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    timeout_ms: Option<u64>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let response =
+        wait_for_remote_action_update(settings, request_id, after_updated_at, timeout_ms).await?;
+    Ok(response.map(|request| request.updated_at))
 }
 
 pub async fn wait_for_inbox_checkpoint(

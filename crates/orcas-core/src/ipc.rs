@@ -17,8 +17,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use url::form_urlencoded;
 use std::collections::BTreeMap;
+use url::form_urlencoded;
 
 use crate::authority;
 use crate::collaboration::{
@@ -600,6 +600,44 @@ pub struct OperatorInboxWaitForCheckpointRequest {
 pub struct OperatorInboxWaitForCheckpointResponse {
     pub origin_node_id: String,
     pub checkpoint: OperatorInboxCheckpoint,
+    pub timed_out: bool,
+}
+
+/// Monotonic read-model checkpoint for mirrored server-side views.
+///
+/// This is intentionally distinct from the inbox sequence checkpoint so the
+/// operator client can wait on notification and delivery changes without
+/// conflating them with inbox replication semantics.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorReadModelCheckpoint {
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorReadModelCheckpointQueryRequest {
+    pub origin_node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorReadModelCheckpointQueryResponse {
+    pub origin_node_id: String,
+    pub checkpoint: OperatorReadModelCheckpoint,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorReadModelWaitForCheckpointRequest {
+    pub origin_node_id: String,
+    #[serde(default)]
+    pub after_updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorReadModelWaitForCheckpointResponse {
+    pub origin_node_id: String,
+    pub checkpoint: OperatorReadModelCheckpoint,
     pub timed_out: bool,
 }
 
@@ -1694,8 +1732,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BrowserPushNotificationPayload, BrowserPushNotificationRoute, DaemonEvent,
-        DecisionSummary, EventsSubscribeRequest, StateSnapshot,
+        BrowserPushNotificationPayload, BrowserPushNotificationRoute, DaemonEvent, DecisionSummary,
+        EventsSubscribeRequest, StateSnapshot,
     };
     use crate::{DecisionType, WorkstreamStatus};
 

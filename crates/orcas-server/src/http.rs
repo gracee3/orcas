@@ -11,8 +11,8 @@ use axum::{Json, Router};
 use tokio::time::{Duration, Instant, sleep};
 use tracing::info;
 
-use crate::delivery::{LogNotificationDeliveryTransport, MockNotificationDeliveryTransport};
 use crate::delivery::WebPushNotificationDeliveryTransport;
+use crate::delivery::{LogNotificationDeliveryTransport, MockNotificationDeliveryTransport};
 use orcas_core::ipc::{
     NotificationDeliveryJobGetRequest, NotificationDeliveryJobGetResponse,
     NotificationDeliveryJobListRequest, NotificationDeliveryJobListResponse,
@@ -30,6 +30,8 @@ use orcas_core::ipc::{
     OperatorNotificationGetRequest, OperatorNotificationGetResponse,
     OperatorNotificationListRequest, OperatorNotificationListResponse,
     OperatorNotificationSuppressRequest, OperatorNotificationSuppressResponse,
+    OperatorReadModelCheckpointQueryRequest, OperatorReadModelCheckpointQueryResponse,
+    OperatorReadModelWaitForCheckpointRequest, OperatorReadModelWaitForCheckpointResponse,
     OperatorRemoteActionClaimRequest, OperatorRemoteActionClaimResponse,
     OperatorRemoteActionCompleteRequest, OperatorRemoteActionCompleteResponse,
     OperatorRemoteActionCreateRequest, OperatorRemoteActionCreateResponse,
@@ -73,9 +75,10 @@ impl InboxMirrorServer {
             config.push_vapid_private_key_base64,
             config.push_vapid_subject,
         ) {
-            (Some(private_key), Some(subject)) => {
-                Some(WebPushNotificationDeliveryTransport::new(private_key, subject))
-            }
+            (Some(private_key), Some(subject)) => Some(WebPushNotificationDeliveryTransport::new(
+                private_key,
+                subject,
+            )),
             _ => None,
         };
         Self::with_operator_api_token_and_web_push(
@@ -160,6 +163,14 @@ impl InboxMirrorServer {
                 post(wait_for_inbox_checkpoint),
             )
             .route(
+                "/operator-notifications/checkpoint",
+                post(notification_checkpoint),
+            )
+            .route(
+                "/operator-notifications/wait_for_checkpoint",
+                post(wait_for_notification_checkpoint),
+            )
+            .route(
                 "/operator-notifications/list",
                 post(list_notification_candidates),
             )
@@ -202,6 +213,14 @@ impl InboxMirrorServer {
             .route(
                 "/operator-notifications/delivery-jobs/get",
                 post(get_notification_delivery_job),
+            )
+            .route(
+                "/operator-notifications/delivery/checkpoint",
+                post(delivery_checkpoint),
+            )
+            .route(
+                "/operator-notifications/delivery/wait_for_checkpoint",
+                post(wait_for_delivery_checkpoint),
             )
             .route(
                 "/operator-notifications/delivery/run_pending",
@@ -321,6 +340,29 @@ async fn wait_for_inbox_checkpoint(
     let response = state
         .store
         .wait_for_checkpoint(&request)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn notification_checkpoint(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<OperatorReadModelCheckpointQueryRequest>,
+) -> Result<Json<OperatorReadModelCheckpointQueryResponse>, String> {
+    let response = state
+        .store
+        .notification_checkpoint(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn wait_for_notification_checkpoint(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<OperatorReadModelWaitForCheckpointRequest>,
+) -> Result<Json<OperatorReadModelWaitForCheckpointResponse>, String> {
+    let response = state
+        .store
+        .wait_for_notification_checkpoint(&request)
         .await
         .map_err(|error| error.to_string())?;
     Ok(Json(response))
@@ -450,6 +492,29 @@ async fn get_notification_delivery_job(
     Ok(Json(NotificationDeliveryJobGetResponse { job }))
 }
 
+async fn delivery_checkpoint(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<OperatorReadModelCheckpointQueryRequest>,
+) -> Result<Json<OperatorReadModelCheckpointQueryResponse>, String> {
+    let response = state
+        .store
+        .delivery_checkpoint(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
+async fn wait_for_delivery_checkpoint(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<OperatorReadModelWaitForCheckpointRequest>,
+) -> Result<Json<OperatorReadModelWaitForCheckpointResponse>, String> {
+    let response = state
+        .store
+        .wait_for_delivery_checkpoint(&request)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(Json(response))
+}
+
 async fn run_pending_notification_delivery_jobs(
     State(state): State<Arc<InboxMirrorServerState>>,
     Json(request): Json<NotificationDeliveryRunPendingRequest>,
@@ -474,9 +539,7 @@ async fn run_pending_notification_delivery_jobs(
             .map_err(|error| error.to_string())?,
         NotificationTransportKind::WebPush => {
             let Some(transport) = state.web_push_delivery.as_ref() else {
-                return Err(
-                    "browser push delivery is not configured on this server".to_string()
-                );
+                return Err("browser push delivery is not configured on this server".to_string());
             };
             state
                 .store
