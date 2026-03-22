@@ -2390,6 +2390,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tower-http",
  "tracing",
  "uuid",
  "web-push",

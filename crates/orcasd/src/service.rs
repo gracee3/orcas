@@ -73,10 +73,11 @@ use crate::assignment_comm::policy::validate_assignment_packet;
 use crate::assignment_comm::render::build_assignment_communication_record;
 use crate::assignment_comm::stable_fingerprint;
 use crate::authority_store::{AuthorityMutationResult, AuthoritySqliteStore};
+use crate::inbox_mirror::OperatorInboxMirrorHttpClient;
 use crate::landing_authorization::landing_authorization_is_current;
 use crate::landing_execution::landing_execution_matches_authorization_basis;
 use crate::merge_prep::assess_merge_prep;
-use crate::operator_inbox::build_operator_inbox_state;
+use crate::operator_inbox::{build_operator_inbox_state, operator_inbox_changes_after};
 use crate::planning_session::{
     build_planning_revision_proposal, build_research_work_unit,
     planning_session_status_is_terminal, planning_session_thread_prompt,
@@ -315,6 +316,7 @@ impl OrcasDaemonService {
 
         service.initialize_state().await?;
         service.spawn_codex_event_bridge();
+        service.spawn_operator_inbox_mirror_loop();
         debug!(pid = std::process::id(), "daemon service initialized");
 
         Ok(service)
@@ -676,6 +678,94 @@ impl OrcasDaemonService {
                 }
             }
         });
+    }
+
+    fn spawn_operator_inbox_mirror_loop(self: &Arc<Self>) {
+        let Some(server_url) = self.config.inbox_mirror.server_url.clone() else {
+            return;
+        };
+
+        let operator_api_token = self.config.inbox_mirror.operator_api_token.clone();
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            service
+                .operator_inbox_mirror_loop(server_url, operator_api_token)
+                .await;
+        });
+    }
+
+    async fn operator_inbox_mirror_loop(
+        self: Arc<Self>,
+        server_url: String,
+        operator_api_token: Option<String>,
+    ) {
+        let client = match operator_api_token {
+            Some(token) if !token.trim().is_empty() => {
+                OperatorInboxMirrorHttpClient::with_operator_api_token(server_url, token)
+            }
+            _ => OperatorInboxMirrorHttpClient::new(server_url),
+        };
+        let origin_node_id = match self.authority_store.origin_node_id() {
+            Ok(origin) => origin,
+            Err(error) => {
+                warn!(%error, "operator inbox mirror loop could not resolve origin node id");
+                return;
+            }
+        };
+
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut last_exported_sequence = 0u64;
+
+        loop {
+            tokio::select! {
+                _ = self.shutdown.notified() => {
+                    info!("operator inbox mirror loop stopping");
+                    break;
+                }
+                _ = interval.tick() => {
+                    let collaboration = {
+                        self.state.read().await.collaboration.clone()
+                    };
+                    let inbox = build_operator_inbox_state(&collaboration);
+                    let checkpoint = inbox.checkpoint.clone();
+                    if checkpoint.current_sequence <= last_exported_sequence {
+                        continue;
+                    }
+
+                    let changes = operator_inbox_changes_after(
+                        &inbox,
+                        last_exported_sequence,
+                        None,
+                    );
+                    if changes.is_empty() {
+                        last_exported_sequence = checkpoint.current_sequence;
+                        continue;
+                    }
+
+                    let request = orcas_core::ipc::OperatorInboxMirrorApplyRequest {
+                        origin_node_id: origin_node_id.as_str().to_string(),
+                        checkpoint: checkpoint.clone(),
+                        changes,
+                    };
+                    match client.apply(&request).await {
+                        Ok(response) => {
+                            last_exported_sequence = response.mirror_checkpoint.last_exported_sequence;
+                            info!(
+                                origin_node_id = %origin_node_id.as_str(),
+                                checkpoint = response.checkpoint.current_sequence,
+                                exported_sequence = last_exported_sequence,
+                                applied_changes = response.applied_changes,
+                                skipped_changes = response.skipped_changes,
+                                "exported operator inbox mirror to server"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(%error, origin_node_id = %origin_node_id.as_str(), "operator inbox mirror export failed");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn handle_client(self: Arc<Self>, stream: UnixStream) {

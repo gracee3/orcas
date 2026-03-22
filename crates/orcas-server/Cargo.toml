@@ -21,6 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tower-http = { version = "0.6.2", features = ["cors"] }
 uuid.workspace = true
 web-push = "0.11.0"
 

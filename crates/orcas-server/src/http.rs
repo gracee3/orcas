@@ -9,6 +9,7 @@ use axum::middleware::{self, Next};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use tokio::time::{Duration, Instant, sleep};
+use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::delivery::WebPushNotificationDeliveryTransport;
@@ -242,6 +243,9 @@ impl InboxMirrorServer {
                 post(complete_remote_action_request),
             )
             .route("/operator-actions/fail", post(fail_remote_action_request))
+            // Trunk serves the browser app from a different port during local
+            // development, so allow cross-origin operator requests.
+            .layer(CorsLayer::permissive())
             .layer(middleware::from_fn_with_state(state.clone(), operator_auth))
             .with_state(state);
         let bind_addr = listener.local_addr()?;
@@ -256,6 +260,9 @@ async fn operator_auth(
     request: Request<Body>,
     next: Next,
 ) -> Result<axum::response::Response, StatusCode> {
+    if request.method() == axum::http::Method::OPTIONS {
+        return Ok(next.run(request).await);
+    }
     let Some(expected) = state.operator_api_token.as_deref() else {
         return Ok(next.run(request).await);
     };

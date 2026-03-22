@@ -41,7 +41,8 @@ pub fn register_service_worker() {
 pub async fn ensure_service_worker_registration() -> Result<bool, String> {
     #[cfg(target_arch = "wasm32")]
     {
-        let window = web_sys::window().ok_or_else(|| "browser window is unavailable".to_string())?;
+        let window =
+            web_sys::window().ok_or_else(|| "browser window is unavailable".to_string())?;
         let navigator = window.navigator();
         let service_worker = navigator.service_worker();
         let registration = wasm_bindgen_futures::JsFuture::from(service_worker.register("/sw.js"))
@@ -56,7 +57,8 @@ pub async fn ensure_service_worker_registration() -> Result<bool, String> {
 pub async fn inspect_browser_push_state() -> Result<BrowserPushState, String> {
     #[cfg(target_arch = "wasm32")]
     {
-        let window = web_sys::window().ok_or_else(|| "browser window is unavailable".to_string())?;
+        let window =
+            web_sys::window().ok_or_else(|| "browser window is unavailable".to_string())?;
         let navigator = window.navigator();
         let permission = browser_notification_permission();
         let service_worker = navigator.service_worker();
@@ -81,9 +83,8 @@ pub async fn inspect_browser_push_state() -> Result<BrowserPushState, String> {
             if subscription_value.is_undefined() || subscription_value.is_null() {
                 None
             } else {
-                let subscription: web_sys::PushSubscription = subscription_value
-                    .dyn_into()
-                    .map_err(js_error)?;
+                let subscription: web_sys::PushSubscription =
+                    subscription_value.dyn_into().map_err(js_error)?;
                 Some(push_subscription_snapshot(&subscription)?)
             }
         } else {
@@ -105,7 +106,8 @@ pub async fn register_browser_push_subscription(
 ) -> Result<BrowserPushState, String> {
     #[cfg(target_arch = "wasm32")]
     {
-        let window = web_sys::window().ok_or_else(|| "browser window is unavailable".to_string())?;
+        let window =
+            web_sys::window().ok_or_else(|| "browser window is unavailable".to_string())?;
         let navigator = window.navigator();
         let service_worker = navigator.service_worker();
         let _ = wasm_bindgen_futures::JsFuture::from(service_worker.register("/sw.js"))
@@ -139,7 +141,8 @@ pub async fn register_browser_push_subscription(
         }
 
         let registration_value: wasm_bindgen::JsValue = wasm_bindgen_futures::JsFuture::from(
-            service_worker.get_registration_with_document_url(&window.location().href().map_err(js_error)?),
+            service_worker
+                .get_registration_with_document_url(&window.location().href().map_err(js_error)?),
         )
         .await
         .map_err(js_error)?;
@@ -193,11 +196,13 @@ pub async fn register_browser_push_subscription(
 pub async fn disable_browser_push_subscription() -> Result<BrowserPushState, String> {
     #[cfg(target_arch = "wasm32")]
     {
-        let window = web_sys::window().ok_or_else(|| "browser window is unavailable".to_string())?;
+        let window =
+            web_sys::window().ok_or_else(|| "browser window is unavailable".to_string())?;
         let navigator = window.navigator();
         let service_worker = navigator.service_worker();
         let registration_value: wasm_bindgen::JsValue = wasm_bindgen_futures::JsFuture::from(
-            service_worker.get_registration_with_document_url(&window.location().href().map_err(js_error)?),
+            service_worker
+                .get_registration_with_document_url(&window.location().href().map_err(js_error)?),
         )
         .await
         .map_err(js_error)?;
@@ -222,9 +227,10 @@ pub async fn disable_browser_push_subscription() -> Result<BrowserPushState, Str
             let subscription: web_sys::PushSubscription = existing
                 .dyn_into::<web_sys::PushSubscription>()
                 .map_err(js_error)?;
-            let _ = wasm_bindgen_futures::JsFuture::from(subscription.unsubscribe().map_err(js_error)?)
-                .await
-                .map_err(js_error)?;
+            let _ =
+                wasm_bindgen_futures::JsFuture::from(subscription.unsubscribe().map_err(js_error)?)
+                    .await
+                    .map_err(js_error)?;
         }
 
         return inspect_browser_push_state().await;
@@ -273,8 +279,12 @@ fn push_subscription_snapshot(
         .ok_or_else(|| "push subscription missing p256dh key".to_string())?;
     Ok(BrowserPushSubscriptionSnapshot {
         endpoint,
-        auth: Some(base64_url_encode(&js_sys::Uint8Array::new(&auth_buffer).to_vec())),
-        p256dh: Some(base64_url_encode(&js_sys::Uint8Array::new(&p256dh_buffer).to_vec())),
+        auth: Some(base64_url_encode(
+            &js_sys::Uint8Array::new(&auth_buffer).to_vec(),
+        )),
+        p256dh: Some(base64_url_encode(
+            &js_sys::Uint8Array::new(&p256dh_buffer).to_vec(),
+        )),
     })
 }
 
