@@ -36,9 +36,9 @@ a {
 }
 
 .app-shell {
-  max-width: 1440px;
-  margin: 0 auto;
+  width: 100%;
   padding: 1.25rem;
+  box-sizing: border-box;
 }
 
 .shell-header {
@@ -74,6 +74,7 @@ a {
   gap: 1rem;
   position: sticky;
   top: 1rem;
+  min-width: 0;
 }
 
 .workspace-panel,
@@ -115,6 +116,19 @@ a {
 .shell-main {
   display: grid;
   gap: 1rem;
+  min-width: 0;
+}
+
+.page-content,
+.toolbar {
+  min-width: 0;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
 }
 
 .settings-panel,
@@ -176,6 +190,13 @@ a {
 
 .page {
   padding: 1rem;
+  min-width: 0;
+}
+
+.page-content {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
 }
 
 .page-header {
@@ -199,6 +220,7 @@ a {
 
 .card {
   padding: 1rem;
+  min-width: 0;
 }
 
 .card-header {
@@ -218,6 +240,7 @@ a {
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--border);
+  min-width: 0;
 }
 
 .item-card-selected {
@@ -248,16 +271,19 @@ a {
   margin: 0.35rem 0 0.15rem;
   font-weight: 600;
   color: var(--text);
+  overflow-wrap: anywhere;
 }
 
 .item-summary {
   margin: 0;
   color: var(--text);
   opacity: 0.92;
+  overflow-wrap: anywhere;
 }
 
 .item-meta {
   margin: 0.35rem 0 0;
+  overflow-wrap: anywhere;
 }
 
 .detail-grid {
@@ -274,11 +300,13 @@ a {
 
 .detail-grid dd {
   margin: 0.15rem 0 0;
+  overflow-wrap: anywhere;
 }
 
 .workspace-focus-card {
   display: grid;
   gap: 0.35rem;
+  min-width: 0;
 }
 
 .workspace-empty-state {
@@ -332,6 +360,8 @@ button,
   background: rgba(0, 0, 0, 0.25);
   border-radius: 12px;
   border: 1px solid var(--border);
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 @media (max-width: 960px) {
