@@ -375,7 +375,27 @@ fn parse_worker_report_envelope(
     surrounding_text: bool,
 ) -> Option<WorkerReportEnvelope> {
     match serde_json::from_str::<WorkerReportEnvelope>(json_payload.trim()) {
-        Ok(envelope) => return Some(envelope),
+        Ok(envelope) => {
+            if decoded_report_identity_looks_corrupted(&envelope, assignment, record) {
+                if let Some(repaired_payload) =
+                    repair_worker_report_envelope_payload(json_payload, assignment, record)
+                {
+                    if let Ok(repaired) =
+                        serde_json::from_str::<WorkerReportEnvelope>(&repaired_payload)
+                    {
+                        debug!(
+                            assignment_id = %assignment.id,
+                            packet_id = %record.packet.packet_id,
+                            stage = "decode_envelope_repaired",
+                            surrounding_text,
+                            "worker report envelope identity repaired after direct decode"
+                        );
+                        return Some(repaired);
+                    }
+                }
+            }
+            return Some(envelope);
+        }
         Err(error) => {
             debug!(
                 assignment_id = %assignment.id,
@@ -416,6 +436,24 @@ fn parse_worker_report_envelope(
         "worker report envelope decode repaired after a malformed identity field"
     );
     Some(envelope)
+}
+
+fn decoded_report_identity_looks_corrupted(
+    envelope: &WorkerReportEnvelope,
+    assignment: &Assignment,
+    record: &AssignmentCommunicationRecord,
+) -> bool {
+    (envelope.assignment_id != assignment.id
+        && !looks_like_plausible_report_identity(&envelope.assignment_id, "assignment-"))
+        || (envelope.packet_id != record.packet.packet_id
+            && !looks_like_plausible_report_identity(&envelope.packet_id, "packet-"))
+}
+
+fn looks_like_plausible_report_identity(value: &str, prefix: &str) -> bool {
+    value.starts_with(prefix)
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
 }
 
 fn repair_worker_report_envelope_payload(
@@ -1032,6 +1070,26 @@ mod tests {
         assert_eq!(
             parsed.envelope.as_ref().expect("envelope").assignment_id,
             assignment.id
+        );
+    }
+
+    #[test]
+    fn parse_worker_report_repairs_decoded_but_corrupted_packet_identity_field() {
+        let assignment = sample_assignment();
+        let record = sample_record(&assignment);
+        let raw = format!(
+            "worker preamble\nORCAS_REPORT_BEGIN\n{{\n  \"schema_version\": \"worker_report_envelope.v1\",\n  \"assignment_id\": \"{}\",\n  \"packet_id\": \"packet-assignment-1position output in main.c to match the shell test expectation by adding a missing exclamation mark; `make test` now passes.\",\n  \"task_mode\": \"implement\",\n  \"disposition\": \"completed\",\n  \"summary\": \"Completed the bounded change.\",\n  \"confidence\": \"high\",\n  \"acceptance_results\": [],\n  \"triggered_stop_condition_ids\": [],\n  \"touched_files\": [],\n  \"commands_run\": [],\n  \"artifacts\": [],\n  \"blockers\": [],\n  \"questions\": [],\n  \"recommended_next_actions\": [],\n  \"uncertainties\": [],\n  \"review_signal\": {{\n    \"level\": \"normal\",\n    \"reasons\": [],\n    \"focus\": []\n  }},\n  \"workspace_report\": null,\n  \"prune_workspace_result\": null,\n  \"landing_execution_result\": null,\n  \"mode_payload\": {{\n    \"kind\": \"implement\",\n    \"semantic_changes\": [],\n    \"tests_run\": [],\n    \"rough_edges\": []\n  }}\n}}\nORCAS_REPORT_END",
+            assignment.id
+        );
+
+        let parsed = parse_worker_report(&raw, &assignment, &record);
+
+        assert_eq!(parsed.validation.parse_result, ReportParseResult::Ambiguous);
+        assert!(parsed.envelope.is_some());
+        assert_eq!(parsed.disposition, ReportDisposition::Completed);
+        assert_eq!(
+            parsed.envelope.as_ref().expect("envelope").packet_id,
+            record.packet.packet_id
         );
     }
 
