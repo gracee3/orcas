@@ -28,19 +28,52 @@ pub fn inferred_live_thread_for_assignment(
     assignment: &ipc::AssignmentSummary,
     dashboard: &WorkstreamsDashboardData,
 ) -> Option<ipc::ThreadSummary> {
-    dashboard
-        .snapshot
-        .collaboration
-        .codex_thread_assignments
-        .iter()
-        .find(|candidate| candidate.assignment_id == assignment.id)
-        .and_then(|candidate| {
+    assignment
+        .codex_thread_id
+        .as_ref()
+        .and_then(|thread_id| {
             dashboard
                 .snapshot
                 .threads
                 .iter()
-                .find(|thread| thread.id == candidate.codex_thread_id)
+                .find(|thread| thread.id == *thread_id)
                 .cloned()
+        })
+        .or_else(|| {
+            assignment.tracked_thread_id.as_ref().and_then(|tracked_thread_id| {
+                dashboard
+                    .hierarchy
+                    .workstreams
+                    .iter()
+                    .flat_map(|workstream| workstream.work_units.iter())
+                    .flat_map(|work_unit| work_unit.tracked_threads.iter())
+                    .find(|tracked_thread| tracked_thread.id.as_str() == tracked_thread_id)
+                    .and_then(|tracked_thread| tracked_thread.upstream_thread_id.as_ref())
+                    .and_then(|thread_id| {
+                        dashboard
+                            .snapshot
+                            .threads
+                            .iter()
+                            .find(|thread| thread.id == *thread_id)
+                            .cloned()
+                    })
+            })
+        })
+        .or_else(|| {
+            dashboard
+                .snapshot
+                .collaboration
+                .codex_thread_assignments
+                .iter()
+                .find(|candidate| candidate.assignment_id == assignment.id)
+                .and_then(|candidate| {
+                    dashboard
+                        .snapshot
+                        .threads
+                        .iter()
+                        .find(|thread| thread.id == candidate.codex_thread_id)
+                        .cloned()
+                })
         })
         .or_else(|| {
             dashboard
@@ -406,6 +439,8 @@ mod tests {
             alignment_rationale: None,
             worker_id: "worker-1".to_string(),
             worker_session_id: "session-1".to_string(),
+            codex_thread_id: None,
+            tracked_thread_id: None,
             status: orcas_core::AssignmentStatus::AwaitingDecision,
             attempt_number: 1,
             updated_at: Utc::now(),
@@ -432,6 +467,8 @@ mod tests {
             alignment_rationale: None,
             worker_id: "worker-1".to_string(),
             worker_session_id: "session-1".to_string(),
+            codex_thread_id: None,
+            tracked_thread_id: None,
             status: orcas_core::AssignmentStatus::Running,
             attempt_number: 1,
             updated_at: Utc::now(),
@@ -515,5 +552,57 @@ mod tests {
 
         let status = tracked_thread_runtime_status(&tracked_thread(), &dashboard);
         assert_eq!(status.headline, "Waiting for supervisor");
+    }
+
+    #[test]
+    fn inferred_live_thread_prefers_assignment_codex_thread_id() {
+        let mut snapshot = empty_snapshot();
+        snapshot.threads.push(ipc::ThreadSummary {
+            id: "codex-thread-1".to_string(),
+            preview: "live lane".to_string(),
+            name: None,
+            model_provider: "openai:gpt-5.4".to_string(),
+            cwd: "/tmp/lane".to_string(),
+            status: "idle".to_string(),
+            created_at: 0,
+            updated_at: 0,
+            scope: "user".to_string(),
+            archived: false,
+            loaded_status: ipc::ThreadLoadedStatus::Idle,
+            active_flags: Vec::new(),
+            monitor_state: ipc::ThreadMonitorState::default(),
+            turn_in_flight: false,
+            active_turn_id: None,
+            last_seen_turn_id: None,
+            recent_output: None,
+            recent_event: Some("turn completed".to_string()),
+            last_sync_at: Utc::now(),
+            source_kind: None,
+            raw_summary: None,
+        });
+        let assignment = AssignmentSummary {
+            id: "assign-1".to_string(),
+            work_unit_id: "wu-1".to_string(),
+            plan_id: None,
+            plan_version: None,
+            plan_item_id: None,
+            execution_kind: Default::default(),
+            alignment_rationale: None,
+            worker_id: "worker-1".to_string(),
+            worker_session_id: "session-1".to_string(),
+            codex_thread_id: Some("codex-thread-1".to_string()),
+            tracked_thread_id: None,
+            status: orcas_core::AssignmentStatus::AwaitingDecision,
+            attempt_number: 1,
+            updated_at: Utc::now(),
+        };
+        let dashboard = WorkstreamsDashboardData {
+            hierarchy: authority::HierarchySnapshot::default(),
+            snapshot,
+        };
+
+        let thread = inferred_live_thread_for_assignment(&assignment, &dashboard)
+            .expect("thread should resolve from assignment summary");
+        assert_eq!(thread.id, "codex-thread-1");
     }
 }
