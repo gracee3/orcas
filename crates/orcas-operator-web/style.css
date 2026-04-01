@@ -301,6 +301,42 @@ a {
   min-width: 0;
 }
 
+.json-panel {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 0.8rem;
+  min-width: 0;
+}
+
+.json-object {
+  display: grid;
+  grid-template-columns: minmax(110px, 180px) minmax(0, 1fr);
+  gap: 0.35rem 0.85rem;
+  margin: 0;
+}
+
+.json-object dt {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.json-object dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.json-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.json-string {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .detail-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));

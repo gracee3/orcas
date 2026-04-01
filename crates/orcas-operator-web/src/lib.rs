@@ -21,7 +21,7 @@ use leptos_router::hooks::{use_navigate, use_params_map};
 use leptos_router::path;
 
 use orcas_core::authority;
-use orcas_core::ipc::OperatorRemoteActionRequestStatus;
+use orcas_core::ipc::{OperatorInboxActionKind, OperatorRemoteActionRequestStatus};
 use orcas_core::{WorkUnitStatus, WorkstreamStatus};
 use orcas_operator_core::{
     DeliveryJobView, DeliveryPageView, InboxDetailPageView, InboxItemCardView, InboxPageView,
@@ -45,6 +45,119 @@ pub fn mount_app() {
         console_error_panic_hook::set_once();
         pwa::register_service_worker();
         mount_to_body(App);
+    }
+}
+
+#[component]
+fn JsonValueTree(value: serde_json::Value) -> impl IntoView {
+    match value {
+        serde_json::Value::Null => view! { <span class="muted">"null"</span> }.into_any(),
+        serde_json::Value::Bool(value) => view! { <span>{value.to_string()}</span> }.into_any(),
+        serde_json::Value::Number(value) => view! { <span>{value.to_string()}</span> }.into_any(),
+        serde_json::Value::String(value) => view! { <span class="json-string">{value}</span> }.into_any(),
+        serde_json::Value::Array(values) => view! {
+            <ul class="json-list">
+                {values
+                    .into_iter()
+                    .map(|value| view! { <li><JsonValueTree value /></li> })
+                    .collect_view()}
+            </ul>
+        }
+        .into_any(),
+        serde_json::Value::Object(entries) => view! {
+            <dl class="json-object">
+                {entries
+                    .into_iter()
+                    .map(|(key, value)| view! {
+                        <dt>{key}</dt>
+                        <dd><JsonValueTree value /></dd>
+                    })
+                    .collect_view()}
+            </dl>
+        }
+        .into_any(),
+    }
+}
+
+#[component]
+fn TurnItemCard(item: orcas_core::ipc::ItemView) -> impl IntoView {
+    view! {
+        <div class="detail-block">
+            <div class="item-card-topline">
+                <span class="status-pill">{humanize_snake_case(&item.item_type)}</span>
+                <span class="muted">
+                    {item
+                        .status
+                        .clone()
+                        .map(|status| humanize_snake_case(&status))
+                        .unwrap_or_else(|| "No status".to_string())}
+                </span>
+            </div>
+            {item
+                .summary
+                .clone()
+                .map(|summary| view! { <p class="item-summary">{summary}</p> })}
+            {item
+                .text
+                .clone()
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| view! { <pre class="code-block">{text}</pre> })}
+            {item.payload.clone().map(|payload| view! {
+                <div class="json-panel">
+                    <p class="eyebrow">"Payload"</p>
+                    <JsonValueTree value=payload />
+                </div>
+            })}
+        </div>
+    }
+}
+
+#[component]
+fn ThreadTurnCard(turn: orcas_core::ipc::TurnView) -> impl IntoView {
+    view! {
+        <div class="detail-block">
+            <div class="item-card-topline">
+                <span class="status-pill">{humanize_snake_case(&turn.status)}</span>
+                <span class="muted">{turn.id.clone()}</span>
+            </div>
+            <p class="item-meta">
+                {format!(
+                    "{}{}",
+                    turn.started_at
+                        .map(|started_at| format!("started {}", started_at))
+                        .unwrap_or_else(|| "start unknown".to_string()),
+                    turn.completed_at
+                        .map(|completed_at| format!(" · completed {}", completed_at))
+                        .unwrap_or_default()
+                )}
+            </p>
+            {turn
+                .error_summary
+                .clone()
+                .or(turn.error_message.clone())
+                .map(|summary| view! { <p class="item-summary">{summary}</p> })}
+            {turn.latest_diff.clone().map(|diff| view! {
+                <div class="json-panel">
+                    <p class="eyebrow">"Latest diff"</p>
+                    <pre class="code-block">{diff}</pre>
+                </div>
+            })}
+            {turn.latest_plan_snapshot.clone().map(|snapshot| view! {
+                <div class="json-panel">
+                    <p class="eyebrow">"Plan snapshot"</p>
+                    <JsonValueTree value=snapshot />
+                </div>
+            })}
+            {turn.token_usage_snapshot.clone().map(|snapshot| view! {
+                <div class="json-panel">
+                    <p class="eyebrow">"Token usage"</p>
+                    <JsonValueTree value=snapshot />
+                </div>
+            })}
+            <div class="detail-panel">
+                {turn.items.into_iter().map(|item| view! { <TurnItemCard item /> }).collect_view()}
+            </div>
+        </div>
     }
 }
 
@@ -1624,10 +1737,15 @@ fn TrackedThreadCard(
     action_error: RwSignal<Option<String>>,
 ) -> impl IntoView {
     let runtime = tracked_thread_runtime_status(&thread, &dashboard);
+    let navigate = use_navigate();
     let working = RwSignal::new(false);
     let binding = RwSignal::new(false);
     let showing_detail = RwSignal::new(false);
+    let loading_detail = RwSignal::new(false);
+    let detail = RwSignal::new(None::<orcas_core::ipc::ThreadView>);
     let bind_thread_id = RwSignal::new(String::new());
+    let bound_upstream_thread_id = thread.upstream_thread_id.clone();
+    let has_bound_upstream_thread = bound_upstream_thread_id.is_some();
     let available_threads = dashboard
         .snapshot
         .threads
@@ -1672,6 +1790,14 @@ fn TrackedThreadCard(
         .iter()
         .find(|work_unit| work_unit.id == thread.work_unit_id.as_str())
         .and_then(|work_unit| work_unit.proposal.clone());
+    let actionable_inbox_item = dashboard
+        .snapshot
+        .operator_inbox
+        .items
+        .iter()
+        .filter(|item| item.work_unit_id.as_deref() == Some(thread.work_unit_id.as_str()))
+        .max_by_key(|item| item.updated_at)
+        .cloned();
 
     view! {
         <div class="item-card">
@@ -1723,9 +1849,85 @@ fn TrackedThreadCard(
                     }.into_any(),
                     None => view! {}.into_any(),
                 }}
+                {match actionable_inbox_item.clone() {
+                    Some(item) => view! {
+                        <a class="refresh-button" href={format!("/inbox/{}", item.id)}>
+                            "View supervisor item"
+                        </a>
+                    }.into_any(),
+                    None => view! {}.into_any(),
+                }}
                 <button class="refresh-button" on:click=move |_| showing_detail.update(|value| *value = !*value)>
                     {move || if showing_detail.get() { "Hide detail" } else { "Show detail" }}
                 </button>
+                {match actionable_inbox_item.clone() {
+                    Some(item) => {
+                        let available_actions = item.available_actions.clone();
+                        let item_id = item.id.clone();
+                        let item_updated_at = item.updated_at;
+                        available_actions
+                            .into_iter()
+                            .filter(|action_kind| {
+                                matches!(
+                                    action_kind,
+                                    OperatorInboxActionKind::Approve | OperatorInboxActionKind::Reject
+                                )
+                            })
+                            .map(|action_kind| {
+                                let settings = settings;
+                                let navigate = navigate.clone();
+                                let item_id_for_action = item_id.clone();
+                                view! {
+                                    <button
+                                        class="refresh-button"
+                                        disabled=move || working.get()
+                                        on:click=move |_| {
+                                            let settings = settings.get_untracked();
+                                            let item_id = item_id_for_action.clone();
+                                            let navigate = navigate.clone();
+                                            let idempotency_key = storage::remote_action_idempotency_key(
+                                                &settings.origin_node_id,
+                                                &item_id,
+                                                action_kind,
+                                                item_updated_at,
+                                            );
+                                            working.set(true);
+                                            action_error.set(None);
+                                            #[cfg(target_arch = "wasm32")]
+                                            spawn_local(async move {
+                                                match api::submit_remote_action(
+                                                    settings,
+                                                    item_id,
+                                                    action_kind,
+                                                    Some("web-operator".to_string()),
+                                                    None,
+                                                    Some(idempotency_key),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(request) => {
+                                                        action_message.set(Some(format!(
+                                                            "{} request created.",
+                                                            action_kind_label(action_kind)
+                                                        )));
+                                                        refresh_epoch.update(|value| *value += 1);
+                                                        navigate(&format!("/actions/{}", request.request_id), Default::default());
+                                                    }
+                                                    Err(error) => action_error.set(Some(error)),
+                                                }
+                                                working.set(false);
+                                            });
+                                        }
+                                    >
+                                        {action_kind_label(action_kind)}
+                                    </button>
+                                }
+                            })
+                            .collect_view()
+                            .into_any()
+                    }
+                    None => view! {}.into_any(),
+                }}
                 {move || {
                     if matches!(
                         thread.binding_state,
@@ -1770,26 +1972,57 @@ fn TrackedThreadCard(
             </div>
             {move || {
                 if showing_detail.get() {
+                    if detail.get().is_none() && !loading_detail.get() {
+                        if let Some(upstream_thread_id) = bound_upstream_thread_id.clone() {
+                            let settings = settings.get_untracked();
+                            loading_detail.set(true);
+                            action_error.set(None);
+                            #[cfg(target_arch = "wasm32")]
+                            spawn_local(async move {
+                                match api::load_thread_detail(settings, upstream_thread_id).await {
+                                    Ok(response) => detail.set(Some(response.thread)),
+                                    Err(error) => action_error.set(Some(error)),
+                                }
+                                loading_detail.set(false);
+                            });
+                        }
+                    }
                     view! {
                         <div class="detail-panel">
                             {match latest_report.clone() {
                                 Some(report) => view! {
                                     <div class="detail-block">
                                         <p class="eyebrow">"Latest report"</p>
-                                        <p class="item-meta">{format!(
-                                            "{} · {} · supervisor_review={}",
-                                            humanize_snake_case(
-                                                serde_json::to_string(&report.disposition)
-                                                    .unwrap_or_default()
-                                                    .trim_matches('"')
-                                            ),
-                                            humanize_snake_case(
-                                                serde_json::to_string(&report.parse_result)
-                                                    .unwrap_or_default()
-                                                    .trim_matches('"')
-                                            ),
-                                            report.needs_supervisor_review
-                                        )}</p>
+                                        <dl class="detail-grid">
+                                            <div>
+                                                <dt>"Disposition"</dt>
+                                                <dd>{humanize_snake_case(
+                                                    serde_json::to_string(&report.disposition)
+                                                        .unwrap_or_default()
+                                                        .trim_matches('"')
+                                                )}</dd>
+                                            </div>
+                                            <div>
+                                                <dt>"Parse result"</dt>
+                                                <dd>{humanize_snake_case(
+                                                    serde_json::to_string(&report.parse_result)
+                                                        .unwrap_or_default()
+                                                        .trim_matches('"')
+                                                )}</dd>
+                                            </div>
+                                            <div>
+                                                <dt>"Supervisor review"</dt>
+                                                <dd>{if report.needs_supervisor_review { "Required" } else { "Not required" }}</dd>
+                                            </div>
+                                            <div>
+                                                <dt>"Confidence"</dt>
+                                                <dd>{humanize_snake_case(
+                                                    serde_json::to_string(&report.confidence)
+                                                        .unwrap_or_default()
+                                                        .trim_matches('"')
+                                                )}</dd>
+                                            </div>
+                                        </dl>
                                         <p class="item-summary">{report.summary.clone()}</p>
                                     </div>
                                 }.into_any(),
@@ -1804,52 +2037,161 @@ fn TrackedThreadCard(
                                 Some(proposal) => view! {
                                     <div class="detail-block">
                                         <p class="eyebrow">"Supervisor proposal"</p>
-                                        <p class="item-meta">{format!(
-                                            "{}{}",
-                                            humanize_snake_case(
-                                                serde_json::to_string(&proposal.latest_status)
-                                                    .unwrap_or_default()
-                                                    .trim_matches('"')
-                                            ),
-                                            proposal
-                                                .latest_proposed_decision_type
-                                                .as_ref()
-                                                .map(|decision| format!(
-                                                    " · {}",
-                                                    humanize_snake_case(
+                                        <dl class="detail-grid">
+                                            <div>
+                                                <dt>"Status"</dt>
+                                                <dd>{humanize_snake_case(
+                                                    serde_json::to_string(&proposal.latest_status)
+                                                        .unwrap_or_default()
+                                                        .trim_matches('"')
+                                                )}</dd>
+                                            </div>
+                                            <div>
+                                                <dt>"Decision type"</dt>
+                                                <dd>{proposal
+                                                    .latest_proposed_decision_type
+                                                    .as_ref()
+                                                    .map(|decision| humanize_snake_case(
                                                         serde_json::to_string(decision)
                                                             .unwrap_or_default()
                                                             .trim_matches('"')
-                                                    )
-                                                ))
-                                                .unwrap_or_default()
-                                        )}</p>
-                                        <p class="item-meta">{format!(
-                                            "proposal {} · open={}",
-                                            proposal.latest_proposal_id,
-                                            proposal.has_open_proposal
-                                        )}</p>
+                                                    ))
+                                                    .unwrap_or_else(|| "Unknown".to_string())}</dd>
+                                            </div>
+                                            <div>
+                                                <dt>"Proposal id"</dt>
+                                                <dd>{proposal.latest_proposal_id.clone()}</dd>
+                                            </div>
+                                            <div>
+                                                <dt>"Open"</dt>
+                                                <dd>{if proposal.has_open_proposal { "Yes" } else { "No" }}</dd>
+                                            </div>
+                                        </dl>
                                     </div>
                                 }.into_any(),
-                                None => view! {}.into_any(),
+                                None => match actionable_inbox_item.clone() {
+                                    Some(item) => view! {
+                                        <div class="detail-block">
+                                            <p class="eyebrow">"Supervisor item"</p>
+                                            <p class="item-summary">{item.summary.clone()}</p>
+                                            <p class="item-meta">
+                                                {format!(
+                                                    "{} · {}",
+                                                    humanize_snake_case(
+                                                        serde_json::to_string(&item.source_kind)
+                                                            .unwrap_or_default()
+                                                            .trim_matches('"')
+                                                    ),
+                                                    humanize_snake_case(
+                                                        serde_json::to_string(&item.status)
+                                                            .unwrap_or_default()
+                                                            .trim_matches('"')
+                                                    )
+                                                )}
+                                            </p>
+                                        </div>
+                                    }.into_any(),
+                                    None => view! {
+                                        <div class="detail-block">
+                                            <p class="eyebrow">"Supervisor item"</p>
+                                            <p class="item-meta">
+                                                "No mirrored proposal or decision item is available yet for this work unit."
+                                            </p>
+                                        </div>
+                                    }.into_any(),
+                                },
                             }}
                             {match latest_decision.clone() {
                                 Some(decision) => view! {
                                     <div class="detail-block">
                                         <p class="eyebrow">"Latest decision"</p>
-                                        <p class="item-meta">{format!(
-                                            "{} · {}",
-                                            decision.id,
-                                            humanize_snake_case(
-                                                serde_json::to_string(&decision.decision_type)
-                                                    .unwrap_or_default()
-                                                    .trim_matches('"')
-                                            )
-                                        )}</p>
+                                        <dl class="detail-grid">
+                                            <div>
+                                                <dt>"Decision id"</dt>
+                                                <dd>{decision.id.clone()}</dd>
+                                            </div>
+                                            <div>
+                                                <dt>"Type"</dt>
+                                                <dd>{humanize_snake_case(
+                                                    serde_json::to_string(&decision.decision_type)
+                                                        .unwrap_or_default()
+                                                        .trim_matches('"')
+                                                )}</dd>
+                                            </div>
+                                        </dl>
                                         <p class="item-summary">{decision.rationale.clone()}</p>
                                     </div>
                                 }.into_any(),
                                 None => view! {}.into_any(),
+                            }}
+                            {move || match detail.get() {
+                                Some(detail) => view! {
+                                    <div class="detail-block">
+                                        <p class="eyebrow">"Live thread monitor"</p>
+                                        <dl class="detail-grid">
+                                            <div>
+                                                <dt>"Thread"</dt>
+                                                <dd>{detail.summary.id.clone()}</dd>
+                                            </div>
+                                            <div>
+                                                <dt>"Status"</dt>
+                                                <dd>{detail.summary.status.clone()}</dd>
+                                            </div>
+                                            <div>
+                                                <dt>"Monitor"</dt>
+                                                <dd>{humanize_snake_case(
+                                                    serde_json::to_string(&detail.summary.monitor_state)
+                                                        .unwrap_or_default()
+                                                        .trim_matches('"')
+                                                )}</dd>
+                                            </div>
+                                            <div>
+                                                <dt>"Turns"</dt>
+                                                <dd>{detail.turns.len().to_string()}</dd>
+                                            </div>
+                                        </dl>
+                                        <p class="item-summary">{detail.summary.preview.clone()}</p>
+                                        {detail.summary.raw_summary.clone().map(|raw_summary| view! {
+                                            <div class="json-panel">
+                                                <p class="eyebrow">"Thread summary"</p>
+                                                <JsonValueTree value=raw_summary />
+                                            </div>
+                                        })}
+                                        <div class="detail-panel">
+                                            {detail
+                                                .turns
+                                                .into_iter()
+                                                .rev()
+                                                .take(3)
+                                                .map(|turn| view! { <ThreadTurnCard turn /> })
+                                                .collect_view()}
+                                        </div>
+                                    </div>
+                                }.into_any(),
+                                None => {
+                                    if loading_detail.get() {
+                                        view! {
+                                            <div class="detail-block">
+                                                <p class="eyebrow">"Live thread monitor"</p>
+                                                <p class="item-meta">"Loading live thread detail…"</p>
+                                            </div>
+                                        }.into_any()
+                                    } else if has_bound_upstream_thread {
+                                        view! {
+                                            <div class="detail-block">
+                                                <p class="eyebrow">"Live thread monitor"</p>
+                                                <p class="item-meta">"No thread detail loaded yet."</p>
+                                            </div>
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <div class="detail-block">
+                                                <p class="eyebrow">"Live thread monitor"</p>
+                                                <p class="item-meta">"No live Codex thread is bound to this tracked thread yet."</p>
+                                            </div>
+                                        }.into_any()
+                                    }
+                                }
                             }}
                         </div>
                     }.into_any()
