@@ -5453,8 +5453,6 @@ impl OrcasDaemonService {
             worker_session_id = %worker_session_id,
             "recording assignment turn outcome"
         );
-        self.ensure_assignment_communication_record(assignment_id, None, None)
-            .await?;
         let (assignment_for_parse, communication_record) = {
             let state = self.state.read().await;
             let assignment = state
@@ -5469,13 +5467,26 @@ impl OrcasDaemonService {
                 .collaboration
                 .assignment_communications
                 .get(assignment_id)
-                .cloned()
-                .ok_or_else(|| {
-                    OrcasError::Protocol(format!(
-                        "missing assignment communication record for `{assignment_id}`"
-                    ))
-                })?;
+                .cloned();
             (assignment, record)
+        };
+        let communication_record = match communication_record {
+            Some(record) => record,
+            None => {
+                self.ensure_assignment_communication_record(assignment_id, None, None)
+                    .await?;
+                let state = self.state.read().await;
+                state
+                    .collaboration
+                    .assignment_communications
+                    .get(assignment_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        OrcasError::Protocol(format!(
+                            "missing assignment communication record for `{assignment_id}`"
+                        ))
+                    })?
+            }
         };
         let plan = Self::derive_assignment_turn_ingestion_plan(
             assignment_id,
@@ -11210,6 +11221,15 @@ impl OrcasDaemonService {
                     .get(assignment_id)
                     .and_then(|record| record.packet.workspace_contract.clone())
                     == workspace_contract
+                && state
+                    .collaboration
+                    .assignment_communications
+                    .get(assignment_id)
+                    .map(|record| {
+                        record.packet.execution_context.requested_model == requested_model
+                            && record.packet.execution_context.cwd == requested_cwd
+                    })
+                    .unwrap_or(false)
             {
                 debug!(
                     assignment_id,
@@ -26820,6 +26840,100 @@ Boundedness note: Stay within the legacy compatibility boundary."#
                 .prompt_render
                 .prompt_text,
             original_prompt
+        );
+    }
+
+    #[tokio::test]
+    async fn assignment_start_refreshes_persisted_packet_when_cwd_changes() {
+        let reasoner = Arc::new(PackDrivenSupervisorReasoner::new(DecisionType::Continue));
+        let (service, fake_runtime_state) = test_service_with_fake_codex_runtime_capture(
+            auto_proposal_config(false),
+            reasoner,
+            sample_runtime_report_output_template(),
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let workstream = service
+            .workstream_create(ipc::WorkstreamCreateRequest {
+                title: "Refresh cwd".to_string(),
+                objective: "Verify prompt dispatch refreshes the packet when cwd changes."
+                    .to_string(),
+                priority: None,
+            })
+            .await
+            .expect("workstream")
+            .workstream;
+        let work_unit = service
+            .workunit_create(ipc::WorkunitCreateRequest {
+                workstream_id: workstream.id.clone(),
+                title: "Refresh cwd work unit".to_string(),
+                task_statement: "Refresh the persisted packet when cwd changes.".to_string(),
+                dependencies: Vec::new(),
+            })
+            .await
+            .expect("workunit")
+            .work_unit;
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-refresh-cwd".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Initial packet instructions".to_string()),
+                model: None,
+                cwd: None,
+                ..Default::default()
+            })
+            .await
+            .expect("prepared assignment");
+        let original_prompt = service
+            .state
+            .read()
+            .await
+            .collaboration
+            .assignment_communications
+            .get(&prepared.assignment.id)
+            .expect("communication record")
+            .prompt_render
+            .prompt_text
+            .clone();
+
+        let refreshed_cwd = "/tmp/refreshed-cwd".to_string();
+        let response = service
+            .assignment_start(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.clone(),
+                worker_id: "worker-refresh-cwd".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("new start text should rebuild for cwd".to_string()),
+                model: None,
+                cwd: Some(refreshed_cwd.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("assignment start");
+
+        let sent_prompt = fake_runtime_state
+            .lock()
+            .await
+            .last_turn_start_text
+            .clone()
+            .expect("sent prompt");
+        assert_ne!(sent_prompt, original_prompt);
+        assert!(sent_prompt.contains("Cwd: /tmp/refreshed-cwd"));
+        assert_eq!(response.report.parse_result, ReportParseResult::Parsed);
+
+        let state = service.state.read().await;
+        let refreshed_record = state
+            .collaboration
+            .assignment_communications
+            .get(&prepared.assignment.id)
+            .expect("refreshed communication record");
+        assert_eq!(
+            refreshed_record.packet.execution_context.cwd.as_deref(),
+            Some("/tmp/refreshed-cwd")
+        );
+        assert_eq!(
+            refreshed_record.packet.execution_context.repo_root.as_deref(),
+            Some("/tmp/refreshed-cwd")
         );
     }
 
