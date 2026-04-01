@@ -48,6 +48,27 @@ pub fn mount_app() {
     }
 }
 
+fn format_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> String {
+    timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+}
+
+fn format_optional_timestamp(timestamp: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    timestamp
+        .map(format_timestamp)
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn format_unix_millis(timestamp_ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
+        .map(format_timestamp)
+        .unwrap_or_else(|| timestamp_ms.to_string())
+}
+
+fn is_message_like_item(item_type: &str) -> bool {
+    let lowered = item_type.to_ascii_lowercase();
+    lowered.contains("message") || lowered.contains("reasoning") || lowered.contains("comment")
+}
+
 #[component]
 fn JsonValueTree(value: serde_json::Value) -> impl IntoView {
     match value {
@@ -81,6 +102,7 @@ fn JsonValueTree(value: serde_json::Value) -> impl IntoView {
 
 #[component]
 fn TurnItemCard(item: orcas_core::ipc::ItemView) -> impl IntoView {
+    let message_like = is_message_like_item(&item.item_type);
     view! {
         <div class="detail-block">
             <div class="item-card-topline">
@@ -101,11 +123,20 @@ fn TurnItemCard(item: orcas_core::ipc::ItemView) -> impl IntoView {
                 .text
                 .clone()
                 .filter(|text| !text.trim().is_empty())
-                .map(|text| view! { <pre class="code-block">{text}</pre> })}
+                .map(|text| {
+                    if message_like {
+                        view! { <div class="message-block">{text}</div> }.into_any()
+                    } else {
+                        view! { <pre class="code-block">{text}</pre> }.into_any()
+                    }
+                })}
             {item.payload.clone().map(|payload| view! {
                 <div class="json-panel">
                     <p class="eyebrow">"Payload"</p>
-                    <JsonValueTree value=payload />
+                    <details>
+                        <summary>"Show payload"</summary>
+                        <JsonValueTree value=payload />
+                    </details>
                 </div>
             })}
         </div>
@@ -124,10 +155,10 @@ fn ThreadTurnCard(turn: orcas_core::ipc::TurnView) -> impl IntoView {
                 {format!(
                     "{}{}",
                     turn.started_at
-                        .map(|started_at| format!("started {}", started_at))
+                        .map(|started_at| format!("started {}", format_timestamp(started_at)))
                         .unwrap_or_else(|| "start unknown".to_string()),
                     turn.completed_at
-                        .map(|completed_at| format!(" · completed {}", completed_at))
+                        .map(|completed_at| format!(" · completed {}", format_timestamp(completed_at)))
                         .unwrap_or_default()
                 )}
             </p>
@@ -1941,6 +1972,8 @@ fn TrackedThreadCard(
                         let available_actions = item.available_actions.clone();
                         let item_id = item.id.clone();
                         let item_updated_at = item.updated_at;
+                        let item_source_kind = item.source_kind;
+                        let actionable_object_id = item.actionable_object_id.clone();
                         available_actions
                             .into_iter()
                             .filter(|action_kind| {
@@ -1953,6 +1986,7 @@ fn TrackedThreadCard(
                                 let settings = settings;
                                 let navigate = navigate.clone();
                                 let item_id_for_action = item_id.clone();
+                                let actionable_object_id = actionable_object_id.clone();
                                 view! {
                                     <button
                                         class="refresh-button"
@@ -1961,33 +1995,59 @@ fn TrackedThreadCard(
                                             let settings = settings.get_untracked();
                                             let item_id = item_id_for_action.clone();
                                             let navigate = navigate.clone();
-                                            let idempotency_key = storage::remote_action_idempotency_key(
-                                                &settings.origin_node_id,
-                                                &item_id,
-                                                action_kind,
-                                                item_updated_at,
-                                            );
+                                            let actionable_object_id = actionable_object_id.clone();
                                             working.set(true);
                                             action_error.set(None);
                                             #[cfg(target_arch = "wasm32")]
                                             spawn_local(async move {
-                                                match api::submit_remote_action(
-                                                    settings,
-                                                    item_id,
-                                                    action_kind,
-                                                    Some("web-operator".to_string()),
-                                                    None,
-                                                    Some(idempotency_key),
-                                                )
-                                                .await
+                                                let result = if item_source_kind
+                                                    == orcas_core::OperatorInboxSourceKind::SupervisorProposal
                                                 {
+                                                    match action_kind {
+                                                        OperatorInboxActionKind::Approve => api::proposal_approve(
+                                                            settings,
+                                                            actionable_object_id.clone(),
+                                                            Some("Approved from workstreams dashboard".to_string()),
+                                                        )
+                                                        .await
+                                                        .map(|_| None),
+                                                        OperatorInboxActionKind::Reject => api::proposal_reject(
+                                                            settings,
+                                                            actionable_object_id.clone(),
+                                                            Some("Rejected from workstreams dashboard".to_string()),
+                                                        )
+                                                        .await
+                                                        .map(|_| None),
+                                                        _ => Ok(None),
+                                                    }
+                                                } else {
+                                                    let idempotency_key = storage::remote_action_idempotency_key(
+                                                        &settings.origin_node_id,
+                                                        &item_id,
+                                                        action_kind,
+                                                        item_updated_at,
+                                                    );
+                                                    api::submit_remote_action(
+                                                        settings,
+                                                        item_id,
+                                                        action_kind,
+                                                        Some("web-operator".to_string()),
+                                                        None,
+                                                        Some(idempotency_key),
+                                                    )
+                                                    .await
+                                                    .map(Some)
+                                                };
+                                                match result {
                                                     Ok(request) => {
                                                         action_message.set(Some(format!(
-                                                            "{} request created.",
+                                                            "{} submitted.",
                                                             action_kind_label(action_kind)
                                                         )));
                                                         refresh_epoch.update(|value| *value += 1);
-                                                        navigate(&format!("/actions/{}", request.request_id), Default::default());
+                                                        if let Some(request) = request {
+                                                            navigate(&format!("/actions/{}", request.request_id), Default::default());
+                                                        }
                                                     }
                                                     Err(error) => action_error.set(Some(error)),
                                                 }
@@ -2098,6 +2158,10 @@ fn TrackedThreadCard(
                                                         .trim_matches('"')
                                                 )}</dd>
                                             </div>
+                                            <div>
+                                                <dt>"Recorded"</dt>
+                                                <dd>{format_timestamp(report.created_at)}</dd>
+                                            </div>
                                         </dl>
                                         <p class="item-summary">{report.summary.clone()}</p>
                                     </div>
@@ -2142,6 +2206,14 @@ fn TrackedThreadCard(
                                                 <dt>"Open"</dt>
                                                 <dd>{if proposal.has_open_proposal { "Yes" } else { "No" }}</dd>
                                             </div>
+                                            <div>
+                                                <dt>"Created"</dt>
+                                                <dd>{format_timestamp(proposal.latest_created_at)}</dd>
+                                            </div>
+                                            <div>
+                                                <dt>"Reviewed"</dt>
+                                                <dd>{format_optional_timestamp(proposal.latest_reviewed_at)}</dd>
+                                            </div>
                                         </dl>
                                     </div>
                                 }.into_any(),
@@ -2163,6 +2235,13 @@ fn TrackedThreadCard(
                                                             .unwrap_or_default()
                                                             .trim_matches('"')
                                                     )
+                                                )}
+                                            </p>
+                                            <p class="item-meta">
+                                                {format!(
+                                                    "created {} · updated {}",
+                                                    format_timestamp(item.created_at),
+                                                    format_timestamp(item.updated_at)
                                                 )}
                                             </p>
                                         </div>
@@ -2193,6 +2272,10 @@ fn TrackedThreadCard(
                                                         .unwrap_or_default()
                                                         .trim_matches('"')
                                                 )}</dd>
+                                            </div>
+                                            <div>
+                                                <dt>"Recorded"</dt>
+                                                <dd>{format_timestamp(decision.created_at)}</dd>
                                             </div>
                                         </dl>
                                         <p class="item-summary">{decision.rationale.clone()}</p>
@@ -2225,12 +2308,19 @@ fn TrackedThreadCard(
                                                 <dt>"Turns"</dt>
                                                 <dd>{detail.turns.len().to_string()}</dd>
                                             </div>
+                                            <div>
+                                                <dt>"Updated"</dt>
+                                                <dd>{format_unix_millis(detail.summary.updated_at)}</dd>
+                                            </div>
                                         </dl>
                                         <p class="item-summary">{detail.summary.preview.clone()}</p>
                                         {detail.summary.raw_summary.clone().map(|raw_summary| view! {
                                             <div class="json-panel">
                                                 <p class="eyebrow">"Thread summary"</p>
-                                                <JsonValueTree value=raw_summary />
+                                                <details>
+                                                    <summary>"Show raw thread summary"</summary>
+                                                    <JsonValueTree value=raw_summary />
+                                                </details>
                                             </div>
                                         })}
                                         <div class="detail-panel">

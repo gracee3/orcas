@@ -17,7 +17,8 @@ use orcas_core::ipc::{
     OperatorNotificationListRequest, OperatorReadModelCheckpointQueryRequest,
     OperatorReadModelWaitForCheckpointRequest, OperatorRemoteActionCreateRequest,
     OperatorRemoteActionGetRequest, OperatorRemoteActionListRequest,
-    OperatorRemoteActionWaitRequest, ProposalCreateRequest, ProposalCreateResponse,
+    OperatorRemoteActionWaitRequest, ProposalApproveRequest, ProposalCreateRequest,
+    ProposalCreateResponse, ProposalRejectRequest,
 };
 use orcas_operator_core::{
     DeliveryPageView, InboxDetailPageView, InboxPageView, NotificationPageView,
@@ -552,6 +553,41 @@ pub async fn proposal_create(
         })
         .await
         .map_err(|error| error.to_string())
+}
+
+pub async fn proposal_approve(
+    settings: OperatorServerSettings,
+    proposal_id: String,
+    review_note: Option<String>,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .proposal_approve(&ProposalApproveRequest {
+            proposal_id,
+            reviewed_by: Some("operator_web".to_string()),
+            review_note: review_note.filter(|value| !value.trim().is_empty()),
+            edits: Default::default(),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn proposal_reject(
+    settings: OperatorServerSettings,
+    proposal_id: String,
+    review_note: Option<String>,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .proposal_reject(&ProposalRejectRequest {
+            proposal_id,
+            reviewed_by: Some("operator_web".to_string()),
+            review_note: review_note.filter(|value| !value.trim().is_empty()),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub async fn delete_tracked_thread(

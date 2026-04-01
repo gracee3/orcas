@@ -36,8 +36,9 @@ use orcas_core::ipc::{
     OperatorRemoteActionCreateResponse, OperatorRemoteActionFailRequest,
     OperatorRemoteActionFailResponse, OperatorRemoteActionGetRequest,
     OperatorRemoteActionGetResponse, OperatorRemoteActionListRequest,
-    OperatorRemoteActionListResponse, OperatorRemoteActionWaitRequest, ProposalCreateRequest,
-    ProposalCreateResponse, OperatorRemoteActionWaitResponse, StateGetRequest, StateGetResponse,
+    OperatorRemoteActionListResponse, OperatorRemoteActionWaitRequest, ProposalApproveRequest,
+    ProposalApproveResponse, ProposalCreateRequest, ProposalCreateResponse, ProposalRejectRequest,
+    ProposalRejectResponse, OperatorRemoteActionWaitResponse, StateGetRequest, StateGetResponse,
     ThreadGetRequest, ThreadGetResponse, CodexAssignmentPauseRequest,
     CodexAssignmentPauseResponse, CodexAssignmentResumeRequest, CodexAssignmentResumeResponse,
 };
@@ -425,6 +426,22 @@ impl OrcasServerClient {
         request: &ProposalCreateRequest,
     ) -> OrcasResult<ProposalCreateResponse> {
         self.post_json("operator-runtime/proposals/create", request)
+            .await
+    }
+
+    pub async fn proposal_approve(
+        &self,
+        request: &ProposalApproveRequest,
+    ) -> OrcasResult<ProposalApproveResponse> {
+        self.post_json("operator-runtime/proposals/approve", request)
+            .await
+    }
+
+    pub async fn proposal_reject(
+        &self,
+        request: &ProposalRejectRequest,
+    ) -> OrcasResult<ProposalRejectResponse> {
+        self.post_json("operator-runtime/proposals/reject", request)
             .await
     }
 

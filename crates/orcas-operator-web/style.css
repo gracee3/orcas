@@ -308,6 +308,15 @@ a {
   min-width: 0;
 }
 
+.json-panel details {
+  min-width: 0;
+}
+
+.json-panel summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
 .json-object {
   display: grid;
   grid-template-columns: minmax(110px, 180px) minmax(0, 1fr);
@@ -413,6 +422,15 @@ button,
   border: 1px solid var(--border);
   max-width: 100%;
   box-sizing: border-box;
+}
+
+.message-block {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 0.85rem;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 12px;
+  border: 1px solid var(--border);
 }
 
 @media (max-width: 960px) {
