@@ -399,25 +399,6 @@ grep -q "workspace_worktree_path: $lane_a_worktree_path" "$lane_a_tracked_after_
 grep -q "workspace_worktree_path: $lane_b_worktree_path" "$lane_b_tracked_after_stdout"
 grep -q "workspace_branch_name: $lane_a_branch_name" "$lane_a_tracked_after_stdout"
 grep -q "workspace_branch_name: $lane_b_branch_name" "$lane_b_tracked_after_stdout"
-
-timeout "${TIMEOUT_SECONDS}s" "$e2e_bin_dir/orcas.sh" assignments start \
-  --workunit "$lane_b_workunit_id" \
-  --worker live-concurrent-lanes-b \
-  --worker-kind codex \
-  --instructions "Lane B: update the tiny C fixture so make test passes with the exact greeting 'Hello, Lane B!'. Edit only main.c and tests/test.sh. Do not touch lane A or create backup files. Return a brief summary of the exact lane B edits." \
-  --cwd "$lane_b_worktree_path" \
-  >"$lane_b_assignment_start_stdout" 2>&1 &
-lane_b_assignment_start_pid=$!
-
-wait_for_report_id "$lane_b_workunit_id" lane_b_report_id
-
-e2e_orcas reports get --report "$lane_b_report_id" >"$lane_b_report_get_stdout"
-lane_b_assignment_id="$(field_value assignment_id "$lane_b_report_get_stdout")"
-lane_b_report_workunit_id="$(field_value work_unit_id "$lane_b_report_get_stdout")"
-e2e_orcas assignments get --assignment "$lane_b_assignment_id" >"$lane_b_assignment_get_stdout"
-lane_b_assignment_status="$(field_value status "$lane_b_assignment_get_stdout")"
-lane_b_worker_session_id="$(field_value worker_session_id "$lane_b_assignment_get_stdout")"
-lane_b_report_parse_result="$(field_value parse_result "$lane_b_report_get_stdout")"
 lane_b_thread_id="$(field_value thread_id "$lane_b_assignment_start_stdout")"
 
 test -n "$lane_b_assignment_id"
