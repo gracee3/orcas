@@ -69,6 +69,76 @@ fn is_message_like_item(item_type: &str) -> bool {
     lowered.contains("message") || lowered.contains("reasoning") || lowered.contains("comment")
 }
 
+fn humanize_optional_kind(kind: Option<&str>, fallback: &str) -> String {
+    kind.map(humanize_snake_case)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+#[component]
+fn TurnPlanCard(plan: orcas_core::ipc::TurnPlanView) -> impl IntoView {
+    let explanation = plan.explanation.clone();
+    let steps = plan.plan.clone();
+    view! {
+        <div class="json-panel">
+            <p class="eyebrow">"Plan"</p>
+            {explanation
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| view! { <p class="item-summary">{value}</p> })}
+            {if steps.is_empty() {
+                view! { <p class="item-meta">"No structured plan steps recorded."</p> }.into_any()
+            } else {
+                view! {
+                    <div class="detail-panel">
+                        {steps
+                            .into_iter()
+                            .map(|step| view! {
+                                <div class="detail-block">
+                                    <div class="item-card-topline">
+                                        <span class="status-pill">{humanize_snake_case(&step.status)}</span>
+                                    </div>
+                                    <p class="item-summary">{step.step}</p>
+                                </div>
+                            })
+                            .collect_view()}
+                    </div>
+                }
+                .into_any()
+            }}
+        </div>
+    }
+}
+
+#[component]
+fn TokenUsageCard(token_usage: orcas_core::ipc::ThreadTokenUsageView) -> impl IntoView {
+    view! {
+        <div class="json-panel">
+            <p class="eyebrow">"Token usage"</p>
+            <dl class="detail-grid">
+                <div>
+                    <dt>"Total"</dt>
+                    <dd>{token_usage.total_tokens.to_string()}</dd>
+                </div>
+                <div>
+                    <dt>"Input"</dt>
+                    <dd>{token_usage.input_tokens.to_string()}</dd>
+                </div>
+                <div>
+                    <dt>"Cached input"</dt>
+                    <dd>{token_usage.cached_input_tokens.to_string()}</dd>
+                </div>
+                <div>
+                    <dt>"Output"</dt>
+                    <dd>{token_usage.output_tokens.to_string()}</dd>
+                </div>
+                <div>
+                    <dt>"Reasoning output"</dt>
+                    <dd>{token_usage.reasoning_output_tokens.to_string()}</dd>
+                </div>
+            </dl>
+        </div>
+    }
+}
+
 #[component]
 fn JsonValueTree(value: serde_json::Value) -> impl IntoView {
     match value {
@@ -103,6 +173,7 @@ fn JsonValueTree(value: serde_json::Value) -> impl IntoView {
 #[component]
 fn TurnItemCard(item: orcas_core::ipc::ItemView) -> impl IntoView {
     let message_like = is_message_like_item(&item.item_type);
+    let detail_kind = humanize_optional_kind(item.detail_kind.as_deref(), "Detail");
     view! {
         <div class="detail-block">
             <div class="item-card-topline">
@@ -136,6 +207,15 @@ fn TurnItemCard(item: orcas_core::ipc::ItemView) -> impl IntoView {
                     <details>
                         <summary>"Show payload"</summary>
                         <JsonValueTree value=payload />
+                    </details>
+                </div>
+            })}
+            {item.detail.clone().map(|detail| view! {
+                <div class="json-panel">
+                    <p class="eyebrow">{detail_kind.clone()}</p>
+                    <details>
+                        <summary>"Show typed detail"</summary>
+                        <JsonValueTree value=detail />
                     </details>
                 </div>
             })}
@@ -173,18 +253,34 @@ fn ThreadTurnCard(turn: orcas_core::ipc::TurnView) -> impl IntoView {
                     <pre class="code-block">{diff}</pre>
                 </div>
             })}
-            {turn.latest_plan_snapshot.clone().map(|snapshot| view! {
-                <div class="json-panel">
-                    <p class="eyebrow">"Plan snapshot"</p>
-                    <JsonValueTree value=snapshot />
-                </div>
-            })}
-            {turn.token_usage_snapshot.clone().map(|snapshot| view! {
-                <div class="json-panel">
-                    <p class="eyebrow">"Token usage"</p>
-                    <JsonValueTree value=snapshot />
-                </div>
-            })}
+            {match turn.latest_plan.clone() {
+                Some(plan) => view! { <TurnPlanCard plan /> }.into_any(),
+                None => turn
+                    .latest_plan_snapshot
+                    .clone()
+                    .map(|snapshot| view! {
+                        <div class="json-panel">
+                            <p class="eyebrow">"Plan snapshot"</p>
+                            <JsonValueTree value=snapshot />
+                        </div>
+                    }
+                    .into_any())
+                    .unwrap_or_else(|| view! {}.into_any()),
+            }}
+            {match turn.token_usage.clone() {
+                Some(token_usage) => view! { <TokenUsageCard token_usage /> }.into_any(),
+                None => turn
+                    .token_usage_snapshot
+                    .clone()
+                    .map(|snapshot| view! {
+                        <div class="json-panel">
+                            <p class="eyebrow">"Token usage"</p>
+                            <JsonValueTree value=snapshot />
+                        </div>
+                    }
+                    .into_any())
+                    .unwrap_or_else(|| view! {}.into_any()),
+            }}
             <div class="detail-panel">
                 {turn.items.into_iter().map(|item| view! { <TurnItemCard item /> }).collect_view()}
             </div>
@@ -1094,17 +1190,59 @@ fn LiveThreadCard(
                     match detail.get() {
                         Some(detail) => view! {
                             <div class="stack">
-                                <pre class="code-block">{detail.summary.raw_summary.map(|value| serde_json::to_string_pretty(&value).unwrap_or_default()).unwrap_or_else(|| "No raw summary".to_string())}</pre>
-                                {detail.turns.into_iter().rev().take(3).map(|turn| view! {
-                                    <div class="item-card">
-                                        <div class="item-card-topline">
-                                            <span class="status-pill">{turn.status.clone()}</span>
-                                            <span class="muted">{turn.id.clone()}</span>
+                                <div class="detail-block">
+                                    <p class="eyebrow">"Thread summary"</p>
+                                    <dl class="detail-grid">
+                                        <div>
+                                            <dt>"Thread"</dt>
+                                            <dd>{detail.summary.id.clone()}</dd>
                                         </div>
-                                        <p class="item-summary">{turn.error_summary.clone().or(turn.error_message.clone()).unwrap_or_else(|| "No turn error summary.".to_string())}</p>
-                                        {turn.latest_diff.map(|diff| view! { <pre class="code-block">{diff}</pre> })}
-                                    </div>
-                                }).collect_view()}
+                                        <div>
+                                            <dt>"Status"</dt>
+                                            <dd>{detail.summary.status.clone()}</dd>
+                                        </div>
+                                        <div>
+                                            <dt>"Loaded"</dt>
+                                            <dd>{humanize_snake_case(
+                                                serde_json::to_string(&detail.summary.loaded_status)
+                                                    .unwrap_or_default()
+                                                    .trim_matches('"')
+                                            )}</dd>
+                                        </div>
+                                        <div>
+                                            <dt>"Monitor"</dt>
+                                            <dd>{humanize_snake_case(
+                                                serde_json::to_string(&detail.summary.monitor_state)
+                                                    .unwrap_or_default()
+                                                    .trim_matches('"')
+                                            )}</dd>
+                                        </div>
+                                        <div>
+                                            <dt>"Recent event"</dt>
+                                            <dd>{detail.summary.recent_event.clone().unwrap_or_else(|| "None".to_string())}</dd>
+                                        </div>
+                                        <div>
+                                            <dt>"Updated"</dt>
+                                            <dd>{format_unix_millis(detail.summary.updated_at)}</dd>
+                                        </div>
+                                    </dl>
+                                    <p class="item-summary">{detail.summary.preview.clone()}</p>
+                                    {detail.summary.raw_summary.clone().map(|raw_summary| view! {
+                                        <div class="json-panel">
+                                            <details>
+                                                <summary>"Show raw thread summary"</summary>
+                                                <JsonValueTree value=raw_summary />
+                                            </details>
+                                        </div>
+                                    })}
+                                </div>
+                                {detail
+                                    .turns
+                                    .into_iter()
+                                    .rev()
+                                    .take(3)
+                                    .map(|turn| view! { <ThreadTurnCard turn /> })
+                                    .collect_view()}
                             </div>
                         }.into_any(),
                         None => view! { <p class="muted">"Loading thread detail…"</p> }.into_any(),
