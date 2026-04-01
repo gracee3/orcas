@@ -5,6 +5,7 @@ mod push;
 mod pwa;
 mod storage;
 mod watch;
+mod workstreams;
 mod workspace;
 
 use std::sync::Arc;
@@ -19,7 +20,9 @@ use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::hooks::{use_navigate, use_params_map};
 use leptos_router::path;
 
+use orcas_core::authority;
 use orcas_core::ipc::OperatorRemoteActionRequestStatus;
+use orcas_core::{WorkUnitStatus, WorkstreamStatus};
 use orcas_operator_core::{
     DeliveryJobView, DeliveryPageView, InboxDetailPageView, InboxItemCardView, InboxPageView,
     NotificationCandidateView, NotificationPageView, OperatorServerSettings, RemoteActionPageView,
@@ -30,6 +33,7 @@ use orcas_operator_core::{
     summarize_inbox_page_change, summarize_notification_page_change,
     summarize_remote_action_request_change,
 };
+use workstreams::{WorkstreamsDashboardData, humanize_snake_case, tracked_thread_runtime_status};
 use workspace::{WorkspaceFocus, WorkspaceSection, WorkspaceState};
 
 pub fn mount_app() {
@@ -82,7 +86,8 @@ pub fn App() -> impl IntoView {
                     </aside>
                     <main class="shell-main">
                         <Routes fallback=|| view! { <NotFoundPage /> }>
-                            <Route path=path!("") view=InboxRoute />
+                            <Route path=path!("") view=WorkstreamsRoute />
+                            <Route path=path!("workstreams") view=WorkstreamsRoute />
                             <Route path=path!("inbox") view=InboxRoute />
                             <Route path=path!("inbox/:item_id") view=InboxDetailRoute />
                             <Route path=path!("notifications") view=NotificationsRoute />
@@ -117,6 +122,14 @@ fn WorkspaceShell() -> impl IntoView {
                 </p>
             </div>
             <nav class="shell-nav shell-nav-vertical">
+                <A
+                    href=WorkspaceSection::Workstreams.href()
+                    class:active=move || {
+                        workspace.get().active_section == WorkspaceSection::Workstreams
+                    }
+                >
+                    "Workstreams"
+                </A>
                 <A
                     href=WorkspaceSection::Inbox.href()
                     class:active=move || workspace.get().active_section == WorkspaceSection::Inbox
@@ -406,6 +419,818 @@ fn PushRegistrationPanel() -> impl IntoView {
                 }
             }}
         </article>
+    }
+}
+
+#[component]
+fn WorkstreamsRoute() -> impl IntoView {
+    let settings = use_context::<RwSignal<OperatorServerSettings>>()
+        .expect("settings context should be provided");
+    let workspace =
+        use_context::<RwSignal<WorkspaceState>>().expect("workspace context should be provided");
+    let refresh_epoch = RwSignal::new(0u64);
+    let action_message = RwSignal::new(None::<String>);
+    let action_error = RwSignal::new(None::<String>);
+    let create_title = RwSignal::new(String::new());
+    let create_objective = RwSignal::new(String::new());
+    let create_priority = RwSignal::new("P2".to_string());
+    let create_status = RwSignal::new("active".to_string());
+    let create_working = RwSignal::new(false);
+    let dashboard = LocalResource::new(move || {
+        let settings = settings.get();
+        let _refresh_epoch = refresh_epoch.get();
+        async move { api::load_workstreams_dashboard(settings).await }
+    });
+
+    Effect::new({
+        let workspace = workspace.clone();
+        move |_| workspace.update(|state| state.active_section = WorkspaceSection::Workstreams)
+    });
+
+    view! {
+        <PageFrame
+            title="Workstreams"
+            subtitle="Authority hierarchy grouped by workstream, work unit, and Codex thread"
+        >
+            <div class="toolbar">
+                <button class="refresh-button" on:click=move |_| dashboard.refetch()>"Refresh"</button>
+                <span class="muted">
+                    "Live status joins authority hierarchy with daemon assignment and supervisor state."
+                </span>
+            </div>
+            {move || match action_message.get() {
+                Some(message) => view! {
+                    <div class="info-panel">
+                        <strong>"Saved"</strong>
+                        <p>{message}</p>
+                    </div>
+                }.into_any(),
+                None => view! {}.into_any(),
+            }}
+            {move || match action_error.get() {
+                Some(error) => view! { <ErrorPanel error=error /> }.into_any(),
+                None => view! {}.into_any(),
+            }}
+            <article class="card">
+                <h3>"Create workstream"</h3>
+                <div class="action-form">
+                    <label class="field">
+                        <span>"Title"</span>
+                        <input
+                            type="text"
+                            placeholder="Close operator-web branch"
+                            prop:value=move || create_title.get()
+                            on:input=move |ev| create_title.set(event_target_value(&ev))
+                        />
+                    </label>
+                    <label class="field">
+                        <span>"Objective"</span>
+                        <textarea
+                            rows="3"
+                            placeholder="Ship the dashboard slice for workstream and Codex thread management."
+                            prop:value=move || create_objective.get()
+                            on:input=move |ev| create_objective.set(event_target_value(&ev))
+                        ></textarea>
+                    </label>
+                    <div class="section-grid">
+                        <label class="field">
+                            <span>"Priority"</span>
+                            <input
+                                type="text"
+                                placeholder="P2"
+                                prop:value=move || create_priority.get()
+                                on:input=move |ev| create_priority.set(event_target_value(&ev))
+                            />
+                        </label>
+                        <label class="field">
+                            <span>"Status"</span>
+                            <select
+                                prop:value=move || create_status.get()
+                                on:change=move |ev| create_status.set(event_target_value(&ev))
+                            >
+                                {workstream_status_options()
+                                    .into_iter()
+                                    .map(|(value, label)| view! { <option value=value>{label}</option> })
+                                    .collect_view()}
+                            </select>
+                        </label>
+                    </div>
+                    <div class="action-buttons">
+                        <button
+                            class="primary-button"
+                            disabled=move || create_working.get()
+                            on:click=move |_| {
+                                let settings = settings.get_untracked();
+                                let title = create_title.get_untracked();
+                                let objective = create_objective.get_untracked();
+                                let priority = create_priority.get_untracked();
+                                let status = create_status.get_untracked();
+                                create_working.set(true);
+                                action_error.set(None);
+                                #[cfg(target_arch = "wasm32")]
+                                spawn_local(async move {
+                                    let result = parse_workstream_status(&status)
+                                        .and_then(|parsed_status| {
+                                            Ok((parsed_status, title, objective, priority))
+                                        });
+                                    match result {
+                                        Ok((parsed_status, title, objective, priority)) => {
+                                            match api::create_workstream(
+                                                settings,
+                                                title,
+                                                objective,
+                                                parsed_status,
+                                                priority,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => {
+                                                    create_title.set(String::new());
+                                                    create_objective.set(String::new());
+                                                    create_priority.set("P2".to_string());
+                                                    create_status.set("active".to_string());
+                                                    action_message.set(Some(
+                                                        "Created workstream.".to_string(),
+                                                    ));
+                                                    refresh_epoch.update(|value| *value += 1);
+                                                }
+                                                Err(error) => action_error.set(Some(error)),
+                                            }
+                                        }
+                                        Err(error) => action_error.set(Some(error)),
+                                    }
+                                    create_working.set(false);
+                                });
+                            }
+                        >
+                            "Create workstream"
+                        </button>
+                    </div>
+                </div>
+            </article>
+            {move || match dashboard.get() {
+                None => view! { <p class="muted">"Loading workstreams…"</p> }.into_any(),
+                Some(Err(error)) => view! { <ErrorPanel error=error /> }.into_any(),
+                Some(Ok(dashboard)) => {
+                    if dashboard.hierarchy.workstreams.is_empty() {
+                        view! {
+                            <EmptyState
+                                title="No workstreams yet"
+                                body="Create a workstream to start grouping work units and Codex threads."
+                            />
+                        }
+                        .into_any()
+                    } else {
+                        let workstream_nodes = dashboard.hierarchy.workstreams.clone();
+                        view! {
+                            <div class="stack">
+                                {workstream_nodes
+                                    .into_iter()
+                                    .map(|node| {
+                                        view! {
+                                            <WorkstreamCard
+                                                node
+                                                dashboard=dashboard.clone()
+                                                settings
+                                                refresh_epoch
+                                                action_message
+                                                action_error
+                                            />
+                                        }
+                                    })
+                                    .collect_view()}
+                            </div>
+                        }
+                        .into_any()
+                    }
+                }
+            }}
+        </PageFrame>
+    }
+}
+
+#[component]
+fn WorkstreamCard(
+    node: authority::WorkstreamNode,
+    dashboard: WorkstreamsDashboardData,
+    settings: RwSignal<OperatorServerSettings>,
+    refresh_epoch: RwSignal<u64>,
+    action_message: RwSignal<Option<String>>,
+    action_error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let workstream_id = node.workstream.id.clone();
+    let workstream_revision = node.workstream.revision;
+    let workstream_title_display = node.workstream.title.clone();
+    let workstream_objective_display = node.workstream.objective.clone();
+    let workstream_priority_display = node.workstream.priority.clone();
+    let workstream_status_display = node.workstream.status;
+    let work_unit_nodes = node.work_units.clone();
+    let delete_workstream_id = workstream_id.clone();
+    let edit_workstream_root_id = workstream_id.clone();
+    let create_work_unit_root_id = workstream_id.clone();
+    let editing = RwSignal::new(false);
+    let adding_work_unit = RwSignal::new(false);
+    let working = RwSignal::new(false);
+    let title = RwSignal::new(workstream_title_display.clone());
+    let objective = RwSignal::new(workstream_objective_display.clone());
+    let priority = RwSignal::new(workstream_priority_display.clone());
+    let status = RwSignal::new(workstream_status_value(workstream_status_display).to_string());
+    let unit_title = RwSignal::new(String::new());
+    let unit_task_statement = RwSignal::new(String::new());
+    let unit_status = RwSignal::new("ready".to_string());
+
+    view! {
+        <article class="card">
+            <div class="page-header">
+                <div>
+                    <p class="eyebrow">{format!("{} · {}", workstream_status_label(workstream_status_display), workstream_priority_display)}</p>
+                    <h3>{workstream_title_display.clone()}</h3>
+                    <p class="item-summary">{workstream_objective_display.clone()}</p>
+                </div>
+                <div class="action-buttons">
+                    <button class="refresh-button" on:click=move |_| editing.update(|value| *value = !*value)>
+                        {move || if editing.get() { "Close edit" } else { "Edit" }}
+                    </button>
+                    <button class="refresh-button" on:click=move |_| adding_work_unit.update(|value| *value = !*value)>
+                        {move || if adding_work_unit.get() { "Close work unit form" } else { "Add work unit" }}
+                    </button>
+                    <button
+                        class="refresh-button"
+                        disabled=move || working.get()
+                        on:click=move |_| {
+                            let settings = settings.get_untracked();
+                            let workstream_id = delete_workstream_id.clone();
+                            working.set(true);
+                            action_error.set(None);
+                            #[cfg(target_arch = "wasm32")]
+                            spawn_local(async move {
+                                match api::delete_workstream(settings, workstream_id).await {
+                                    Ok(()) => {
+                                        action_message.set(Some("Deleted workstream.".to_string()));
+                                        refresh_epoch.update(|value| *value += 1);
+                                    }
+                                    Err(error) => action_error.set(Some(error)),
+                                }
+                                working.set(false);
+                            });
+                        }
+                    >
+                        "Delete"
+                    </button>
+                </div>
+            </div>
+            {move || {
+                let save_workstream_id = edit_workstream_root_id.clone();
+                if editing.get() {
+                    view! {
+                    <div class="action-form">
+                        <label class="field">
+                            <span>"Title"</span>
+                            <input
+                                type="text"
+                                prop:value=move || title.get()
+                                on:input=move |ev| title.set(event_target_value(&ev))
+                            />
+                        </label>
+                        <label class="field">
+                            <span>"Objective"</span>
+                            <textarea
+                                rows="3"
+                                prop:value=move || objective.get()
+                                on:input=move |ev| objective.set(event_target_value(&ev))
+                            ></textarea>
+                        </label>
+                        <div class="section-grid">
+                            <label class="field">
+                                <span>"Priority"</span>
+                                <input
+                                    type="text"
+                                    prop:value=move || priority.get()
+                                    on:input=move |ev| priority.set(event_target_value(&ev))
+                                />
+                            </label>
+                            <label class="field">
+                                <span>"Status"</span>
+                                <select
+                                    prop:value=move || status.get()
+                                    on:change=move |ev| status.set(event_target_value(&ev))
+                                >
+                                    {workstream_status_options()
+                                        .into_iter()
+                                        .map(|(value, label)| view! { <option value=value>{label}</option> })
+                                        .collect_view()}
+                                </select>
+                            </label>
+                        </div>
+                        <div class="action-buttons">
+                            <button
+                                class="primary-button"
+                                disabled=move || working.get()
+                                on:click=move |_| {
+                                    let settings = settings.get_untracked();
+                                    let workstream_id = save_workstream_id.clone();
+                                    let expected_revision = workstream_revision;
+                                    let title = title.get_untracked();
+                                    let objective = objective.get_untracked();
+                                    let priority = priority.get_untracked();
+                                    let status = status.get_untracked();
+                                    working.set(true);
+                                    action_error.set(None);
+                                    #[cfg(target_arch = "wasm32")]
+                                    spawn_local(async move {
+                                        match parse_workstream_status(&status) {
+                                            Ok(status) => match api::edit_workstream(
+                                                settings,
+                                                workstream_id,
+                                                expected_revision,
+                                                title,
+                                                objective,
+                                                status,
+                                                priority,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => {
+                                                    action_message.set(Some(
+                                                        "Updated workstream.".to_string(),
+                                                    ));
+                                                    refresh_epoch.update(|value| *value += 1);
+                                                    editing.set(false);
+                                                }
+                                                Err(error) => action_error.set(Some(error)),
+                                            },
+                                            Err(error) => action_error.set(Some(error)),
+                                        }
+                                        working.set(false);
+                                    });
+                                }
+                            >
+                                "Save workstream"
+                            </button>
+                        </div>
+                    </div>
+                    }.into_any()
+                } else {
+                    view! {}.into_any()
+                }
+            }}
+            {move || {
+                let create_workstream_id = create_work_unit_root_id.clone();
+                if adding_work_unit.get() {
+                    view! {
+                    <div class="action-form">
+                        <label class="field">
+                            <span>"Work unit title"</span>
+                            <input
+                                type="text"
+                                prop:value=move || unit_title.get()
+                                on:input=move |ev| unit_title.set(event_target_value(&ev))
+                            />
+                        </label>
+                        <label class="field">
+                            <span>"Task statement"</span>
+                            <textarea
+                                rows="3"
+                                prop:value=move || unit_task_statement.get()
+                                on:input=move |ev| unit_task_statement.set(event_target_value(&ev))
+                            ></textarea>
+                        </label>
+                        <label class="field">
+                            <span>"Status"</span>
+                            <select
+                                prop:value=move || unit_status.get()
+                                on:change=move |ev| unit_status.set(event_target_value(&ev))
+                            >
+                                {workunit_status_options()
+                                    .into_iter()
+                                    .map(|(value, label)| view! { <option value=value>{label}</option> })
+                                    .collect_view()}
+                            </select>
+                        </label>
+                        <div class="action-buttons">
+                            <button
+                                class="primary-button"
+                                disabled=move || working.get()
+                                on:click=move |_| {
+                                    let settings = settings.get_untracked();
+                                    let workstream_id = create_workstream_id.clone();
+                                    let title = unit_title.get_untracked();
+                                    let task_statement = unit_task_statement.get_untracked();
+                                    let status = unit_status.get_untracked();
+                                    working.set(true);
+                                    action_error.set(None);
+                                    #[cfg(target_arch = "wasm32")]
+                                    spawn_local(async move {
+                                        match parse_workunit_status(&status) {
+                                            Ok(status) => match api::create_work_unit(
+                                                settings,
+                                                workstream_id,
+                                                title,
+                                                task_statement,
+                                                status,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => {
+                                                    unit_title.set(String::new());
+                                                    unit_task_statement.set(String::new());
+                                                    unit_status.set("ready".to_string());
+                                                    action_message.set(Some(
+                                                        "Created work unit.".to_string(),
+                                                    ));
+                                                    refresh_epoch.update(|value| *value += 1);
+                                                    adding_work_unit.set(false);
+                                                }
+                                                Err(error) => action_error.set(Some(error)),
+                                            },
+                                            Err(error) => action_error.set(Some(error)),
+                                        }
+                                        working.set(false);
+                                    });
+                                }
+                            >
+                                "Create work unit"
+                            </button>
+                        </div>
+                    </div>
+                    }.into_any()
+                } else {
+                    view! {}.into_any()
+                }
+            }}
+            <div class="stack">
+                {work_unit_nodes.into_iter().map(|work_unit_node| {
+                    view! {
+                        <WorkUnitCard
+                            node=work_unit_node
+                            dashboard=dashboard.clone()
+                            settings
+                            refresh_epoch
+                            action_message
+                            action_error
+                        />
+                    }
+                }).collect_view()}
+            </div>
+        </article>
+    }
+}
+
+#[component]
+fn WorkUnitCard(
+    node: authority::WorkUnitNode,
+    dashboard: WorkstreamsDashboardData,
+    settings: RwSignal<OperatorServerSettings>,
+    refresh_epoch: RwSignal<u64>,
+    action_message: RwSignal<Option<String>>,
+    action_error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let work_unit_id = node.work_unit.id.clone();
+    let work_unit_revision = node.work_unit.revision;
+    let work_unit_title_display = node.work_unit.title.clone();
+    let work_unit_status_display = node.work_unit.status;
+    let tracked_threads = node.tracked_threads.clone();
+    let load_work_unit_id = work_unit_id.clone();
+    let delete_work_unit_id = work_unit_id.clone();
+    let edit_work_unit_root_id = work_unit_id.clone();
+    let add_thread_root_work_unit_id = work_unit_id.clone();
+    let editing = RwSignal::new(false);
+    let adding_thread = RwSignal::new(false);
+    let working = RwSignal::new(false);
+    let edit_title = RwSignal::new(work_unit_title_display.clone());
+    let edit_task = RwSignal::new(String::new());
+    let edit_status = RwSignal::new(workunit_status_value(work_unit_status_display).to_string());
+    let edit_loaded = RwSignal::new(false);
+    let thread_title = RwSignal::new(String::new());
+    let thread_upstream = RwSignal::new(String::new());
+    let thread_notes = RwSignal::new(String::new());
+
+    view! {
+        <article class="card">
+            <div class="page-header">
+                <div>
+                    <p class="eyebrow">{workunit_status_label(work_unit_status_display)}</p>
+                    <h4>{work_unit_title_display.clone()}</h4>
+                    <p class="item-meta">
+                        {format!("{} tracked threads", tracked_threads.len())}
+                    </p>
+                </div>
+                <div class="action-buttons">
+                    <button
+                        class="refresh-button"
+                        on:click=move |_| {
+                            editing.update(|value| *value = !*value);
+                            if !edit_loaded.get_untracked() {
+                                let settings = settings.get_untracked();
+                                let work_unit_id = load_work_unit_id.clone();
+                                action_error.set(None);
+                                #[cfg(target_arch = "wasm32")]
+                                spawn_local(async move {
+                                    match api::load_work_unit(settings, work_unit_id).await {
+                                        Ok(record) => {
+                                            edit_title.set(record.title);
+                                            edit_task.set(record.task_statement);
+                                            edit_status.set(workunit_status_value(record.status).to_string());
+                                            edit_loaded.set(true);
+                                        }
+                                        Err(error) => action_error.set(Some(error)),
+                                    }
+                                });
+                            }
+                        }
+                    >
+                        {move || if editing.get() { "Close edit" } else { "Edit" }}
+                    </button>
+                    <button class="refresh-button" on:click=move |_| adding_thread.update(|value| *value = !*value)>
+                        {move || if adding_thread.get() { "Close thread form" } else { "Add Codex thread" }}
+                    </button>
+                    <button
+                        class="refresh-button"
+                        disabled=move || working.get()
+                        on:click=move |_| {
+                            let settings = settings.get_untracked();
+                            let work_unit_id = delete_work_unit_id.clone();
+                            working.set(true);
+                            action_error.set(None);
+                            #[cfg(target_arch = "wasm32")]
+                            spawn_local(async move {
+                                match api::delete_work_unit(settings, work_unit_id).await {
+                                    Ok(()) => {
+                                        action_message.set(Some("Deleted work unit.".to_string()));
+                                        refresh_epoch.update(|value| *value += 1);
+                                    }
+                                    Err(error) => action_error.set(Some(error)),
+                                }
+                                working.set(false);
+                            });
+                        }
+                    >
+                        "Delete"
+                    </button>
+                </div>
+            </div>
+            {move || {
+                let save_work_unit_id = edit_work_unit_root_id.clone();
+                if editing.get() {
+                    view! {
+                    <div class="action-form">
+                        <label class="field">
+                            <span>"Title"</span>
+                            <input
+                                type="text"
+                                prop:value=move || edit_title.get()
+                                on:input=move |ev| edit_title.set(event_target_value(&ev))
+                            />
+                        </label>
+                        <label class="field">
+                            <span>"Task statement"</span>
+                            <textarea
+                                rows="3"
+                                prop:value=move || edit_task.get()
+                                on:input=move |ev| edit_task.set(event_target_value(&ev))
+                            ></textarea>
+                        </label>
+                        <label class="field">
+                            <span>"Status"</span>
+                            <select
+                                prop:value=move || edit_status.get()
+                                on:change=move |ev| edit_status.set(event_target_value(&ev))
+                            >
+                                {workunit_status_options()
+                                    .into_iter()
+                                    .map(|(value, label)| view! { <option value=value>{label}</option> })
+                                    .collect_view()}
+                            </select>
+                        </label>
+                        <div class="action-buttons">
+                            <button
+                                class="primary-button"
+                                disabled=move || working.get()
+                                on:click=move |_| {
+                                    let settings = settings.get_untracked();
+                                    let work_unit_id = save_work_unit_id.clone();
+                                    let expected_revision = work_unit_revision;
+                                    let title = edit_title.get_untracked();
+                                    let task = edit_task.get_untracked();
+                                    let status = edit_status.get_untracked();
+                                    working.set(true);
+                                    action_error.set(None);
+                                    #[cfg(target_arch = "wasm32")]
+                                    spawn_local(async move {
+                                        match parse_workunit_status(&status) {
+                                            Ok(status) => match api::edit_work_unit(
+                                                settings,
+                                                work_unit_id,
+                                                expected_revision,
+                                                title,
+                                                task,
+                                                status,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => {
+                                                    action_message.set(Some(
+                                                        "Updated work unit.".to_string(),
+                                                    ));
+                                                    refresh_epoch.update(|value| *value += 1);
+                                                    editing.set(false);
+                                                }
+                                                Err(error) => action_error.set(Some(error)),
+                                            },
+                                            Err(error) => action_error.set(Some(error)),
+                                        }
+                                        working.set(false);
+                                    });
+                                }
+                            >
+                                "Save work unit"
+                            </button>
+                        </div>
+                    </div>
+                    }.into_any()
+                } else {
+                    view! {}.into_any()
+                }
+            }}
+            {move || {
+                let add_thread_work_unit_id = add_thread_root_work_unit_id.clone();
+                if adding_thread.get() {
+                    view! {
+                    <div class="action-form">
+                        <label class="field">
+                            <span>"Thread title"</span>
+                            <input
+                                type="text"
+                                placeholder="Codex lane A"
+                                prop:value=move || thread_title.get()
+                                on:input=move |ev| thread_title.set(event_target_value(&ev))
+                            />
+                        </label>
+                        <label class="field">
+                            <span>"Codex thread id"</span>
+                            <input
+                                type="text"
+                                placeholder="Optional existing upstream thread id"
+                                prop:value=move || thread_upstream.get()
+                                on:input=move |ev| thread_upstream.set(event_target_value(&ev))
+                            />
+                        </label>
+                        <label class="field">
+                            <span>"Notes"</span>
+                            <textarea
+                                rows="2"
+                                prop:value=move || thread_notes.get()
+                                on:input=move |ev| thread_notes.set(event_target_value(&ev))
+                            ></textarea>
+                        </label>
+                        <div class="action-buttons">
+                            <button
+                                class="primary-button"
+                                disabled=move || working.get()
+                                on:click=move |_| {
+                                    let settings = settings.get_untracked();
+                                    let work_unit_id = add_thread_work_unit_id.clone();
+                                    let title = thread_title.get_untracked();
+                                    let upstream = thread_upstream.get_untracked();
+                                    let notes = thread_notes.get_untracked();
+                                    working.set(true);
+                                    action_error.set(None);
+                                    #[cfg(target_arch = "wasm32")]
+                                    spawn_local(async move {
+                                        match api::create_tracked_thread(
+                                            settings,
+                                            work_unit_id,
+                                            title,
+                                            Some(upstream),
+                                            if notes.trim().is_empty() { None } else { Some(notes) },
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                thread_title.set(String::new());
+                                                thread_upstream.set(String::new());
+                                                thread_notes.set(String::new());
+                                                action_message.set(Some(
+                                                    "Added Codex thread to work unit.".to_string(),
+                                                ));
+                                                refresh_epoch.update(|value| *value += 1);
+                                                adding_thread.set(false);
+                                            }
+                                            Err(error) => action_error.set(Some(error)),
+                                        }
+                                        working.set(false);
+                                    });
+                                }
+                            >
+                                "Add Codex thread"
+                            </button>
+                        </div>
+                    </div>
+                    }.into_any()
+                } else {
+                    view! {}.into_any()
+                }
+            }}
+            <div class="stack">
+                {tracked_threads.into_iter().map(|thread| {
+                    view! {
+                        <TrackedThreadCard
+                            thread
+                            dashboard=dashboard.clone()
+                            settings
+                            refresh_epoch
+                            action_message
+                            action_error
+                        />
+                    }
+                }).collect_view()}
+            </div>
+        </article>
+    }
+}
+
+#[component]
+fn TrackedThreadCard(
+    thread: authority::TrackedThreadSummary,
+    dashboard: WorkstreamsDashboardData,
+    settings: RwSignal<OperatorServerSettings>,
+    refresh_epoch: RwSignal<u64>,
+    action_message: RwSignal<Option<String>>,
+    action_error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let runtime = tracked_thread_runtime_status(&thread, &dashboard);
+    let working = RwSignal::new(false);
+
+    view! {
+        <div class="item-card">
+            <div class="item-card-topline">
+                <span class="status-pill">{runtime.headline.clone()}</span>
+                <span class="muted">{thread.id.to_string()}</span>
+            </div>
+            <p class="item-title">{thread.title.clone()}</p>
+            <p class="item-summary">{runtime.detail.clone()}</p>
+            <p class="item-meta">
+                {format!(
+                    "binding {}{}",
+                    humanize_snake_case(
+                        serde_json::to_string(&thread.binding_state)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                    ),
+                    thread
+                        .upstream_thread_id
+                        .as_ref()
+                        .map(|thread_id| format!(" · codex {}", thread_id))
+                        .unwrap_or_default()
+                )}
+            </p>
+            {move || match thread.workspace_status {
+                Some(status) => view! {
+                    <p class="item-meta">
+                        {format!(
+                            "workspace {}",
+                            humanize_snake_case(
+                                serde_json::to_string(&status).unwrap_or_default().trim_matches('"')
+                            )
+                        )}
+                    </p>
+                }.into_any(),
+                None => view! {}.into_any(),
+            }}
+            {move || match runtime.assignment_id.clone() {
+                Some(assignment_id) => view! {
+                    <p class="item-meta">{format!("assignment {}", assignment_id)}</p>
+                }.into_any(),
+                None => view! {}.into_any(),
+            }}
+            <div class="action-buttons">
+                <button
+                    class="refresh-button"
+                    disabled=move || working.get()
+                    on:click=move |_| {
+                        let settings = settings.get_untracked();
+                        let tracked_thread_id = thread.id.clone();
+                        working.set(true);
+                        action_error.set(None);
+                        #[cfg(target_arch = "wasm32")]
+                        spawn_local(async move {
+                            match api::delete_tracked_thread(settings, tracked_thread_id).await {
+                                Ok(()) => {
+                                    action_message.set(Some(
+                                        "Removed Codex thread from work unit.".to_string(),
+                                    ));
+                                    refresh_epoch.update(|value| *value += 1);
+                                }
+                                Err(error) => action_error.set(Some(error)),
+                            }
+                            working.set(false);
+                        });
+                    }
+                >
+                    "Remove"
+                </button>
+            </div>
+        </div>
     }
 }
 
@@ -1773,6 +2598,76 @@ fn NotFoundPage() -> impl IntoView {
 fn watch_error_or_log(error: String) {
     #[cfg(target_arch = "wasm32")]
     web_sys::console::error_1(&error.into());
+}
+
+fn workstream_status_options() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("active", "Active"),
+        ("blocked", "Blocked"),
+        ("completed", "Completed"),
+    ]
+}
+
+fn workunit_status_options() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("ready", "Ready"),
+        ("blocked", "Blocked"),
+        ("running", "Running"),
+        ("awaiting_decision", "Awaiting decision"),
+        ("accepted", "Accepted"),
+        ("needs_human", "Needs human"),
+        ("completed", "Completed"),
+    ]
+}
+
+fn parse_workstream_status(value: &str) -> Result<WorkstreamStatus, String> {
+    match value {
+        "active" => Ok(WorkstreamStatus::Active),
+        "blocked" => Ok(WorkstreamStatus::Blocked),
+        "completed" => Ok(WorkstreamStatus::Completed),
+        other => Err(format!("unsupported workstream status `{other}`")),
+    }
+}
+
+fn parse_workunit_status(value: &str) -> Result<WorkUnitStatus, String> {
+    match value {
+        "ready" => Ok(WorkUnitStatus::Ready),
+        "blocked" => Ok(WorkUnitStatus::Blocked),
+        "running" => Ok(WorkUnitStatus::Running),
+        "awaiting_decision" => Ok(WorkUnitStatus::AwaitingDecision),
+        "accepted" => Ok(WorkUnitStatus::Accepted),
+        "needs_human" => Ok(WorkUnitStatus::NeedsHuman),
+        "completed" => Ok(WorkUnitStatus::Completed),
+        other => Err(format!("unsupported work unit status `{other}`")),
+    }
+}
+
+fn workstream_status_value(status: WorkstreamStatus) -> &'static str {
+    match status {
+        WorkstreamStatus::Active => "active",
+        WorkstreamStatus::Blocked => "blocked",
+        WorkstreamStatus::Completed => "completed",
+    }
+}
+
+fn workunit_status_value(status: WorkUnitStatus) -> &'static str {
+    match status {
+        WorkUnitStatus::Ready => "ready",
+        WorkUnitStatus::Blocked => "blocked",
+        WorkUnitStatus::Running => "running",
+        WorkUnitStatus::AwaitingDecision => "awaiting_decision",
+        WorkUnitStatus::Accepted => "accepted",
+        WorkUnitStatus::NeedsHuman => "needs_human",
+        WorkUnitStatus::Completed => "completed",
+    }
+}
+
+fn workstream_status_label(status: WorkstreamStatus) -> String {
+    humanize_snake_case(workstream_status_value(status))
+}
+
+fn workunit_status_label(status: WorkUnitStatus) -> String {
+    humanize_snake_case(workunit_status_value(status))
 }
 
 #[cfg(test)]

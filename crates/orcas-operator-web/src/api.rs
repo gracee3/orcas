@@ -1,6 +1,12 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_variables))]
 
+use orcas_core::authority;
 use orcas_core::ipc::{
+    AuthorityDeletePlanRequest, AuthorityHierarchyGetRequest,
+    AuthorityTrackedThreadCreateRequest, AuthorityTrackedThreadDeleteRequest,
+    AuthorityWorkstreamCreateRequest, AuthorityWorkstreamEditRequest,
+    AuthorityWorkunitCreateRequest, AuthorityWorkunitDeleteRequest,
+    AuthorityWorkunitEditRequest, AuthorityWorkunitGetRequest, StateGetRequest,
     NotificationDeliveryJobListRequest, NotificationRecipientUpsertRequest,
     NotificationSubscriptionListRequest, NotificationSubscriptionSetEnabledRequest,
     NotificationSubscriptionUpsertRequest, NotificationTransportKind,
@@ -22,6 +28,7 @@ use crate::pwa::{
     self, BrowserNotificationPermission, BrowserPushState, BrowserPushSubscriptionSnapshot,
 };
 use crate::storage;
+use crate::workstreams::WorkstreamsDashboardData;
 
 fn client_from_settings(settings: &OperatorServerSettings) -> Result<OrcasServerClient, String> {
     if settings.server_url.trim().is_empty() {
@@ -42,6 +49,14 @@ fn configured_origin(settings: &OperatorServerSettings) -> Result<&str, String> 
         return Err("origin node id is required".to_string());
     }
     Ok(origin)
+}
+
+fn command_metadata(settings: &OperatorServerSettings) -> Result<authority::CommandMetadata, String> {
+    let origin = authority::OriginNodeId::parse(configured_origin(settings)?.to_string())
+        .map_err(|error| error.to_string())?;
+    let actor =
+        authority::CommandActor::parse("operator_web").map_err(|error| error.to_string())?;
+    Ok(authority::CommandMetadata::new(origin, actor))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +253,251 @@ pub async fn load_inbox_page(settings: OperatorServerSettings) -> Result<InboxPa
         .await
         .map_err(|error| error.to_string())?;
     Ok(build_inbox_page(response.origin_node_id, &response.items))
+}
+
+pub async fn load_workstreams_dashboard(
+    settings: OperatorServerSettings,
+) -> Result<WorkstreamsDashboardData, String> {
+    let client = client_from_settings(&settings)?;
+    let hierarchy = client
+        .authority_hierarchy_get(&AuthorityHierarchyGetRequest::default())
+        .await
+        .map_err(|error| error.to_string())?
+        .hierarchy;
+    let snapshot = client
+        .state_get(&StateGetRequest::default())
+        .await
+        .map_err(|error| error.to_string())?
+        .snapshot;
+    Ok(WorkstreamsDashboardData { hierarchy, snapshot })
+}
+
+pub async fn create_workstream(
+    settings: OperatorServerSettings,
+    title: String,
+    objective: String,
+    status: orcas_core::WorkstreamStatus,
+    priority: String,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .authority_workstream_create(&AuthorityWorkstreamCreateRequest {
+            command: authority::CreateWorkstream {
+                metadata: command_metadata(&settings)?,
+                workstream_id: authority::WorkstreamId::new(),
+                title,
+                objective,
+                status,
+                priority,
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn edit_workstream(
+    settings: OperatorServerSettings,
+    workstream_id: authority::WorkstreamId,
+    expected_revision: authority::Revision,
+    title: String,
+    objective: String,
+    status: orcas_core::WorkstreamStatus,
+    priority: String,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .authority_workstream_edit(&AuthorityWorkstreamEditRequest {
+            command: authority::EditWorkstream {
+                metadata: command_metadata(&settings)?,
+                workstream_id,
+                expected_revision,
+                changes: authority::WorkstreamPatch {
+                    title: Some(title),
+                    objective: Some(objective),
+                    status: Some(status),
+                    priority: Some(priority),
+                },
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn delete_workstream(
+    settings: OperatorServerSettings,
+    workstream_id: authority::WorkstreamId,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    let delete_plan = client
+        .authority_delete_plan(&AuthorityDeletePlanRequest {
+            target: authority::DeleteTarget::Workstream {
+                workstream_id: workstream_id.clone(),
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .delete_plan;
+    client
+        .authority_workstream_delete(&orcas_core::ipc::AuthorityWorkstreamDeleteRequest {
+            command: authority::DeleteWorkstream {
+                metadata: command_metadata(&settings)?,
+                workstream_id,
+                expected_revision: delete_plan.expected_revision,
+                delete_token: delete_plan.confirmation_token,
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn load_work_unit(
+    settings: OperatorServerSettings,
+    work_unit_id: authority::WorkUnitId,
+) -> Result<authority::WorkUnitRecord, String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .authority_workunit_get(&AuthorityWorkunitGetRequest { work_unit_id })
+        .await
+        .map_err(|error| error.to_string())
+        .map(|response| response.work_unit)
+}
+
+pub async fn create_work_unit(
+    settings: OperatorServerSettings,
+    workstream_id: authority::WorkstreamId,
+    title: String,
+    task_statement: String,
+    status: orcas_core::WorkUnitStatus,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .authority_workunit_create(&AuthorityWorkunitCreateRequest {
+            command: authority::CreateWorkUnit {
+                metadata: command_metadata(&settings)?,
+                work_unit_id: authority::WorkUnitId::new(),
+                workstream_id,
+                title,
+                task_statement,
+                status,
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn edit_work_unit(
+    settings: OperatorServerSettings,
+    work_unit_id: authority::WorkUnitId,
+    expected_revision: authority::Revision,
+    title: String,
+    task_statement: String,
+    status: orcas_core::WorkUnitStatus,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .authority_workunit_edit(&AuthorityWorkunitEditRequest {
+            command: authority::EditWorkUnit {
+                metadata: command_metadata(&settings)?,
+                work_unit_id,
+                expected_revision,
+                changes: authority::WorkUnitPatch {
+                    title: Some(title),
+                    task_statement: Some(task_statement),
+                    status: Some(status),
+                },
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn delete_work_unit(
+    settings: OperatorServerSettings,
+    work_unit_id: authority::WorkUnitId,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    let delete_plan = client
+        .authority_delete_plan(&AuthorityDeletePlanRequest {
+            target: authority::DeleteTarget::WorkUnit {
+                work_unit_id: work_unit_id.clone(),
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .delete_plan;
+    client
+        .authority_workunit_delete(&AuthorityWorkunitDeleteRequest {
+            command: authority::DeleteWorkUnit {
+                metadata: command_metadata(&settings)?,
+                work_unit_id,
+                expected_revision: delete_plan.expected_revision,
+                delete_token: delete_plan.confirmation_token,
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn create_tracked_thread(
+    settings: OperatorServerSettings,
+    work_unit_id: authority::WorkUnitId,
+    title: String,
+    upstream_thread_id: Option<String>,
+    notes: Option<String>,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .authority_tracked_thread_create(&AuthorityTrackedThreadCreateRequest {
+            command: authority::CreateTrackedThread {
+                metadata: command_metadata(&settings)?,
+                tracked_thread_id: authority::TrackedThreadId::new(),
+                work_unit_id,
+                title,
+                notes,
+                backend_kind: authority::TrackedThreadBackendKind::Codex,
+                upstream_thread_id: upstream_thread_id.filter(|value| !value.trim().is_empty()),
+                preferred_cwd: None,
+                preferred_model: None,
+                workspace: None,
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn delete_tracked_thread(
+    settings: OperatorServerSettings,
+    tracked_thread_id: authority::TrackedThreadId,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    let delete_plan = client
+        .authority_delete_plan(&AuthorityDeletePlanRequest {
+            target: authority::DeleteTarget::TrackedThread {
+                tracked_thread_id: tracked_thread_id.clone(),
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .delete_plan;
+    client
+        .authority_tracked_thread_delete(&AuthorityTrackedThreadDeleteRequest {
+            command: authority::DeleteTrackedThread {
+                metadata: command_metadata(&settings)?,
+                tracked_thread_id,
+                expected_revision: delete_plan.expected_revision,
+                delete_token: delete_plan.confirmation_token,
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub async fn load_inbox_item_detail(

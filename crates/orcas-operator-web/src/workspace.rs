@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceSection {
+    Workstreams,
     Inbox,
     Notifications,
     Deliveries,
@@ -14,6 +15,7 @@ pub enum WorkspaceSection {
 impl WorkspaceSection {
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Workstreams => "Workstreams",
             Self::Inbox => "Inbox",
             Self::Notifications => "Notifications",
             Self::Deliveries => "Deliveries",
@@ -23,6 +25,7 @@ impl WorkspaceSection {
 
     pub const fn href(self) -> &'static str {
         match self {
+            Self::Workstreams => "/workstreams",
             Self::Inbox => "/inbox",
             Self::Notifications => "/notifications",
             Self::Deliveries => "/deliveries",
@@ -196,7 +199,7 @@ pub struct WorkspaceState {
 impl Default for WorkspaceState {
     fn default() -> Self {
         Self {
-            active_section: WorkspaceSection::Inbox,
+            active_section: WorkspaceSection::Workstreams,
             focus: None,
         }
     }
@@ -330,9 +333,9 @@ mod tests {
     }
 
     #[test]
-    fn workspace_state_defaults_to_inbox_section() {
+    fn workspace_state_defaults_to_workstreams_section() {
         let state = WorkspaceState::default();
-        assert_eq!(state.active_section, WorkspaceSection::Inbox);
+        assert_eq!(state.active_section, WorkspaceSection::Workstreams);
         assert!(state.focus.is_none());
     }
 

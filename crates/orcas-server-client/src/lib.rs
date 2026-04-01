@@ -1,6 +1,17 @@
 use tracing::debug;
 
 use orcas_core::ipc::{
+    AuthorityDeletePlanRequest, AuthorityDeletePlanResponse, AuthorityHierarchyGetRequest,
+    AuthorityHierarchyGetResponse, AuthorityTrackedThreadCreateRequest,
+    AuthorityTrackedThreadCreateResponse, AuthorityTrackedThreadDeleteRequest,
+    AuthorityTrackedThreadDeleteResponse, AuthorityWorkstreamCreateRequest,
+    AuthorityWorkstreamCreateResponse, AuthorityWorkstreamDeleteRequest,
+    AuthorityWorkstreamDeleteResponse, AuthorityWorkstreamEditRequest,
+    AuthorityWorkstreamEditResponse, AuthorityWorkunitCreateRequest,
+    AuthorityWorkunitCreateResponse, AuthorityWorkunitDeleteRequest,
+    AuthorityWorkunitDeleteResponse, AuthorityWorkunitEditRequest,
+    AuthorityWorkunitEditResponse, AuthorityWorkunitGetRequest,
+    AuthorityWorkunitGetResponse,
     NotificationDeliveryJobGetRequest, NotificationDeliveryJobGetResponse,
     NotificationDeliveryJobListRequest, NotificationDeliveryJobListResponse,
     NotificationDeliveryRunPendingRequest, NotificationDeliveryRunPendingResponse,
@@ -24,7 +35,7 @@ use orcas_core::ipc::{
     OperatorRemoteActionFailResponse, OperatorRemoteActionGetRequest,
     OperatorRemoteActionGetResponse, OperatorRemoteActionListRequest,
     OperatorRemoteActionListResponse, OperatorRemoteActionWaitRequest,
-    OperatorRemoteActionWaitResponse,
+    OperatorRemoteActionWaitResponse, StateGetRequest, StateGetResponse,
 };
 use orcas_core::{OrcasError, OrcasResult};
 use uuid::Uuid;
@@ -391,6 +402,97 @@ impl OrcasServerClient {
             "remote action wait resolved"
         );
         Ok(response)
+    }
+
+    pub async fn state_get(&self, request: &StateGetRequest) -> OrcasResult<StateGetResponse> {
+        self.post_json("operator-runtime/state/get", request).await
+    }
+
+    pub async fn authority_hierarchy_get(
+        &self,
+        request: &AuthorityHierarchyGetRequest,
+    ) -> OrcasResult<AuthorityHierarchyGetResponse> {
+        self.post_json("operator-authority/hierarchy/get", request)
+            .await
+    }
+
+    pub async fn authority_delete_plan(
+        &self,
+        request: &AuthorityDeletePlanRequest,
+    ) -> OrcasResult<AuthorityDeletePlanResponse> {
+        self.post_json("operator-authority/delete-plan", request).await
+    }
+
+    pub async fn authority_workstream_create(
+        &self,
+        request: &AuthorityWorkstreamCreateRequest,
+    ) -> OrcasResult<AuthorityWorkstreamCreateResponse> {
+        self.post_json("operator-authority/workstreams/create", request)
+            .await
+    }
+
+    pub async fn authority_workstream_edit(
+        &self,
+        request: &AuthorityWorkstreamEditRequest,
+    ) -> OrcasResult<AuthorityWorkstreamEditResponse> {
+        self.post_json("operator-authority/workstreams/edit", request)
+            .await
+    }
+
+    pub async fn authority_workstream_delete(
+        &self,
+        request: &AuthorityWorkstreamDeleteRequest,
+    ) -> OrcasResult<AuthorityWorkstreamDeleteResponse> {
+        self.post_json("operator-authority/workstreams/delete", request)
+            .await
+    }
+
+    pub async fn authority_workunit_get(
+        &self,
+        request: &AuthorityWorkunitGetRequest,
+    ) -> OrcasResult<AuthorityWorkunitGetResponse> {
+        self.post_json("operator-authority/workunits/get", request)
+            .await
+    }
+
+    pub async fn authority_workunit_create(
+        &self,
+        request: &AuthorityWorkunitCreateRequest,
+    ) -> OrcasResult<AuthorityWorkunitCreateResponse> {
+        self.post_json("operator-authority/workunits/create", request)
+            .await
+    }
+
+    pub async fn authority_workunit_edit(
+        &self,
+        request: &AuthorityWorkunitEditRequest,
+    ) -> OrcasResult<AuthorityWorkunitEditResponse> {
+        self.post_json("operator-authority/workunits/edit", request)
+            .await
+    }
+
+    pub async fn authority_workunit_delete(
+        &self,
+        request: &AuthorityWorkunitDeleteRequest,
+    ) -> OrcasResult<AuthorityWorkunitDeleteResponse> {
+        self.post_json("operator-authority/workunits/delete", request)
+            .await
+    }
+
+    pub async fn authority_tracked_thread_create(
+        &self,
+        request: &AuthorityTrackedThreadCreateRequest,
+    ) -> OrcasResult<AuthorityTrackedThreadCreateResponse> {
+        self.post_json("operator-authority/tracked-threads/create", request)
+            .await
+    }
+
+    pub async fn authority_tracked_thread_delete(
+        &self,
+        request: &AuthorityTrackedThreadDeleteRequest,
+    ) -> OrcasResult<AuthorityTrackedThreadDeleteResponse> {
+        self.post_json("operator-authority/tracked-threads/delete", request)
+            .await
     }
 }
 

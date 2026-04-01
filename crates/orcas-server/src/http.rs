@@ -8,13 +8,28 @@ use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::time::{Duration, Instant, sleep};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::delivery::WebPushNotificationDeliveryTransport;
 use crate::delivery::{LogNotificationDeliveryTransport, MockNotificationDeliveryTransport};
 use orcas_core::ipc::{
+    AuthorityDeletePlanRequest, AuthorityDeletePlanResponse, AuthorityHierarchyGetRequest,
+    AuthorityHierarchyGetResponse, AuthorityTrackedThreadCreateRequest,
+    AuthorityTrackedThreadCreateResponse, AuthorityTrackedThreadDeleteRequest,
+    AuthorityTrackedThreadDeleteResponse, AuthorityWorkstreamCreateRequest,
+    AuthorityWorkstreamCreateResponse, AuthorityWorkstreamDeleteRequest,
+    AuthorityWorkstreamDeleteResponse, AuthorityWorkstreamEditRequest,
+    AuthorityWorkstreamEditResponse, AuthorityWorkunitCreateRequest,
+    AuthorityWorkunitCreateResponse, AuthorityWorkunitDeleteRequest,
+    AuthorityWorkunitDeleteResponse, AuthorityWorkunitEditRequest,
+    AuthorityWorkunitEditResponse, AuthorityWorkunitGetRequest,
+    AuthorityWorkunitGetResponse,
     NotificationDeliveryJobGetRequest, NotificationDeliveryJobGetResponse,
     NotificationDeliveryJobListRequest, NotificationDeliveryJobListResponse,
     NotificationDeliveryRunPendingRequest, NotificationDeliveryRunPendingResponse,
@@ -39,8 +54,10 @@ use orcas_core::ipc::{
     OperatorRemoteActionFailRequest, OperatorRemoteActionFailResponse,
     OperatorRemoteActionGetRequest, OperatorRemoteActionGetResponse,
     OperatorRemoteActionListRequest, OperatorRemoteActionListResponse,
-    OperatorRemoteActionWaitRequest, OperatorRemoteActionWaitResponse,
+    OperatorRemoteActionWaitRequest, OperatorRemoteActionWaitResponse, StateGetRequest,
+    StateGetResponse,
 };
+use orcas_core::jsonrpc::{JsonRpcMessage, JsonRpcRequest, RequestId};
 use orcas_core::{AppPaths, OrcasResult};
 
 use crate::store::InboxMirrorStore;
@@ -49,6 +66,7 @@ use crate::store::InboxMirrorStore;
 pub struct InboxMirrorServerConfig {
     pub bind_addr: SocketAddr,
     pub data_dir: PathBuf,
+    pub daemon_socket_file: Option<PathBuf>,
     pub operator_api_token: Option<String>,
     pub push_vapid_private_key_base64: Option<String>,
     pub push_vapid_subject: Option<String>,
@@ -57,6 +75,7 @@ pub struct InboxMirrorServerConfig {
 #[derive(Clone)]
 struct InboxMirrorServerState {
     store: Arc<InboxMirrorStore>,
+    daemon_socket_file: Option<PathBuf>,
     operator_api_token: Option<String>,
     web_push_delivery: Option<WebPushNotificationDeliveryTransport>,
 }
@@ -82,11 +101,14 @@ impl InboxMirrorServer {
             )),
             _ => None,
         };
-        Self::with_operator_api_token_and_web_push(
-            store,
-            config.operator_api_token,
-            web_push_delivery,
-        )
+        Self {
+            state: Arc::new(InboxMirrorServerState {
+                store: Arc::new(store),
+                daemon_socket_file: config.daemon_socket_file,
+                operator_api_token: config.operator_api_token,
+                web_push_delivery,
+            }),
+        }
     }
 
     pub fn with_operator_api_token(
@@ -104,6 +126,7 @@ impl InboxMirrorServer {
         Self {
             state: Arc::new(InboxMirrorServerState {
                 store: Arc::new(store),
+                daemon_socket_file: None,
                 operator_api_token,
                 web_push_delivery,
             }),
@@ -243,6 +266,45 @@ impl InboxMirrorServer {
                 post(complete_remote_action_request),
             )
             .route("/operator-actions/fail", post(fail_remote_action_request))
+            .route("/operator-runtime/state/get", post(state_get))
+            .route("/operator-authority/hierarchy/get", post(authority_hierarchy_get))
+            .route("/operator-authority/delete-plan", post(authority_delete_plan))
+            .route(
+                "/operator-authority/workstreams/create",
+                post(authority_workstream_create),
+            )
+            .route(
+                "/operator-authority/workstreams/edit",
+                post(authority_workstream_edit),
+            )
+            .route(
+                "/operator-authority/workstreams/delete",
+                post(authority_workstream_delete),
+            )
+            .route(
+                "/operator-authority/workunits/get",
+                post(authority_workunit_get),
+            )
+            .route(
+                "/operator-authority/workunits/create",
+                post(authority_workunit_create),
+            )
+            .route(
+                "/operator-authority/workunits/edit",
+                post(authority_workunit_edit),
+            )
+            .route(
+                "/operator-authority/workunits/delete",
+                post(authority_workunit_delete),
+            )
+            .route(
+                "/operator-authority/tracked-threads/create",
+                post(authority_tracked_thread_create),
+            )
+            .route(
+                "/operator-authority/tracked-threads/delete",
+                post(authority_tracked_thread_delete),
+            )
             // Trunk serves the browser app from a different port during local
             // development, so allow cross-origin operator requests.
             .layer(CorsLayer::permissive())
@@ -276,6 +338,65 @@ async fn operator_auth(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(request).await)
+}
+
+async fn daemon_request<P, T>(
+    state: &InboxMirrorServerState,
+    method: &str,
+    params: &P,
+) -> Result<T, String>
+where
+    P: Serialize,
+    T: DeserializeOwned,
+{
+    let socket_path = state
+        .daemon_socket_file
+        .as_ref()
+        .ok_or_else(|| "daemon socket is not configured for this server".to_string())?;
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(|error| format!("failed to connect to daemon socket {}: {error}", socket_path.display()))?;
+    let payload = serde_json::to_value(params).map_err(|error| error.to_string())?;
+    let request = JsonRpcRequest::new(
+        RequestId::Integer(1),
+        method,
+        Some(payload),
+    );
+    let mut line = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    line.push(b'\n');
+    stream
+        .write_all(&line)
+        .await
+        .map_err(|error| format!("failed to write daemon request: {error}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|error| format!("failed to flush daemon request: {error}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    let bytes = reader
+        .read_line(&mut response_line)
+        .await
+        .map_err(|error| format!("failed to read daemon response: {error}"))?;
+    if bytes == 0 {
+        return Err("daemon closed the socket before sending a response".to_string());
+    }
+    let message: JsonRpcMessage =
+        serde_json::from_str(&response_line).map_err(|error| error.to_string())?;
+    match message {
+        JsonRpcMessage::Response(response) => {
+            serde_json::from_value(response.result).map_err(|error| error.to_string())
+        }
+        JsonRpcMessage::Error(error) => Err(error.error.message),
+        JsonRpcMessage::Notification(notification) => Err(format!(
+            "unexpected daemon notification `{}` while waiting for `{method}`",
+            notification.method
+        )),
+        JsonRpcMessage::Request(request) => Err(format!(
+            "unexpected daemon request `{}` while waiting for `{method}`",
+            request.method
+        )),
+    }
 }
 
 async fn apply(
@@ -665,6 +786,169 @@ async fn fail_remote_action_request(
     Ok(Json(response))
 }
 
+async fn state_get(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<StateGetRequest>,
+) -> Result<Json<StateGetResponse>, String> {
+    Ok(Json(
+        daemon_request(&state, orcas_core::ipc::methods::STATE_GET, &request).await?,
+    ))
+}
+
+async fn authority_hierarchy_get(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityHierarchyGetRequest>,
+) -> Result<Json<AuthorityHierarchyGetResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_HIERARCHY_GET,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn authority_delete_plan(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityDeletePlanRequest>,
+) -> Result<Json<AuthorityDeletePlanResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_DELETE_PLAN,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn authority_workstream_create(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityWorkstreamCreateRequest>,
+) -> Result<Json<AuthorityWorkstreamCreateResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_WORKSTREAM_CREATE,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn authority_workstream_edit(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityWorkstreamEditRequest>,
+) -> Result<Json<AuthorityWorkstreamEditResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_WORKSTREAM_EDIT,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn authority_workstream_delete(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityWorkstreamDeleteRequest>,
+) -> Result<Json<AuthorityWorkstreamDeleteResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_WORKSTREAM_DELETE,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn authority_workunit_get(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityWorkunitGetRequest>,
+) -> Result<Json<AuthorityWorkunitGetResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_WORKUNIT_GET,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn authority_workunit_create(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityWorkunitCreateRequest>,
+) -> Result<Json<AuthorityWorkunitCreateResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_WORKUNIT_CREATE,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn authority_workunit_edit(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityWorkunitEditRequest>,
+) -> Result<Json<AuthorityWorkunitEditResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_WORKUNIT_EDIT,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn authority_workunit_delete(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityWorkunitDeleteRequest>,
+) -> Result<Json<AuthorityWorkunitDeleteResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_WORKUNIT_DELETE,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn authority_tracked_thread_create(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityTrackedThreadCreateRequest>,
+) -> Result<Json<AuthorityTrackedThreadCreateResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_TRACKED_THREAD_CREATE,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn authority_tracked_thread_delete(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityTrackedThreadDeleteRequest>,
+) -> Result<Json<AuthorityTrackedThreadDeleteResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_TRACKED_THREAD_DELETE,
+            &request,
+        )
+        .await?,
+    ))
+}
+
 pub fn app(store: InboxMirrorStore) -> Router {
     app_with_operator_api_token(store, None)
 }
@@ -675,6 +959,7 @@ pub fn app_with_operator_api_token(
 ) -> Router {
     let state = Arc::new(InboxMirrorServerState {
         store: Arc::new(store),
+        daemon_socket_file: None,
         operator_api_token,
         web_push_delivery: None,
     });
@@ -753,6 +1038,45 @@ pub fn app_with_operator_api_token(
             post(complete_remote_action_request),
         )
         .route("/operator-actions/fail", post(fail_remote_action_request))
+        .route("/operator-runtime/state/get", post(state_get))
+        .route("/operator-authority/hierarchy/get", post(authority_hierarchy_get))
+        .route("/operator-authority/delete-plan", post(authority_delete_plan))
+        .route(
+            "/operator-authority/workstreams/create",
+            post(authority_workstream_create),
+        )
+        .route(
+            "/operator-authority/workstreams/edit",
+            post(authority_workstream_edit),
+        )
+        .route(
+            "/operator-authority/workstreams/delete",
+            post(authority_workstream_delete),
+        )
+        .route(
+            "/operator-authority/workunits/get",
+            post(authority_workunit_get),
+        )
+        .route(
+            "/operator-authority/workunits/create",
+            post(authority_workunit_create),
+        )
+        .route(
+            "/operator-authority/workunits/edit",
+            post(authority_workunit_edit),
+        )
+        .route(
+            "/operator-authority/workunits/delete",
+            post(authority_workunit_delete),
+        )
+        .route(
+            "/operator-authority/tracked-threads/create",
+            post(authority_tracked_thread_create),
+        )
+        .route(
+            "/operator-authority/tracked-threads/delete",
+            post(authority_tracked_thread_delete),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), operator_auth))
         .with_state(state)
 }

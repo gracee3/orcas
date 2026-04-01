@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
     let config = orcas_server::InboxMirrorServerConfig {
         bind_addr: cli.bind,
         data_dir: paths.data_dir.clone(),
+        daemon_socket_file: Some(paths.socket_file.clone()),
         operator_api_token: cli.operator_api_token,
         push_vapid_private_key_base64: cli.push_vapid_private_key_base64,
         push_vapid_subject: cli.push_vapid_subject,
