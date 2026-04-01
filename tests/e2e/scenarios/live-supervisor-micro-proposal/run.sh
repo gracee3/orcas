@@ -7,6 +7,7 @@ fixture_dir="$scenario_dir/fixture"
 
 e2e_load_scenario_metadata "$scenario_dir"
 e2e_prepare_scenario_dirs "$NAME"
+e2e_require_local_supervisor_endpoint
 
 field_value() {
   local key="$1"
@@ -20,8 +21,8 @@ short_xdg_config_home="$short_xdg_root/config"
 short_xdg_runtime_home="$short_xdg_root/runtime"
 listen_port="$((5600 + ($(printf '%s' "$E2E_RUN_ID" | cksum | awk '{print $1}') % 1000)))"
 listen_url="ws://127.0.0.1:$listen_port"
-supervisor_base_url="${ORCAS_SUPERVISOR_BASE_URL:-http://127.0.0.1:8000/v1}"
-supervisor_model="${ORCAS_SUPERVISOR_MODEL:-gpt-oss-20b}"
+supervisor_base_url="${ORCAS_SUPERVISOR_BASE_URL}"
+supervisor_model="${ORCAS_SUPERVISOR_MODEL}"
 supervisor_api_key_env="${ORCAS_SUPERVISOR_API_KEY_ENV:-}"
 supervisor_reasoning_effort="${ORCAS_SUPERVISOR_REASONING_EFFORT:-}"
 supervisor_max_output_tokens="${ORCAS_SUPERVISOR_MAX_OUTPUT_TOKENS:-16384}"
@@ -72,7 +73,7 @@ rm -rf "$fixture_repo"
 mkdir -p "$fixture_repo" "$reports_dir" "$artifacts_dir"
 cp -R "$fixture_dir/." "$fixture_repo/"
 
-e2e_orcas daemon start --force-spawn >"$daemon_log" 2>&1 &
+e2e_orcasd >"$daemon_log" 2>&1 &
 daemon_pid=$!
 cleanup() {
   kill "$daemon_pid" >/dev/null 2>&1 || true

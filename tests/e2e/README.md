@@ -37,6 +37,11 @@ Each scenario must provide `scenario.env` with shell-friendly key/value pairs:
 
 Metadata is validated before execution. Missing or malformed metadata fails the run.
 
+Lane contract:
+
+- the default daily deterministic lane is expected to work from a normal dirty developer checkout
+- scenarios that require a clean git tree are opt-in and must not be default-enabled
+
 ## Running Scenarios
 
 Run the default deterministic lane:
@@ -44,6 +49,8 @@ Run the default deterministic lane:
 ```bash
 make test-e2e
 ```
+
+That default lane is the daily confidence path. It should stay usable from an ordinary in-progress checkout.
 
 Run the live-only lane:
 
@@ -78,18 +85,35 @@ tests/e2e/run_scenario.sh tests/e2e/scenarios/hello
 
 ### Local Supervisor Models
 
-The live supervisor scenario can use a local OpenAI-compatible Responses endpoint, such as vLLM.
+Only scenarios that actually generate a live supervisor proposal require a local OpenAI-compatible supervisor endpoint.
 
-For [`live-supervisor-micro-proposal`](./scenarios/live-supervisor-micro-proposal), set:
+Current live supervisor proposal scenarios:
+
+- `supervisor-planning`
+- `live-supervisor-micro-proposal`
+- `live-reject-redirect`
+- `live-multi-phase-lane`
+
+These scenarios are opt-in. They are not part of the default daily deterministic lane.
+
+Seeded proposal scenarios remain model-free:
+
+- `proposals-decisions`
+- `phased-fibonacci`
+
+For live supervisor proposal scenarios, export:
 
 ```bash
-export ORCAS_SUPERVISOR_BASE_URL="http://127.0.0.1:8000/v1"
-export ORCAS_SUPERVISOR_MODEL="gpt-oss-20b"
-export ORCAS_SUPERVISOR_API_KEY_ENV=""
-export ORCAS_SUPERVISOR_REASONING_EFFORT=""
+export ORCAS_E2E_SUPERVISOR_BASE_URL="http://127.0.0.1:8000/v1"
+export ORCAS_E2E_SUPERVISOR_MODEL="gpt-oss-20b"
+export ORCAS_E2E_SUPERVISOR_API_KEY_ENV=""
+export ORCAS_E2E_SUPERVISOR_REASONING_EFFORT=""
+export ORCAS_E2E_SUPERVISOR_MAX_OUTPUT_TOKENS="2048"
 ```
 
-The scenario runner writes those values into its repo-local config before the daemon starts. If you leave them unset, the scenario defaults to the local vLLM-shaped configuration shown above.
+The scenario runner probes `.../models` before it starts. If those variables are unset, or if the endpoint is unreachable, the scenario fails immediately with an actionable message instead of silently depending on a hidden local model setup.
+
+The harness still accepts the older `ORCAS_E2E_QWEN_*` variable names as a fallback, but the intended contract is provider-neutral: any local OpenAI-compatible endpoint is acceptable for these opt-in proposal scenarios.
 
 ## Cleanup
 

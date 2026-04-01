@@ -182,6 +182,54 @@ e2e_prepare_scenario_dirs() {
   chmod 700 "$E2E_SCENARIO_XDG_RUNTIME_HOME" || true
 }
 
+e2e_use_short_xdg_paths() {
+  local suffix="$1"
+  [[ -n "$suffix" ]] || e2e_fail "short XDG path suffix is required"
+
+  local short_xdg_root="$e2e_output_root/xdg/$E2E_RUN_ID/$suffix"
+  local short_xdg_data_home="$short_xdg_root/data"
+  local short_xdg_config_home="$short_xdg_root/config"
+  local short_xdg_runtime_home="$short_xdg_root/runtime"
+
+  rm -rf "$short_xdg_root"
+  mkdir -p \
+    "$short_xdg_data_home/orcas" \
+    "$short_xdg_config_home/orcas" \
+    "$short_xdg_runtime_home/orcas"
+  chmod 700 "$short_xdg_runtime_home" || true
+
+  E2E_SCENARIO_XDG_DIR="$short_xdg_root"
+  E2E_SCENARIO_XDG_DATA_HOME="$short_xdg_data_home"
+  E2E_SCENARIO_XDG_CONFIG_HOME="$short_xdg_config_home"
+  E2E_SCENARIO_XDG_RUNTIME_HOME="$short_xdg_runtime_home"
+
+  export E2E_SCENARIO_XDG_DIR \
+    E2E_SCENARIO_XDG_DATA_HOME \
+    E2E_SCENARIO_XDG_CONFIG_HOME \
+    E2E_SCENARIO_XDG_RUNTIME_HOME \
+    ORCAS_E2E_XDG_DATA_HOME="$short_xdg_data_home" \
+    ORCAS_E2E_XDG_CONFIG_HOME="$short_xdg_config_home" \
+    ORCAS_E2E_XDG_RUNTIME_HOME="$short_xdg_runtime_home"
+}
+
+e2e_require_local_supervisor_endpoint() {
+  local base_url="${ORCAS_E2E_SUPERVISOR_BASE_URL:-${ORCAS_E2E_QWEN_BASE_URL:-}}"
+  local model="${ORCAS_E2E_SUPERVISOR_MODEL:-${ORCAS_E2E_QWEN_MODEL:-}}"
+
+  [[ -n "$base_url" ]] || e2e_fail "scenario $E2E_SCENARIO_NAME requires a local OpenAI-compatible supervisor endpoint; export ORCAS_E2E_SUPERVISOR_BASE_URL=http://127.0.0.1:8000/v1"
+  [[ -n "$model" ]] || e2e_fail "scenario $E2E_SCENARIO_NAME requires a served supervisor model name; export ORCAS_E2E_SUPERVISOR_MODEL=<served-model-name>"
+
+  local models_url="${base_url%/}/models"
+  curl -sf "$models_url" >/dev/null 2>&1 || e2e_fail "scenario $E2E_SCENARIO_NAME could not reach the local supervisor endpoint at $models_url"
+
+  export ORCAS_SUPERVISOR_BASE_URL="$base_url"
+  export ORCAS_SUPERVISOR_MODEL="$model"
+  export ORCAS_SUPERVISOR_API_KEY_ENV="${ORCAS_E2E_SUPERVISOR_API_KEY_ENV:-${ORCAS_E2E_QWEN_API_KEY_ENV:-}}"
+  export ORCAS_SUPERVISOR_REASONING_EFFORT="${ORCAS_E2E_SUPERVISOR_REASONING_EFFORT:-${ORCAS_E2E_QWEN_REASONING_EFFORT:-}}"
+  export ORCAS_SUPERVISOR_MAX_OUTPUT_TOKENS="${ORCAS_E2E_SUPERVISOR_MAX_OUTPUT_TOKENS:-${ORCAS_E2E_QWEN_MAX_OUTPUT_TOKENS:-4096}}"
+  export ORCAS_SUPERVISOR_TEMPERATURE="${ORCAS_E2E_SUPERVISOR_TEMPERATURE:-${ORCAS_E2E_QWEN_TEMPERATURE:-0.0}}"
+}
+
 e2e_require_clean_git() {
   local status
   status="$(git -C "$e2e_repo_root" status --porcelain)"
@@ -210,4 +258,24 @@ e2e_print_scenario_end() {
 
 e2e_orcas() {
   "$e2e_bin_dir/orcas.sh" "$@"
+}
+
+e2e_orcasd() {
+  local orcasd_bin="$e2e_repo_root/target/debug/orcasd"
+  local xdg_data_home="${ORCAS_E2E_XDG_DATA_HOME:-$e2e_output_root/xdg/default/data}"
+  local xdg_config_home="${ORCAS_E2E_XDG_CONFIG_HOME:-$e2e_output_root/xdg/default/config}"
+  local xdg_runtime_home="${ORCAS_E2E_XDG_RUNTIME_HOME:-$e2e_output_root/xdg/default/runtime}"
+
+  mkdir -p "$xdg_data_home" "$xdg_config_home" "$xdg_runtime_home"
+  mkdir -p "$xdg_data_home/orcas/logs"
+  chmod 700 "$xdg_runtime_home" || true
+
+  if [[ ! -x "$orcasd_bin" || "${ORCAS_E2E_FORCE_CARGO_RUN:-0}" == "1" ]]; then
+    cargo build -q --manifest-path "$e2e_repo_root/Cargo.toml" -p orcas -p orcasd
+  fi
+
+  XDG_DATA_HOME="$xdg_data_home" \
+    XDG_CONFIG_HOME="$xdg_config_home" \
+    XDG_RUNTIME_DIR="$xdg_runtime_home" \
+    "$orcasd_bin" "$@"
 }
