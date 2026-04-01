@@ -22,6 +22,7 @@ use orcas_core::ipc::{
     AssignmentStartRequest, AssignmentStartResponse,
     AuthorityDeletePlanRequest, AuthorityDeletePlanResponse, AuthorityHierarchyGetRequest,
     AuthorityHierarchyGetResponse, AuthorityTrackedThreadCreateRequest,
+    AuthorityTrackedThreadEditRequest, AuthorityTrackedThreadEditResponse,
     AuthorityTrackedThreadCreateResponse, AuthorityTrackedThreadDeleteRequest,
     AuthorityTrackedThreadDeleteResponse, AuthorityWorkstreamCreateRequest,
     AuthorityWorkstreamCreateResponse, AuthorityWorkstreamDeleteRequest,
@@ -56,7 +57,8 @@ use orcas_core::ipc::{
     OperatorRemoteActionGetRequest, OperatorRemoteActionGetResponse,
     OperatorRemoteActionListRequest, OperatorRemoteActionListResponse,
     OperatorRemoteActionWaitRequest, OperatorRemoteActionWaitResponse, StateGetRequest,
-    StateGetResponse,
+    StateGetResponse, ThreadGetRequest, ThreadGetResponse, CodexAssignmentPauseRequest,
+    CodexAssignmentPauseResponse, CodexAssignmentResumeRequest, CodexAssignmentResumeResponse,
 };
 use orcas_core::jsonrpc::{JsonRpcMessage, JsonRpcRequest, RequestId};
 use orcas_core::{AppPaths, OrcasResult};
@@ -304,8 +306,21 @@ impl InboxMirrorServer {
                 post(authority_tracked_thread_create),
             )
             .route(
+                "/operator-authority/tracked-threads/edit",
+                post(authority_tracked_thread_edit),
+            )
+            .route(
                 "/operator-authority/tracked-threads/delete",
                 post(authority_tracked_thread_delete),
+            )
+            .route("/operator-runtime/threads/get", post(thread_get))
+            .route(
+                "/operator-runtime/codex-assignments/pause",
+                post(codex_assignment_pause),
+            )
+            .route(
+                "/operator-runtime/codex-assignments/resume",
+                post(codex_assignment_resume),
             )
             // Trunk serves the browser app from a different port during local
             // development, so allow cross-origin operator requests.
@@ -946,6 +961,20 @@ async fn authority_tracked_thread_create(
     ))
 }
 
+async fn authority_tracked_thread_edit(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityTrackedThreadEditRequest>,
+) -> Result<Json<AuthorityTrackedThreadEditResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_TRACKED_THREAD_EDIT,
+            &request,
+        )
+        .await?,
+    ))
+}
+
 async fn authority_tracked_thread_delete(
     State(state): State<Arc<InboxMirrorServerState>>,
     Json(request): Json<AuthorityTrackedThreadDeleteRequest>,
@@ -957,6 +986,35 @@ async fn authority_tracked_thread_delete(
             &request,
         )
         .await?,
+    ))
+}
+
+async fn thread_get(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<ThreadGetRequest>,
+) -> Result<Json<ThreadGetResponse>, String> {
+    Ok(Json(
+        daemon_request(&state, orcas_core::ipc::methods::THREAD_GET, &request).await?,
+    ))
+}
+
+async fn codex_assignment_pause(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<CodexAssignmentPauseRequest>,
+) -> Result<Json<CodexAssignmentPauseResponse>, String> {
+    Ok(Json(
+        daemon_request(&state, orcas_core::ipc::methods::CODEX_ASSIGNMENT_PAUSE, &request)
+            .await?,
+    ))
+}
+
+async fn codex_assignment_resume(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<CodexAssignmentResumeRequest>,
+) -> Result<Json<CodexAssignmentResumeResponse>, String> {
+    Ok(Json(
+        daemon_request(&state, orcas_core::ipc::methods::CODEX_ASSIGNMENT_RESUME, &request)
+            .await?,
     ))
 }
 
@@ -1086,8 +1144,21 @@ pub fn app_with_operator_api_token(
             post(authority_tracked_thread_create),
         )
         .route(
+            "/operator-authority/tracked-threads/edit",
+            post(authority_tracked_thread_edit),
+        )
+        .route(
             "/operator-authority/tracked-threads/delete",
             post(authority_tracked_thread_delete),
+        )
+        .route("/operator-runtime/threads/get", post(thread_get))
+        .route(
+            "/operator-runtime/codex-assignments/pause",
+            post(codex_assignment_pause),
+        )
+        .route(
+            "/operator-runtime/codex-assignments/resume",
+            post(codex_assignment_resume),
         )
         .layer(middleware::from_fn_with_state(state.clone(), operator_auth))
         .with_state(state)

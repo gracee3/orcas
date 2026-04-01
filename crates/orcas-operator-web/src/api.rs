@@ -5,6 +5,8 @@ use orcas_core::ipc::{
     AssignmentStartRequest, AssignmentStartResponse,
     AuthorityDeletePlanRequest, AuthorityHierarchyGetRequest,
     AuthorityTrackedThreadCreateRequest, AuthorityTrackedThreadDeleteRequest,
+    AuthorityTrackedThreadEditRequest, ThreadGetRequest, ThreadGetResponse,
+    CodexAssignmentPauseRequest, CodexAssignmentResumeRequest,
     AuthorityWorkstreamCreateRequest, AuthorityWorkstreamEditRequest,
     AuthorityWorkunitCreateRequest, AuthorityWorkunitDeleteRequest,
     AuthorityWorkunitEditRequest, AuthorityWorkunitGetRequest, StateGetRequest,
@@ -451,6 +453,7 @@ pub async fn create_tracked_thread(
     title: String,
     upstream_thread_id: Option<String>,
     notes: Option<String>,
+    preferred_cwd: Option<String>,
 ) -> Result<(), String> {
     let client = client_from_settings(&settings)?;
     client
@@ -463,9 +466,41 @@ pub async fn create_tracked_thread(
                 notes,
                 backend_kind: authority::TrackedThreadBackendKind::Codex,
                 upstream_thread_id: upstream_thread_id.filter(|value| !value.trim().is_empty()),
-                preferred_cwd: None,
+                preferred_cwd: preferred_cwd.filter(|value| !value.trim().is_empty()),
                 preferred_model: None,
                 workspace: None,
+            },
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn bind_tracked_thread(
+    settings: OperatorServerSettings,
+    tracked_thread_id: authority::TrackedThreadId,
+    expected_revision: authority::Revision,
+    upstream_thread_id: String,
+    preferred_cwd: Option<String>,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .authority_tracked_thread_edit(&AuthorityTrackedThreadEditRequest {
+            command: authority::EditTrackedThread {
+                metadata: command_metadata(&settings)?,
+                tracked_thread_id,
+                expected_revision,
+                changes: authority::TrackedThreadPatch {
+                    title: None,
+                    notes: None,
+                    backend_kind: None,
+                    upstream_thread_id: Some(Some(upstream_thread_id)),
+                    binding_state: Some(authority::TrackedThreadBindingState::Bound),
+                    preferred_cwd: Some(preferred_cwd.filter(|value| !value.trim().is_empty())),
+                    preferred_model: None,
+                    last_seen_turn_id: None,
+                    workspace: None,
+                },
             },
         })
         .await
@@ -522,6 +557,47 @@ pub async fn delete_tracked_thread(
                 expected_revision: delete_plan.expected_revision,
                 delete_token: delete_plan.confirmation_token,
             },
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn load_thread_detail(
+    settings: OperatorServerSettings,
+    thread_id: String,
+) -> Result<ThreadGetResponse, String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .thread_get(&ThreadGetRequest { thread_id })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn pause_codex_assignment(
+    settings: OperatorServerSettings,
+    assignment_id: String,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .codex_assignment_pause(&CodexAssignmentPauseRequest {
+            assignment_id,
+            notes: Some("Paused from operator web".to_string()),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn resume_codex_assignment(
+    settings: OperatorServerSettings,
+    assignment_id: String,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .codex_assignment_resume(&CodexAssignmentResumeRequest {
+            assignment_id,
+            notes: Some("Resumed from operator web".to_string()),
         })
         .await
         .map_err(|error| error.to_string())?;

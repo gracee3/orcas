@@ -33,7 +33,10 @@ use orcas_operator_core::{
     summarize_inbox_page_change, summarize_notification_page_change,
     summarize_remote_action_request_change,
 };
-use workstreams::{WorkstreamsDashboardData, humanize_snake_case, tracked_thread_runtime_status};
+use workstreams::{
+    WorkstreamsDashboardData, humanize_snake_case, live_thread_linkage,
+    tracked_thread_runtime_status,
+};
 use workspace::{WorkspaceFocus, WorkspaceSection, WorkspaceState};
 
 pub fn mount_app() {
@@ -88,6 +91,7 @@ pub fn App() -> impl IntoView {
                         <Routes fallback=|| view! { <NotFoundPage /> }>
                             <Route path=path!("") view=WorkstreamsRoute />
                             <Route path=path!("workstreams") view=WorkstreamsRoute />
+                            <Route path=path!("threads") view=ThreadsRoute />
                             <Route path=path!("inbox") view=InboxRoute />
                             <Route path=path!("inbox/:item_id") view=InboxDetailRoute />
                             <Route path=path!("notifications") view=NotificationsRoute />
@@ -129,6 +133,12 @@ fn WorkspaceShell() -> impl IntoView {
                     }
                 >
                     "Workstreams"
+                </A>
+                <A
+                    href=WorkspaceSection::Threads.href()
+                    class:active=move || workspace.get().active_section == WorkspaceSection::Threads
+                >
+                    "Threads"
                 </A>
                 <A
                     href=WorkspaceSection::Inbox.href()
@@ -606,6 +616,360 @@ fn WorkstreamsRoute() -> impl IntoView {
                 }
             }}
         </PageFrame>
+    }
+}
+
+#[component]
+fn ThreadsRoute() -> impl IntoView {
+    let settings = use_context::<RwSignal<OperatorServerSettings>>()
+        .expect("settings context should be provided");
+    let workspace =
+        use_context::<RwSignal<WorkspaceState>>().expect("workspace context should be provided");
+    let refresh_epoch = RwSignal::new(0u64);
+    let action_message = RwSignal::new(None::<String>);
+    let action_error = RwSignal::new(None::<String>);
+    let dashboard = LocalResource::new(move || {
+        let settings = settings.get();
+        let _refresh_epoch = refresh_epoch.get();
+        async move { api::load_workstreams_dashboard(settings).await }
+    });
+
+    Effect::new({
+        let workspace = workspace.clone();
+        move |_| workspace.update(|state| state.active_section = WorkspaceSection::Threads)
+    });
+
+    view! {
+        <PageFrame
+            title="Codex Threads"
+            subtitle="Live Codex app-server threads joined with Orcas runtime assignment state and authority bindings"
+        >
+            <div class="toolbar">
+                <button class="refresh-button" on:click=move |_| dashboard.refetch()>"Refresh"</button>
+                <span class="muted">
+                    "Inspect live thread state, attach existing threads to work units, and pause or resume Orcas-managed assignments."
+                </span>
+            </div>
+            {move || match action_message.get() {
+                Some(message) => view! {
+                    <div class="info-panel">
+                        <strong>"Updated"</strong>
+                        <p>{message}</p>
+                    </div>
+                }.into_any(),
+                None => view! {}.into_any(),
+            }}
+            {move || match action_error.get() {
+                Some(error) => view! { <ErrorPanel error=error /> }.into_any(),
+                None => view! {}.into_any(),
+            }}
+            {move || match dashboard.get() {
+                None => view! { <p class="muted">"Loading live threads…"</p> }.into_any(),
+                Some(Err(error)) => view! { <ErrorPanel error=error /> }.into_any(),
+                Some(Ok(dashboard)) => {
+                    if dashboard.snapshot.threads.is_empty() {
+                        view! {
+                            <EmptyState
+                                title="No live Codex threads"
+                                body="The daemon is connected, but no thread summaries are currently available from the app-server."
+                            />
+                        }.into_any()
+                    } else {
+                        let threads = dashboard.snapshot.threads.clone();
+                        view! {
+                            <div class="stack">
+                                {threads.into_iter().map(|thread| {
+                                    view! {
+                                        <LiveThreadCard
+                                            thread
+                                            dashboard=dashboard.clone()
+                                            settings
+                                            refresh_epoch
+                                            action_message
+                                            action_error
+                                        />
+                                    }
+                                }).collect_view()}
+                            </div>
+                        }.into_any()
+                    }
+                }
+            }}
+        </PageFrame>
+    }
+}
+
+#[component]
+fn LiveThreadCard(
+    thread: orcas_core::ipc::ThreadSummary,
+    dashboard: WorkstreamsDashboardData,
+    settings: RwSignal<OperatorServerSettings>,
+    refresh_epoch: RwSignal<u64>,
+    action_message: RwSignal<Option<String>>,
+    action_error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let linkage = live_thread_linkage(&thread, &dashboard);
+    let inspecting = RwSignal::new(false);
+    let attaching = RwSignal::new(false);
+    let working = RwSignal::new(false);
+    let detail = RwSignal::new(None::<orcas_core::ipc::ThreadView>);
+    let attach_work_unit = RwSignal::new(String::new());
+    let attach_title = RwSignal::new(
+        thread
+            .name
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("Codex {}", &thread.id[..thread.id.len().min(8)])),
+    );
+    let attach_notes = RwSignal::new(String::new());
+    let attach_thread_id = thread.id.clone();
+    let attach_thread_cwd = thread.cwd.clone();
+    let work_unit_options = dashboard
+        .hierarchy
+        .workstreams
+        .iter()
+        .flat_map(|workstream| {
+            workstream.work_units.iter().map(move |work_unit| {
+                (
+                    work_unit.work_unit.id.to_string(),
+                    format!("{} / {}", workstream.workstream.title, work_unit.work_unit.title),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    view! {
+        <article class="card">
+            <div class="page-header">
+                <div>
+                    <p class="eyebrow">{thread.status.clone()}</p>
+                    <h3>{thread.name.clone().unwrap_or_else(|| thread.id.clone())}</h3>
+                    <p class="item-meta">
+                        {format!(
+                            "{} · scope {} · loaded {} · monitor {}",
+                            thread.model_provider,
+                            thread.scope,
+                            humanize_snake_case(
+                                serde_json::to_string(&thread.loaded_status)
+                                    .unwrap_or_default()
+                                    .trim_matches('"')
+                            ),
+                            humanize_snake_case(
+                                serde_json::to_string(&thread.monitor_state)
+                                    .unwrap_or_default()
+                                    .trim_matches('"')
+                            )
+                        )}
+                    </p>
+                </div>
+                <div class="action-buttons">
+                    <button class="refresh-button" on:click=move |_| inspecting.update(|value| *value = !*value)>
+                        {move || if inspecting.get() { "Hide details" } else { "Inspect" }}
+                    </button>
+                    <button class="refresh-button" on:click=move |_| attaching.update(|value| *value = !*value)>
+                        {move || if attaching.get() { "Close attach" } else { "Attach to work unit" }}
+                    </button>
+                    {move || match linkage.codex_assignment.clone() {
+                        Some(codex_assignment) if matches!(codex_assignment.status, orcas_core::CodexThreadAssignmentStatus::Active) => view! {
+                            <button
+                                class="refresh-button"
+                                disabled=move || working.get()
+                                on:click=move |_| {
+                                    let settings = settings.get_untracked();
+                                    let assignment_id = codex_assignment.assignment_id.clone();
+                                    working.set(true);
+                                    action_error.set(None);
+                                    #[cfg(target_arch = "wasm32")]
+                                    spawn_local(async move {
+                                        match api::pause_codex_assignment(settings, assignment_id).await {
+                                            Ok(()) => {
+                                                action_message.set(Some("Paused Codex assignment.".to_string()));
+                                                refresh_epoch.update(|value| *value += 1);
+                                            }
+                                            Err(error) => action_error.set(Some(error)),
+                                        }
+                                        working.set(false);
+                                    });
+                                }
+                            >
+                                "Pause"
+                            </button>
+                        }.into_any(),
+                        Some(codex_assignment) if matches!(codex_assignment.status, orcas_core::CodexThreadAssignmentStatus::Paused) => view! {
+                            <button
+                                class="refresh-button"
+                                disabled=move || working.get()
+                                on:click=move |_| {
+                                    let settings = settings.get_untracked();
+                                    let assignment_id = codex_assignment.assignment_id.clone();
+                                    working.set(true);
+                                    action_error.set(None);
+                                    #[cfg(target_arch = "wasm32")]
+                                    spawn_local(async move {
+                                        match api::resume_codex_assignment(settings, assignment_id).await {
+                                            Ok(()) => {
+                                                action_message.set(Some("Resumed Codex assignment.".to_string()));
+                                                refresh_epoch.update(|value| *value += 1);
+                                            }
+                                            Err(error) => action_error.set(Some(error)),
+                                        }
+                                        working.set(false);
+                                    });
+                                }
+                            >
+                                "Resume"
+                            </button>
+                        }.into_any(),
+                        _ => view! {}.into_any(),
+                    }}
+                </div>
+            </div>
+            <p class="item-summary">{thread.preview.clone()}</p>
+            <p class="item-meta">{format!("thread {} · cwd {}", thread.id, if thread.cwd.is_empty() { "(none)" } else { thread.cwd.as_str() })}</p>
+            <p class="item-meta">
+                {format!(
+                    "in_flight {}{}{}",
+                    thread.turn_in_flight,
+                    thread.active_turn_id.as_ref().map(|value| format!(" · active turn {}", value)).unwrap_or_default(),
+                    thread.recent_event.as_ref().map(|value| format!(" · {}", value)).unwrap_or_default()
+                )}
+            </p>
+            {move || match linkage.tracked_thread.clone() {
+                Some(tracked_thread) => view! {
+                    <p class="item-meta">{format!("bound tracked thread {} · work unit {}", tracked_thread.id, tracked_thread.work_unit_id)}</p>
+                }.into_any(),
+                None => view! { <p class="item-meta">"No authority binding yet"</p> }.into_any(),
+            }}
+            {move || match linkage.assignment.clone() {
+                Some(assignment) => view! {
+                    <p class="item-meta">{format!("assignment {} · worker {} · {}", assignment.id, assignment.worker_id, humanize_snake_case(serde_json::to_string(&assignment.status).unwrap_or_default().trim_matches('\"')))}</p>
+                }.into_any(),
+                None => view! {}.into_any(),
+            }}
+            {move || match linkage.open_decision.clone() {
+                Some(decision) => view! {
+                    <p class="item-meta">{format!("supervisor decision {} · {}", decision.decision_id, humanize_snake_case(serde_json::to_string(&decision.status).unwrap_or_default().trim_matches('\"')))}</p>
+                }.into_any(),
+                None => view! {}.into_any(),
+            }}
+            {move || {
+                if attaching.get() {
+                    let work_unit_options = work_unit_options.clone();
+                    let attach_thread_id = attach_thread_id.clone();
+                    let attach_thread_cwd = attach_thread_cwd.clone();
+                    view! {
+                        <div class="action-form">
+                            <label class="field">
+                                <span>"Work unit"</span>
+                                <select
+                                    prop:value=move || attach_work_unit.get()
+                                    on:change=move |ev| attach_work_unit.set(event_target_value(&ev))
+                                >
+                                    <option value="">"Select work unit"</option>
+                                    {work_unit_options.iter().map(|(value, label)| view! {
+                                        <option value=value.clone()>{label.clone()}</option>
+                                    }).collect_view()}
+                                </select>
+                            </label>
+                            <label class="field">
+                                <span>"Tracked thread title"</span>
+                                <input
+                                    type="text"
+                                    prop:value=move || attach_title.get()
+                                    on:input=move |ev| attach_title.set(event_target_value(&ev))
+                                />
+                            </label>
+                            <label class="field">
+                                <span>"Notes"</span>
+                                <textarea
+                                    rows="2"
+                                    prop:value=move || attach_notes.get()
+                                    on:input=move |ev| attach_notes.set(event_target_value(&ev))
+                                ></textarea>
+                            </label>
+                            <div class="action-buttons">
+                                <button
+                                    class="primary-button"
+                                    disabled=move || working.get()
+                                    on:click=move |_| {
+                                        let settings = settings.get_untracked();
+                                        let work_unit_id = attach_work_unit.get_untracked();
+                                        let title = attach_title.get_untracked();
+                                        let notes = attach_notes.get_untracked();
+                                        let upstream_thread_id = attach_thread_id.clone();
+                                        let cwd = if attach_thread_cwd.is_empty() { None } else { Some(attach_thread_cwd.clone()) };
+                                        working.set(true);
+                                        action_error.set(None);
+                                        #[cfg(target_arch = "wasm32")]
+                                        spawn_local(async move {
+                                            match authority::WorkUnitId::parse(work_unit_id.as_str()) {
+                                                Ok(work_unit_id) => match api::create_tracked_thread(
+                                                    settings,
+                                                    work_unit_id,
+                                                    title,
+                                                    Some(upstream_thread_id),
+                                                    if notes.trim().is_empty() { None } else { Some(notes) },
+                                                    cwd,
+                                                ).await {
+                                                    Ok(()) => {
+                                                        action_message.set(Some("Attached live Codex thread to work unit.".to_string()));
+                                                        refresh_epoch.update(|value| *value += 1);
+                                                        attaching.set(false);
+                                                    }
+                                                    Err(error) => action_error.set(Some(error)),
+                                                },
+                                                Err(error) => action_error.set(Some(error.to_string())),
+                                            }
+                                            working.set(false);
+                                        });
+                                    }
+                                >
+                                    "Attach live thread"
+                                </button>
+                            </div>
+                        </div>
+                    }.into_any()
+                } else {
+                    view! {}.into_any()
+                }
+            }}
+            {move || {
+                if inspecting.get() {
+                    if detail.get().is_none() {
+                        let settings = settings.get_untracked();
+                        let thread_id = thread.id.clone();
+                        action_error.set(None);
+                        #[cfg(target_arch = "wasm32")]
+                        spawn_local(async move {
+                            match api::load_thread_detail(settings, thread_id).await {
+                                Ok(response) => detail.set(Some(response.thread)),
+                                Err(error) => action_error.set(Some(error)),
+                            }
+                        });
+                    }
+                    match detail.get() {
+                        Some(detail) => view! {
+                            <div class="stack">
+                                <pre class="code-block">{detail.summary.raw_summary.map(|value| serde_json::to_string_pretty(&value).unwrap_or_default()).unwrap_or_else(|| "No raw summary".to_string())}</pre>
+                                {detail.turns.into_iter().rev().take(3).map(|turn| view! {
+                                    <div class="item-card">
+                                        <div class="item-card-topline">
+                                            <span class="status-pill">{turn.status.clone()}</span>
+                                            <span class="muted">{turn.id.clone()}</span>
+                                        </div>
+                                        <p class="item-summary">{turn.error_summary.clone().or(turn.error_message.clone()).unwrap_or_else(|| "No turn error summary.".to_string())}</p>
+                                        {turn.latest_diff.map(|diff| view! { <pre class="code-block">{diff}</pre> })}
+                                    </div>
+                                }).collect_view()}
+                            </div>
+                        }.into_any(),
+                        None => view! { <p class="muted">"Loading thread detail…"</p> }.into_any(),
+                    }
+                } else {
+                    view! {}.into_any()
+                }
+            }}
+        </article>
     }
 }
 
@@ -1203,6 +1567,7 @@ fn WorkUnitCard(
                                             title,
                                             Some(upstream),
                                             if notes.trim().is_empty() { None } else { Some(notes) },
+                                            None,
                                         )
                                         .await
                                         {
@@ -1260,6 +1625,25 @@ fn TrackedThreadCard(
 ) -> impl IntoView {
     let runtime = tracked_thread_runtime_status(&thread, &dashboard);
     let working = RwSignal::new(false);
+    let binding = RwSignal::new(false);
+    let bind_thread_id = RwSignal::new(String::new());
+    let available_threads = dashboard
+        .snapshot
+        .threads
+        .iter()
+        .filter(|candidate| {
+            dashboard
+                .hierarchy
+                .workstreams
+                .iter()
+                .flat_map(|workstream| workstream.work_units.iter())
+                .flat_map(|work_unit| work_unit.tracked_threads.iter())
+                .all(|tracked_thread| tracked_thread.upstream_thread_id.as_deref() != Some(candidate.id.as_str()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let available_threads_for_bind = available_threads.clone();
+    let tracked_thread_id_for_bind = thread.id.clone();
 
     view! {
         <div class="item-card">
@@ -1304,6 +1688,22 @@ fn TrackedThreadCard(
                 None => view! {}.into_any(),
             }}
             <div class="action-buttons">
+                {move || {
+                    if matches!(
+                        thread.binding_state,
+                        authority::TrackedThreadBindingState::Unbound
+                            | authority::TrackedThreadBindingState::Detached
+                            | authority::TrackedThreadBindingState::Missing
+                    ) {
+                        view! {
+                            <button class="refresh-button" on:click=move |_| binding.update(|value| *value = !*value)>
+                                {move || if binding.get() { "Close bind" } else { "Bind existing" }}
+                            </button>
+                        }.into_any()
+                    } else {
+                        view! {}.into_any()
+                    }
+                }}
                 <button
                     class="refresh-button"
                     disabled=move || working.get()
@@ -1330,6 +1730,75 @@ fn TrackedThreadCard(
                     "Remove"
                 </button>
             </div>
+            {move || {
+                if binding.get() {
+                    let available_threads_for_bind = available_threads_for_bind.clone();
+                    let tracked_thread_id_for_bind = tracked_thread_id_for_bind.clone();
+                    view! {
+                        <div class="action-form">
+                            <label class="field">
+                                <span>"Live Codex thread"</span>
+                                <select
+                                    prop:value=move || bind_thread_id.get()
+                                    on:change=move |ev| bind_thread_id.set(event_target_value(&ev))
+                                >
+                                    <option value="">"Select live thread"</option>
+                                    {available_threads.iter().map(|candidate| view! {
+                                        <option value=candidate.id.clone()>
+                                            {format!(
+                                                "{} · {} · {}",
+                                                candidate.id,
+                                                if candidate.cwd.is_empty() { "(no cwd)" } else { candidate.cwd.as_str() },
+                                                candidate.status
+                                            )}
+                                        </option>
+                                    }).collect_view()}
+                                </select>
+                            </label>
+                            <div class="action-buttons">
+                                <button
+                                    class="primary-button"
+                                    disabled=move || working.get()
+                                    on:click=move |_| {
+                                        let settings = settings.get_untracked();
+                                        let selected_thread_id = bind_thread_id.get_untracked();
+                                        let preferred_cwd = available_threads_for_bind
+                                            .iter()
+                                            .find(|candidate| candidate.id == selected_thread_id)
+                                            .and_then(|candidate| (!candidate.cwd.is_empty()).then(|| candidate.cwd.clone()));
+                                        let tracked_thread_id = tracked_thread_id_for_bind.clone();
+                                        let expected_revision = thread.revision;
+                                        working.set(true);
+                                        action_error.set(None);
+                                        #[cfg(target_arch = "wasm32")]
+                                        spawn_local(async move {
+                                            match api::bind_tracked_thread(
+                                                settings,
+                                                tracked_thread_id,
+                                                expected_revision,
+                                                selected_thread_id,
+                                                preferred_cwd,
+                                            ).await {
+                                                Ok(()) => {
+                                                    action_message.set(Some("Bound tracked thread to live Codex thread.".to_string()));
+                                                    refresh_epoch.update(|value| *value += 1);
+                                                    binding.set(false);
+                                                }
+                                                Err(error) => action_error.set(Some(error)),
+                                            }
+                                            working.set(false);
+                                        });
+                                    }
+                                >
+                                    "Bind live thread"
+                                </button>
+                            </div>
+                        </div>
+                    }.into_any()
+                } else {
+                    view! {}.into_any()
+                }
+            }}
         </div>
     }
 }

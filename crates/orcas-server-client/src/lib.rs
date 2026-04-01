@@ -4,6 +4,7 @@ use orcas_core::ipc::{
     AssignmentStartRequest, AssignmentStartResponse,
     AuthorityDeletePlanRequest, AuthorityDeletePlanResponse, AuthorityHierarchyGetRequest,
     AuthorityHierarchyGetResponse, AuthorityTrackedThreadCreateRequest,
+    AuthorityTrackedThreadEditRequest, AuthorityTrackedThreadEditResponse,
     AuthorityTrackedThreadCreateResponse, AuthorityTrackedThreadDeleteRequest,
     AuthorityTrackedThreadDeleteResponse, AuthorityWorkstreamCreateRequest,
     AuthorityWorkstreamCreateResponse, AuthorityWorkstreamDeleteRequest,
@@ -37,6 +38,8 @@ use orcas_core::ipc::{
     OperatorRemoteActionGetResponse, OperatorRemoteActionListRequest,
     OperatorRemoteActionListResponse, OperatorRemoteActionWaitRequest,
     OperatorRemoteActionWaitResponse, StateGetRequest, StateGetResponse,
+    ThreadGetRequest, ThreadGetResponse, CodexAssignmentPauseRequest,
+    CodexAssignmentPauseResponse, CodexAssignmentResumeRequest, CodexAssignmentResumeResponse,
 };
 use orcas_core::{OrcasError, OrcasResult};
 use uuid::Uuid;
@@ -496,11 +499,39 @@ impl OrcasServerClient {
             .await
     }
 
+    pub async fn authority_tracked_thread_edit(
+        &self,
+        request: &AuthorityTrackedThreadEditRequest,
+    ) -> OrcasResult<AuthorityTrackedThreadEditResponse> {
+        self.post_json("operator-authority/tracked-threads/edit", request)
+            .await
+    }
+
     pub async fn authority_tracked_thread_delete(
         &self,
         request: &AuthorityTrackedThreadDeleteRequest,
     ) -> OrcasResult<AuthorityTrackedThreadDeleteResponse> {
         self.post_json("operator-authority/tracked-threads/delete", request)
+            .await
+    }
+
+    pub async fn thread_get(&self, request: &ThreadGetRequest) -> OrcasResult<ThreadGetResponse> {
+        self.post_json("operator-runtime/threads/get", request).await
+    }
+
+    pub async fn codex_assignment_pause(
+        &self,
+        request: &CodexAssignmentPauseRequest,
+    ) -> OrcasResult<CodexAssignmentPauseResponse> {
+        self.post_json("operator-runtime/codex-assignments/pause", request)
+            .await
+    }
+
+    pub async fn codex_assignment_resume(
+        &self,
+        request: &CodexAssignmentResumeRequest,
+    ) -> OrcasResult<CodexAssignmentResumeResponse> {
+        self.post_json("operator-runtime/codex-assignments/resume", request)
             .await
     }
 }

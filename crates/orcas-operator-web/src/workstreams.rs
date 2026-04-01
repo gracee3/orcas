@@ -15,6 +15,14 @@ pub struct TrackedThreadRuntimeStatusView {
     pub codex_thread_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LiveThreadLinkageView {
+    pub tracked_thread: Option<authority::TrackedThreadSummary>,
+    pub codex_assignment: Option<ipc::CodexThreadAssignmentSummary>,
+    pub assignment: Option<ipc::AssignmentSummary>,
+    pub open_decision: Option<ipc::SupervisorTurnDecisionSummary>,
+}
+
 pub fn humanize_snake_case(raw: &str) -> String {
     raw.split('_')
         .filter(|segment| !segment.is_empty())
@@ -33,6 +41,14 @@ pub fn tracked_thread_runtime_status(
     thread: &authority::TrackedThreadSummary,
     dashboard: &WorkstreamsDashboardData,
 ) -> TrackedThreadRuntimeStatusView {
+    let live_thread = thread.upstream_thread_id.as_ref().and_then(|upstream_thread_id| {
+        dashboard
+            .snapshot
+            .threads
+            .iter()
+            .find(|candidate| candidate.id == *upstream_thread_id)
+            .cloned()
+    });
     let codex_assignment = dashboard
         .snapshot
         .collaboration
@@ -52,6 +68,16 @@ pub fn tracked_thread_runtime_status(
             .iter()
             .find(|assignment| assignment.id == codex_assignment.assignment_id)
             .cloned()
+    }).or_else(|| {
+        let assignments = dashboard
+            .snapshot
+            .collaboration
+            .assignments
+            .iter()
+            .filter(|assignment| assignment.work_unit_id == thread.work_unit_id.as_str())
+            .cloned()
+            .collect::<Vec<_>>();
+        (assignments.len() == 1).then(|| assignments.into_iter().next()).flatten()
     });
     let open_decision = codex_assignment.as_ref().and_then(|codex_assignment| {
         dashboard
@@ -116,6 +142,8 @@ pub fn tracked_thread_runtime_status(
         "Stopped".to_string()
     } else if thread.deleted_at.is_some() {
         "Removed".to_string()
+    } else if live_thread.as_ref().is_some_and(|thread| thread.turn_in_flight || thread.status == "active") {
+        "In progress".to_string()
     } else if thread.binding_state == authority::TrackedThreadBindingState::Missing {
         "Missing".to_string()
     } else if thread.binding_state == authority::TrackedThreadBindingState::Detached {
@@ -142,6 +170,12 @@ pub fn tracked_thread_runtime_status(
                     .trim_matches('"')
             )
         ));
+    }
+    if let Some(live_thread) = live_thread.as_ref() {
+        detail_parts.push(format!("thread {}", live_thread.status));
+        if live_thread.turn_in_flight {
+            detail_parts.push("turn in flight".to_string());
+        }
     }
     if let Some(assignment) = assignment.as_ref() {
         detail_parts.push(format!(
@@ -189,6 +223,53 @@ pub fn tracked_thread_runtime_status(
         detail: detail_parts.join(" · "),
         assignment_id: assignment.map(|assignment| assignment.id),
         codex_thread_id: codex_assignment.map(|assignment| assignment.codex_thread_id),
+    }
+}
+
+pub fn live_thread_linkage(
+    thread: &ipc::ThreadSummary,
+    dashboard: &WorkstreamsDashboardData,
+) -> LiveThreadLinkageView {
+    let tracked_thread = dashboard
+        .hierarchy
+        .workstreams
+        .iter()
+        .flat_map(|workstream| workstream.work_units.iter())
+        .flat_map(|work_unit| work_unit.tracked_threads.iter())
+        .find(|tracked_thread| tracked_thread.upstream_thread_id.as_deref() == Some(thread.id.as_str()))
+        .cloned();
+    let codex_assignment = dashboard
+        .snapshot
+        .collaboration
+        .codex_thread_assignments
+        .iter()
+        .find(|assignment| assignment.codex_thread_id == thread.id)
+        .cloned();
+    let assignment = codex_assignment.as_ref().and_then(|codex_assignment| {
+        dashboard
+            .snapshot
+            .collaboration
+            .assignments
+            .iter()
+            .find(|assignment| assignment.id == codex_assignment.assignment_id)
+            .cloned()
+    });
+    let open_decision = codex_assignment.as_ref().and_then(|codex_assignment| {
+        dashboard
+            .snapshot
+            .collaboration
+            .supervisor_turn_decisions
+            .iter()
+            .filter(|decision| decision.assignment_id == codex_assignment.assignment_id && decision.open)
+            .max_by_key(|decision| decision.created_at)
+            .cloned()
+    });
+
+    LiveThreadLinkageView {
+        tracked_thread,
+        codex_assignment,
+        assignment,
+        open_decision,
     }
 }
 

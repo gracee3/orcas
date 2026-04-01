@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceSection {
     Workstreams,
+    Threads,
     Inbox,
     Notifications,
     Deliveries,
@@ -16,6 +17,7 @@ impl WorkspaceSection {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Workstreams => "Workstreams",
+            Self::Threads => "Threads",
             Self::Inbox => "Inbox",
             Self::Notifications => "Notifications",
             Self::Deliveries => "Deliveries",
@@ -26,6 +28,7 @@ impl WorkspaceSection {
     pub const fn href(self) -> &'static str {
         match self {
             Self::Workstreams => "/workstreams",
+            Self::Threads => "/threads",
             Self::Inbox => "/inbox",
             Self::Notifications => "/notifications",
             Self::Deliveries => "/deliveries",
@@ -327,6 +330,7 @@ mod tests {
     #[test]
     fn workspace_section_labels_and_hrefs_are_stable() {
         assert_eq!(WorkspaceSection::Inbox.label(), "Inbox");
+        assert_eq!(WorkspaceSection::Threads.href(), "/threads");
         assert_eq!(WorkspaceSection::Notifications.href(), "/notifications");
         assert_eq!(WorkspaceSection::Deliveries.label(), "Deliveries");
         assert_eq!(WorkspaceSection::Actions.href(), "/actions");
