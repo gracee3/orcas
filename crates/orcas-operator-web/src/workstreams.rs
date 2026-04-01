@@ -24,6 +24,34 @@ pub struct LiveThreadLinkageView {
     pub open_decision: Option<ipc::SupervisorTurnDecisionSummary>,
 }
 
+pub fn inferred_live_thread_for_assignment(
+    assignment: &ipc::AssignmentSummary,
+    dashboard: &WorkstreamsDashboardData,
+) -> Option<ipc::ThreadSummary> {
+    dashboard
+        .snapshot
+        .collaboration
+        .codex_thread_assignments
+        .iter()
+        .find(|candidate| candidate.assignment_id == assignment.id)
+        .and_then(|candidate| {
+            dashboard
+                .snapshot
+                .threads
+                .iter()
+                .find(|thread| thread.id == candidate.codex_thread_id)
+                .cloned()
+        })
+        .or_else(|| {
+            dashboard
+                .snapshot
+                .threads
+                .iter()
+                .find(|thread| thread.preview.contains(&assignment.id))
+                .cloned()
+        })
+}
+
 pub fn humanize_snake_case(raw: &str) -> String {
     raw.split('_')
         .filter(|segment| !segment.is_empty())

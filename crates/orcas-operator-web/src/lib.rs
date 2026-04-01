@@ -34,7 +34,7 @@ use orcas_operator_core::{
     summarize_remote_action_request_change,
 };
 use workstreams::{
-    WorkstreamsDashboardData, humanize_snake_case, live_thread_linkage,
+    WorkstreamsDashboardData, humanize_snake_case, inferred_live_thread_for_assignment, live_thread_linkage,
     tracked_thread_runtime_status,
 };
 use workspace::{WorkspaceFocus, WorkspaceSection, WorkspaceState};
@@ -1536,6 +1536,7 @@ fn WorkUnitCard(
     let work_unit_title_display = node.work_unit.title.clone();
     let work_unit_status_display = node.work_unit.status;
     let tracked_threads = node.tracked_threads.clone();
+    let has_tracked_threads = !tracked_threads.is_empty();
     let load_work_unit_id = work_unit_id.clone();
     let delete_work_unit_id = work_unit_id.clone();
     let edit_work_unit_root_id = work_unit_id.clone();
@@ -1558,6 +1559,15 @@ fn WorkUnitCard(
     let start_instructions = RwSignal::new(String::new());
     let auto_bind_tracked_thread =
         StoredValue::new((tracked_threads.len() == 1).then(|| tracked_threads[0].clone()));
+    let runtime_assignments = dashboard
+        .snapshot
+        .collaboration
+        .assignments
+        .iter()
+        .filter(|assignment| assignment.work_unit_id == work_unit_id.as_str())
+        .cloned()
+        .collect::<Vec<_>>();
+    let runtime_assignment_cards = runtime_assignments.clone();
 
     view! {
         <article class="card">
@@ -1920,8 +1930,388 @@ fn WorkUnitCard(
                         />
                     }
                 }).collect_view()}
+                {move || {
+                    if !has_tracked_threads {
+                        runtime_assignment_cards.clone().into_iter().map(|assignment| {
+                            view! {
+                                <RuntimeAssignmentCard
+                                    work_unit_id=work_unit_id.clone()
+                                    assignment
+                                    dashboard=dashboard.clone()
+                                    settings
+                                    refresh_epoch
+                                    action_message
+                                    action_error
+                                />
+                            }
+                        }).collect_view().into_any()
+                    } else {
+                        view! {}.into_any()
+                    }
+                }}
             </div>
         </article>
+    }
+}
+
+#[component]
+fn RuntimeAssignmentCard(
+    work_unit_id: authority::WorkUnitId,
+    assignment: orcas_core::ipc::AssignmentSummary,
+    dashboard: WorkstreamsDashboardData,
+    settings: RwSignal<OperatorServerSettings>,
+    refresh_epoch: RwSignal<u64>,
+    action_message: RwSignal<Option<String>>,
+    action_error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let navigate = use_navigate();
+    let working = RwSignal::new(false);
+    let showing_detail = RwSignal::new(false);
+    let loading_detail = RwSignal::new(false);
+    let detail = RwSignal::new(None::<orcas_core::ipc::ThreadView>);
+    let inferred_thread = inferred_live_thread_for_assignment(&assignment, &dashboard);
+    let latest_report = dashboard
+        .snapshot
+        .collaboration
+        .reports
+        .iter()
+        .filter(|report| report.assignment_id == assignment.id)
+        .max_by_key(|report| report.created_at)
+        .cloned();
+    let latest_decision = latest_report.as_ref().and_then(|report| {
+        dashboard
+            .snapshot
+            .collaboration
+            .decisions
+            .iter()
+            .filter(|decision| decision.report_id.as_deref() == Some(report.id.as_str()))
+            .max_by_key(|decision| decision.created_at)
+            .cloned()
+    });
+    let work_unit_proposal = dashboard
+        .snapshot
+        .collaboration
+        .work_units
+        .iter()
+        .find(|work_unit| work_unit.id == work_unit_id.as_str())
+        .and_then(|work_unit| work_unit.proposal.clone());
+    let actionable_inbox_item = dashboard
+        .snapshot
+        .operator_inbox
+        .items
+        .iter()
+        .filter(|item| item.work_unit_id.as_deref() == Some(work_unit_id.as_str()))
+        .max_by_key(|item| item.updated_at)
+        .cloned();
+    let headline = if assignment.status == orcas_core::AssignmentStatus::AwaitingDecision {
+        "Waiting for supervisor".to_string()
+    } else {
+        humanize_snake_case(
+            serde_json::to_string(&assignment.status)
+                .unwrap_or_default()
+                .trim_matches('"'),
+        )
+    };
+    let mut detail_parts = Vec::new();
+    if let Some(thread) = inferred_thread.as_ref() {
+        if assignment.status == orcas_core::AssignmentStatus::AwaitingDecision && thread.status == "idle" {
+            detail_parts.push("report submitted".to_string());
+        } else {
+            detail_parts.push(format!("thread {}", thread.status));
+        }
+        if thread.turn_in_flight {
+            detail_parts.push("turn in flight".to_string());
+        }
+    } else {
+        detail_parts.push("runtime lane".to_string());
+    }
+    detail_parts.push(format!(
+        "assignment {}",
+        humanize_snake_case(
+            serde_json::to_string(&assignment.status)
+                .unwrap_or_default()
+                .trim_matches('"')
+        )
+    ));
+    let inferred_thread_id_for_detail = inferred_thread.as_ref().map(|thread| thread.id.clone());
+    let has_inferred_thread = inferred_thread.is_some();
+
+    view! {
+        <div class="item-card">
+            <div class="item-card-topline">
+                <span class="status-pill">{headline}</span>
+                <span class="muted">"runtime lane"</span>
+            </div>
+            <p class="item-title">{assignment.worker_id.clone()}</p>
+            <p class="item-summary">{detail_parts.join(" · ")}</p>
+            <p class="item-meta">{format!("assignment {}", assignment.id)}</p>
+            {match inferred_thread.as_ref() {
+                Some(thread) => view! {
+                    <p class="item-meta">{format!("codex {}", thread.id)}</p>
+                }.into_any(),
+                None => view! {
+                    <p class="item-meta">"No inferred live Codex thread yet"</p>
+                }.into_any(),
+            }}
+            <div class="action-buttons">
+                {match inferred_thread.as_ref() {
+                    Some(thread) => view! {
+                        <a class="refresh-button" href="/threads">"Open in Threads"</a>
+                        <span class="muted">{thread.id.clone()}</span>
+                    }.into_any(),
+                    None => view! {}.into_any(),
+                }}
+                {match actionable_inbox_item.clone() {
+                    Some(item) => view! {
+                        <a class="refresh-button" href={format!("/inbox/{}", item.id)}>
+                            "View supervisor item"
+                        </a>
+                    }.into_any(),
+                    None => view! {}.into_any(),
+                }}
+                {match (
+                    latest_report.clone(),
+                    work_unit_proposal.clone(),
+                    actionable_inbox_item.clone(),
+                ) {
+                    (Some(report), None, None) if report.needs_supervisor_review => {
+                        let work_unit_id = work_unit_id.to_string();
+                        let report_id = report.id.clone();
+                        view! {
+                            <button
+                                class="refresh-button"
+                                disabled=move || working.get()
+                                on:click=move |_| {
+                                    let settings = settings.get_untracked();
+                                    let work_unit_id = work_unit_id.clone();
+                                    let report_id = report_id.clone();
+                                    working.set(true);
+                                    action_error.set(None);
+                                    #[cfg(target_arch = "wasm32")]
+                                    spawn_local(async move {
+                                        match api::proposal_create(
+                                            settings,
+                                            work_unit_id,
+                                            Some(report_id),
+                                            Some("Created from workstreams dashboard".to_string()),
+                                        )
+                                        .await
+                                        {
+                                            Ok(response) => {
+                                                action_message.set(Some(format!(
+                                                    "Created supervisor proposal {}.",
+                                                    response.proposal.id
+                                                )));
+                                                refresh_epoch.update(|value| *value += 1);
+                                            }
+                                            Err(error) => action_error.set(Some(error)),
+                                        }
+                                        working.set(false);
+                                    });
+                                }
+                            >
+                                "Create proposal"
+                            </button>
+                        }.into_any()
+                    }
+                    _ => view! {}.into_any(),
+                }}
+                <button class="refresh-button" on:click=move |_| showing_detail.update(|value| *value = !*value)>
+                    {move || if showing_detail.get() { "Hide detail" } else { "Show detail" }}
+                </button>
+                {match actionable_inbox_item.clone() {
+                    Some(item) => {
+                        let available_actions = item.available_actions.clone();
+                        let item_id = item.id.clone();
+                        let item_updated_at = item.updated_at;
+                        let item_source_kind = item.source_kind;
+                        let actionable_object_id = item.actionable_object_id.clone();
+                        available_actions
+                            .into_iter()
+                            .filter(|action_kind| {
+                                matches!(
+                                    action_kind,
+                                    OperatorInboxActionKind::Approve | OperatorInboxActionKind::Reject
+                                )
+                            })
+                            .map(|action_kind| {
+                                let settings = settings;
+                                let navigate = navigate.clone();
+                                let item_id_for_action = item_id.clone();
+                                let actionable_object_id = actionable_object_id.clone();
+                                view! {
+                                    <button
+                                        class="refresh-button"
+                                        disabled=move || working.get()
+                                        on:click=move |_| {
+                                            let settings = settings.get_untracked();
+                                            let item_id = item_id_for_action.clone();
+                                            let navigate = navigate.clone();
+                                            let actionable_object_id = actionable_object_id.clone();
+                                            working.set(true);
+                                            action_error.set(None);
+                                            #[cfg(target_arch = "wasm32")]
+                                            spawn_local(async move {
+                                                let result = if item_source_kind
+                                                    == orcas_core::OperatorInboxSourceKind::SupervisorProposal
+                                                {
+                                                    match action_kind {
+                                                        OperatorInboxActionKind::Approve => api::proposal_approve(
+                                                            settings,
+                                                            actionable_object_id.clone(),
+                                                            Some("Approved from workstreams dashboard".to_string()),
+                                                        )
+                                                        .await
+                                                        .map(|_| None),
+                                                        OperatorInboxActionKind::Reject => api::proposal_reject(
+                                                            settings,
+                                                            actionable_object_id.clone(),
+                                                            Some("Rejected from workstreams dashboard".to_string()),
+                                                        )
+                                                        .await
+                                                        .map(|_| None),
+                                                        _ => Ok(None),
+                                                    }
+                                                } else {
+                                                    let idempotency_key = storage::remote_action_idempotency_key(
+                                                        &settings.origin_node_id,
+                                                        &item_id,
+                                                        action_kind,
+                                                        item_updated_at,
+                                                    );
+                                                    api::submit_remote_action(
+                                                        settings,
+                                                        item_id,
+                                                        action_kind,
+                                                        Some("web-operator".to_string()),
+                                                        None,
+                                                        Some(idempotency_key),
+                                                    )
+                                                    .await
+                                                    .map(Some)
+                                                };
+                                                match result {
+                                                    Ok(request) => {
+                                                        action_message.set(Some(format!(
+                                                            "{} submitted.",
+                                                            action_kind_label(action_kind)
+                                                        )));
+                                                        refresh_epoch.update(|value| *value += 1);
+                                                        if let Some(request) = request {
+                                                            navigate(&format!("/actions/{}", request.request_id), Default::default());
+                                                        }
+                                                    }
+                                                    Err(error) => action_error.set(Some(error)),
+                                                }
+                                                working.set(false);
+                                            });
+                                        }
+                                    >
+                                        {action_kind_label(action_kind)}
+                                    </button>
+                                }
+                            })
+                            .collect_view()
+                            .into_any()
+                    }
+                    None => view! {}.into_any(),
+                }}
+            </div>
+            {move || {
+                    if showing_detail.get() {
+                        if detail.get().is_none() && !loading_detail.get() {
+                            if let Some(thread_id) = inferred_thread_id_for_detail.clone() {
+                                let settings = settings.get_untracked();
+                                loading_detail.set(true);
+                                action_error.set(None);
+                                #[cfg(target_arch = "wasm32")]
+                                spawn_local(async move {
+                                    match api::load_thread_detail(settings, thread_id).await {
+                                        Ok(response) => detail.set(Some(response.thread)),
+                                        Err(error) => action_error.set(Some(error)),
+                                    }
+                                    loading_detail.set(false);
+                                });
+                            }
+                        }
+                    
+                    view! {
+                        <div class="detail-panel">
+                            {match latest_report.clone() {
+                                Some(report) => view! {
+                                    <div class="detail-block">
+                                        <p class="eyebrow">"Latest report"</p>
+                                        <dl class="detail-grid">
+                                            <div><dt>"Disposition"</dt><dd>{humanize_snake_case(serde_json::to_string(&report.disposition).unwrap_or_default().trim_matches('"'))}</dd></div>
+                                            <div><dt>"Parse result"</dt><dd>{humanize_snake_case(serde_json::to_string(&report.parse_result).unwrap_or_default().trim_matches('"'))}</dd></div>
+                                            <div><dt>"Supervisor review"</dt><dd>{if report.needs_supervisor_review { "Required" } else { "Not required" }}</dd></div>
+                                            <div><dt>"Recorded"</dt><dd>{format_timestamp(report.created_at)}</dd></div>
+                                        </dl>
+                                        <p class="item-summary">{report.summary.clone()}</p>
+                                    </div>
+                                }.into_any(),
+                                None => view! { <div class="detail-block"><p class="eyebrow">"Latest report"</p><p class="item-meta">"No report recorded yet"</p></div> }.into_any(),
+                            }}
+                            {match work_unit_proposal.clone() {
+                                Some(proposal) => view! {
+                                    <div class="detail-block">
+                                        <p class="eyebrow">"Supervisor proposal"</p>
+                                        <dl class="detail-grid">
+                                            <div><dt>"Status"</dt><dd>{humanize_snake_case(serde_json::to_string(&proposal.latest_status).unwrap_or_default().trim_matches('"'))}</dd></div>
+                                            <div><dt>"Proposal id"</dt><dd>{proposal.latest_proposal_id.clone()}</dd></div>
+                                            <div><dt>"Created"</dt><dd>{format_timestamp(proposal.latest_created_at)}</dd></div>
+                                        </dl>
+                                    </div>
+                                }.into_any(),
+                                None => view! {}.into_any(),
+                            }}
+                            {match latest_decision.clone() {
+                                Some(decision) => view! {
+                                    <div class="detail-block">
+                                        <p class="eyebrow">"Latest decision"</p>
+                                        <dl class="detail-grid">
+                                            <div><dt>"Decision id"</dt><dd>{decision.id.clone()}</dd></div>
+                                            <div><dt>"Type"</dt><dd>{humanize_snake_case(serde_json::to_string(&decision.decision_type).unwrap_or_default().trim_matches('"'))}</dd></div>
+                                            <div><dt>"Recorded"</dt><dd>{format_timestamp(decision.created_at)}</dd></div>
+                                        </dl>
+                                        <p class="item-summary">{decision.rationale.clone()}</p>
+                                    </div>
+                                }.into_any(),
+                                None => view! {}.into_any(),
+                            }}
+                            {move || match detail.get() {
+                                Some(detail) => view! {
+                                    <div class="detail-block">
+                                        <p class="eyebrow">"Live thread monitor"</p>
+                                        <dl class="detail-grid">
+                                            <div><dt>"Thread"</dt><dd>{detail.summary.id.clone()}</dd></div>
+                                            <div><dt>"Status"</dt><dd>{detail.summary.status.clone()}</dd></div>
+                                            <div><dt>"Turns"</dt><dd>{detail.turns.len().to_string()}</dd></div>
+                                            <div><dt>"Updated"</dt><dd>{format_unix_millis(detail.summary.updated_at)}</dd></div>
+                                        </dl>
+                                        <p class="item-summary">{detail.summary.preview.clone()}</p>
+                                        <div class="detail-panel">
+                                            {detail.turns.into_iter().rev().take(3).map(|turn| view! { <ThreadTurnCard turn /> }).collect_view()}
+                                        </div>
+                                    </div>
+                                }.into_any(),
+                                None => {
+                                    if loading_detail.get() {
+                                        view! { <div class="detail-block"><p class="eyebrow">"Live thread monitor"</p><p class="item-meta">"Loading live thread detail…"</p></div> }.into_any()
+                                    } else if has_inferred_thread {
+                                        view! { <div class="detail-block"><p class="eyebrow">"Live thread monitor"</p><p class="item-meta">"No thread detail loaded yet."</p></div> }.into_any()
+                                    } else {
+                                        view! { <div class="detail-block"><p class="eyebrow">"Live thread monitor"</p><p class="item-meta">"No live Codex thread could be inferred for this runtime lane yet."</p></div> }.into_any()
+                                    }
+                                }
+                            }}
+                        </div>
+                    }.into_any()
+                } else {
+                    view! {}.into_any()
+                }
+            }}
+        </div>
     }
 }
 
