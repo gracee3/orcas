@@ -1567,6 +1567,10 @@ pub struct AssignmentSummary {
     pub alignment_rationale: Option<String>,
     pub worker_id: String,
     pub worker_session_id: String,
+    #[serde(default)]
+    pub codex_thread_id: Option<String>,
+    #[serde(default)]
+    pub tracked_thread_id: Option<String>,
     pub status: AssignmentStatus,
     pub attempt_number: u32,
     pub updated_at: DateTime<Utc>,

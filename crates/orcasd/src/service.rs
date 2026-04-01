@@ -11533,6 +11533,129 @@ impl OrcasDaemonService {
         Ok(())
     }
 
+    async fn ensure_assignment_tracked_thread_binding(
+        &self,
+        worker_session_id: &str,
+        work_unit_id: &str,
+        requested_model: Option<&str>,
+        requested_cwd: Option<&str>,
+    ) -> OrcasResult<()> {
+        let worker_session = self
+            .state
+            .read()
+            .await
+            .collaboration
+            .worker_sessions
+            .get(worker_session_id)
+            .cloned();
+        let Some(worker_session) = worker_session else {
+            return Ok(());
+        };
+        let Some(worker_thread_id) = worker_session.thread_id.clone() else {
+            return Ok(());
+        };
+        if worker_session.tracked_thread_id.is_some() {
+            return Ok(());
+        }
+
+        let work_unit_id = orcas_core::authority::WorkUnitId::parse(work_unit_id.to_string())?;
+        let tracked_threads = self
+            .authority_store
+            .list_tracked_threads(&work_unit_id, false)
+            .await?;
+
+        if let Some(tracked_thread_id) = tracked_threads
+            .iter()
+            .find(|tracked_thread| {
+                tracked_thread.upstream_thread_id.as_deref() == Some(worker_thread_id.as_str())
+            })
+            .map(|tracked_thread| tracked_thread.id.clone())
+        {
+            self.sync_worker_session_tracked_thread_binding(
+                &tracked_thread_id,
+                Some(worker_thread_id.as_str()),
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if tracked_threads.is_empty() {
+            let metadata = self.authority_command_metadata("orcasd")?;
+            let tracked_thread_id = orcas_core::authority::TrackedThreadId::new();
+            self.authority_tracked_thread_create(ipc::AuthorityTrackedThreadCreateRequest {
+                command: orcas_core::authority::CreateTrackedThread {
+                    metadata,
+                    tracked_thread_id,
+                    work_unit_id: work_unit_id.clone(),
+                    title: worker_session.worker_id.clone(),
+                    notes: Some("auto-created from assignment_start".to_string()),
+                    backend_kind: orcas_core::authority::TrackedThreadBackendKind::Codex,
+                    upstream_thread_id: Some(worker_thread_id.clone()),
+                    preferred_cwd: requested_cwd.map(ToOwned::to_owned),
+                    preferred_model: requested_model.map(ToOwned::to_owned),
+                    workspace: None,
+                },
+            })
+            .await?;
+            self.sync_worker_session_tracked_thread_binding_for_assignment(
+                worker_session_id,
+                work_unit_id.as_str(),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if tracked_threads.len() == 1
+            && tracked_threads[0].upstream_thread_id.is_none()
+            && tracked_threads[0].deleted_at.is_none()
+        {
+            let tracked_thread = self
+                .authority_tracked_thread_get(ipc::AuthorityTrackedThreadGetRequest {
+                    tracked_thread_id: tracked_threads[0].id.clone(),
+                })
+                .await?
+                .tracked_thread;
+            let mut changes = orcas_core::authority::TrackedThreadPatch {
+                title: None,
+                notes: None,
+                backend_kind: None,
+                upstream_thread_id: Some(Some(worker_thread_id.clone())),
+                binding_state: Some(orcas_core::authority::TrackedThreadBindingState::Bound),
+                preferred_cwd: None,
+                preferred_model: None,
+                last_seen_turn_id: None,
+                workspace: None,
+            };
+            if tracked_thread.preferred_cwd.is_none()
+                && let Some(cwd) = requested_cwd
+            {
+                changes.preferred_cwd = Some(Some(cwd.to_string()));
+            }
+            if tracked_thread.preferred_model.is_none()
+                && let Some(model) = requested_model
+            {
+                changes.preferred_model = Some(Some(model.to_string()));
+            }
+            self.authority_tracked_thread_edit(ipc::AuthorityTrackedThreadEditRequest {
+                command: orcas_core::authority::EditTrackedThread {
+                    metadata: self.authority_command_metadata("orcasd")?,
+                    tracked_thread_id: tracked_thread.id.clone(),
+                    expected_revision: tracked_thread.revision,
+                    changes,
+                },
+            })
+            .await?;
+            self.sync_worker_session_tracked_thread_binding_for_assignment(
+                worker_session_id,
+                work_unit_id.as_str(),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     async fn reconcile_worker_session_tracked_thread_bindings(&self) -> OrcasResult<()> {
         let work_unit_ids = {
             self.state
@@ -11559,6 +11682,30 @@ impl OrcasDaemonService {
                 .await?;
             }
         }
+        let assignment_bindings = {
+            self.state
+                .read()
+                .await
+                .collaboration
+                .assignments
+                .values()
+                .map(|assignment| {
+                    (
+                        assignment.worker_session_id.clone(),
+                        assignment.work_unit_id.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (worker_session_id, work_unit_id) in assignment_bindings {
+            self.ensure_assignment_tracked_thread_binding(
+                &worker_session_id,
+                &work_unit_id,
+                None,
+                None,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -11569,6 +11716,8 @@ impl OrcasDaemonService {
         cwd: Option<String>,
         work_unit_id: Option<&str>,
     ) -> OrcasResult<WorkerSession> {
+        let requested_model = model.clone();
+        let requested_cwd = cwd.clone();
         // Worker sessions may be reused across assignments, but that reuse only preserves the
         // runtime thread anchor. It does not carry hidden workflow continuity; each assignment
         // still records its own explicit worker_session binding and executes as a distinct step.
@@ -11592,6 +11741,13 @@ impl OrcasDaemonService {
                 .is_ok()
         {
             if let Some(work_unit_id) = work_unit_id {
+                self.ensure_assignment_tracked_thread_binding(
+                    worker_session_id,
+                    work_unit_id,
+                    requested_model.as_deref(),
+                    requested_cwd.as_deref(),
+                )
+                .await?;
                 self.sync_worker_session_tracked_thread_binding_for_assignment(
                     worker_session_id,
                     work_unit_id,
@@ -11639,6 +11795,13 @@ impl OrcasDaemonService {
         };
         self.persist_collaboration_state().await?;
         if let Some(work_unit_id) = work_unit_id {
+            self.ensure_assignment_tracked_thread_binding(
+                worker_session_id,
+                work_unit_id,
+                requested_model.as_deref(),
+                requested_cwd.as_deref(),
+            )
+            .await?;
             self.sync_worker_session_tracked_thread_binding_for_assignment(
                 worker_session_id,
                 work_unit_id,
@@ -11785,9 +11948,13 @@ impl OrcasDaemonService {
         action: ipc::AssignmentLifecycleAction,
         assignment: &Assignment,
     ) {
+        let assignment = {
+            let state = self.state.read().await;
+            Self::assignment_summary(&state.collaboration, assignment)
+        };
         self.emit(ipc::DaemonEvent::AssignmentLifecycle {
             action,
-            assignment: Self::assignment_summary(assignment),
+            assignment,
         })
         .await;
     }
@@ -12026,7 +12193,7 @@ impl OrcasDaemonService {
             .assignments
             .values()
             .filter(|assignment| assignment.status != AssignmentStatus::Closed)
-            .map(Self::assignment_summary)
+            .map(|assignment| Self::assignment_summary(collaboration, assignment))
             .collect::<Vec<_>>();
         assignments.sort_by(|left, right| {
             right
@@ -12221,7 +12388,13 @@ impl OrcasDaemonService {
         }
     }
 
-    fn assignment_summary(assignment: &Assignment) -> ipc::AssignmentSummary {
+    fn assignment_summary(
+        collaboration: &CollaborationState,
+        assignment: &Assignment,
+    ) -> ipc::AssignmentSummary {
+        let worker_session = collaboration
+            .worker_sessions
+            .get(&assignment.worker_session_id);
         ipc::AssignmentSummary {
             id: assignment.id.clone(),
             work_unit_id: assignment.work_unit_id.clone(),
@@ -12232,6 +12405,10 @@ impl OrcasDaemonService {
             alignment_rationale: assignment.alignment_rationale.clone(),
             worker_id: assignment.worker_id.clone(),
             worker_session_id: assignment.worker_session_id.clone(),
+            codex_thread_id: worker_session.and_then(|session| session.thread_id.clone()),
+            tracked_thread_id: worker_session
+                .and_then(|session| session.tracked_thread_id.as_ref())
+                .map(ToString::to_string),
             status: assignment.status,
             attempt_number: assignment.attempt_number,
             updated_at: assignment.updated_at,
@@ -26565,6 +26742,235 @@ ORCAS_REPORT_END"#
                 .map(|tracked_thread_id| tracked_thread_id.as_str()),
             Some("binding-tt")
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_worker_session_thread_auto_creates_tracked_thread_for_assignment_lane() {
+        let base =
+            std::env::temp_dir().join(format!("orcas-auto-tracked-thread-{}", Uuid::new_v4()));
+        let service = test_service_at(base).await;
+        let origin_node_id = service.authority_store.origin_node_id().expect("origin");
+        let metadata = |label: &str| orcas_core::authority::CommandMetadata {
+            command_id: orcas_core::authority::CommandId::new(),
+            issued_at: Utc::now(),
+            origin_node_id: origin_node_id.clone(),
+            actor: orcas_core::authority::CommandActor::parse("workspace_test")
+                .expect("command actor"),
+            correlation_id: Some(
+                orcas_core::authority::CorrelationId::parse(format!("corr-{label}"))
+                    .expect("correlation id"),
+            ),
+        };
+
+        let workstream = service
+            .authority_workstream_create(ipc::AuthorityWorkstreamCreateRequest {
+                command: orcas_core::authority::CreateWorkstream {
+                    metadata: metadata("ws"),
+                    workstream_id: orcas_core::authority::WorkstreamId::parse("auto-ws")
+                        .expect("workstream id"),
+                    title: "Auto stream".to_string(),
+                    objective: "Exercise auto tracked thread binding".to_string(),
+                    status: WorkstreamStatus::Active,
+                    priority: "high".to_string(),
+                },
+            })
+            .await
+            .expect("authority workstream")
+            .workstream;
+        let work_unit = service
+            .authority_workunit_create(ipc::AuthorityWorkunitCreateRequest {
+                command: orcas_core::authority::CreateWorkUnit {
+                    metadata: metadata("wu"),
+                    work_unit_id: orcas_core::authority::WorkUnitId::parse("auto-wu")
+                        .expect("work unit id"),
+                    workstream_id: workstream.id.clone(),
+                    title: "Auto unit".to_string(),
+                    task_statement: "Bind the launched Codex lane automatically.".to_string(),
+                    status: WorkUnitStatus::Ready,
+                },
+            })
+            .await
+            .expect("authority work unit")
+            .work_unit;
+
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.to_string(),
+                worker_id: "auto-worker".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Keep the auto-binding test narrow.".to_string()),
+                model: Some("gpt-5.4".to_string()),
+                cwd: Some("/tmp/orcas-auto".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("prepare assignment");
+
+        let worker_session = service
+            .ensure_worker_session_thread(
+                &prepared.assignment.worker_session_id,
+                Some("gpt-5.4".to_string()),
+                Some("/tmp/orcas-auto".to_string()),
+                Some(work_unit.id.as_str()),
+            )
+            .await
+            .expect("worker session thread");
+        let thread_id = worker_session.thread_id.clone().expect("thread id");
+        let tracked_thread_id = worker_session
+            .tracked_thread_id
+            .clone()
+            .expect("tracked thread id");
+        let tracked_thread = service
+            .authority_tracked_thread_get(ipc::AuthorityTrackedThreadGetRequest {
+                tracked_thread_id: tracked_thread_id.clone(),
+            })
+            .await
+            .expect("tracked thread")
+            .tracked_thread;
+
+        assert_eq!(tracked_thread.work_unit_id, work_unit.id);
+        assert_eq!(
+            tracked_thread.upstream_thread_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(tracked_thread.title, "auto-worker");
+        assert_eq!(tracked_thread.preferred_cwd.as_deref(), Some("/tmp/orcas-auto"));
+        assert_eq!(tracked_thread.preferred_model.as_deref(), Some("gpt-5.4"));
+
+        let snapshot = service.state_get().await.expect("state snapshot");
+        let assignment_summary = snapshot
+            .snapshot
+            .collaboration
+            .assignments
+            .into_iter()
+            .find(|assignment| assignment.id == prepared.assignment.id)
+            .expect("assignment summary");
+        assert_eq!(
+            assignment_summary.codex_thread_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(
+            assignment_summary.tracked_thread_id.as_deref(),
+            Some(tracked_thread_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_worker_session_thread_binds_single_existing_unbound_tracked_thread() {
+        let base =
+            std::env::temp_dir().join(format!("orcas-auto-bind-existing-{}", Uuid::new_v4()));
+        let service = test_service_at(base).await;
+        let origin_node_id = service.authority_store.origin_node_id().expect("origin");
+        let metadata = |label: &str| orcas_core::authority::CommandMetadata {
+            command_id: orcas_core::authority::CommandId::new(),
+            issued_at: Utc::now(),
+            origin_node_id: origin_node_id.clone(),
+            actor: orcas_core::authority::CommandActor::parse("workspace_test")
+                .expect("command actor"),
+            correlation_id: Some(
+                orcas_core::authority::CorrelationId::parse(format!("corr-{label}"))
+                    .expect("correlation id"),
+            ),
+        };
+
+        let workstream = service
+            .authority_workstream_create(ipc::AuthorityWorkstreamCreateRequest {
+                command: orcas_core::authority::CreateWorkstream {
+                    metadata: metadata("ws"),
+                    workstream_id: orcas_core::authority::WorkstreamId::parse("single-ws")
+                        .expect("workstream id"),
+                    title: "Single stream".to_string(),
+                    objective: "Bind one existing unbound lane".to_string(),
+                    status: WorkstreamStatus::Active,
+                    priority: "high".to_string(),
+                },
+            })
+            .await
+            .expect("authority workstream")
+            .workstream;
+        let work_unit = service
+            .authority_workunit_create(ipc::AuthorityWorkunitCreateRequest {
+                command: orcas_core::authority::CreateWorkUnit {
+                    metadata: metadata("wu"),
+                    work_unit_id: orcas_core::authority::WorkUnitId::parse("single-wu")
+                        .expect("work unit id"),
+                    workstream_id: workstream.id.clone(),
+                    title: "Single unit".to_string(),
+                    task_statement: "Reuse the one available lane.".to_string(),
+                    status: WorkUnitStatus::Ready,
+                },
+            })
+            .await
+            .expect("authority work unit")
+            .work_unit;
+        let tracked_thread = service
+            .authority_tracked_thread_create(ipc::AuthorityTrackedThreadCreateRequest {
+                command: orcas_core::authority::CreateTrackedThread {
+                    metadata: metadata("tt"),
+                    tracked_thread_id: orcas_core::authority::TrackedThreadId::parse("single-tt")
+                        .expect("tracked thread id"),
+                    work_unit_id: work_unit.id.clone(),
+                    title: "Single lane".to_string(),
+                    notes: None,
+                    backend_kind: orcas_core::authority::TrackedThreadBackendKind::Codex,
+                    upstream_thread_id: None,
+                    preferred_cwd: None,
+                    preferred_model: None,
+                    workspace: None,
+                },
+            })
+            .await
+            .expect("tracked thread")
+            .tracked_thread;
+
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.to_string(),
+                worker_id: "bind-worker".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Bind the existing lane.".to_string()),
+                model: Some("gpt-5.4-mini".to_string()),
+                cwd: Some("/tmp/orcas-bind-existing".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("prepare assignment");
+
+        let worker_session = service
+            .ensure_worker_session_thread(
+                &prepared.assignment.worker_session_id,
+                Some("gpt-5.4-mini".to_string()),
+                Some("/tmp/orcas-bind-existing".to_string()),
+                Some(work_unit.id.as_str()),
+            )
+            .await
+            .expect("worker session thread");
+
+        assert_eq!(
+            worker_session
+                .tracked_thread_id
+                .as_ref()
+                .map(|tracked_thread_id| tracked_thread_id.as_str()),
+            Some(tracked_thread.id.as_str())
+        );
+
+        let rebound = service
+            .authority_tracked_thread_get(ipc::AuthorityTrackedThreadGetRequest {
+                tracked_thread_id: tracked_thread.id.clone(),
+            })
+            .await
+            .expect("tracked thread")
+            .tracked_thread;
+        assert_eq!(rebound.binding_state, orcas_core::authority::TrackedThreadBindingState::Bound);
+        assert_eq!(
+            rebound.upstream_thread_id.as_deref(),
+            worker_session.thread_id.as_deref()
+        );
+        assert_eq!(
+            rebound.preferred_cwd.as_deref(),
+            Some("/tmp/orcas-bind-existing")
+        );
+        assert_eq!(rebound.preferred_model.as_deref(), Some("gpt-5.4-mini"));
     }
 
     #[test]
