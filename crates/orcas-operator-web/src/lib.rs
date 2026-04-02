@@ -681,6 +681,48 @@ fn ThreadMonitorBlock(detail: orcas_core::ipc::ThreadView) -> impl IntoView {
 }
 
 #[component]
+fn WorkspaceLifecycleBlock(thread: authority::TrackedThreadSummary) -> impl IntoView {
+    view! {
+        <div class="detail-block">
+            <p class="eyebrow">"Workspace lifecycle"</p>
+            <div class="compact-grid">
+                <div class="mini-stat">
+                    <span class="mini-label">"Binding"</span>
+                    <strong>{humanize_snake_case(
+                        serde_json::to_string(&thread.binding_state)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                    )}</strong>
+                </div>
+                {thread.workspace_strategy.as_ref().map(|strategy| view! {
+                    <div class="mini-stat">
+                        <span class="mini-label">"Strategy"</span>
+                        <strong>{humanize_snake_case(
+                            serde_json::to_string(strategy)
+                                .unwrap_or_default()
+                                .trim_matches('"')
+                        )}</strong>
+                    </div>
+                })}
+                {thread.workspace_status.as_ref().map(|status| view! {
+                    <div class="mini-stat">
+                        <span class="mini-label">"Workspace"</span>
+                        <strong>{humanize_snake_case(
+                            serde_json::to_string(status)
+                                .unwrap_or_default()
+                                .trim_matches('"')
+                        )}</strong>
+                    </div>
+                })}
+            </div>
+            {thread.upstream_thread_id.as_ref().map(|thread_id| view! {
+                <p class="item-meta">{format!("bound Codex thread {thread_id}")}</p>
+            })}
+        </div>
+    }
+}
+
+#[component]
 pub fn App() -> impl IntoView {
     let settings = RwSignal::new(storage::load_settings());
     let workspace = RwSignal::new(storage::load_workspace_state());
@@ -2782,6 +2824,9 @@ fn TrackedThreadCard(
     let proposal_record = RwSignal::new(None::<orcas_core::supervisor::SupervisorProposalRecord>);
     let proposal_artifact =
         RwSignal::new(None::<orcas_core::ipc::SupervisorProposalArtifactDetail>);
+    let workspace_thread = thread.clone();
+    let has_workspace_lifecycle =
+        workspace_thread.workspace_strategy.is_some() || workspace_thread.workspace_status.is_some();
     let bind_thread_id = RwSignal::new(String::new());
     let bound_upstream_thread_id = thread.upstream_thread_id.clone();
     let has_bound_upstream_thread = bound_upstream_thread_id.is_some();
@@ -3132,6 +3177,9 @@ fn TrackedThreadCard(
                                     }
                                 }
                             }}
+                            {has_workspace_lifecycle.then(|| view! {
+                                <WorkspaceLifecycleBlock thread=workspace_thread.clone() />
+                            })}
                             <SupervisorWorkflowBlock
                                 assignment_label=runtime
                                     .assignment_id
