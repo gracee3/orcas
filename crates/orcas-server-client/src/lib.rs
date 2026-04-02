@@ -37,8 +37,9 @@ use orcas_core::ipc::{
     OperatorRemoteActionFailResponse, OperatorRemoteActionGetRequest,
     OperatorRemoteActionGetResponse, OperatorRemoteActionListRequest,
     OperatorRemoteActionListResponse, OperatorRemoteActionWaitRequest, ProposalApproveRequest,
-    ProposalApproveResponse, ProposalCreateRequest, ProposalCreateResponse, ProposalRejectRequest,
-    ProposalRejectResponse, OperatorRemoteActionWaitResponse, StateGetRequest, StateGetResponse,
+    ProposalApproveResponse, ProposalArtifactDetailGetRequest, ProposalArtifactDetailGetResponse,
+    ProposalCreateRequest, ProposalCreateResponse, ProposalGetRequest, ProposalGetResponse,
+    ProposalRejectRequest, ProposalRejectResponse, OperatorRemoteActionWaitResponse, StateGetRequest, StateGetResponse,
     ThreadGetRequest, ThreadGetResponse, CodexAssignmentPauseRequest,
     CodexAssignmentPauseResponse, CodexAssignmentResumeRequest, CodexAssignmentResumeResponse,
 };
@@ -426,6 +427,21 @@ impl OrcasServerClient {
         request: &ProposalCreateRequest,
     ) -> OrcasResult<ProposalCreateResponse> {
         self.post_json("operator-runtime/proposals/create", request)
+            .await
+    }
+
+    pub async fn proposal_get(
+        &self,
+        request: &ProposalGetRequest,
+    ) -> OrcasResult<ProposalGetResponse> {
+        self.post_json("operator-runtime/proposals/get", request).await
+    }
+
+    pub async fn proposal_artifact_detail_get(
+        &self,
+        request: &ProposalArtifactDetailGetRequest,
+    ) -> OrcasResult<ProposalArtifactDetailGetResponse> {
+        self.post_json("operator-runtime/proposals/artifact-detail", request)
             .await
     }
 

@@ -18,7 +18,8 @@ use orcas_core::ipc::{
     OperatorReadModelWaitForCheckpointRequest, OperatorRemoteActionCreateRequest,
     OperatorRemoteActionGetRequest, OperatorRemoteActionListRequest,
     OperatorRemoteActionWaitRequest, ProposalApproveRequest, ProposalCreateRequest,
-    ProposalCreateResponse, ProposalRejectRequest,
+    ProposalCreateResponse, ProposalGetRequest, ProposalGetResponse,
+    ProposalArtifactDetailGetRequest, ProposalArtifactDetailGetResponse, ProposalRejectRequest,
 };
 use orcas_operator_core::{
     DeliveryPageView, InboxDetailPageView, InboxPageView, NotificationPageView,
@@ -551,6 +552,28 @@ pub async fn proposal_create(
             note: note.filter(|value| !value.trim().is_empty()),
             supersede_open: false,
         })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn proposal_get(
+    settings: OperatorServerSettings,
+    proposal_id: String,
+) -> Result<ProposalGetResponse, String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .proposal_get(&ProposalGetRequest { proposal_id })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn proposal_artifact_detail_get(
+    settings: OperatorServerSettings,
+    proposal_id: String,
+) -> Result<ProposalArtifactDetailGetResponse, String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .proposal_artifact_detail_get(&ProposalArtifactDetailGetRequest { proposal_id })
         .await
         .map_err(|error| error.to_string())
 }

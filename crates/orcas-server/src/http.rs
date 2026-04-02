@@ -57,8 +57,9 @@ use orcas_core::ipc::{
     OperatorRemoteActionGetRequest, OperatorRemoteActionGetResponse,
     OperatorRemoteActionListRequest, OperatorRemoteActionListResponse,
     OperatorRemoteActionWaitRequest, OperatorRemoteActionWaitResponse, ProposalApproveRequest,
-    ProposalApproveResponse, ProposalCreateRequest, ProposalCreateResponse, ProposalRejectRequest,
-    ProposalRejectResponse, StateGetRequest, StateGetResponse, ThreadGetRequest,
+    ProposalApproveResponse, ProposalArtifactDetailGetRequest, ProposalArtifactDetailGetResponse,
+    ProposalCreateRequest, ProposalCreateResponse, ProposalGetRequest, ProposalGetResponse,
+    ProposalRejectRequest, ProposalRejectResponse, StateGetRequest, StateGetResponse, ThreadGetRequest,
     ThreadGetResponse, CodexAssignmentPauseRequest, CodexAssignmentPauseResponse,
     CodexAssignmentResumeRequest, CodexAssignmentResumeResponse,
 };
@@ -274,6 +275,11 @@ impl InboxMirrorServer {
             .route("/operator-runtime/state/get", post(state_get))
             .route("/operator-runtime/assignments/start", post(assignment_start))
             .route("/operator-runtime/proposals/create", post(proposal_create))
+            .route("/operator-runtime/proposals/get", post(proposal_get))
+            .route(
+                "/operator-runtime/proposals/artifact-detail",
+                post(proposal_artifact_detail_get),
+            )
             .route("/operator-runtime/proposals/approve", post(proposal_approve))
             .route("/operator-runtime/proposals/reject", post(proposal_reject))
             .route("/operator-authority/hierarchy/get", post(authority_hierarchy_get))
@@ -832,6 +838,29 @@ async fn proposal_create(
 ) -> Result<Json<ProposalCreateResponse>, String> {
     Ok(Json(
         daemon_request(&state, orcas_core::ipc::methods::PROPOSAL_CREATE, &request).await?,
+    ))
+}
+
+async fn proposal_get(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<ProposalGetRequest>,
+) -> Result<Json<ProposalGetResponse>, String> {
+    Ok(Json(
+        daemon_request(&state, orcas_core::ipc::methods::PROPOSAL_GET, &request).await?,
+    ))
+}
+
+async fn proposal_artifact_detail_get(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<ProposalArtifactDetailGetRequest>,
+) -> Result<Json<ProposalArtifactDetailGetResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::PROPOSAL_ARTIFACT_DETAIL_GET,
+            &request,
+        )
+        .await?,
     ))
 }
 

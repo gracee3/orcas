@@ -190,6 +190,80 @@ fn humanize_optional_kind(kind: Option<&str>, fallback: &str) -> String {
 }
 
 #[component]
+fn SupervisorProposalDetailBlock(
+    proposal: orcas_core::supervisor::SupervisorProposalRecord,
+    artifact_detail: Option<orcas_core::ipc::SupervisorProposalArtifactDetail>,
+) -> impl IntoView {
+    let effective_proposal = proposal
+        .approved_proposal
+        .clone()
+        .or(proposal.proposal.clone());
+    view! {
+        <div class="detail-block">
+            <p class="eyebrow">"Supervisor recommendation"</p>
+            <dl class="detail-grid">
+                <div><dt>"Status"</dt><dd>{humanize_snake_case(serde_json::to_string(&proposal.status).unwrap_or_default().trim_matches('"'))}</dd></div>
+                <div><dt>"Created"</dt><dd>{format_timestamp(proposal.created_at)}</dd></div>
+                <div><dt>"Reviewed"</dt><dd>{format_optional_timestamp(proposal.reviewed_at)}</dd></div>
+                <div><dt>"Model"</dt><dd>{proposal.reasoner_model.clone()}</dd></div>
+            </dl>
+            {effective_proposal.as_ref().map(|value| view! {
+                <>
+                    <p class="item-summary">{value.summary.headline.clone()}</p>
+                    <p class="item-meta">{value.summary.recommended_action.clone()}</p>
+                    <dl class="detail-grid">
+                        <div><dt>"Decision"</dt><dd>{humanize_snake_case(serde_json::to_string(&value.proposed_decision.decision_type).unwrap_or_default().trim_matches('"'))}</dd></div>
+                        <div><dt>"Confidence"</dt><dd>{humanize_snake_case(serde_json::to_string(&value.confidence).unwrap_or_default().trim_matches('"'))}</dd></div>
+                    </dl>
+                    <p class="item-summary">{value.proposed_decision.rationale.clone()}</p>
+                    {(!value.summary.key_evidence.is_empty()).then(|| view! {
+                        <div class="json-panel">
+                            <p class="eyebrow">"Key evidence"</p>
+                            <ul class="json-list">
+                                {value.summary.key_evidence.iter().cloned().map(|entry| view! { <li>{entry}</li> }).collect_view()}
+                            </ul>
+                        </div>
+                    })}
+                    {value.draft_next_assignment.as_ref().map(|draft| view! {
+                        <div class="json-panel">
+                            <p class="eyebrow">"Next assignment draft"</p>
+                            <dl class="detail-grid">
+                                <div><dt>"Worker"</dt><dd>{draft.preferred_worker_id.clone().unwrap_or_else(|| "Unspecified".to_string())}</dd></div>
+                                <div><dt>"Execution"</dt><dd>{humanize_snake_case(serde_json::to_string(&draft.execution_kind).unwrap_or_default().trim_matches('"'))}</dd></div>
+                                <div><dt>"Objective"</dt><dd>{draft.objective.clone()}</dd></div>
+                            </dl>
+                            {(!draft.instructions.is_empty()).then(|| view! {
+                                <>
+                                    <p class="item-meta">"Instructions"</p>
+                                    <ul class="json-list">
+                                        {draft.instructions.iter().cloned().map(|entry| view! { <li>{entry}</li> }).collect_view()}
+                                    </ul>
+                                </>
+                            })}
+                        </div>
+                    })}
+                </>
+            })}
+            {proposal.generation_failure.as_ref().map(|failure| view! {
+                <div class="json-panel">
+                    <p class="eyebrow">"Generation failure"</p>
+                    <p class="item-summary">{humanize_snake_case(serde_json::to_string(&failure.stage).unwrap_or_default().trim_matches('"'))}</p>
+                    <p class="item-meta">{failure.message.clone()}</p>
+                </div>
+            })}
+            {artifact_detail.and_then(|detail| detail.reasoner_output_text).map(|text| view! {
+                <div class="json-panel">
+                    <details>
+                        <summary>"Show supervisor output"</summary>
+                        <pre class="code-block">{text}</pre>
+                    </details>
+                </div>
+            })}
+        </div>
+    }
+}
+
+#[component]
 fn TurnPlanCard(plan: orcas_core::ipc::TurnPlanView) -> impl IntoView {
     let explanation = plan.explanation.clone();
     let steps = plan.plan.clone();
@@ -2135,7 +2209,11 @@ fn RuntimeAssignmentCard(
     let working = RwSignal::new(false);
     let showing_detail = RwSignal::new(false);
     let loading_detail = RwSignal::new(false);
+    let loading_proposal = RwSignal::new(false);
     let detail = RwSignal::new(None::<orcas_core::ipc::ThreadView>);
+    let proposal_record = RwSignal::new(None::<orcas_core::supervisor::SupervisorProposalRecord>);
+    let proposal_artifact =
+        RwSignal::new(None::<orcas_core::ipc::SupervisorProposalArtifactDetail>);
     let inferred_thread = inferred_live_thread_for_assignment(&assignment, &dashboard);
     let latest_report = dashboard
         .snapshot
@@ -2205,6 +2283,9 @@ fn RuntimeAssignmentCard(
         work_unit_proposal.as_ref(),
         latest_decision.as_ref(),
     );
+    let proposal_id_for_detail = work_unit_proposal
+        .as_ref()
+        .map(|proposal| proposal.latest_proposal_id.clone());
     let inferred_thread_id_for_detail = inferred_thread.as_ref().map(|thread| thread.id.clone());
     let has_inferred_thread = inferred_thread.is_some();
 
@@ -2387,6 +2468,26 @@ fn RuntimeAssignmentCard(
             </div>
             {move || {
                     if showing_detail.get() {
+                        if proposal_record.get().is_none() && !loading_proposal.get() {
+                            if let Some(proposal_id) = proposal_id_for_detail.clone() {
+                                let settings = settings.get_untracked();
+                                loading_proposal.set(true);
+                                action_error.set(None);
+                                #[cfg(target_arch = "wasm32")]
+                                spawn_local(async move {
+                                    match api::proposal_get(settings.clone(), proposal_id.clone()).await {
+                                        Ok(response) => {
+                                            proposal_record.set(Some(response.proposal));
+                                            if let Ok(detail_response) = api::proposal_artifact_detail_get(settings, proposal_id).await {
+                                                proposal_artifact.set(Some(detail_response.detail));
+                                            }
+                                        }
+                                        Err(error) => action_error.set(Some(error)),
+                                    }
+                                    loading_proposal.set(false);
+                                });
+                            }
+                        }
                         if detail.get().is_none() && !loading_detail.get() {
                             if let Some(thread_id) = inferred_thread_id_for_detail.clone() {
                                 let settings = settings.get_untracked();
@@ -2405,6 +2506,21 @@ fn RuntimeAssignmentCard(
                     
                     view! {
                         <div class="detail-panel">
+                            {move || match proposal_record.get() {
+                                Some(proposal) => view! {
+                                    <SupervisorProposalDetailBlock
+                                        proposal
+                                        artifact_detail=proposal_artifact.get()
+                                    />
+                                }.into_any(),
+                                None => {
+                                    if loading_proposal.get() {
+                                        view! { <div class="detail-block"><p class="eyebrow">"Supervisor recommendation"</p><p class="item-meta">"Loading proposal detail…"</p></div> }.into_any()
+                                    } else {
+                                        view! {}.into_any()
+                                    }
+                                }
+                            }}
                             {match latest_report.clone() {
                                 Some(report) => view! {
                                     <div class="detail-block">
@@ -2509,7 +2625,11 @@ fn TrackedThreadCard(
     let binding = RwSignal::new(false);
     let showing_detail = RwSignal::new(false);
     let loading_detail = RwSignal::new(false);
+    let loading_proposal = RwSignal::new(false);
     let detail = RwSignal::new(None::<orcas_core::ipc::ThreadView>);
+    let proposal_record = RwSignal::new(None::<orcas_core::supervisor::SupervisorProposalRecord>);
+    let proposal_artifact =
+        RwSignal::new(None::<orcas_core::ipc::SupervisorProposalArtifactDetail>);
     let bind_thread_id = RwSignal::new(String::new());
     let bound_upstream_thread_id = thread.upstream_thread_id.clone();
     let has_bound_upstream_thread = bound_upstream_thread_id.is_some();
@@ -2570,6 +2690,9 @@ fn TrackedThreadCard(
         work_unit_proposal.as_ref(),
         latest_decision.as_ref(),
     );
+    let proposal_id_for_detail = work_unit_proposal
+        .as_ref()
+        .map(|proposal| proposal.latest_proposal_id.clone());
 
     view! {
         <div class="item-card">
@@ -2804,6 +2927,26 @@ fn TrackedThreadCard(
             </div>
             {move || {
                 if showing_detail.get() {
+                    if proposal_record.get().is_none() && !loading_proposal.get() {
+                        if let Some(proposal_id) = proposal_id_for_detail.clone() {
+                            let settings = settings.get_untracked();
+                            loading_proposal.set(true);
+                            action_error.set(None);
+                            #[cfg(target_arch = "wasm32")]
+                            spawn_local(async move {
+                                match api::proposal_get(settings.clone(), proposal_id.clone()).await {
+                                    Ok(response) => {
+                                        proposal_record.set(Some(response.proposal));
+                                        if let Ok(detail_response) = api::proposal_artifact_detail_get(settings, proposal_id).await {
+                                            proposal_artifact.set(Some(detail_response.detail));
+                                        }
+                                    }
+                                    Err(error) => action_error.set(Some(error)),
+                                }
+                                loading_proposal.set(false);
+                            });
+                        }
+                    }
                     if detail.get().is_none() && !loading_detail.get() {
                         if let Some(upstream_thread_id) = bound_upstream_thread_id.clone() {
                             let settings = settings.get_untracked();
@@ -2821,6 +2964,21 @@ fn TrackedThreadCard(
                     }
                     view! {
                         <div class="detail-panel">
+                            {move || match proposal_record.get() {
+                                Some(proposal) => view! {
+                                    <SupervisorProposalDetailBlock
+                                        proposal
+                                        artifact_detail=proposal_artifact.get()
+                                    />
+                                }.into_any(),
+                                None => {
+                                    if loading_proposal.get() {
+                                        view! { <div class="detail-block"><p class="eyebrow">"Supervisor recommendation"</p><p class="item-meta">"Loading proposal detail…"</p></div> }.into_any()
+                                    } else {
+                                        view! {}.into_any()
+                                    }
+                                }
+                            }}
                             {match latest_report.clone() {
                                 Some(report) => view! {
                                     <div class="detail-block">
