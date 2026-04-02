@@ -2147,7 +2147,7 @@ async fn real_cli_can_apply_decision_after_real_assignment_setup() {
     assert!(workunit_stdout.contains("surface: authority"));
     assert!(workunit_stdout.contains(&format!("work_unit_id: {}", started.report.work_unit_id)));
     assert!(workunit_stdout.contains("status: "));
-    assert!(workunit_stdout.contains("tracked_threads: 0"));
+    assert!(workunit_stdout.contains("tracked_threads: 1"));
 
     let report_output = run_orcas(&daemon, &["reports", "get", "--report", &started.report.id]);
     assert!(
