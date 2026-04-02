@@ -169,6 +169,10 @@ pub fn tracked_thread_runtime_status(
         assignment.status == orcas_core::CodexThreadAssignmentStatus::Active
     }) {
         "In progress".to_string()
+    } else if assignment.as_ref().is_some_and(|assignment| {
+        assignment.status == orcas_core::AssignmentStatus::Created
+    }) {
+        "Queued".to_string()
     } else if codex_assignment
         .as_ref()
         .is_some_and(|assignment| assignment.status == orcas_core::CodexThreadAssignmentStatus::Paused)

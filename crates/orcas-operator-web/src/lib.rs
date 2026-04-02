@@ -104,6 +104,21 @@ fn proposal_status_summary(proposal: &orcas_core::ipc::WorkUnitProposalSummary) 
             })
             .unwrap_or_else(|| "Review ready".to_string());
         format!("proposal ready · {decision}")
+    } else if matches!(
+        proposal.latest_status,
+        orcas_core::supervisor::SupervisorProposalStatus::Approved
+    ) {
+        let decision = proposal
+            .latest_proposed_decision_type
+            .map(|decision| {
+                humanize_snake_case(
+                    serde_json::to_string(&decision)
+                        .unwrap_or_default()
+                        .trim_matches('"'),
+                )
+            })
+            .unwrap_or_else(|| "Approved".to_string());
+        format!("proposal approved · {decision}")
     } else {
         let status = humanize_snake_case(
             serde_json::to_string(&proposal.latest_status)
@@ -152,6 +167,23 @@ fn lane_activity_summary(
         "No supervisor activity yet".to_string()
     } else {
         parts.join(" · ")
+    }
+}
+
+fn lane_summary_for_display(
+    headline: &str,
+    report: Option<&orcas_core::ipc::ReportSummary>,
+    proposal: Option<&orcas_core::ipc::WorkUnitProposalSummary>,
+    decision: Option<&orcas_core::ipc::DecisionSummary>,
+) -> String {
+    if report.is_some() || proposal.is_some() || decision.is_some() {
+        lane_activity_summary(report, proposal, decision)
+    } else if headline == "In progress" {
+        "Codex turn in progress".to_string()
+    } else if headline == "Queued" {
+        "Supervisor approved the next assignment".to_string()
+    } else {
+        "No supervisor activity yet".to_string()
     }
 }
 
@@ -414,11 +446,35 @@ fn TurnItemCard(item: orcas_core::ipc::ItemView) -> impl IntoView {
 
 #[component]
 fn ThreadTurnCard(turn: orcas_core::ipc::TurnView) -> impl IntoView {
+    let item_count = turn.items.len();
+    let primary_summary = turn
+        .error_summary
+        .clone()
+        .or(turn.error_message.clone())
+        .or_else(|| {
+            turn.items
+                .iter()
+                .rev()
+                .find_map(|item| item.summary.clone().filter(|value| !value.trim().is_empty()))
+        })
+        .unwrap_or_else(|| {
+            if matches!(turn.status.as_str(), "inProgress" | "in_progress") {
+                "Codex is still working on this turn.".to_string()
+            } else {
+                "No structured turn summary recorded.".to_string()
+            }
+        });
     view! {
         <div class="detail-block">
             <div class="item-card-topline">
                 <span class="status-pill">{humanize_snake_case(&turn.status)}</span>
-                <span class="muted">{turn.id.clone()}</span>
+                <span class="muted">
+                    {if item_count == 1 {
+                        "1 event".to_string()
+                    } else {
+                        format!("{item_count} events")
+                    }}
+                </span>
             </div>
             <p class="item-meta">
                 {format!(
@@ -431,16 +487,12 @@ fn ThreadTurnCard(turn: orcas_core::ipc::TurnView) -> impl IntoView {
                         .unwrap_or_default()
                 )}
             </p>
-            {turn
-                .error_summary
-                .clone()
-                .or(turn.error_message.clone())
-                .map(|summary| view! { <p class="item-summary">{summary}</p> })}
+            <p class="item-summary">{primary_summary}</p>
             {turn.latest_diff.clone().map(|diff| view! {
-                <div class="json-panel">
-                    <p class="eyebrow">"Latest diff"</p>
+                <details class="json-panel">
+                    <summary>"Show latest diff"</summary>
                     <pre class="code-block">{diff}</pre>
-                </div>
+                </details>
             })}
             {match turn.latest_plan.clone() {
                 Some(plan) => view! { <TurnPlanCard plan /> }.into_any(),
@@ -470,9 +522,19 @@ fn ThreadTurnCard(turn: orcas_core::ipc::TurnView) -> impl IntoView {
                     .into_any())
                     .unwrap_or_else(|| view! {}.into_any()),
             }}
-            <div class="detail-panel">
-                {turn.items.into_iter().map(|item| view! { <TurnItemCard item /> }).collect_view()}
-            </div>
+            {if turn.items.is_empty() {
+                view! {}.into_any()
+            } else {
+                view! {
+                    <details class="json-panel">
+                        <summary>{format!("Show turn events ({item_count})")}</summary>
+                        <div class="detail-panel">
+                            {turn.items.into_iter().map(|item| view! { <TurnItemCard item /> }).collect_view()}
+                        </div>
+                    </details>
+                }
+                .into_any()
+            }}
         </div>
     }
 }
@@ -2278,7 +2340,8 @@ fn RuntimeAssignmentCard(
                 .trim_matches('"')
         )
     ));
-    let supervisor_summary = lane_activity_summary(
+    let supervisor_summary = lane_summary_for_display(
+        &headline,
         latest_report.as_ref(),
         work_unit_proposal.as_ref(),
         latest_decision.as_ref(),
@@ -2685,7 +2748,8 @@ fn TrackedThreadCard(
         .filter(|item| item.work_unit_id.as_deref() == Some(thread.work_unit_id.as_str()))
         .max_by_key(|item| item.updated_at)
         .cloned();
-    let supervisor_summary = lane_activity_summary(
+    let supervisor_summary = lane_summary_for_display(
+        &runtime.headline,
         latest_report.as_ref(),
         work_unit_proposal.as_ref(),
         latest_decision.as_ref(),
