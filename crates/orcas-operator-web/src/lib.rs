@@ -5,8 +5,8 @@ mod push;
 mod pwa;
 mod storage;
 mod watch;
-mod workstreams;
 mod workspace;
+mod workstreams;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,11 +33,11 @@ use orcas_operator_core::{
     summarize_inbox_page_change, summarize_notification_page_change,
     summarize_remote_action_request_change,
 };
-use workstreams::{
-    WorkstreamsDashboardData, humanize_snake_case, inferred_live_thread_for_assignment, live_thread_linkage,
-    tracked_thread_runtime_status,
-};
 use workspace::{WorkspaceFocus, WorkspaceSection, WorkspaceState};
+use workstreams::{
+    WorkstreamsDashboardData, humanize_snake_case, inferred_live_thread_for_assignment,
+    live_thread_linkage, tracked_thread_runtime_status,
+};
 
 pub fn mount_app() {
     #[cfg(target_arch = "wasm32")]
@@ -71,7 +71,11 @@ fn thread_activity_summary(thread: &orcas_core::ipc::ThreadSummary) -> String {
     } else {
         parts.push(format!("thread {}", thread.status));
     }
-    if let Some(event) = thread.recent_event.as_ref().filter(|value| !value.trim().is_empty()) {
+    if let Some(event) = thread
+        .recent_event
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
         parts.push(event.clone());
     }
     parts.join(" · ")
@@ -193,7 +197,12 @@ fn latest_supervisor_timestamp(
     decision: Option<&orcas_core::ipc::DecisionSummary>,
 ) -> Option<String> {
     decision
-        .map(|decision| format!("decision recorded {}", format_timestamp(decision.created_at)))
+        .map(|decision| {
+            format!(
+                "decision recorded {}",
+                format_timestamp(decision.created_at)
+            )
+        })
         .or_else(|| {
             proposal.map(|proposal| {
                 let label = if proposal.has_generation_failed {
@@ -304,11 +313,8 @@ fn SupervisorWorkflowBlock(
     proposal: Option<orcas_core::ipc::WorkUnitProposalSummary>,
     decision: Option<orcas_core::ipc::DecisionSummary>,
 ) -> impl IntoView {
-    let latest_timestamp = latest_supervisor_timestamp(
-        report.as_ref(),
-        proposal.as_ref(),
-        decision.as_ref(),
-    );
+    let latest_timestamp =
+        latest_supervisor_timestamp(report.as_ref(), proposal.as_ref(), decision.as_ref());
     view! {
         <div class="detail-block">
             <p class="eyebrow">"Supervisor workflow"</p>
@@ -384,6 +390,139 @@ fn SupervisorWorkflowBlock(
     }
 }
 
+fn planning_headline(
+    status: &orcas_core::PlanningSessionStatus,
+    summary: &orcas_core::PlanningSessionStructuredSummary,
+) -> String {
+    match status {
+        orcas_core::PlanningSessionStatus::Approved => "Plan approved".to_string(),
+        orcas_core::PlanningSessionStatus::Rejected => "Plan rejected".to_string(),
+        orcas_core::PlanningSessionStatus::Superseded => "Plan superseded".to_string(),
+        orcas_core::PlanningSessionStatus::Aborted => "Plan aborted".to_string(),
+        orcas_core::PlanningSessionStatus::AwaitingApproval => {
+            "Waiting for supervisor review".to_string()
+        }
+        orcas_core::PlanningSessionStatus::ResearchRequested => {
+            "Supervisor requested research".to_string()
+        }
+        orcas_core::PlanningSessionStatus::Draft | orcas_core::PlanningSessionStatus::Chatting => {
+            if summary.ready_for_review {
+                "Ready for supervisor review".to_string()
+            } else {
+                "Planning in progress".to_string()
+            }
+        }
+    }
+}
+
+fn planning_summary_line(
+    status: &orcas_core::PlanningSessionStatus,
+    summary: &orcas_core::PlanningSessionStructuredSummary,
+) -> String {
+    if let Some(draft) = summary
+        .draft_plan_summary
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return draft.clone();
+    }
+
+    if !summary.open_questions.is_empty() {
+        return format!(
+            "{} open question{} still need{} a supervisor answer.",
+            summary.open_questions.len(),
+            if summary.open_questions.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            if summary.open_questions.len() == 1 {
+                "s"
+            } else {
+                ""
+            }
+        );
+    }
+
+    match status {
+        orcas_core::PlanningSessionStatus::Approved => {
+            "Supervisor approved this planning session.".to_string()
+        }
+        orcas_core::PlanningSessionStatus::Rejected => {
+            "Supervisor rejected this planning session.".to_string()
+        }
+        orcas_core::PlanningSessionStatus::AwaitingApproval => {
+            "The draft plan is waiting for supervisor review.".to_string()
+        }
+        orcas_core::PlanningSessionStatus::ResearchRequested => {
+            "A bounded research pass is needed before the plan can move forward.".to_string()
+        }
+        _ => "Keep the session pre-execution and use research only for bounded questions."
+            .to_string(),
+    }
+}
+
+#[component]
+fn PlanningWorkflowBlock(session: orcas_core::PlanningSession) -> impl IntoView {
+    let headline = planning_headline(&session.status, &session.latest_structured_summary);
+    let summary_line = planning_summary_line(&session.status, &session.latest_structured_summary);
+    let planning_summary = session.latest_structured_summary.clone();
+
+    view! {
+        <div class="detail-block">
+            <p class="eyebrow">"Planning workflow"</p>
+            <div class="item-card-topline">
+                <span class="status-pill">{headline}</span>
+                <span class="muted">{format_timestamp(session.updated_at)}</span>
+            </div>
+            <p class="item-summary">{summary_line}</p>
+            <div class="compact-grid">
+                <div class="mini-stat">
+                    <span class="mini-label">"Research"</span>
+                    <strong>{humanize_snake_case(
+                        serde_json::to_string(&planning_summary.research_status)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                    )}</strong>
+                    <span class="muted">
+                        {if planning_summary.ready_for_review {
+                            "Ready for review".to_string()
+                        } else {
+                            "Drafting".to_string()
+                        }}
+                    </span>
+                </div>
+                <div class="mini-stat">
+                    <span class="mini-label">"Open questions"</span>
+                    <strong>{planning_summary.open_questions.len().to_string()}</strong>
+                    <span class="muted">
+                        {match session.reviewed_at {
+                            Some(reviewed_at) => format!("Reviewed {}", format_timestamp(reviewed_at)),
+                            None => format!("Created {}", format_timestamp(session.created_at)),
+                        }}
+                    </span>
+                </div>
+            </div>
+            {(!planning_summary.open_questions.is_empty()).then(|| view! {
+                <details class="json-panel">
+                    <summary>{format!(
+                        "Show open question{}",
+                        if planning_summary.open_questions.len() == 1 { "" } else { "s" }
+                    )}</summary>
+                    <ul class="json-list">
+                        {planning_summary
+                            .open_questions
+                            .iter()
+                            .cloned()
+                            .map(|value| view! { <li>{value}</li> })
+                            .collect_view()}
+                    </ul>
+                </details>
+            })}
+        </div>
+    }
+}
+
 #[component]
 fn TurnPlanCard(plan: orcas_core::ipc::TurnPlanView) -> impl IntoView {
     let explanation = plan.explanation.clone();
@@ -455,7 +594,9 @@ fn JsonValueTree(value: serde_json::Value) -> impl IntoView {
         serde_json::Value::Null => view! { <span class="muted">"null"</span> }.into_any(),
         serde_json::Value::Bool(value) => view! { <span>{value.to_string()}</span> }.into_any(),
         serde_json::Value::Number(value) => view! { <span>{value.to_string()}</span> }.into_any(),
-        serde_json::Value::String(value) => view! { <span class="json-string">{value}</span> }.into_any(),
+        serde_json::Value::String(value) => {
+            view! { <span class="json-string">{value}</span> }.into_any()
+        }
         serde_json::Value::Array(values) => view! {
             <ul class="json-list">
                 {values
@@ -541,10 +682,11 @@ fn ThreadTurnCard(turn: orcas_core::ipc::TurnView) -> impl IntoView {
         .clone()
         .or(turn.error_message.clone())
         .or_else(|| {
-            turn.items
-                .iter()
-                .rev()
-                .find_map(|item| item.summary.clone().filter(|value| !value.trim().is_empty()))
+            turn.items.iter().rev().find_map(|item| {
+                item.summary
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+            })
         })
         .unwrap_or_else(|| {
             if matches!(turn.status.as_str(), "inProgress" | "in_progress") {
@@ -946,14 +1088,20 @@ fn PlanningSessionCard(
     let planning_thread_id = StoredValue::new(session.planning_thread_id.clone());
     let status = session.status;
     let summary = session.latest_structured_summary.clone();
+    let headline = planning_headline(&status, &summary);
+    let summary_line = planning_summary_line(&status, &summary);
 
     view! {
         <div class="detail-block">
             <div class="item-card-topline">
-                <span class="status-pill">{humanize_snake_case(
-                    serde_json::to_string(&status).unwrap_or_default().trim_matches('"')
-                )}</span>
-                <span class="muted">{format!("planning {}", session.session_id)}</span>
+                <span class="status-pill">{headline}</span>
+                <span class="muted">
+                    {if summary.ready_for_review {
+                        "Supervisor-owned".to_string()
+                    } else {
+                        "Drafting".to_string()
+                    }}
+                </span>
             </div>
             <p class="item-summary">{summary.objective.clone()}</p>
             <p class="item-meta">
@@ -972,9 +1120,7 @@ fn PlanningSessionCard(
                     }
                 )}
             </p>
-            {summary.draft_plan_summary.as_ref().map(|draft| view! {
-                <p class="item-meta">{draft.clone()}</p>
-            })}
+            <p class="item-meta">{summary_line}</p>
             <div class="action-buttons">
                 {match status {
                     orcas_core::PlanningSessionStatus::Draft | orcas_core::PlanningSessionStatus::Chatting | orcas_core::PlanningSessionStatus::ResearchRequested => view! {
@@ -1000,10 +1146,10 @@ fn PlanningSessionCard(
                                     });
                                 }
                             >
-                                "Request supervisor context"
+                                "Refresh supervisor context"
                             </button>
                             <button class="refresh-button" on:click=move |_| research_form_open.update(|value| *value = !*value)>
-                                {move || if research_form_open.get() { "Close research" } else { "Request research" }}
+                                {move || if research_form_open.get() { "Close research request" } else { "Ask for research" }}
                             </button>
                             <button
                                 class="refresh-button"
@@ -1026,7 +1172,7 @@ fn PlanningSessionCard(
                                     });
                                 }
                             >
-                                "Mark ready"
+                                "Send for review"
                             </button>
                         </>
                     }.into_any(),
@@ -1083,7 +1229,7 @@ fn PlanningSessionCard(
                     _ => view! {}.into_any(),
                 }}
                 <button class="refresh-button" on:click=move |_| showing_detail.update(|value| *value = !*value)>
-                    {move || if showing_detail.get() { "Hide planning thread" } else { "Inspect planning" }}
+                    {move || if showing_detail.get() { "Hide planning lane" } else { "Inspect planning lane" }}
                 </button>
             </div>
             {move || {
@@ -1178,28 +1324,21 @@ fn PlanningSessionCard(
                     }
                     view! {
                         <div class="detail-panel">
+                            <PlanningWorkflowBlock session=session.clone() />
                             <div class="detail-block">
-                                <p class="eyebrow">"Planning summary"</p>
+                                <p class="eyebrow">"Planning lane"</p>
                                 <dl class="detail-grid">
                                     <div><dt>"Created"</dt><dd>{format_timestamp(session.created_at)}</dd></div>
                                     <div><dt>"Updated"</dt><dd>{format_timestamp(session.updated_at)}</dd></div>
                                     <div><dt>"Reviewed"</dt><dd>{format_optional_timestamp(session.reviewed_at)}</dd></div>
                                     <div><dt>"Planning thread"</dt><dd>{planning_thread_id.get_value()}</dd></div>
                                 </dl>
-                                {(!summary.open_questions.is_empty()).then(|| view! {
-                                    <>
-                                        <p class="item-meta">"Open questions"</p>
-                                        <ul class="json-list">
-                                            {summary.open_questions.iter().cloned().map(|value| view! { <li>{value}</li> }).collect_view()}
-                                        </ul>
-                                    </>
-                                })}
                             </div>
                             {move || match thread_detail.get() {
                                 Some(detail) => view! { <ThreadMonitorBlock detail /> }.into_any(),
                                 None => {
                                     if loading_detail.get() {
-                                        view! { <div class="detail-block"><p class="eyebrow">"Planning thread"</p><p class="item-meta">"Loading planning thread detail…"</p></div> }.into_any()
+                                        view! { <div class="detail-block"><p class="eyebrow">"Planning monitor"</p><p class="item-meta">"Loading planning thread detail…"</p></div> }.into_any()
                                     } else {
                                         view! {}.into_any()
                                     }
@@ -1246,11 +1385,11 @@ fn PlanningSessionsPanel(
                 </span>
             </div>
             <p class="item-meta">
-                "Supervisor-owned planning sessions stay pre-execution and can request bounded research when needed."
+                "Use planning to work through the supervisor before starting execution."
             </p>
             <div class="action-buttons">
                 <button class="refresh-button" on:click=move |_| create_open.update(|value| *value = !*value)>
-                    {move || if create_open.get() { "Close planning form" } else { "Open planning session" }}
+                    {move || if create_open.get() { "Close planner" } else { "Open planning session" }}
                 </button>
             </div>
             {move || {
@@ -2026,14 +2165,12 @@ fn LiveThreadCard(
     let linkage_summary = if let Some(tracked_thread) = linkage.tracked_thread.as_ref() {
         format!(
             "tracked lane {} · work unit {}",
-            tracked_thread.title,
-            tracked_thread.work_unit_id
+            tracked_thread.title, tracked_thread.work_unit_id
         )
     } else if let Some(assignment) = linkage.assignment.as_ref() {
         format!(
             "assignment {} · worker {}",
-            assignment.id,
-            assignment.worker_id
+            assignment.id, assignment.worker_id
         )
     } else {
         "No Orcas lane binding yet".to_string()
@@ -2072,7 +2209,10 @@ fn LiveThreadCard(
             workstream.work_units.iter().map(move |work_unit| {
                 (
                     work_unit.work_unit.id.to_string(),
-                    format!("{} / {}", workstream.workstream.title, work_unit.work_unit.title),
+                    format!(
+                        "{} / {}",
+                        workstream.workstream.title, work_unit.work_unit.title
+                    ),
                 )
             })
         })
@@ -3155,7 +3295,9 @@ fn RuntimeAssignmentCard(
     };
     let mut detail_parts = Vec::new();
     if let Some(thread) = inferred_thread.as_ref() {
-        if assignment.status == orcas_core::AssignmentStatus::AwaitingDecision && thread.status == "idle" {
+        if assignment.status == orcas_core::AssignmentStatus::AwaitingDecision
+            && thread.status == "idle"
+        {
             detail_parts.push("report submitted".to_string());
         } else {
             detail_parts.push(format!("thread {}", thread.status));
@@ -3400,7 +3542,7 @@ fn RuntimeAssignmentCard(
                                 });
                             }
                         }
-                    
+
                     view! {
                         <div class="detail-panel">
                             {move || match proposal_record.get() {
@@ -3473,16 +3615,15 @@ fn TrackedThreadCard(
     let loading_tracked_detail = RwSignal::new(false);
     let loading_proposal = RwSignal::new(false);
     let detail = RwSignal::new(None::<orcas_core::ipc::ThreadView>);
-    let tracked_detail =
-        RwSignal::new(None::<orcas_core::ipc::AuthorityTrackedThreadGetResponse>);
+    let tracked_detail = RwSignal::new(None::<orcas_core::ipc::AuthorityTrackedThreadGetResponse>);
     let proposal_record = RwSignal::new(None::<orcas_core::supervisor::SupervisorProposalRecord>);
     let proposal_artifact =
         RwSignal::new(None::<orcas_core::ipc::SupervisorProposalArtifactDetail>);
     let workspace_thread = thread.clone();
     let workspace_thread_value = StoredValue::new(workspace_thread.clone());
     let tracked_thread_id_value = StoredValue::new(thread.id.clone());
-    let has_workspace_lifecycle =
-        workspace_thread.workspace_strategy.is_some() || workspace_thread.workspace_status.is_some();
+    let has_workspace_lifecycle = workspace_thread.workspace_strategy.is_some()
+        || workspace_thread.workspace_status.is_some();
     let bind_thread_id = RwSignal::new(String::new());
     let bound_upstream_thread_id = thread.upstream_thread_id.clone();
     let has_bound_upstream_thread = bound_upstream_thread_id.is_some();
@@ -3497,7 +3638,9 @@ fn TrackedThreadCard(
                 .iter()
                 .flat_map(|workstream| workstream.work_units.iter())
                 .flat_map(|work_unit| work_unit.tracked_threads.iter())
-                .all(|tracked_thread| tracked_thread.upstream_thread_id.as_deref() != Some(candidate.id.as_str()))
+                .all(|tracked_thread| {
+                    tracked_thread.upstream_thread_id.as_deref() != Some(candidate.id.as_str())
+                })
         })
         .cloned()
         .collect::<Vec<_>>();
