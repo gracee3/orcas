@@ -5,7 +5,8 @@ use orcas_core::ipc::{
     AssignmentStartRequest, AssignmentStartResponse,
     AuthorityDeletePlanRequest, AuthorityHierarchyGetRequest,
     AuthorityTrackedThreadCreateRequest, AuthorityTrackedThreadDeleteRequest,
-    AuthorityTrackedThreadEditRequest, ThreadGetRequest, ThreadGetResponse,
+    AuthorityTrackedThreadEditRequest, AuthorityTrackedThreadGetRequest,
+    AuthorityTrackedThreadGetResponse, ThreadGetRequest, ThreadGetResponse,
     CodexAssignmentPauseRequest, CodexAssignmentResumeRequest,
     AuthorityWorkstreamCreateRequest, AuthorityWorkstreamEditRequest,
     AuthorityWorkunitCreateRequest, AuthorityWorkunitDeleteRequest,
@@ -20,6 +21,11 @@ use orcas_core::ipc::{
     OperatorRemoteActionWaitRequest, ProposalApproveRequest, ProposalCreateRequest,
     ProposalCreateResponse, ProposalGetRequest, ProposalGetResponse,
     ProposalArtifactDetailGetRequest, ProposalArtifactDetailGetResponse, ProposalRejectRequest,
+    PlanningSessionApproveRequest, PlanningSessionCreateRequest, PlanningSessionCreateResponse,
+    PlanningSessionListRequest,
+    PlanningSessionMarkReadyForReviewRequest, PlanningSessionRejectRequest,
+    PlanningSessionRequestResearchRequest, PlanningSessionRequestResearchResponse,
+    PlanningSessionRequestSupervisorContextRequest,
 };
 use orcas_operator_core::{
     DeliveryPageView, InboxDetailPageView, InboxPageView, NotificationPageView,
@@ -274,7 +280,19 @@ pub async fn load_workstreams_dashboard(
         .await
         .map_err(|error| error.to_string())?
         .snapshot;
-    Ok(WorkstreamsDashboardData { hierarchy, snapshot })
+    let planning_sessions = client
+        .planning_session_list(&PlanningSessionListRequest {
+            workstream_id: None,
+            include_closed: true,
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .sessions;
+    Ok(WorkstreamsDashboardData {
+        hierarchy,
+        snapshot,
+        planning_sessions,
+    })
 }
 
 pub async fn create_workstream(
@@ -641,6 +659,17 @@ pub async fn delete_tracked_thread(
     Ok(())
 }
 
+pub async fn load_tracked_thread_detail(
+    settings: OperatorServerSettings,
+    tracked_thread_id: authority::TrackedThreadId,
+) -> Result<AuthorityTrackedThreadGetResponse, String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .authority_tracked_thread_get(&AuthorityTrackedThreadGetRequest { tracked_thread_id })
+        .await
+        .map_err(|error| error.to_string())
+}
+
 pub async fn load_thread_detail(
     settings: OperatorServerSettings,
     thread_id: String,
@@ -661,6 +690,122 @@ pub async fn pause_codex_assignment(
         .codex_assignment_pause(&CodexAssignmentPauseRequest {
             assignment_id,
             notes: Some("Paused from operator web".to_string()),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn planning_session_create(
+    settings: OperatorServerSettings,
+    workstream_id: String,
+    initial_objective: String,
+    model: Option<String>,
+    cwd: Option<String>,
+) -> Result<PlanningSessionCreateResponse, String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .planning_session_create(&PlanningSessionCreateRequest {
+            workstream_id,
+            planning_thread_id: None,
+            initial_objective,
+            research_status: orcas_core::PlanningSessionResearchStatus::NotRequested,
+            requirements: Vec::new(),
+            constraints: Vec::new(),
+            non_goals: Vec::new(),
+            open_questions: Vec::new(),
+            draft_plan_summary: None,
+            created_by: Some("operator_web".to_string()),
+            request_note: Some("Opened from workstreams dashboard".to_string()),
+            model: model.filter(|value| !value.trim().is_empty()),
+            cwd: cwd.filter(|value| !value.trim().is_empty()),
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn planning_session_request_supervisor_context(
+    settings: OperatorServerSettings,
+    session_id: String,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .planning_session_request_supervisor_context(
+            &PlanningSessionRequestSupervisorContextRequest {
+                session_id,
+                requested_by: Some("operator_web".to_string()),
+                note: Some("Requested from workstreams dashboard".to_string()),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn planning_session_request_research(
+    settings: OperatorServerSettings,
+    session_id: String,
+    worker_id: String,
+    model: Option<String>,
+    cwd: Option<String>,
+) -> Result<PlanningSessionRequestResearchResponse, String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .planning_session_request_research(&PlanningSessionRequestResearchRequest {
+            session_id,
+            worker_id,
+            requested_by: Some("operator_web".to_string()),
+            request_note: Some("Requested from workstreams dashboard".to_string()),
+            worker_kind: Some("codex".to_string()),
+            model: model.filter(|value| !value.trim().is_empty()),
+            cwd: cwd.filter(|value| !value.trim().is_empty()),
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn planning_session_mark_ready_for_review(
+    settings: OperatorServerSettings,
+    session_id: String,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .planning_session_mark_ready_for_review(&PlanningSessionMarkReadyForReviewRequest {
+            session_id,
+            updated_by: Some("operator_web".to_string()),
+            note: Some("Marked ready from workstreams dashboard".to_string()),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn planning_session_approve(
+    settings: OperatorServerSettings,
+    session_id: String,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .planning_session_approve(&PlanningSessionApproveRequest {
+            session_id,
+            approved_by: Some("operator_web".to_string()),
+            review_note: Some("Approved from workstreams dashboard".to_string()),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn planning_session_reject(
+    settings: OperatorServerSettings,
+    session_id: String,
+) -> Result<(), String> {
+    let client = client_from_settings(&settings)?;
+    client
+        .planning_session_reject(&PlanningSessionRejectRequest {
+            session_id,
+            rejected_by: Some("operator_web".to_string()),
+            review_note: Some("Rejected from workstreams dashboard".to_string()),
         })
         .await
         .map_err(|error| error.to_string())?;

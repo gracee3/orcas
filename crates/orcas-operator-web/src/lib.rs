@@ -723,6 +723,630 @@ fn WorkspaceLifecycleBlock(thread: authority::TrackedThreadSummary) -> impl Into
 }
 
 #[component]
+fn WorkspaceLifecycleDetailBlock(
+    thread: authority::TrackedThreadSummary,
+    detail: orcas_core::ipc::AuthorityTrackedThreadGetResponse,
+) -> impl IntoView {
+    let inspection = detail.workspace_inspection.clone();
+    let workspace_operation = detail.workspace_operation.clone();
+    let prune_workspace_operation = detail.prune_workspace_operation.clone();
+    let merge_prep_assessment = detail.merge_prep_assessment.clone();
+    let landing_authorization = detail.landing_authorization.clone();
+    let landing_execution = detail.landing_execution.clone();
+
+    view! {
+        <div class="detail-panel">
+            <WorkspaceLifecycleBlock thread=thread />
+            {inspection.map(|inspection| view! {
+                <div class="detail-block">
+                    <p class="eyebrow">"Workspace inspection"</p>
+                    <dl class="detail-grid">
+                        <div><dt>"Worktree"</dt><dd>{inspection.worktree_path}</dd></div>
+                        <div><dt>"Branch"</dt><dd>{inspection.current_branch.unwrap_or_else(|| "Unknown".to_string())}</dd></div>
+                        <div><dt>"Head"</dt><dd>{inspection.current_head_commit.unwrap_or_else(|| "Unknown".to_string())}</dd></div>
+                        <div><dt>"Dirty"</dt><dd>{inspection.dirty.map(|value| value.to_string()).unwrap_or_else(|| "Unknown".to_string())}</dd></div>
+                    </dl>
+                    {(!inspection.warnings.is_empty()).then(|| view! {
+                        <ul class="json-list">
+                            {inspection
+                                .warnings
+                                .into_iter()
+                                .map(|warning| view! {
+                                    <li>{humanize_snake_case(
+                                        serde_json::to_string(&warning)
+                                            .unwrap_or_default()
+                                            .trim_matches('"')
+                                    )}</li>
+                                })
+                                .collect_view()}
+                        </ul>
+                    })}
+                </div>
+            })}
+            {workspace_operation.map(|operation| view! {
+                <div class="detail-block">
+                    <p class="eyebrow">"Workspace operation"</p>
+                    <div class="item-card-topline">
+                        <span class="status-pill">{humanize_snake_case(
+                            serde_json::to_string(&operation.kind)
+                                .unwrap_or_default()
+                                .trim_matches('"')
+                        )}</span>
+                        <span class="muted">{humanize_snake_case(
+                            serde_json::to_string(&operation.status)
+                                .unwrap_or_default()
+                                .trim_matches('"')
+                        )}</span>
+                    </div>
+                    <p class="item-meta">
+                        {format!(
+                            "requested {}{}{}",
+                            format_timestamp(operation.requested_at),
+                            operation
+                                .dispatched_at
+                                .map(|value| format!(" · dispatched {}", format_timestamp(value)))
+                                .unwrap_or_default(),
+                            operation
+                                .completed_at
+                                .or(operation.failed_at)
+                                .or(operation.canceled_at)
+                                .map(|value| format!(" · updated {}", format_timestamp(value)))
+                                .unwrap_or_default()
+                        )}
+                    </p>
+                    {operation.outcome_summary.map(|summary| view! {
+                        <p class="item-summary">{summary}</p>
+                    })}
+                </div>
+            })}
+            {merge_prep_assessment.map(|assessment| view! {
+                <div class="detail-block">
+                    <p class="eyebrow">"Merge prep"</p>
+                    <div class="item-card-topline">
+                        <span class="status-pill">{humanize_snake_case(
+                            serde_json::to_string(&assessment.readiness)
+                                .unwrap_or_default()
+                                .trim_matches('"')
+                        )}</span>
+                        <span class="muted">{format_timestamp(assessment.assessed_at)}</span>
+                    </div>
+                    {(!assessment.reasons.is_empty()).then(|| view! {
+                        <ul class="json-list">
+                            {assessment
+                                .reasons
+                                .into_iter()
+                                .map(|reason| view! {
+                                    <li>{humanize_snake_case(
+                                        serde_json::to_string(&reason)
+                                            .unwrap_or_default()
+                                            .trim_matches('"')
+                                    )}</li>
+                                })
+                                .collect_view()}
+                        </ul>
+                    })}
+                </div>
+            })}
+            {landing_authorization.map(|authorization| view! {
+                <div class="detail-block">
+                    <p class="eyebrow">"Landing authorization"</p>
+                    <div class="item-card-topline">
+                        <span class="status-pill">{humanize_snake_case(
+                            serde_json::to_string(&authorization.status)
+                                .unwrap_or_default()
+                                .trim_matches('"')
+                        )}</span>
+                        <span class="muted">{format_timestamp(authorization.authorized_at)}</span>
+                    </div>
+                    <p class="item-summary">
+                        {format!(
+                            "target {} · head {}",
+                            authorization.landing_target, authorization.authorized_head_commit
+                        )}
+                    </p>
+                    {authorization.outcome_summary.map(|summary| view! {
+                        <p class="item-meta">{summary}</p>
+                    })}
+                </div>
+            })}
+            {landing_execution.map(|execution| view! {
+                <div class="detail-block">
+                    <p class="eyebrow">"Landing execution"</p>
+                    <div class="item-card-topline">
+                        <span class="status-pill">{humanize_snake_case(
+                            serde_json::to_string(&execution.status)
+                                .unwrap_or_default()
+                                .trim_matches('"')
+                        )}</span>
+                        <span class="muted">{format_timestamp(execution.requested_at)}</span>
+                    </div>
+                    <p class="item-summary">
+                        {format!(
+                            "target {}{}{}",
+                            execution.landing_target,
+                            execution
+                                .landed_commit
+                                .as_ref()
+                                .map(|value| format!(" · landed {value}"))
+                                .unwrap_or_default(),
+                            execution
+                                .failure_reason
+                                .as_ref()
+                                .map(|value| format!(" · {value}"))
+                                .unwrap_or_default()
+                        )}
+                    </p>
+                    {execution.notes.map(|notes| view! {
+                        <p class="item-meta">{notes}</p>
+                    })}
+                </div>
+            })}
+            {prune_workspace_operation.map(|operation| view! {
+                <div class="detail-block">
+                    <p class="eyebrow">"Workspace prune"</p>
+                    <div class="item-card-topline">
+                        <span class="status-pill">{humanize_snake_case(
+                            serde_json::to_string(&operation.status)
+                                .unwrap_or_default()
+                                .trim_matches('"')
+                        )}</span>
+                        <span class="muted">
+                            {operation
+                                .prune_result_status
+                                .map(|status| humanize_snake_case(
+                                    serde_json::to_string(&status)
+                                        .unwrap_or_default()
+                                        .trim_matches('"')
+                                ))
+                                .unwrap_or_else(|| "No prune result".to_string())}
+                        </span>
+                    </div>
+                    <p class="item-summary">
+                        {format!(
+                            "{}{}{}",
+                            operation
+                                .target_worktree_path
+                                .unwrap_or_else(|| "unknown worktree".to_string()),
+                            operation
+                                .worktree_removed
+                                .map(|value| format!(" · removed {value}"))
+                                .unwrap_or_default(),
+                            operation
+                                .branch_removed
+                                .map(|value| format!(" · branch removed {value}"))
+                                .unwrap_or_default()
+                        )}
+                    </p>
+                    {operation.prune_notes.map(|notes| view! {
+                        <p class="item-meta">{notes}</p>
+                    })}
+                </div>
+            })}
+        </div>
+    }
+}
+
+#[component]
+fn PlanningSessionCard(
+    session: orcas_core::PlanningSession,
+    settings: RwSignal<OperatorServerSettings>,
+    refresh_epoch: RwSignal<u64>,
+    action_message: RwSignal<Option<String>>,
+    action_error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let working = RwSignal::new(false);
+    let loading_detail = RwSignal::new(false);
+    let showing_detail = RwSignal::new(false);
+    let thread_detail = RwSignal::new(None::<orcas_core::ipc::ThreadView>);
+    let research_worker_id = RwSignal::new("planning-research-worker".to_string());
+    let research_model = RwSignal::new(String::new());
+    let research_cwd = RwSignal::new(String::new());
+    let research_form_open = RwSignal::new(false);
+    let session_id = StoredValue::new(session.session_id.clone());
+    let planning_thread_id = StoredValue::new(session.planning_thread_id.clone());
+    let status = session.status;
+    let summary = session.latest_structured_summary.clone();
+
+    view! {
+        <div class="detail-block">
+            <div class="item-card-topline">
+                <span class="status-pill">{humanize_snake_case(
+                    serde_json::to_string(&status).unwrap_or_default().trim_matches('"')
+                )}</span>
+                <span class="muted">{format!("planning {}", session.session_id)}</span>
+            </div>
+            <p class="item-summary">{summary.objective.clone()}</p>
+            <p class="item-meta">
+                {format!(
+                    "updated {} · research {}{}",
+                    format_timestamp(session.updated_at),
+                    humanize_snake_case(
+                        serde_json::to_string(&summary.research_status)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                    ),
+                    if summary.ready_for_review {
+                        " · ready for review".to_string()
+                    } else {
+                        String::new()
+                    }
+                )}
+            </p>
+            {summary.draft_plan_summary.as_ref().map(|draft| view! {
+                <p class="item-meta">{draft.clone()}</p>
+            })}
+            <div class="action-buttons">
+                {match status {
+                    orcas_core::PlanningSessionStatus::Draft | orcas_core::PlanningSessionStatus::Chatting | orcas_core::PlanningSessionStatus::ResearchRequested => view! {
+                        <>
+                            <button
+                                class="refresh-button"
+                                disabled=move || working.get()
+                                on:click=move |_| {
+                                    let settings = settings.get_untracked();
+                                    let session_id = session_id.get_value();
+                                    working.set(true);
+                                    action_error.set(None);
+                                    #[cfg(target_arch = "wasm32")]
+                                    spawn_local(async move {
+                                        match api::planning_session_request_supervisor_context(settings, session_id).await {
+                                            Ok(()) => {
+                                                action_message.set(Some("Requested supervisor context.".to_string()));
+                                                refresh_epoch.update(|value| *value += 1);
+                                            }
+                                            Err(error) => action_error.set(Some(error)),
+                                        }
+                                        working.set(false);
+                                    });
+                                }
+                            >
+                                "Request supervisor context"
+                            </button>
+                            <button class="refresh-button" on:click=move |_| research_form_open.update(|value| *value = !*value)>
+                                {move || if research_form_open.get() { "Close research" } else { "Request research" }}
+                            </button>
+                            <button
+                                class="refresh-button"
+                                disabled=move || working.get()
+                                on:click=move |_| {
+                                    let settings = settings.get_untracked();
+                                    let session_id = session_id.get_value();
+                                    working.set(true);
+                                    action_error.set(None);
+                                    #[cfg(target_arch = "wasm32")]
+                                    spawn_local(async move {
+                                        match api::planning_session_mark_ready_for_review(settings, session_id).await {
+                                            Ok(()) => {
+                                                action_message.set(Some("Marked planning session ready for review.".to_string()));
+                                                refresh_epoch.update(|value| *value += 1);
+                                            }
+                                            Err(error) => action_error.set(Some(error)),
+                                        }
+                                        working.set(false);
+                                    });
+                                }
+                            >
+                                "Mark ready"
+                            </button>
+                        </>
+                    }.into_any(),
+                    orcas_core::PlanningSessionStatus::AwaitingApproval => view! {
+                        <>
+                            <button
+                                class="refresh-button"
+                                disabled=move || working.get()
+                                on:click=move |_| {
+                                    let settings = settings.get_untracked();
+                                    let session_id = session_id.get_value();
+                                    working.set(true);
+                                    action_error.set(None);
+                                    #[cfg(target_arch = "wasm32")]
+                                    spawn_local(async move {
+                                        match api::planning_session_approve(settings, session_id).await {
+                                            Ok(()) => {
+                                                action_message.set(Some("Approved planning session.".to_string()));
+                                                refresh_epoch.update(|value| *value += 1);
+                                            }
+                                            Err(error) => action_error.set(Some(error)),
+                                        }
+                                        working.set(false);
+                                    });
+                                }
+                            >
+                                "Approve"
+                            </button>
+                            <button
+                                class="refresh-button"
+                                disabled=move || working.get()
+                                on:click=move |_| {
+                                    let settings = settings.get_untracked();
+                                    let session_id = session_id.get_value();
+                                    working.set(true);
+                                    action_error.set(None);
+                                    #[cfg(target_arch = "wasm32")]
+                                    spawn_local(async move {
+                                        match api::planning_session_reject(settings, session_id).await {
+                                            Ok(()) => {
+                                                action_message.set(Some("Rejected planning session.".to_string()));
+                                                refresh_epoch.update(|value| *value += 1);
+                                            }
+                                            Err(error) => action_error.set(Some(error)),
+                                        }
+                                        working.set(false);
+                                    });
+                                }
+                            >
+                                "Reject"
+                            </button>
+                        </>
+                    }.into_any(),
+                    _ => view! {}.into_any(),
+                }}
+                <button class="refresh-button" on:click=move |_| showing_detail.update(|value| *value = !*value)>
+                    {move || if showing_detail.get() { "Hide planning thread" } else { "Inspect planning" }}
+                </button>
+            </div>
+            {move || {
+                if research_form_open.get() {
+                    view! {
+                        <div class="action-form">
+                            <div class="section-grid">
+                                <label class="field">
+                                    <span>"Research worker"</span>
+                                    <input
+                                        type="text"
+                                        prop:value=move || research_worker_id.get()
+                                        on:input=move |ev| research_worker_id.set(event_target_value(&ev))
+                                    />
+                                </label>
+                                <label class="field">
+                                    <span>"Model"</span>
+                                    <input
+                                        type="text"
+                                        prop:value=move || research_model.get()
+                                        on:input=move |ev| research_model.set(event_target_value(&ev))
+                                    />
+                                </label>
+                            </div>
+                            <label class="field">
+                                <span>"Working directory"</span>
+                                <input
+                                    type="text"
+                                    prop:value=move || research_cwd.get()
+                                    on:input=move |ev| research_cwd.set(event_target_value(&ev))
+                                />
+                            </label>
+                            <div class="action-buttons">
+                                <button
+                                    class="primary-button"
+                                    disabled=move || working.get()
+                                    on:click=move |_| {
+                                        let settings = settings.get_untracked();
+                                        let session_id = session_id.get_value();
+                                        let worker_id = research_worker_id.get_untracked();
+                                        let model = research_model.get_untracked();
+                                        let cwd = research_cwd.get_untracked();
+                                        working.set(true);
+                                        action_error.set(None);
+                                        #[cfg(target_arch = "wasm32")]
+                                        spawn_local(async move {
+                                            match api::planning_session_request_research(
+                                                settings,
+                                                session_id,
+                                                worker_id,
+                                                Some(model),
+                                                Some(cwd),
+                                            ).await {
+                                                Ok(response) => {
+                                                    action_message.set(Some(format!(
+                                                        "Requested research assignment {}.",
+                                                        response.assignment.id
+                                                    )));
+                                                    refresh_epoch.update(|value| *value += 1);
+                                                    research_form_open.set(false);
+                                                }
+                                                Err(error) => action_error.set(Some(error)),
+                                            }
+                                            working.set(false);
+                                        });
+                                    }
+                                >
+                                    "Start research"
+                                </button>
+                            </div>
+                        </div>
+                    }.into_any()
+                } else {
+                    view! {}.into_any()
+                }
+            }}
+            {move || {
+                if showing_detail.get() {
+                    if thread_detail.get().is_none() && !loading_detail.get() {
+                        let settings = settings.get_untracked();
+                        let planning_thread_id = planning_thread_id.get_value();
+                        loading_detail.set(true);
+                        action_error.set(None);
+                        #[cfg(target_arch = "wasm32")]
+                        spawn_local(async move {
+                            match api::load_thread_detail(settings, planning_thread_id).await {
+                                Ok(response) => thread_detail.set(Some(response.thread)),
+                                Err(error) => action_error.set(Some(error)),
+                            }
+                            loading_detail.set(false);
+                        });
+                    }
+                    view! {
+                        <div class="detail-panel">
+                            <div class="detail-block">
+                                <p class="eyebrow">"Planning summary"</p>
+                                <dl class="detail-grid">
+                                    <div><dt>"Created"</dt><dd>{format_timestamp(session.created_at)}</dd></div>
+                                    <div><dt>"Updated"</dt><dd>{format_timestamp(session.updated_at)}</dd></div>
+                                    <div><dt>"Reviewed"</dt><dd>{format_optional_timestamp(session.reviewed_at)}</dd></div>
+                                    <div><dt>"Planning thread"</dt><dd>{planning_thread_id.get_value()}</dd></div>
+                                </dl>
+                                {(!summary.open_questions.is_empty()).then(|| view! {
+                                    <>
+                                        <p class="item-meta">"Open questions"</p>
+                                        <ul class="json-list">
+                                            {summary.open_questions.iter().cloned().map(|value| view! { <li>{value}</li> }).collect_view()}
+                                        </ul>
+                                    </>
+                                })}
+                            </div>
+                            {move || match thread_detail.get() {
+                                Some(detail) => view! { <ThreadMonitorBlock detail /> }.into_any(),
+                                None => {
+                                    if loading_detail.get() {
+                                        view! { <div class="detail-block"><p class="eyebrow">"Planning thread"</p><p class="item-meta">"Loading planning thread detail…"</p></div> }.into_any()
+                                    } else {
+                                        view! {}.into_any()
+                                    }
+                                }
+                            }}
+                        </div>
+                    }.into_any()
+                } else {
+                    view! {}.into_any()
+                }
+            }}
+        </div>
+    }
+}
+
+#[component]
+fn PlanningSessionsPanel(
+    workstream_id: authority::WorkstreamId,
+    workstream_objective: String,
+    sessions: Vec<orcas_core::PlanningSession>,
+    settings: RwSignal<OperatorServerSettings>,
+    refresh_epoch: RwSignal<u64>,
+    action_message: RwSignal<Option<String>>,
+    action_error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let create_open = RwSignal::new(false);
+    let working = RwSignal::new(false);
+    let objective = RwSignal::new(workstream_objective);
+    let model = RwSignal::new(String::new());
+    let cwd = RwSignal::new(String::new());
+    let mut sessions_sorted = sessions;
+    sessions_sorted.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+
+    view! {
+        <div class="detail-block">
+            <div class="item-card-topline">
+                <span class="status-pill">"Planning"</span>
+                <span class="muted">
+                    {if sessions_sorted.len() == 1 {
+                        "1 session".to_string()
+                    } else {
+                        format!("{} sessions", sessions_sorted.len())
+                    }}
+                </span>
+            </div>
+            <p class="item-meta">
+                "Supervisor-owned planning sessions stay pre-execution and can request bounded research when needed."
+            </p>
+            <div class="action-buttons">
+                <button class="refresh-button" on:click=move |_| create_open.update(|value| *value = !*value)>
+                    {move || if create_open.get() { "Close planning form" } else { "Open planning session" }}
+                </button>
+            </div>
+            {move || {
+                if create_open.get() {
+                    let workstream_id = workstream_id.clone();
+                    view! {
+                        <div class="action-form">
+                            <label class="field">
+                                <span>"Objective"</span>
+                                <textarea
+                                    rows="3"
+                                    prop:value=move || objective.get()
+                                    on:input=move |ev| objective.set(event_target_value(&ev))
+                                ></textarea>
+                            </label>
+                            <div class="section-grid">
+                                <label class="field">
+                                    <span>"Model"</span>
+                                    <input
+                                        type="text"
+                                        prop:value=move || model.get()
+                                        on:input=move |ev| model.set(event_target_value(&ev))
+                                    />
+                                </label>
+                                <label class="field">
+                                    <span>"Working directory"</span>
+                                    <input
+                                        type="text"
+                                        prop:value=move || cwd.get()
+                                        on:input=move |ev| cwd.set(event_target_value(&ev))
+                                    />
+                                </label>
+                            </div>
+                            <div class="action-buttons">
+                                <button
+                                    class="primary-button"
+                                    disabled=move || working.get()
+                                    on:click=move |_| {
+                                        let settings = settings.get_untracked();
+                                        let workstream_id = workstream_id.to_string();
+                                        let objective = objective.get_untracked();
+                                        let model = model.get_untracked();
+                                        let cwd = cwd.get_untracked();
+                                        working.set(true);
+                                        action_error.set(None);
+                                        #[cfg(target_arch = "wasm32")]
+                                        spawn_local(async move {
+                                            match api::planning_session_create(
+                                                settings,
+                                                workstream_id,
+                                                objective,
+                                                Some(model),
+                                                Some(cwd),
+                                            ).await {
+                                                Ok(response) => {
+                                                    action_message.set(Some(format!(
+                                                        "Opened planning session {}.",
+                                                        response.session.session_id
+                                                    )));
+                                                    refresh_epoch.update(|value| *value += 1);
+                                                    create_open.set(false);
+                                                }
+                                                Err(error) => action_error.set(Some(error)),
+                                            }
+                                            working.set(false);
+                                        });
+                                    }
+                                >
+                                    "Create planning session"
+                                </button>
+                            </div>
+                        </div>
+                    }.into_any()
+                } else {
+                    view! {}.into_any()
+                }
+            }}
+            <div class="stack">
+                {sessions_sorted
+                    .into_iter()
+                    .map(|session| view! {
+                        <PlanningSessionCard
+                            session
+                            settings
+                            refresh_epoch
+                            action_message
+                            action_error
+                        />
+                    })
+                    .collect_view()}
+            </div>
+        </div>
+    }
+}
+
+#[component]
 pub fn App() -> impl IntoView {
     let settings = RwSignal::new(storage::load_settings());
     let workspace = RwSignal::new(storage::load_workspace_state());
@@ -1762,6 +2386,7 @@ fn WorkstreamCard(
     let create_work_unit_root_id = workstream_id.clone();
     let editing = RwSignal::new(false);
     let adding_work_unit = RwSignal::new(false);
+    let showing_planning = RwSignal::new(false);
     let working = RwSignal::new(false);
     let title = RwSignal::new(workstream_title_display.clone());
     let objective = RwSignal::new(workstream_objective_display.clone());
@@ -1770,6 +2395,12 @@ fn WorkstreamCard(
     let unit_title = RwSignal::new(String::new());
     let unit_task_statement = RwSignal::new(String::new());
     let unit_status = RwSignal::new("ready".to_string());
+    let planning_sessions = dashboard
+        .planning_sessions
+        .iter()
+        .filter(|session| session.workstream_id == workstream_id.as_str())
+        .cloned()
+        .collect::<Vec<_>>();
 
     view! {
         <article class="card">
@@ -1785,6 +2416,9 @@ fn WorkstreamCard(
                     </button>
                     <button class="refresh-button" on:click=move |_| adding_work_unit.update(|value| *value = !*value)>
                         {move || if adding_work_unit.get() { "Close work unit form" } else { "Add work unit" }}
+                    </button>
+                    <button class="refresh-button" on:click=move |_| showing_planning.update(|value| *value = !*value)>
+                        {move || if showing_planning.get() { "Hide planning" } else { "Planning" }}
                     </button>
                     <button
                         class="refresh-button"
@@ -1985,6 +2619,23 @@ fn WorkstreamCard(
                             </button>
                         </div>
                     </div>
+                    }.into_any()
+                } else {
+                    view! {}.into_any()
+                }
+            }}
+            {move || {
+                if showing_planning.get() {
+                    view! {
+                        <PlanningSessionsPanel
+                            workstream_id=workstream_id.clone()
+                            workstream_objective=workstream_objective_display.clone()
+                            sessions=planning_sessions.clone()
+                            settings
+                            refresh_epoch
+                            action_message
+                            action_error
+                        />
                     }.into_any()
                 } else {
                     view! {}.into_any()
@@ -2819,12 +3470,17 @@ fn TrackedThreadCard(
     let binding = RwSignal::new(false);
     let showing_detail = RwSignal::new(false);
     let loading_detail = RwSignal::new(false);
+    let loading_tracked_detail = RwSignal::new(false);
     let loading_proposal = RwSignal::new(false);
     let detail = RwSignal::new(None::<orcas_core::ipc::ThreadView>);
+    let tracked_detail =
+        RwSignal::new(None::<orcas_core::ipc::AuthorityTrackedThreadGetResponse>);
     let proposal_record = RwSignal::new(None::<orcas_core::supervisor::SupervisorProposalRecord>);
     let proposal_artifact =
         RwSignal::new(None::<orcas_core::ipc::SupervisorProposalArtifactDetail>);
     let workspace_thread = thread.clone();
+    let workspace_thread_value = StoredValue::new(workspace_thread.clone());
+    let tracked_thread_id_value = StoredValue::new(thread.id.clone());
     let has_workspace_lifecycle =
         workspace_thread.workspace_strategy.is_some() || workspace_thread.workspace_status.is_some();
     let bind_thread_id = RwSignal::new(String::new());
@@ -3102,7 +3758,7 @@ fn TrackedThreadCard(
                     disabled=move || working.get()
                     on:click=move |_| {
                         let settings = settings.get_untracked();
-                        let tracked_thread_id = thread.id.clone();
+                        let tracked_thread_id = tracked_thread_id_value.get_value();
                         working.set(true);
                         action_error.set(None);
                         #[cfg(target_arch = "wasm32")]
@@ -3160,6 +3816,20 @@ fn TrackedThreadCard(
                             });
                         }
                     }
+                    if tracked_detail.get().is_none() && !loading_tracked_detail.get() {
+                        let settings = settings.get_untracked();
+                        let tracked_thread_id = tracked_thread_id_value.get_value();
+                        loading_tracked_detail.set(true);
+                        action_error.set(None);
+                        #[cfg(target_arch = "wasm32")]
+                        spawn_local(async move {
+                            match api::load_tracked_thread_detail(settings, tracked_thread_id).await {
+                                Ok(response) => tracked_detail.set(Some(response)),
+                                Err(error) => action_error.set(Some(error)),
+                            }
+                            loading_tracked_detail.set(false);
+                        });
+                    }
                     view! {
                         <div class="detail-panel">
                             {move || match proposal_record.get() {
@@ -3177,9 +3847,23 @@ fn TrackedThreadCard(
                                     }
                                 }
                             }}
-                            {has_workspace_lifecycle.then(|| view! {
-                                <WorkspaceLifecycleBlock thread=workspace_thread.clone() />
-                            })}
+                            {move || match tracked_detail.get() {
+                                Some(detail) => view! {
+                                    <WorkspaceLifecycleDetailBlock
+                                        thread=workspace_thread_value.get_value()
+                                        detail
+                                    />
+                                }.into_any(),
+                                None => {
+                                    if loading_tracked_detail.get() {
+                                        view! { <div class="detail-block"><p class="eyebrow">"Workspace lifecycle"</p><p class="item-meta">"Loading tracked-thread lifecycle…"</p></div> }.into_any()
+                                    } else if has_workspace_lifecycle {
+                                        view! { <WorkspaceLifecycleBlock thread=workspace_thread_value.get_value() /> }.into_any()
+                                    } else {
+                                        view! {}.into_any()
+                                    }
+                                }
+                            }}
                             <SupervisorWorkflowBlock
                                 assignment_label=runtime
                                     .assignment_id

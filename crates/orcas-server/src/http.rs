@@ -31,7 +31,15 @@ use orcas_core::ipc::{
     AuthorityWorkunitCreateResponse, AuthorityWorkunitDeleteRequest,
     AuthorityWorkunitDeleteResponse, AuthorityWorkunitEditRequest,
     AuthorityWorkunitEditResponse, AuthorityWorkunitGetRequest,
-    AuthorityWorkunitGetResponse,
+    AuthorityWorkunitGetResponse, AuthorityTrackedThreadGetRequest,
+    AuthorityTrackedThreadGetResponse, PlanningSessionCreateRequest,
+    PlanningSessionCreateResponse, PlanningSessionRequestSupervisorContextRequest,
+    PlanningSessionRequestSupervisorContextResponse, PlanningSessionRequestResearchRequest,
+    PlanningSessionRequestResearchResponse, PlanningSessionMarkReadyForReviewRequest,
+    PlanningSessionMarkReadyForReviewResponse, PlanningSessionApproveRequest,
+    PlanningSessionApproveResponse, PlanningSessionRejectRequest,
+    PlanningSessionRejectResponse, PlanningSessionListRequest,
+    PlanningSessionListResponse,
     NotificationDeliveryJobGetRequest, NotificationDeliveryJobGetResponse,
     NotificationDeliveryJobListRequest, NotificationDeliveryJobListResponse,
     NotificationDeliveryRunPendingRequest, NotificationDeliveryRunPendingResponse,
@@ -323,6 +331,38 @@ impl InboxMirrorServer {
             .route(
                 "/operator-authority/tracked-threads/delete",
                 post(authority_tracked_thread_delete),
+            )
+            .route(
+                "/operator-authority/tracked-threads/get",
+                post(authority_tracked_thread_get),
+            )
+            .route(
+                "/operator-runtime/planning-sessions/list",
+                post(planning_session_list),
+            )
+            .route(
+                "/operator-runtime/planning-sessions/create",
+                post(planning_session_create),
+            )
+            .route(
+                "/operator-runtime/planning-sessions/request-supervisor-context",
+                post(planning_session_request_supervisor_context),
+            )
+            .route(
+                "/operator-runtime/planning-sessions/request-research",
+                post(planning_session_request_research),
+            )
+            .route(
+                "/operator-runtime/planning-sessions/mark-ready",
+                post(planning_session_mark_ready_for_review),
+            )
+            .route(
+                "/operator-runtime/planning-sessions/approve",
+                post(planning_session_approve),
+            )
+            .route(
+                "/operator-runtime/planning-sessions/reject",
+                post(planning_session_reject),
             )
             .route("/operator-runtime/threads/get", post(thread_get))
             .route(
@@ -1050,6 +1090,118 @@ async fn authority_tracked_thread_delete(
     ))
 }
 
+async fn authority_tracked_thread_get(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<AuthorityTrackedThreadGetRequest>,
+) -> Result<Json<AuthorityTrackedThreadGetResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::AUTHORITY_TRACKED_THREAD_GET,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn planning_session_create(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<PlanningSessionCreateRequest>,
+) -> Result<Json<PlanningSessionCreateResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::PLANNING_SESSION_CREATE,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn planning_session_list(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<PlanningSessionListRequest>,
+) -> Result<Json<PlanningSessionListResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::PLANNING_SESSION_LIST,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn planning_session_request_supervisor_context(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<PlanningSessionRequestSupervisorContextRequest>,
+) -> Result<Json<PlanningSessionRequestSupervisorContextResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::PLANNING_SESSION_REQUEST_SUPERVISOR_CONTEXT,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn planning_session_request_research(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<PlanningSessionRequestResearchRequest>,
+) -> Result<Json<PlanningSessionRequestResearchResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::PLANNING_SESSION_REQUEST_RESEARCH,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn planning_session_mark_ready_for_review(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<PlanningSessionMarkReadyForReviewRequest>,
+) -> Result<Json<PlanningSessionMarkReadyForReviewResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::PLANNING_SESSION_MARK_READY_FOR_REVIEW,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn planning_session_approve(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<PlanningSessionApproveRequest>,
+) -> Result<Json<PlanningSessionApproveResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::PLANNING_SESSION_APPROVE,
+            &request,
+        )
+        .await?,
+    ))
+}
+
+async fn planning_session_reject(
+    State(state): State<Arc<InboxMirrorServerState>>,
+    Json(request): Json<PlanningSessionRejectRequest>,
+) -> Result<Json<PlanningSessionRejectResponse>, String> {
+    Ok(Json(
+        daemon_request(
+            &state,
+            orcas_core::ipc::methods::PLANNING_SESSION_REJECT,
+            &request,
+        )
+        .await?,
+    ))
+}
+
 async fn thread_get(
     State(state): State<Arc<InboxMirrorServerState>>,
     Json(request): Json<ThreadGetRequest>,
@@ -1214,6 +1366,38 @@ pub fn app_with_operator_api_token(
         .route(
             "/operator-authority/tracked-threads/delete",
             post(authority_tracked_thread_delete),
+        )
+        .route(
+            "/operator-authority/tracked-threads/get",
+            post(authority_tracked_thread_get),
+        )
+        .route(
+            "/operator-runtime/planning-sessions/list",
+            post(planning_session_list),
+        )
+        .route(
+            "/operator-runtime/planning-sessions/create",
+            post(planning_session_create),
+        )
+        .route(
+            "/operator-runtime/planning-sessions/request-supervisor-context",
+            post(planning_session_request_supervisor_context),
+        )
+        .route(
+            "/operator-runtime/planning-sessions/request-research",
+            post(planning_session_request_research),
+        )
+        .route(
+            "/operator-runtime/planning-sessions/mark-ready",
+            post(planning_session_mark_ready_for_review),
+        )
+        .route(
+            "/operator-runtime/planning-sessions/approve",
+            post(planning_session_approve),
+        )
+        .route(
+            "/operator-runtime/planning-sessions/reject",
+            post(planning_session_reject),
         )
         .route("/operator-runtime/threads/get", post(thread_get))
         .route(

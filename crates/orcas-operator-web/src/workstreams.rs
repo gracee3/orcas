@@ -5,6 +5,7 @@ use orcas_core::ipc;
 pub struct WorkstreamsDashboardData {
     pub hierarchy: authority::HierarchySnapshot,
     pub snapshot: ipc::StateSnapshot,
+    pub planning_sessions: Vec<orcas_core::PlanningSession>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,6 +453,7 @@ mod tests {
         let dashboard = WorkstreamsDashboardData {
             hierarchy: authority::HierarchySnapshot::default(),
             snapshot,
+            planning_sessions: Vec::new(),
         };
 
         let status = tracked_thread_runtime_status(&tracked_thread(), &dashboard);
@@ -498,6 +500,7 @@ mod tests {
         let dashboard = WorkstreamsDashboardData {
             hierarchy: authority::HierarchySnapshot::default(),
             snapshot,
+            planning_sessions: Vec::new(),
         };
 
         let status = tracked_thread_runtime_status(&tracked_thread(), &dashboard);
@@ -552,6 +555,7 @@ mod tests {
         let dashboard = WorkstreamsDashboardData {
             hierarchy: authority::HierarchySnapshot::default(),
             snapshot,
+            planning_sessions: Vec::new(),
         };
 
         let status = tracked_thread_runtime_status(&tracked_thread(), &dashboard);
@@ -603,6 +607,7 @@ mod tests {
         let dashboard = WorkstreamsDashboardData {
             hierarchy: authority::HierarchySnapshot::default(),
             snapshot,
+            planning_sessions: Vec::new(),
         };
 
         let thread = inferred_live_thread_for_assignment(&assignment, &dashboard)

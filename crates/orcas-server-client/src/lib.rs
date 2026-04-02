@@ -13,7 +13,15 @@ use orcas_core::ipc::{
     AuthorityWorkunitCreateResponse, AuthorityWorkunitDeleteRequest,
     AuthorityWorkunitDeleteResponse, AuthorityWorkunitEditRequest,
     AuthorityWorkunitEditResponse, AuthorityWorkunitGetRequest,
-    AuthorityWorkunitGetResponse,
+    AuthorityWorkunitGetResponse, AuthorityTrackedThreadGetRequest,
+    AuthorityTrackedThreadGetResponse, PlanningSessionCreateRequest,
+    PlanningSessionCreateResponse, PlanningSessionRequestSupervisorContextRequest,
+    PlanningSessionRequestSupervisorContextResponse, PlanningSessionRequestResearchRequest,
+    PlanningSessionRequestResearchResponse, PlanningSessionMarkReadyForReviewRequest,
+    PlanningSessionMarkReadyForReviewResponse, PlanningSessionApproveRequest,
+    PlanningSessionApproveResponse, PlanningSessionRejectRequest,
+    PlanningSessionRejectResponse, PlanningSessionListRequest,
+    PlanningSessionListResponse,
     NotificationDeliveryJobGetRequest, NotificationDeliveryJobGetResponse,
     NotificationDeliveryJobListRequest, NotificationDeliveryJobListResponse,
     NotificationDeliveryRunPendingRequest, NotificationDeliveryRunPendingResponse,
@@ -553,6 +561,73 @@ impl OrcasServerClient {
         request: &AuthorityTrackedThreadDeleteRequest,
     ) -> OrcasResult<AuthorityTrackedThreadDeleteResponse> {
         self.post_json("operator-authority/tracked-threads/delete", request)
+            .await
+    }
+
+    pub async fn authority_tracked_thread_get(
+        &self,
+        request: &AuthorityTrackedThreadGetRequest,
+    ) -> OrcasResult<AuthorityTrackedThreadGetResponse> {
+        self.post_json("operator-authority/tracked-threads/get", request)
+            .await
+    }
+
+    pub async fn planning_session_create(
+        &self,
+        request: &PlanningSessionCreateRequest,
+    ) -> OrcasResult<PlanningSessionCreateResponse> {
+        self.post_json("operator-runtime/planning-sessions/create", request)
+            .await
+    }
+
+    pub async fn planning_session_list(
+        &self,
+        request: &PlanningSessionListRequest,
+    ) -> OrcasResult<PlanningSessionListResponse> {
+        self.post_json("operator-runtime/planning-sessions/list", request)
+            .await
+    }
+
+    pub async fn planning_session_request_supervisor_context(
+        &self,
+        request: &PlanningSessionRequestSupervisorContextRequest,
+    ) -> OrcasResult<PlanningSessionRequestSupervisorContextResponse> {
+        self.post_json(
+            "operator-runtime/planning-sessions/request-supervisor-context",
+            request,
+        )
+        .await
+    }
+
+    pub async fn planning_session_request_research(
+        &self,
+        request: &PlanningSessionRequestResearchRequest,
+    ) -> OrcasResult<PlanningSessionRequestResearchResponse> {
+        self.post_json("operator-runtime/planning-sessions/request-research", request)
+            .await
+    }
+
+    pub async fn planning_session_mark_ready_for_review(
+        &self,
+        request: &PlanningSessionMarkReadyForReviewRequest,
+    ) -> OrcasResult<PlanningSessionMarkReadyForReviewResponse> {
+        self.post_json("operator-runtime/planning-sessions/mark-ready", request)
+            .await
+    }
+
+    pub async fn planning_session_approve(
+        &self,
+        request: &PlanningSessionApproveRequest,
+    ) -> OrcasResult<PlanningSessionApproveResponse> {
+        self.post_json("operator-runtime/planning-sessions/approve", request)
+            .await
+    }
+
+    pub async fn planning_session_reject(
+        &self,
+        request: &PlanningSessionRejectRequest,
+    ) -> OrcasResult<PlanningSessionRejectResponse> {
+        self.post_json("operator-runtime/planning-sessions/reject", request)
             .await
     }
 
