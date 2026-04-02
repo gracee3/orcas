@@ -244,6 +244,15 @@ a {
   min-width: 0;
 }
 
+.item-card details {
+  min-width: 0;
+}
+
+.item-card summary {
+  color: var(--accent);
+  cursor: pointer;
+}
+
 .item-card-selected {
   border-color: rgba(125, 211, 252, 0.5);
   background: rgba(125, 211, 252, 0.08);
@@ -361,6 +370,29 @@ a {
 .detail-grid dd {
   margin: 0.15rem 0 0;
   overflow-wrap: anywhere;
+}
+
+.compact-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+}
+
+.mini-stat {
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.65rem 0.75rem;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+}
+
+.mini-label {
+  color: var(--muted);
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
 }
 
 .workspace-focus-card {
