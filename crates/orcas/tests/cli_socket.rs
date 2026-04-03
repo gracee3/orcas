@@ -1439,7 +1439,7 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
     let create_tracked_thread = run_orcas(
         &daemon,
         &[
-            "tracked-threads",
+            "threads",
             "create",
             "--workunit",
             &work_unit_id,
@@ -1470,12 +1470,7 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
 
     let get_output = run_orcas(
         &daemon,
-        &[
-            "tracked-threads",
-            "get",
-            "--tracked-thread",
-            &tracked_thread_id,
-        ],
+        &["threads", "get", "--tracked-thread", &tracked_thread_id],
     );
     assert!(
         get_output.status.success(),
@@ -1496,7 +1491,7 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
     let edit_output = run_orcas(
         &daemon,
         &[
-            "tracked-threads",
+            "threads",
             "edit",
             "--tracked-thread",
             &tracked_thread_id,
@@ -1537,12 +1532,7 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
 
     let delete_output = run_orcas(
         &daemon,
-        &[
-            "tracked-threads",
-            "delete",
-            "--tracked-thread",
-            &tracked_thread_id,
-        ],
+        &["threads", "delete", "--tracked-thread", &tracked_thread_id],
     );
     assert!(
         delete_output.status.success(),
@@ -2240,7 +2230,6 @@ async fn real_cli_can_discover_pending_review_item_via_queue_and_history() {
     let queue_output = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "queue",
             "--assignment",
@@ -2265,7 +2254,6 @@ async fn real_cli_can_discover_pending_review_item_via_queue_and_history() {
     let history_output = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "history",
             "--assignment",
@@ -2298,7 +2286,7 @@ async fn real_cli_can_fetch_pending_review_item_detail_via_get() {
 
     let get_output = run_orcas(
         &daemon,
-        &["codex", "review", "get", "--decision", &pending_decision_id],
+        &["review", "get", "--decision", &pending_decision_id],
     );
     assert!(
         get_output.status.success(),
@@ -2340,7 +2328,6 @@ async fn real_cli_can_approve_pending_review_item() {
     let approve_output = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "approve",
             "--decision",
@@ -2372,7 +2359,7 @@ async fn real_cli_can_approve_pending_review_item() {
 
     let get_output = run_orcas(
         &daemon,
-        &["codex", "review", "get", "--decision", &pending_decision_id],
+        &["review", "get", "--decision", &pending_decision_id],
     );
     assert!(
         get_output.status.success(),
@@ -2401,7 +2388,6 @@ async fn real_cli_can_reject_pending_review_item() {
     let reject_output = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "reject",
             "--decision",
@@ -2432,7 +2418,7 @@ async fn real_cli_can_reject_pending_review_item() {
 
     let get_output = run_orcas(
         &daemon,
-        &["codex", "review", "get", "--decision", &pending_decision_id],
+        &["review", "get", "--decision", &pending_decision_id],
     );
     assert!(
         get_output.status.success(),
@@ -2460,7 +2446,6 @@ async fn real_cli_review_queue_and_history_reflect_approval_transition() {
     let queue_before = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "queue",
             "--assignment",
@@ -2479,7 +2464,6 @@ async fn real_cli_review_queue_and_history_reflect_approval_transition() {
     let approve_output = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "approve",
             "--decision",
@@ -2499,7 +2483,6 @@ async fn real_cli_review_queue_and_history_reflect_approval_transition() {
     let queue_after = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "queue",
             "--assignment",
@@ -2517,7 +2500,6 @@ async fn real_cli_review_queue_and_history_reflect_approval_transition() {
     let history_after = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "history",
             "--assignment",
@@ -2548,7 +2530,7 @@ async fn real_cli_reports_missing_review_item_with_nonzero_exit() {
 
     let output = run_orcas(
         &daemon,
-        &["codex", "review", "get", "--decision", "missing-decision"],
+        &["review", "get", "--decision", "missing-decision"],
     );
     assert!(!output.status.success());
     assert!(stdout(&output).is_empty());
