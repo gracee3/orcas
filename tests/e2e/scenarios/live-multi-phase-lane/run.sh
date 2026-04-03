@@ -161,11 +161,11 @@ phase1_git_status_stdout="$reports_dir/phase1-git-status.txt"
 phase1_tracked_thread_bind_stdout="$reports_dir/tracked-thread-bind.txt"
 phase1_tracked_thread_after_stdout="$reports_dir/tracked-thread-after-phase1.txt"
 
-e2e_orcas reports get --report "$phase1_report_id" >"$phase1_report_get_stdout"
+e2e_orcas supervisor work reports get --report "$phase1_report_id" >"$phase1_report_get_stdout"
 phase1_assignment_id="$(field_value assignment_id "$phase1_report_get_stdout")"
 phase1_report_parse_result="$(field_value parse_result "$phase1_report_get_stdout")"
 
-e2e_orcas assignments get --assignment "$phase1_assignment_id" >"$phase1_assignment_get_stdout"
+e2e_orcas supervisor work assignments get --assignment "$phase1_assignment_id" >"$phase1_assignment_get_stdout"
 phase1_assignment_status="$(field_value status "$phase1_assignment_get_stdout")"
 phase1_worker_session_id="$(field_value worker_session_id "$phase1_assignment_get_stdout")"
 phase1_thread_id="$(field_value thread_id "$phase1_assignment_stdout")"
@@ -208,7 +208,7 @@ phase1_proposal_get_stdout="$reports_dir/phase1-proposal-get.txt"
 phase1_proposal_approve_stdout="$reports_dir/phase1-proposal-approve.txt"
 
 phase1_proposal_create_output="$(
-  e2e_orcas proposals create \
+  e2e_orcas supervisor work proposals create \
     --workunit "$workunit_id" \
     --report "$phase1_report_id" \
     --requested-by live-multi-phase-lane \
@@ -217,14 +217,14 @@ phase1_proposal_create_output="$(
 )"
 phase1_proposal_id="$(printf '%s\n' "$phase1_proposal_create_output" | awk -F': ' '/^proposal_id:/ {print $2; exit}')"
 
-e2e_orcas proposals get --proposal "$phase1_proposal_id" >"$phase1_proposal_get_stdout"
+e2e_orcas supervisor work proposals get --proposal "$phase1_proposal_id" >"$phase1_proposal_get_stdout"
 grep -q "status: Open" "$phase1_proposal_get_stdout"
 grep -q "source_report_id: $phase1_report_id" "$phase1_proposal_get_stdout"
 grep -q "^model_summary_headline:" "$phase1_proposal_get_stdout"
 grep -q "^model_draft_assignment_objective:" "$phase1_proposal_get_stdout"
 
 phase1_proposal_approve_output="$(
-  e2e_orcas proposals approve \
+  e2e_orcas supervisor work proposals approve \
     --proposal "$phase1_proposal_id" \
     --reviewed-by live-multi-phase-lane \
     --review-note "Redirect this into a test-only follow-up that stays smaller than the original fix." \
@@ -248,7 +248,7 @@ grep -q "status: Approved" "$phase1_proposal_approve_stdout"
 grep -q "decision_type: Redirect" "$phase1_proposal_approve_stdout"
 grep -q "next_assignment_id: $phase1_next_assignment_id" "$phase1_proposal_approve_stdout"
 
-e2e_orcas proposals get --proposal "$phase1_proposal_id" >"$phase1_proposal_get_stdout"
+e2e_orcas supervisor work proposals get --proposal "$phase1_proposal_id" >"$phase1_proposal_get_stdout"
 grep -q "status: Approved" "$phase1_proposal_get_stdout"
 grep -q "approved_decision_id: $phase1_decision_id" "$phase1_proposal_get_stdout"
 grep -q "approved_assignment_id: $phase1_next_assignment_id" "$phase1_proposal_get_stdout"
@@ -268,7 +268,7 @@ phase2_assignment_start_pid=$!
 
 phase2_report_id=""
 for _ in $(seq 1 120); do
-  e2e_orcas assignments get --assignment "$phase1_next_assignment_id" >"$reports_dir/phase2-assignment-get.txt" 2>/dev/null || true
+  e2e_orcas supervisor work assignments get --assignment "$phase1_next_assignment_id" >"$reports_dir/phase2-assignment-get.txt" 2>/dev/null || true
   phase2_report_id="$(field_value report_id "$reports_dir/phase2-assignment-get.txt")"
   [[ -n "$phase2_report_id" ]] && break
   sleep 5
@@ -281,11 +281,11 @@ phase2_make_test_stdout="$reports_dir/phase2-make-test.txt"
 phase2_tree_diff_stdout="$reports_dir/phase2-tree-diff.txt"
 phase2_tracked_thread_after_stdout="$reports_dir/tracked-thread-after-phase2.txt"
 
-e2e_orcas reports get --report "$phase2_report_id" >"$phase2_report_get_stdout"
+e2e_orcas supervisor work reports get --report "$phase2_report_id" >"$phase2_report_get_stdout"
 phase2_assignment_id="$(field_value assignment_id "$phase2_report_get_stdout")"
 phase2_report_parse_result="$(field_value parse_result "$phase2_report_get_stdout")"
 
-e2e_orcas assignments get --assignment "$phase2_assignment_id" >"$phase2_assignment_get_stdout"
+e2e_orcas supervisor work assignments get --assignment "$phase2_assignment_id" >"$phase2_assignment_get_stdout"
 phase2_assignment_status="$(field_value status "$phase2_assignment_get_stdout")"
 phase2_worker_session_id="$(field_value worker_session_id "$phase2_assignment_get_stdout")"
 

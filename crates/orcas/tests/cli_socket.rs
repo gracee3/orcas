@@ -1579,7 +1579,7 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
 async fn real_cli_can_read_report_state_after_real_assignment_setup() {
     let (_fake_codex, mut daemon, started) = spawn_assignment_ready_daemon("cli-report-get").await;
 
-    let output = run_orcas(&daemon, &["reports", "get", "--report", &started.report.id]);
+    let output = run_orcas(&daemon, &["supervisor", "work", "reports", "get", "--report", &started.report.id]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
 
     let stdout = stdout(&output);
@@ -1600,7 +1600,7 @@ async fn real_cli_can_read_assignment_state_after_real_assignment_setup() {
 
     let output = run_orcas(
         &daemon,
-        &["assignments", "get", "--assignment", &started.assignment.id],
+        &["supervisor", "work", "assignments", "get", "--assignment", &started.assignment.id],
     );
     assert!(output.status.success(), "stderr: {}", stderr(&output));
 
@@ -1708,7 +1708,7 @@ async fn real_cli_planning_session_create_rejects_ready_for_review_shortcut_and_
         stderr(&invalid_create)
     );
 
-    let empty_list = run_orcas_with_env(&["plan", "list", "--workstream", workstream_id], &envs);
+    let empty_list = run_orcas_with_env(&["supervisor", "plan", "list", "--workstream", workstream_id], &envs);
     assert!(
         empty_list.status.success(),
         "stderr: {}",
@@ -1756,7 +1756,7 @@ async fn real_cli_planning_session_create_rejects_ready_for_review_shortcut_and_
 
     let created_session_id =
         field_value(&valid_stdout, "planning_session_id").expect("create should print session id");
-    let created_list = run_orcas_with_env(&["plan", "list", "--workstream", workstream_id], &envs);
+    let created_list = run_orcas_with_env(&["supervisor", "plan", "list", "--workstream", workstream_id], &envs);
     assert!(
         created_list.status.success(),
         "stderr: {}",
@@ -2001,7 +2001,7 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
     let _guard = planning_session_cli_test_lock().lock().await;
     let mut daemon = TestDaemon::spawn("cli-planning-help").await;
 
-    let root_help = run_orcas(&daemon, &["plan", "--help"]);
+    let root_help = run_orcas(&daemon, &["supervisor", "plan", "--help"]);
     assert!(root_help.status.success(), "stderr: {}", stderr(&root_help));
     let root_stdout = stdout(&root_help);
     assert!(root_stdout.contains("Supervisor-owned planning session orchestration"));
@@ -2011,7 +2011,7 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
     assert!(root_stdout.contains("update-summary"));
     assert!(root_stdout.contains("mark-ready-for-review"));
 
-    let create_help = run_orcas(&daemon, &["plan", "create", "--help"]);
+    let create_help = run_orcas(&daemon, &["supervisor", "plan", "create", "--help"]);
     assert!(
         create_help.status.success(),
         "stderr: {}",
@@ -2022,7 +2022,7 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
         "Create a draft planning session; readiness must be set later with mark-ready-for-review"
     ));
 
-    let approve_help = run_orcas(&daemon, &["plan", "approve", "--help"]);
+    let approve_help = run_orcas(&daemon, &["supervisor", "plan", "approve", "--help"]);
     assert!(
         approve_help.status.success(),
         "stderr: {}",
@@ -2034,7 +2034,7 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
             .contains("Stage a canonical plan revision proposal from the session summary")
     );
 
-    let research_help = run_orcas(&daemon, &["plan", "request-research", "--help"]);
+    let research_help = run_orcas(&daemon, &["supervisor", "plan", "request-research", "--help"]);
     assert!(
         research_help.status.success(),
         "stderr: {}",
@@ -2043,7 +2043,7 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
     let research_stdout = stdout(&research_help);
     assert!(research_stdout.contains("bounded one-turn research assignment"));
 
-    let update_help = run_orcas(&daemon, &["plan", "update-summary", "--help"]);
+    let update_help = run_orcas(&daemon, &["supervisor", "plan", "update-summary", "--help"]);
     assert!(
         update_help.status.success(),
         "stderr: {}",
@@ -2054,7 +2054,7 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
         "Update the descriptive planning summary only; use mark-ready-for-review for readiness"
     ));
 
-    let ready_help = run_orcas(&daemon, &["plan", "mark-ready-for-review", "--help"]);
+    let ready_help = run_orcas(&daemon, &["supervisor", "plan", "mark-ready-for-review", "--help"]);
     assert!(
         ready_help.status.success(),
         "stderr: {}",
@@ -2141,7 +2141,7 @@ async fn real_cli_can_apply_decision_after_real_assignment_setup() {
     assert!(workunit_stdout.contains("status: "));
     assert!(workunit_stdout.contains("tracked_threads: 1"));
 
-    let report_output = run_orcas(&daemon, &["reports", "get", "--report", &started.report.id]);
+    let report_output = run_orcas(&daemon, &["supervisor", "work", "reports", "get", "--report", &started.report.id]);
     assert!(
         report_output.status.success(),
         "stderr: {}",
@@ -2207,7 +2207,7 @@ async fn real_cli_can_create_list_and_approve_proposal_after_real_assignment_set
     assert!(approve_stdout.contains("decision_id:"));
     assert!(approve_stdout.contains("decision_type:"));
 
-    let get_output = run_orcas(&daemon, &["proposals", "get", "--proposal", &proposal_id]);
+    let get_output = run_orcas(&daemon, &["supervisor", "work", "proposals", "get", "--proposal", &proposal_id]);
     assert!(
         get_output.status.success(),
         "stderr: {}",
@@ -2288,7 +2288,7 @@ async fn real_cli_can_fetch_pending_review_item_detail_via_get() {
 
     let get_output = run_orcas(
         &daemon,
-        &["review", "get", "--decision", &pending_decision_id],
+        &["supervisor", "review", "get", "--decision", &pending_decision_id],
     );
     assert!(
         get_output.status.success(),
@@ -2361,7 +2361,7 @@ async fn real_cli_can_approve_pending_review_item() {
 
     let get_output = run_orcas(
         &daemon,
-        &["review", "get", "--decision", &pending_decision_id],
+        &["supervisor", "review", "get", "--decision", &pending_decision_id],
     );
     assert!(
         get_output.status.success(),
@@ -2420,7 +2420,7 @@ async fn real_cli_can_reject_pending_review_item() {
 
     let get_output = run_orcas(
         &daemon,
-        &["review", "get", "--decision", &pending_decision_id],
+        &["supervisor", "review", "get", "--decision", &pending_decision_id],
     );
     assert!(
         get_output.status.success(),
@@ -2532,7 +2532,7 @@ async fn real_cli_reports_missing_review_item_with_nonzero_exit() {
 
     let output = run_orcas(
         &daemon,
-        &["review", "get", "--decision", "missing-decision"],
+        &["supervisor", "review", "get", "--decision", "missing-decision"],
     );
     assert!(!output.status.success());
     assert!(stdout(&output).is_empty());
@@ -2594,7 +2594,7 @@ async fn real_cli_can_create_list_and_reject_proposal_after_real_assignment_setu
     assert!(reject_stdout.contains("reviewed_by: cli_operator"));
     assert!(reject_stdout.contains("review_note: Reject the bounded fake supervisor proposal"));
 
-    let get_output = run_orcas(&daemon, &["proposals", "get", "--proposal", &proposal_id]);
+    let get_output = run_orcas(&daemon, &["supervisor", "work", "proposals", "get", "--proposal", &proposal_id]);
     assert!(
         get_output.status.success(),
         "stderr: {}",
@@ -2662,7 +2662,7 @@ async fn real_cli_rejects_approving_non_open_proposal_with_nonzero_exit() {
 async fn real_cli_reports_missing_report_with_nonzero_exit() {
     let mut daemon = TestDaemon::spawn("cli-missing-report").await;
 
-    let output = run_orcas(&daemon, &["reports", "get", "--report", "missing-report"]);
+    let output = run_orcas(&daemon, &["supervisor", "work", "reports", "get", "--report", "missing-report"]);
     assert!(!output.status.success());
     assert!(stdout(&output).is_empty());
     assert!(stderr(&output).contains("unknown report `missing-report`"));

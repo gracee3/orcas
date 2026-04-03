@@ -90,10 +90,6 @@ enum TopCommand {
         command: DaemonCommand,
     },
     Doctor,
-    Session {
-        #[command(subcommand)]
-        command: SessionCommand,
-    },
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
@@ -110,29 +106,9 @@ enum TopCommand {
         #[command(subcommand)]
         command: WorkunitsCommand,
     },
-    Plan {
+    Supervisor {
         #[command(subcommand)]
-        command: PlanCommand,
-    },
-    Assignments {
-        #[command(subcommand)]
-        command: AssignmentsCommand,
-    },
-    Reports {
-        #[command(subcommand)]
-        command: ReportsCommand,
-    },
-    Decisions {
-        #[command(subcommand)]
-        command: DecisionsCommand,
-    },
-    Proposals {
-        #[command(subcommand)]
-        command: ProposalsCommand,
-    },
-    Review {
-        #[command(subcommand)]
-        command: ReviewCommand,
+        command: SupervisorCommand,
     },
     Codex {
         #[command(subcommand)]
@@ -299,6 +275,46 @@ enum CodexCommand {
     Turns {
         #[command(subcommand)]
         command: TurnsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SupervisorCommand {
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
+    },
+    Work {
+        #[command(subcommand)]
+        command: SupervisorWorkCommand,
+    },
+    Review {
+        #[command(subcommand)]
+        command: ReviewCommand,
+    },
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SupervisorWorkCommand {
+    Assignments {
+        #[command(subcommand)]
+        command: AssignmentsCommand,
+    },
+    Reports {
+        #[command(subcommand)]
+        command: ReportsCommand,
+    },
+    Decisions {
+        #[command(subcommand)]
+        command: DecisionsCommand,
+    },
+    Proposals {
+        #[command(subcommand)]
+        command: ProposalsCommand,
     },
 }
 
@@ -1317,12 +1333,6 @@ async fn main() -> Result<()> {
             let service = SupervisorService::load(&overrides).await?;
             service.doctor().await?;
         }
-        TopCommand::Session { command } => {
-            let service = SupervisorService::load(&overrides).await?;
-            match command {
-                SessionCommand::Active => service.session_active().await?,
-            }
-        }
         TopCommand::Events { command } => {
             let service = SupervisorService::load(&overrides).await?;
             match command {
@@ -1471,239 +1481,356 @@ async fn main() -> Result<()> {
                 },
             }
         }
-        TopCommand::Plan { command } => {
+        TopCommand::Supervisor { command } => {
             let service = SupervisorService::load(&overrides).await?;
             match command {
-                PlanCommand::Create(args) => {
-                    service
-                        .planning_session_create(
-                            &args.workstream,
-                            args.planning_thread_id,
-                            args.summary.objective,
-                            args.summary.research_status.into(),
-                            args.summary.requirements,
-                            args.summary.constraints,
-                            args.summary.non_goals,
-                            args.summary.open_questions,
-                            args.summary.draft_plan_summary,
-                            args.summary.ready_for_review,
-                            args.created_by,
-                            args.request_note,
-                            args.model,
-                            args.cwd,
-                        )
-                        .await?;
-                }
-                PlanCommand::Get(args) => {
-                    service.planning_session_get(&args.session).await?;
-                }
-                PlanCommand::List(args) => {
-                    service
-                        .planning_session_list(args.workstream, args.include_closed)
-                        .await?;
-                }
-                PlanCommand::UpdateSummary(args) => {
-                    service
-                        .planning_session_update_summary(
-                            &args.session,
-                            args.summary.objective,
-                            args.summary.requirements,
-                            args.summary.constraints,
-                            args.summary.non_goals,
-                            args.summary.open_questions,
-                            args.summary.research_status.into(),
-                            args.summary.draft_plan_summary,
-                            args.summary.ready_for_review,
-                            args.updated_by,
-                            args.note,
-                        )
-                        .await?;
-                }
-                PlanCommand::RequestSupervisorContext(args) => {
-                    service
-                        .planning_session_request_supervisor_context(
-                            &args.session,
-                            args.requested_by,
-                            args.note,
-                        )
-                        .await?;
-                }
-                PlanCommand::RequestResearch(args) => {
-                    service
-                        .planning_session_request_research(
-                            &args.session,
-                            &args.worker,
-                            args.worker_kind,
-                            args.model,
-                            args.cwd,
-                            args.requested_by,
-                            args.request_note,
-                        )
-                        .await?;
-                }
-                PlanCommand::MarkReadyForReview(args) => {
-                    service
-                        .planning_session_mark_ready_for_review(
-                            &args.session,
-                            args.updated_by,
-                            args.note,
-                        )
-                        .await?;
-                }
-                PlanCommand::Abort(args) => {
-                    service
-                        .planning_session_abort(&args.session, args.updated_by, args.note)
-                        .await?;
-                }
-                PlanCommand::Approve(args) => {
-                    service
-                        .planning_session_approve(&args.session, args.approved_by, args.review_note)
-                        .await?;
-                }
-                PlanCommand::Reject(args) => {
-                    service
-                        .planning_session_reject(&args.session, args.rejected_by, args.review_note)
-                        .await?;
-                }
-                PlanCommand::Supersede(args) => {
-                    service
-                        .planning_session_supersede(
-                            &args.session,
-                            args.superseded_by_session,
-                            args.updated_by,
-                            args.note,
-                        )
-                        .await?;
-                }
-            }
-        }
-        TopCommand::Assignments { command } => {
-            let service = SupervisorService::load(&overrides).await?;
-            match command {
-                AssignmentsCommand::Start(args) => {
-                    service
-                        .assignment_start(
-                            &args.workunit,
-                            &args.worker,
-                            args.instructions,
-                            args.worker_kind,
-                            args.cwd,
-                            args.model,
-                        )
-                        .await?;
-                }
-                AssignmentsCommand::Get(args) => service.assignment_get(&args.assignment).await?,
-                AssignmentsCommand::Communication(args) => {
-                    service
-                        .assignment_communication_get(&args.assignment)
-                        .await?
-                }
-            }
-        }
-        TopCommand::Reports { command } => {
-            let service = SupervisorService::load(&overrides).await?;
-            match command {
-                ReportsCommand::Get(args) => service.report_get(&args.report).await?,
-                ReportsCommand::ListForWorkunit(args) => {
-                    service.report_list_for_workunit(&args.workunit).await?;
-                }
-            }
-        }
-        TopCommand::Decisions { command } => {
-            let service = SupervisorService::load(&overrides).await?;
-            match command {
-                DecisionsCommand::Apply(args) => {
-                    service
-                        .decision_apply(
-                            &args.workunit,
-                            args.report,
-                            match args.decision_type {
-                                DecisionTypeArg::Accept => DecisionType::Accept,
-                                DecisionTypeArg::Continue => DecisionType::Continue,
-                                DecisionTypeArg::Redirect => DecisionType::Redirect,
-                                DecisionTypeArg::MarkComplete => DecisionType::MarkComplete,
-                                DecisionTypeArg::EscalateToHuman => DecisionType::EscalateToHuman,
-                            },
-                            args.rationale,
-                            args.instructions,
-                            args.worker,
-                            args.worker_kind,
-                        )
-                        .await?;
-                }
-            }
-        }
-        TopCommand::Proposals { command } => {
-            let service = SupervisorService::load(&overrides).await?;
-            match command {
-                ProposalsCommand::Create(args) => {
-                    service
-                        .proposal_create(
-                            &args.workunit,
-                            args.report,
-                            args.note,
-                            args.requested_by,
-                            args.supersede_open,
-                        )
-                        .await?;
-                }
-                ProposalsCommand::Get(args) => service.proposal_get(&args.proposal).await?,
-                ProposalsCommand::ArtifactSummary(args) => {
-                    service
-                        .proposal_artifact_summary_get(&args.proposal)
-                        .await?;
-                }
-                ProposalsCommand::ArtifactDetail(args) => {
-                    service.proposal_artifact_detail_get(&args.proposal).await?;
-                }
-                ProposalsCommand::ArtifactExport(args) => {
-                    service
-                        .proposal_artifact_export(
-                            &args.proposal,
-                            match args.format {
-                                ProposalArtifactExportFormatArg::Json => {
-                                    service::ProposalArtifactExportFormat::Json
-                                }
-                                ProposalArtifactExportFormatArg::Md => {
-                                    service::ProposalArtifactExportFormat::Markdown
-                                }
-                            },
-                            args.output.as_deref(),
-                        )
-                        .await?;
-                }
-                ProposalsCommand::ListForWorkunit(args) => {
-                    service.proposal_list_for_workunit(&args.workunit).await?;
-                }
-                ProposalsCommand::Approve(args) => {
-                    service
-                        .proposal_approve(
-                            &args.proposal,
-                            args.reviewed_by,
-                            args.review_note,
-                            args.decision_type.map(|decision_type| match decision_type {
-                                DecisionTypeArg::Accept => DecisionType::Accept,
-                                DecisionTypeArg::Continue => DecisionType::Continue,
-                                DecisionTypeArg::Redirect => DecisionType::Redirect,
-                                DecisionTypeArg::MarkComplete => DecisionType::MarkComplete,
-                                DecisionTypeArg::EscalateToHuman => DecisionType::EscalateToHuman,
-                            }),
-                            args.rationale,
-                            args.worker,
-                            args.worker_kind,
-                            args.objective,
-                            args.instructions,
-                            args.acceptance_criteria,
-                            args.stop_conditions,
-                            args.expected_report_fields,
-                        )
-                        .await?;
-                }
-                ProposalsCommand::Reject(args) => {
-                    service
-                        .proposal_reject(&args.proposal, args.reviewed_by, args.review_note)
-                        .await?;
-                }
+                SupervisorCommand::Session { command } => match command {
+                    SessionCommand::Active => service.session_active().await?,
+                },
+                SupervisorCommand::Plan { command } => match command {
+                    PlanCommand::Create(args) => {
+                        service
+                            .planning_session_create(
+                                &args.workstream,
+                                args.planning_thread_id,
+                                args.summary.objective,
+                                args.summary.research_status.into(),
+                                args.summary.requirements,
+                                args.summary.constraints,
+                                args.summary.non_goals,
+                                args.summary.open_questions,
+                                args.summary.draft_plan_summary,
+                                args.summary.ready_for_review,
+                                args.created_by,
+                                args.request_note,
+                                args.model,
+                                args.cwd,
+                            )
+                            .await?;
+                    }
+                    PlanCommand::Get(args) => {
+                        service.planning_session_get(&args.session).await?;
+                    }
+                    PlanCommand::List(args) => {
+                        service
+                            .planning_session_list(args.workstream, args.include_closed)
+                            .await?;
+                    }
+                    PlanCommand::UpdateSummary(args) => {
+                        service
+                            .planning_session_update_summary(
+                                &args.session,
+                                args.summary.objective,
+                                args.summary.requirements,
+                                args.summary.constraints,
+                                args.summary.non_goals,
+                                args.summary.open_questions,
+                                args.summary.research_status.into(),
+                                args.summary.draft_plan_summary,
+                                args.summary.ready_for_review,
+                                args.updated_by,
+                                args.note,
+                            )
+                            .await?;
+                    }
+                    PlanCommand::RequestSupervisorContext(args) => {
+                        service
+                            .planning_session_request_supervisor_context(
+                                &args.session,
+                                args.requested_by,
+                                args.note,
+                            )
+                            .await?;
+                    }
+                    PlanCommand::RequestResearch(args) => {
+                        service
+                            .planning_session_request_research(
+                                &args.session,
+                                &args.worker,
+                                args.worker_kind,
+                                args.model,
+                                args.cwd,
+                                args.requested_by,
+                                args.request_note,
+                            )
+                            .await?;
+                    }
+                    PlanCommand::MarkReadyForReview(args) => {
+                        service
+                            .planning_session_mark_ready_for_review(
+                                &args.session,
+                                args.updated_by,
+                                args.note,
+                            )
+                            .await?;
+                    }
+                    PlanCommand::Abort(args) => {
+                        service
+                            .planning_session_abort(&args.session, args.updated_by, args.note)
+                            .await?;
+                    }
+                    PlanCommand::Approve(args) => {
+                        service
+                            .planning_session_approve(
+                                &args.session,
+                                args.approved_by,
+                                args.review_note,
+                            )
+                            .await?;
+                    }
+                    PlanCommand::Reject(args) => {
+                        service
+                            .planning_session_reject(
+                                &args.session,
+                                args.rejected_by,
+                                args.review_note,
+                            )
+                            .await?;
+                    }
+                    PlanCommand::Supersede(args) => {
+                        service
+                            .planning_session_supersede(
+                                &args.session,
+                                args.superseded_by_session,
+                                args.updated_by,
+                                args.note,
+                            )
+                            .await?;
+                    }
+                },
+                SupervisorCommand::Work { command } => match command {
+                    SupervisorWorkCommand::Assignments { command } => match command {
+                        AssignmentsCommand::Start(args) => {
+                            service
+                                .assignment_start(
+                                    &args.workunit,
+                                    &args.worker,
+                                    args.instructions,
+                                    args.worker_kind,
+                                    args.cwd,
+                                    args.model,
+                                )
+                                .await?;
+                        }
+                        AssignmentsCommand::Get(args) => {
+                            service.assignment_get(&args.assignment).await?
+                        }
+                        AssignmentsCommand::Communication(args) => {
+                            service
+                                .assignment_communication_get(&args.assignment)
+                                .await?
+                        }
+                    },
+                    SupervisorWorkCommand::Reports { command } => match command {
+                        ReportsCommand::Get(args) => service.report_get(&args.report).await?,
+                        ReportsCommand::ListForWorkunit(args) => {
+                            service.report_list_for_workunit(&args.workunit).await?;
+                        }
+                    },
+                    SupervisorWorkCommand::Decisions { command } => match command {
+                        DecisionsCommand::Apply(args) => {
+                            service
+                                .decision_apply(
+                                    &args.workunit,
+                                    args.report,
+                                    match args.decision_type {
+                                        DecisionTypeArg::Accept => DecisionType::Accept,
+                                        DecisionTypeArg::Continue => DecisionType::Continue,
+                                        DecisionTypeArg::Redirect => DecisionType::Redirect,
+                                        DecisionTypeArg::MarkComplete => DecisionType::MarkComplete,
+                                        DecisionTypeArg::EscalateToHuman => {
+                                            DecisionType::EscalateToHuman
+                                        }
+                                    },
+                                    args.rationale,
+                                    args.instructions,
+                                    args.worker,
+                                    args.worker_kind,
+                                )
+                                .await?;
+                        }
+                    },
+                    SupervisorWorkCommand::Proposals { command } => match command {
+                        ProposalsCommand::Create(args) => {
+                            service
+                                .proposal_create(
+                                    &args.workunit,
+                                    args.report,
+                                    args.note,
+                                    args.requested_by,
+                                    args.supersede_open,
+                                )
+                                .await?;
+                        }
+                        ProposalsCommand::Get(args) => {
+                            service.proposal_get(&args.proposal).await?
+                        }
+                        ProposalsCommand::ArtifactSummary(args) => {
+                            service
+                                .proposal_artifact_summary_get(&args.proposal)
+                                .await?;
+                        }
+                        ProposalsCommand::ArtifactDetail(args) => {
+                            service.proposal_artifact_detail_get(&args.proposal).await?;
+                        }
+                        ProposalsCommand::ArtifactExport(args) => {
+                            service
+                                .proposal_artifact_export(
+                                    &args.proposal,
+                                    match args.format {
+                                        ProposalArtifactExportFormatArg::Json => {
+                                            service::ProposalArtifactExportFormat::Json
+                                        }
+                                        ProposalArtifactExportFormatArg::Md => {
+                                            service::ProposalArtifactExportFormat::Markdown
+                                        }
+                                    },
+                                    args.output.as_deref(),
+                                )
+                                .await?;
+                        }
+                        ProposalsCommand::ListForWorkunit(args) => {
+                            service.proposal_list_for_workunit(&args.workunit).await?;
+                        }
+                        ProposalsCommand::Approve(args) => {
+                            service
+                                .proposal_approve(
+                                    &args.proposal,
+                                    args.reviewed_by,
+                                    args.review_note,
+                                    args.decision_type.map(|decision_type| match decision_type {
+                                        DecisionTypeArg::Accept => DecisionType::Accept,
+                                        DecisionTypeArg::Continue => DecisionType::Continue,
+                                        DecisionTypeArg::Redirect => DecisionType::Redirect,
+                                        DecisionTypeArg::MarkComplete => DecisionType::MarkComplete,
+                                        DecisionTypeArg::EscalateToHuman => {
+                                            DecisionType::EscalateToHuman
+                                        }
+                                    }),
+                                    args.rationale,
+                                    args.worker,
+                                    args.worker_kind,
+                                    args.objective,
+                                    args.instructions,
+                                    args.acceptance_criteria,
+                                    args.stop_conditions,
+                                    args.expected_report_fields,
+                                )
+                                .await?;
+                        }
+                        ProposalsCommand::Reject(args) => {
+                            service
+                                .proposal_reject(&args.proposal, args.reviewed_by, args.review_note)
+                                .await?;
+                        }
+                    },
+                },
+                SupervisorCommand::Review { command } => match command {
+                    ReviewCommand::List(args) => {
+                        service
+                            .codex_decision_list(
+                                args.filters.thread.as_deref(),
+                                args.filters.assignment.as_deref(),
+                                args.filters.workstream.as_deref(),
+                                args.filters.workunit.as_deref(),
+                                args.filters.supervisor.as_deref(),
+                                args.filters.status.map(Into::into),
+                                args.filters.kind.map(Into::into),
+                                args.include_closed,
+                                args.filters.include_superseded,
+                                false,
+                                args.filters.limit,
+                            )
+                            .await?;
+                    }
+                    ReviewCommand::Queue(args) => {
+                        service
+                            .codex_decision_list(
+                                args.filters.thread.as_deref(),
+                                args.filters.assignment.as_deref(),
+                                args.filters.workstream.as_deref(),
+                                args.filters.workunit.as_deref(),
+                                args.filters.supervisor.as_deref(),
+                                args.filters.status.map(Into::into),
+                                args.filters.kind.map(Into::into),
+                                false,
+                                args.filters.include_superseded,
+                                true,
+                                args.filters.limit,
+                            )
+                            .await?;
+                    }
+                    ReviewCommand::History(args) => {
+                        service
+                            .codex_decision_history(
+                                args.thread.as_deref(),
+                                args.assignment.as_deref(),
+                                args.include_superseded,
+                                args.limit,
+                            )
+                            .await?;
+                    }
+                    ReviewCommand::Get(args) => {
+                        service.codex_decision_get(&args.decision).await?;
+                    }
+                    ReviewCommand::ProposeSteer(args) => {
+                        service
+                            .codex_decision_propose_steer(
+                                &args.thread,
+                                &args.text,
+                                args.requested_by,
+                                args.rationale_note,
+                            )
+                            .await?;
+                    }
+                    ReviewCommand::ReplacePendingSteer(args) => {
+                        service
+                            .codex_decision_replace_pending_steer(
+                                &args.decision,
+                                &args.text,
+                                args.requested_by,
+                                args.rationale_note,
+                            )
+                            .await?;
+                    }
+                    ReviewCommand::RecordNoAction(args) => {
+                        service
+                            .codex_decision_record_no_action(
+                                &args.decision,
+                                args.reviewed_by,
+                                args.review_note,
+                            )
+                            .await?;
+                    }
+                    ReviewCommand::ManualRefresh(args) => {
+                        service
+                            .codex_decision_manual_refresh(
+                                args.thread.as_deref(),
+                                args.assignment.as_deref(),
+                                args.requested_by,
+                                args.rationale_note,
+                            )
+                            .await?;
+                    }
+                    ReviewCommand::Approve(args) => {
+                        service
+                            .codex_decision_approve_and_send(
+                                &args.decision,
+                                args.reviewed_by,
+                                args.review_note,
+                            )
+                            .await?;
+                    }
+                    ReviewCommand::Reject(args) => {
+                        service
+                            .codex_decision_reject(
+                                &args.decision,
+                                args.reviewed_by,
+                                args.review_note,
+                            )
+                            .await?;
+                    }
+                },
             }
         }
         TopCommand::Codex { command } => {
@@ -1734,111 +1861,6 @@ async fn main() -> Result<()> {
                     }
                     TurnsCommand::Get(args) => service.turn_get(&args.thread, &args.turn).await?,
                 },
-            }
-        }
-        TopCommand::Review { command } => {
-            let service = SupervisorService::load(&overrides).await?;
-            match command {
-                ReviewCommand::List(args) => {
-                    service
-                        .codex_decision_list(
-                            args.filters.thread.as_deref(),
-                            args.filters.assignment.as_deref(),
-                            args.filters.workstream.as_deref(),
-                            args.filters.workunit.as_deref(),
-                            args.filters.supervisor.as_deref(),
-                            args.filters.status.map(Into::into),
-                            args.filters.kind.map(Into::into),
-                            args.include_closed,
-                            args.filters.include_superseded,
-                            false,
-                            args.filters.limit,
-                        )
-                        .await?;
-                }
-                ReviewCommand::Queue(args) => {
-                    service
-                        .codex_decision_list(
-                            args.filters.thread.as_deref(),
-                            args.filters.assignment.as_deref(),
-                            args.filters.workstream.as_deref(),
-                            args.filters.workunit.as_deref(),
-                            args.filters.supervisor.as_deref(),
-                            args.filters.status.map(Into::into),
-                            args.filters.kind.map(Into::into),
-                            false,
-                            args.filters.include_superseded,
-                            true,
-                            args.filters.limit,
-                        )
-                        .await?;
-                }
-                ReviewCommand::History(args) => {
-                    service
-                        .codex_decision_history(
-                            args.thread.as_deref(),
-                            args.assignment.as_deref(),
-                            args.include_superseded,
-                            args.limit,
-                        )
-                        .await?;
-                }
-                ReviewCommand::Get(args) => {
-                    service.codex_decision_get(&args.decision).await?;
-                }
-                ReviewCommand::ProposeSteer(args) => {
-                    service
-                        .codex_decision_propose_steer(
-                            &args.thread,
-                            &args.text,
-                            args.requested_by,
-                            args.rationale_note,
-                        )
-                        .await?;
-                }
-                ReviewCommand::ReplacePendingSteer(args) => {
-                    service
-                        .codex_decision_replace_pending_steer(
-                            &args.decision,
-                            &args.text,
-                            args.requested_by,
-                            args.rationale_note,
-                        )
-                        .await?;
-                }
-                ReviewCommand::RecordNoAction(args) => {
-                    service
-                        .codex_decision_record_no_action(
-                            &args.decision,
-                            args.reviewed_by,
-                            args.review_note,
-                        )
-                        .await?;
-                }
-                ReviewCommand::ManualRefresh(args) => {
-                    service
-                        .codex_decision_manual_refresh(
-                            args.thread.as_deref(),
-                            args.assignment.as_deref(),
-                            args.requested_by,
-                            args.rationale_note,
-                        )
-                        .await?;
-                }
-                ReviewCommand::Approve(args) => {
-                    service
-                        .codex_decision_approve_and_send(
-                            &args.decision,
-                            args.reviewed_by,
-                            args.review_note,
-                        )
-                        .await?;
-                }
-                ReviewCommand::Reject(args) => {
-                    service
-                        .codex_decision_reject(&args.decision, args.reviewed_by, args.review_note)
-                        .await?;
-                }
             }
         }
         TopCommand::Prompt(args) => {
@@ -1898,12 +1920,14 @@ mod tests {
     }
 
     #[test]
-    fn top_level_help_mentions_only_canonical_planning_namespaces() {
+    fn top_level_help_mentions_only_canonical_namespace_groups() {
         let help = Cli::command().render_help().to_string();
 
         assert!(help.contains("workstreams"));
         assert!(help.contains("workunits"));
+        assert!(help.contains("supervisor"));
         assert!(!help.contains("tracked-threads"));
+        assert!(!help.contains("planning-sessions"));
         assert!(!help.contains("legacy-workstreams"));
         assert!(!help.contains("legacy-workunits"));
     }
@@ -1983,12 +2007,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_session_active_command() {
-        let cli = Cli::parse_from(["orcas", "session", "active"]);
+    fn parses_supervisor_session_active_command() {
+        let cli = Cli::parse_from(["orcas", "supervisor", "session", "active"]);
 
         match cli.command {
-            TopCommand::Session {
-                command: SessionCommand::Active,
+            TopCommand::Supervisor {
+                command: SupervisorCommand::Session {
+                    command: SessionCommand::Active,
+                },
             } => {}
             other => panic!("unexpected command parse: {other:?}"),
         }
@@ -2168,9 +2194,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_review_propose_steer_command() {
+    fn parses_supervisor_review_propose_steer_command() {
         let cli = Cli::parse_from([
             "orcas",
+            "supervisor",
             "review",
             "propose-steer",
             "--thread",
@@ -2182,8 +2209,10 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Review {
-                command: ReviewCommand::ProposeSteer(args),
+            TopCommand::Supervisor {
+                command: SupervisorCommand::Review {
+                    command: ReviewCommand::ProposeSteer(args),
+                },
             } => {
                 assert_eq!(args.thread, "thread-1");
                 assert_eq!(args.text, "stay focused");
@@ -2194,9 +2223,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_plan_create_command() {
+    fn parses_supervisor_plan_create_command() {
         let cli = Cli::parse_from([
             "orcas",
+            "supervisor",
             "plan",
             "create",
             "--workstream",
@@ -2208,8 +2238,10 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Plan {
-                command: PlanCommand::Create(args),
+            TopCommand::Supervisor {
+                command: SupervisorCommand::Plan {
+                    command: PlanCommand::Create(args),
+                },
             } => {
                 assert_eq!(args.workstream, "ws-1");
                 assert_eq!(args.summary.objective, "Plan a bounded change");
@@ -2220,9 +2252,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_plan_mark_ready_for_review_command() {
+    fn parses_supervisor_plan_mark_ready_for_review_command() {
         let cli = Cli::parse_from([
             "orcas",
+            "supervisor",
             "plan",
             "mark-ready-for-review",
             "--session",
@@ -2232,8 +2265,10 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Plan {
-                command: PlanCommand::MarkReadyForReview(args),
+            TopCommand::Supervisor {
+                command: SupervisorCommand::Plan {
+                    command: PlanCommand::MarkReadyForReview(args),
+                },
             } => {
                 assert_eq!(args.session, "ps-1");
                 assert_eq!(args.updated_by.as_deref(), Some("cli_user"));
@@ -2403,9 +2438,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_review_replace_pending_steer_command() {
+    fn parses_supervisor_review_replace_pending_steer_command() {
         let cli = Cli::parse_from([
             "orcas",
+            "supervisor",
             "review",
             "replace-pending-steer",
             "--decision",
@@ -2415,8 +2451,10 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Review {
-                command: ReviewCommand::ReplacePendingSteer(args),
+            TopCommand::Supervisor {
+                command: SupervisorCommand::Review {
+                    command: ReviewCommand::ReplacePendingSteer(args),
+                },
             } => {
                 assert_eq!(args.decision, "std-7");
                 assert_eq!(args.text, "updated steer text");
@@ -2426,9 +2464,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_review_record_no_action_command() {
+    fn parses_supervisor_review_record_no_action_command() {
         let cli = Cli::parse_from([
             "orcas",
+            "supervisor",
             "review",
             "record-no-action",
             "--decision",
@@ -2438,8 +2477,10 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Review {
-                command: ReviewCommand::RecordNoAction(args),
+            TopCommand::Supervisor {
+                command: SupervisorCommand::Review {
+                    command: ReviewCommand::RecordNoAction(args),
+                },
             } => {
                 assert_eq!(args.decision, "std-7");
                 assert_eq!(args.reviewed_by.as_deref(), Some("cli_user"));
@@ -2449,9 +2490,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_review_manual_refresh_command() {
+    fn parses_supervisor_review_manual_refresh_command() {
         let cli = Cli::parse_from([
             "orcas",
+            "supervisor",
             "review",
             "manual-refresh",
             "--thread",
@@ -2461,8 +2503,10 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Review {
-                command: ReviewCommand::ManualRefresh(args),
+            TopCommand::Supervisor {
+                command: SupervisorCommand::Review {
+                    command: ReviewCommand::ManualRefresh(args),
+                },
             } => {
                 assert_eq!(args.thread.as_deref(), Some("thread-1"));
                 assert_eq!(args.assignment, None);
@@ -2473,9 +2517,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_review_queue_command_with_filters() {
+    fn parses_supervisor_review_queue_command_with_filters() {
         let cli = Cli::parse_from([
             "orcas",
+            "supervisor",
             "review",
             "queue",
             "--workstream",
@@ -2487,8 +2532,10 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Review {
-                command: ReviewCommand::Queue(args),
+            TopCommand::Supervisor {
+                command: SupervisorCommand::Review {
+                    command: ReviewCommand::Queue(args),
+                },
             } => {
                 assert_eq!(args.filters.workstream.as_deref(), Some("ws-1"));
                 assert!(matches!(
@@ -2502,9 +2549,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_review_history_command() {
+    fn parses_supervisor_review_history_command() {
         let cli = Cli::parse_from([
             "orcas",
+            "supervisor",
             "review",
             "history",
             "--assignment",
@@ -2514,8 +2562,10 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Review {
-                command: ReviewCommand::History(args),
+            TopCommand::Supervisor {
+                command: SupervisorCommand::Review {
+                    command: ReviewCommand::History(args),
+                },
             } => {
                 assert_eq!(args.assignment.as_deref(), Some("cta-1"));
                 assert_eq!(args.limit, Some(20));
@@ -2526,9 +2576,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_proposal_artifact_summary_command() {
+    fn parses_supervisor_proposal_artifact_summary_command() {
         let cli = Cli::parse_from([
             "orcas",
+            "supervisor",
+            "work",
             "proposals",
             "artifact-summary",
             "--proposal",
@@ -2536,8 +2588,12 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Proposals {
-                command: ProposalsCommand::ArtifactSummary(args),
+            TopCommand::Supervisor {
+                command: SupervisorCommand::Work {
+                    command: SupervisorWorkCommand::Proposals {
+                        command: ProposalsCommand::ArtifactSummary(args),
+                    },
+                },
             } => {
                 assert_eq!(args.proposal, "proposal-1");
             }
@@ -2546,9 +2602,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_proposal_artifact_detail_command() {
+    fn parses_supervisor_proposal_artifact_detail_command() {
         let cli = Cli::parse_from([
             "orcas",
+            "supervisor",
+            "work",
             "proposals",
             "artifact-detail",
             "--proposal",
@@ -2556,8 +2614,12 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Proposals {
-                command: ProposalsCommand::ArtifactDetail(args),
+            TopCommand::Supervisor {
+                command: SupervisorCommand::Work {
+                    command: SupervisorWorkCommand::Proposals {
+                        command: ProposalsCommand::ArtifactDetail(args),
+                    },
+                },
             } => {
                 assert_eq!(args.proposal, "proposal-1");
             }
@@ -2566,9 +2628,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_proposal_artifact_export_command() {
+    fn parses_supervisor_proposal_artifact_export_command() {
         let cli = Cli::parse_from([
             "orcas",
+            "supervisor",
+            "work",
             "proposals",
             "artifact-export",
             "--proposal",
@@ -2580,8 +2644,12 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Proposals {
-                command: ProposalsCommand::ArtifactExport(args),
+            TopCommand::Supervisor {
+                command: SupervisorCommand::Work {
+                    command: SupervisorWorkCommand::Proposals {
+                        command: ProposalsCommand::ArtifactExport(args),
+                    },
+                },
             } => {
                 assert_eq!(args.proposal, "proposal-1");
                 assert!(matches!(args.format, ProposalArtifactExportFormatArg::Md));
@@ -2592,8 +2660,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_supervisor_namespace() {
-        assert!(Cli::try_parse_from(["orcas", "supervisor", "doctor"]).is_err());
+    fn rejects_removed_top_level_supervisor_peer_namespaces() {
+        assert!(Cli::try_parse_from(["orcas", "plan", "create"]).is_err());
+        assert!(Cli::try_parse_from(["orcas", "assignments", "start"]).is_err());
+        assert!(Cli::try_parse_from(["orcas", "reports", "get", "--report", "r-1"]).is_err());
+        assert!(
+            Cli::try_parse_from(["orcas", "proposals", "create", "--workunit", "wu-1"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["orcas", "decisions", "apply", "--workunit", "wu-1"]).is_err());
+        assert!(Cli::try_parse_from(["orcas", "review", "list"]).is_err());
+        assert!(Cli::try_parse_from(["orcas", "session", "active"]).is_err());
     }
 
     #[test]

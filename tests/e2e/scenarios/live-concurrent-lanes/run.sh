@@ -126,11 +126,11 @@ run_lane() {
 
   wait_for_report_id "$workunit_id" report_id
 
-  e2e_orcas reports get --report "$report_id" >"$report_get_stdout"
+  e2e_orcas supervisor work reports get --report "$report_id" >"$report_get_stdout"
   assignment_id="$(field_value assignment_id "$report_get_stdout")"
   report_parse_result="$(field_value parse_result "$report_get_stdout")"
 
-  e2e_orcas assignments get --assignment "$assignment_id" >"$assignment_get_stdout"
+  e2e_orcas supervisor work assignments get --assignment "$assignment_id" >"$assignment_get_stdout"
   assignment_status="$(field_value status "$assignment_get_stdout")"
   worker_session_id="$(field_value worker_session_id "$assignment_get_stdout")"
   thread_id="$(field_value thread_id "$assignment_stdout")"
@@ -311,10 +311,10 @@ lane_b_tracked_after_stdout="$reports_dir/lane-b-tracked-thread-after.txt"
 lane_a_decision_stdout="$reports_dir/lane-a-decision-complete.txt"
 lane_b_decision_stdout="$reports_dir/lane-b-decision-complete.txt"
 
-e2e_orcas reports get --report "$lane_a_report_id" >"$lane_a_report_get_stdout"
+e2e_orcas supervisor work reports get --report "$lane_a_report_id" >"$lane_a_report_get_stdout"
 lane_a_assignment_id="$(field_value assignment_id "$lane_a_report_get_stdout")"
 lane_a_report_workunit_id="$(field_value work_unit_id "$lane_a_report_get_stdout")"
-e2e_orcas assignments get --assignment "$lane_a_assignment_id" >"$lane_a_assignment_get_stdout"
+e2e_orcas supervisor work assignments get --assignment "$lane_a_assignment_id" >"$lane_a_assignment_get_stdout"
 lane_a_assignment_status="$(field_value status "$lane_a_assignment_get_stdout")"
 lane_a_worker_session_id="$(field_value worker_session_id "$lane_a_assignment_get_stdout")"
 lane_a_report_parse_result="$(field_value parse_result "$lane_a_report_get_stdout")"
@@ -331,10 +331,10 @@ lane_b_assignment_start_pid=$!
 
 wait_for_report_id "$lane_b_workunit_id" lane_b_report_id
 
-e2e_orcas reports get --report "$lane_b_report_id" >"$lane_b_report_get_stdout"
+e2e_orcas supervisor work reports get --report "$lane_b_report_id" >"$lane_b_report_get_stdout"
 lane_b_assignment_id="$(field_value assignment_id "$lane_b_report_get_stdout")"
 lane_b_report_workunit_id="$(field_value work_unit_id "$lane_b_report_get_stdout")"
-e2e_orcas assignments get --assignment "$lane_b_assignment_id" >"$lane_b_assignment_get_stdout"
+e2e_orcas supervisor work assignments get --assignment "$lane_b_assignment_id" >"$lane_b_assignment_get_stdout"
 lane_b_assignment_status="$(field_value status "$lane_b_assignment_get_stdout")"
 lane_b_worker_session_id="$(field_value worker_session_id "$lane_b_assignment_get_stdout")"
 lane_b_report_parse_result="$(field_value parse_result "$lane_b_report_get_stdout")"

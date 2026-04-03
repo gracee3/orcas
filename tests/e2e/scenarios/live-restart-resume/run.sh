@@ -181,11 +181,11 @@ done
 test -n "$report_id"
 report_count="$(printf '%s\n' "$reports_output_final" | sed '/^$/d' | wc -l | tr -d ' ')"
 test "$report_count" -eq 1
-e2e_orcas reports get --report "$report_id" >"$report_get_stdout"
+e2e_orcas supervisor work reports get --report "$report_id" >"$report_get_stdout"
 assignment_id="$(field_value assignment_id "$report_get_stdout")"
 report_parse_result="$(field_value parse_result "$report_get_stdout")"
 
-e2e_orcas assignments get --assignment "$assignment_id" >"$assignment_after_get_stdout"
+e2e_orcas supervisor work assignments get --assignment "$assignment_id" >"$assignment_after_get_stdout"
 assignment_status="$(field_value status "$assignment_after_get_stdout")"
 worker_session_id="$(field_value worker_session_id "$assignment_after_get_stdout")"
 

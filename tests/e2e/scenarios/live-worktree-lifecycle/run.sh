@@ -185,11 +185,11 @@ bootstrap_make_test_stdout="$reports_dir/bootstrap-make-test.txt"
 bootstrap_git_status_stdout="$reports_dir/bootstrap-git-status.txt"
 bootstrap_churn_stdout="$reports_dir/bootstrap-churn.txt"
 
-e2e_orcas reports get --report "$bootstrap_report_id" >"$bootstrap_report_get_stdout"
+e2e_orcas supervisor work reports get --report "$bootstrap_report_id" >"$bootstrap_report_get_stdout"
 bootstrap_assignment_id="$(field_value assignment_id "$bootstrap_report_get_stdout")"
 bootstrap_report_parse_result="$(field_value parse_result "$bootstrap_report_get_stdout")"
 
-e2e_orcas assignments get --assignment "$bootstrap_assignment_id" >"$bootstrap_assignment_get_stdout"
+e2e_orcas supervisor work assignments get --assignment "$bootstrap_assignment_id" >"$bootstrap_assignment_get_stdout"
 bootstrap_assignment_status="$(field_value status "$bootstrap_assignment_get_stdout")"
 
 case "$bootstrap_report_parse_result" in
@@ -275,11 +275,11 @@ prepare_make_test_stdout="$reports_dir/prepare-make-test.txt"
 prepare_git_status_stdout="$reports_dir/prepare-git-status.txt"
 prepare_git_log_stdout="$reports_dir/prepare-git-log.txt"
 
-e2e_orcas reports get --report "$prepare_report_id" >"$prepare_report_get_stdout"
+e2e_orcas supervisor work reports get --report "$prepare_report_id" >"$prepare_report_get_stdout"
 prepare_report_assignment_id="$(field_value assignment_id "$prepare_report_get_stdout")"
 prepare_report_parse_result="$(field_value parse_result "$prepare_report_get_stdout")"
 
-e2e_orcas assignments get --assignment "$prepare_assignment_id" >"$prepare_assignment_get_stdout"
+e2e_orcas supervisor work assignments get --assignment "$prepare_assignment_id" >"$prepare_assignment_get_stdout"
 prepare_assignment_status="$(field_value status "$prepare_assignment_get_stdout")"
 
 make -C "$worktree_path" test >"$prepare_make_test_stdout"
@@ -344,8 +344,8 @@ merge_prep_report_get_stdout="$reports_dir/merge-prep-report-get.txt"
 merge_prep_assignment_get_stdout="$reports_dir/merge-prep-assignment-get.txt"
 merge_prep_thread_get_stdout="$reports_dir/tracked-thread-after-merge-prep.txt"
 
-e2e_orcas reports get --report "$merge_prep_report_id" >"$merge_prep_report_get_stdout"
-e2e_orcas assignments get --assignment "$merge_prep_assignment_id" >"$merge_prep_assignment_get_stdout"
+e2e_orcas supervisor work reports get --report "$merge_prep_report_id" >"$merge_prep_report_get_stdout"
+e2e_orcas supervisor work assignments get --assignment "$merge_prep_assignment_id" >"$merge_prep_assignment_get_stdout"
 e2e_orcas tracked-threads get --tracked-thread "$tracked_thread_id" >"$merge_prep_thread_get_stdout"
 
 merge_prep_report_assignment_id="$(field_value assignment_id "$merge_prep_report_get_stdout")"
