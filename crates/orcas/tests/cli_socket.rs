@@ -1439,6 +1439,7 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
     let create_tracked_thread = run_orcas(
         &daemon,
         &[
+            "workunits",
             "threads",
             "create",
             "--workunit",
@@ -1470,7 +1471,13 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
 
     let get_output = run_orcas(
         &daemon,
-        &["threads", "get", "--tracked-thread", &tracked_thread_id],
+        &[
+            "workunits",
+            "threads",
+            "get",
+            "--tracked-thread",
+            &tracked_thread_id,
+        ],
     );
     assert!(
         get_output.status.success(),
@@ -1491,6 +1498,7 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
     let edit_output = run_orcas(
         &daemon,
         &[
+            "workunits",
             "threads",
             "edit",
             "--tracked-thread",
@@ -1532,7 +1540,13 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
 
     let delete_output = run_orcas(
         &daemon,
-        &["threads", "delete", "--tracked-thread", &tracked_thread_id],
+        &[
+            "workunits",
+            "threads",
+            "delete",
+            "--tracked-thread",
+            &tracked_thread_id,
+        ],
     );
     assert!(
         delete_output.status.success(),

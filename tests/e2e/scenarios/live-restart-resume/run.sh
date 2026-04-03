@@ -146,7 +146,7 @@ test -n "$workunit_id"
 test -n "$thread_id"
 test -n "$turn_id"
 
-e2e_orcas threads read --thread "$thread_id" >"$threads_read_stdout"
+e2e_orcas codex threads read --thread "$thread_id" >"$threads_read_stdout"
 
 grep -q "turn_in_flight: true" "$threads_read_stdout"
 grep -q "$thread_id" "$turns_active_stdout"

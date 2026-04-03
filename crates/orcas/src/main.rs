@@ -98,10 +98,6 @@ enum TopCommand {
         #[command(subcommand)]
         command: RemoteCommand,
     },
-    Threads {
-        #[command(subcommand)]
-        command: ThreadsCommand,
-    },
     Events {
         #[command(subcommand)]
         command: EventsCommand,
@@ -200,16 +196,29 @@ enum WorkunitsCommand {
     Delete(WorkunitRefArgs),
     List(WorkunitListArgs),
     Get(WorkunitRefArgs),
+    Threads {
+        #[command(subcommand)]
+        command: WorkunitThreadsCommand,
+    },
+    Workspace {
+        #[command(subcommand)]
+        command: WorkunitWorkspaceCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 #[command(about = "Canonical authority-backed CRUD for tracked-thread planning records")]
-enum ThreadsCommand {
+enum WorkunitThreadsCommand {
     Create(TrackedThreadCreateArgs),
     Edit(TrackedThreadEditArgs),
     Delete(TrackedThreadRefArgs),
     List(TrackedThreadListArgs),
     Get(TrackedThreadRefArgs),
+}
+
+#[derive(Debug, Subcommand)]
+#[command(about = "Workspace operations for tracked-thread planning records")]
+enum WorkunitWorkspaceCommand {
     PrepareWorkspace(TrackedThreadRefArgs),
     RefreshWorkspace(TrackedThreadRefArgs),
     MergePrep(TrackedThreadRefArgs),
@@ -1314,87 +1323,6 @@ async fn main() -> Result<()> {
                 SessionCommand::Active => service.session_active().await?,
             }
         }
-        TopCommand::Threads { command } => {
-            let service = SupervisorService::load(&overrides).await?;
-            match command {
-                ThreadsCommand::Create(args) => {
-                    let tracked_thread_id = authority::TrackedThreadId::new();
-                    let workspace = args
-                        .workspace
-                        .try_into_workspace(tracked_thread_id.clone())?;
-                    service
-                        .tracked_thread_create(
-                            &args.workunit,
-                            args.title,
-                            args.root_dir,
-                            args.notes,
-                            args.upstream_thread,
-                            args.model,
-                            tracked_thread_id,
-                            workspace,
-                        )
-                        .await?;
-                }
-                ThreadsCommand::Edit(args) => {
-                    let tracked_thread_id =
-                        authority::TrackedThreadId::parse(args.tracked_thread.clone())?;
-                    let workspace = args
-                        .workspace
-                        .try_into_workspace(tracked_thread_id.clone())?;
-                    service
-                        .tracked_thread_edit(
-                            &args.tracked_thread,
-                            args.title,
-                            args.root_dir,
-                            args.notes,
-                            args.upstream_thread,
-                            args.binding_state.map(Into::into),
-                            args.model,
-                            workspace,
-                        )
-                        .await?;
-                }
-                ThreadsCommand::Delete(args) => {
-                    service.tracked_thread_delete(&args.tracked_thread).await?;
-                }
-                ThreadsCommand::List(args) => {
-                    service.tracked_thread_list(&args.workunit).await?;
-                }
-                ThreadsCommand::Get(args) => {
-                    service.tracked_thread_get(&args.tracked_thread).await?;
-                }
-                ThreadsCommand::PrepareWorkspace(args) => {
-                    service
-                        .tracked_thread_prepare_workspace(&args.tracked_thread, args.request_note)
-                        .await?;
-                }
-                ThreadsCommand::RefreshWorkspace(args) => {
-                    service
-                        .tracked_thread_refresh_workspace(&args.tracked_thread, args.request_note)
-                        .await?;
-                }
-                ThreadsCommand::MergePrep(args) => {
-                    service
-                        .tracked_thread_merge_prep(&args.tracked_thread, args.request_note)
-                        .await?;
-                }
-                ThreadsCommand::AuthorizeMerge(args) => {
-                    service
-                        .tracked_thread_authorize_merge(&args.tracked_thread, args.request_note)
-                        .await?;
-                }
-                ThreadsCommand::ExecuteLanding(args) => {
-                    service
-                        .tracked_thread_execute_landing(&args.tracked_thread, args.request_note)
-                        .await?;
-                }
-                ThreadsCommand::PruneWorkspace(args) => {
-                    service
-                        .tracked_thread_prune_workspace(&args.tracked_thread, args.request_note)
-                        .await?;
-                }
-            }
-        }
         TopCommand::Events { command } => {
             let service = SupervisorService::load(&overrides).await?;
             match command {
@@ -1455,6 +1383,92 @@ async fn main() -> Result<()> {
                     service.workunit_list(args.workstream.as_deref()).await?;
                 }
                 WorkunitsCommand::Get(args) => service.workunit_get(&args.workunit).await?,
+                WorkunitsCommand::Threads { command } => match command {
+                    WorkunitThreadsCommand::Create(args) => {
+                        let tracked_thread_id = authority::TrackedThreadId::new();
+                        let workspace = args
+                            .workspace
+                            .try_into_workspace(tracked_thread_id.clone())?;
+                        service
+                            .tracked_thread_create(
+                                &args.workunit,
+                                args.title,
+                                args.root_dir,
+                                args.notes,
+                                args.upstream_thread,
+                                args.model,
+                                tracked_thread_id,
+                                workspace,
+                            )
+                            .await?;
+                    }
+                    WorkunitThreadsCommand::Edit(args) => {
+                        let tracked_thread_id =
+                            authority::TrackedThreadId::parse(args.tracked_thread.clone())?;
+                        let workspace = args
+                            .workspace
+                            .try_into_workspace(tracked_thread_id.clone())?;
+                        service
+                            .tracked_thread_edit(
+                                &args.tracked_thread,
+                                args.title,
+                                args.root_dir,
+                                args.notes,
+                                args.upstream_thread,
+                                args.binding_state.map(Into::into),
+                                args.model,
+                                workspace,
+                            )
+                            .await?;
+                    }
+                    WorkunitThreadsCommand::Delete(args) => {
+                        service.tracked_thread_delete(&args.tracked_thread).await?;
+                    }
+                    WorkunitThreadsCommand::List(args) => {
+                        service.tracked_thread_list(&args.workunit).await?;
+                    }
+                    WorkunitThreadsCommand::Get(args) => {
+                        service.tracked_thread_get(&args.tracked_thread).await?;
+                    }
+                },
+                WorkunitsCommand::Workspace { command } => match command {
+                    WorkunitWorkspaceCommand::PrepareWorkspace(args) => {
+                        service
+                            .tracked_thread_prepare_workspace(
+                                &args.tracked_thread,
+                                args.request_note,
+                            )
+                            .await?;
+                    }
+                    WorkunitWorkspaceCommand::RefreshWorkspace(args) => {
+                        service
+                            .tracked_thread_refresh_workspace(
+                                &args.tracked_thread,
+                                args.request_note,
+                            )
+                            .await?;
+                    }
+                    WorkunitWorkspaceCommand::MergePrep(args) => {
+                        service
+                            .tracked_thread_merge_prep(&args.tracked_thread, args.request_note)
+                            .await?;
+                    }
+                    WorkunitWorkspaceCommand::AuthorizeMerge(args) => {
+                        service
+                            .tracked_thread_authorize_merge(&args.tracked_thread, args.request_note)
+                            .await?;
+                    }
+                    WorkunitWorkspaceCommand::ExecuteLanding(args) => {
+                        service
+                            .tracked_thread_execute_landing(&args.tracked_thread, args.request_note)
+                            .await?;
+                    }
+                    WorkunitWorkspaceCommand::PruneWorkspace(args) => {
+                        service
+                            .tracked_thread_prune_workspace(&args.tracked_thread, args.request_note)
+                            .await?;
+                    }
+                },
             }
         }
         TopCommand::Plan { command } => {
@@ -1889,7 +1903,6 @@ mod tests {
 
         assert!(help.contains("workstreams"));
         assert!(help.contains("workunits"));
-        assert!(help.contains("threads"));
         assert!(!help.contains("tracked-threads"));
         assert!(!help.contains("legacy-workstreams"));
         assert!(!help.contains("legacy-workunits"));
@@ -2022,9 +2035,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_threads_create_command() {
+    fn parses_workunits_threads_create_command() {
         let cli = Cli::parse_from([
             "orcas",
+            "workunits",
             "threads",
             "create",
             "--workunit",
@@ -2048,8 +2062,11 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Threads {
-                command: ThreadsCommand::Create(args),
+            TopCommand::Workunits {
+                command:
+                    WorkunitsCommand::Threads {
+                        command: WorkunitThreadsCommand::Create(args),
+                    },
             } => {
                 assert_eq!(args.workunit, "wu-1");
                 assert_eq!(args.title, "Thread record");
@@ -2069,9 +2086,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_threads_edit_command() {
+    fn parses_workunits_threads_edit_command() {
         let cli = Cli::parse_from([
             "orcas",
+            "workunits",
             "threads",
             "edit",
             "--tracked-thread",
@@ -2083,8 +2101,11 @@ mod tests {
         ]);
 
         match cli.command {
-            TopCommand::Threads {
-                command: ThreadsCommand::Edit(args),
+            TopCommand::Workunits {
+                command:
+                    WorkunitsCommand::Threads {
+                        command: WorkunitThreadsCommand::Edit(args),
+                    },
             } => {
                 assert_eq!(args.tracked_thread, "tt-1");
                 assert!(matches!(
@@ -2092,6 +2113,31 @@ mod tests {
                     Some(TrackedThreadBindingStateArg::Detached)
                 ));
                 assert_eq!(args.model.as_deref(), Some("gpt-5.5"));
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_workunits_workspace_merge_prep_command() {
+        let cli = Cli::parse_from([
+            "orcas",
+            "workunits",
+            "workspace",
+            "merge-prep",
+            "--tracked-thread",
+            "tt-1",
+        ]);
+
+        match cli.command {
+            TopCommand::Workunits {
+                command:
+                    WorkunitsCommand::Workspace {
+                        command: WorkunitWorkspaceCommand::MergePrep(args),
+                    },
+            } => {
+                assert_eq!(args.tracked_thread, "tt-1");
+                assert!(args.request_note.is_none());
             }
             other => panic!("unexpected command parse: {other:?}"),
         }
