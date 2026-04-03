@@ -11,7 +11,7 @@ orcas_cli() {
   e2e_orcas --connect-only "$@"
 }
 
-cp "$scenario_dir/seed_state.json" "$E2E_SCENARIO_XDG_DATA_HOME/orcas/state.json"
+e2e_normalize_state_json "$scenario_dir/seed_state.json" "$E2E_SCENARIO_XDG_DATA_HOME/orcas/state.json"
 rm -f "$E2E_SCENARIO_XDG_DATA_HOME/orcas/state.db" "$E2E_SCENARIO_XDG_DATA_HOME/orcas/state.db-wal" "$E2E_SCENARIO_XDG_DATA_HOME/orcas/state.db-shm"
 
 daemon_log="$E2E_SCENARIO_LOGS_DIR/orcasd.log"

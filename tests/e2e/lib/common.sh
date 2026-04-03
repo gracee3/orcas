@@ -301,6 +301,23 @@ e2e_orcas() {
   "$e2e_bin_dir/orcas.sh" "$@"
 }
 
+e2e_orcas_state_seed() {
+  local seed_bin="$e2e_repo_root/target/debug/orcas-state-seed"
+
+  if [[ ! -x "$seed_bin" || "${ORCAS_E2E_FORCE_CARGO_RUN:-0}" == "1" ]]; then
+    cargo build -q --manifest-path "$e2e_repo_root/Cargo.toml" -p orcas -p orcasd
+  fi
+
+  "$seed_bin" "$@"
+}
+
+e2e_normalize_state_json() {
+  local input="$1"
+  local output="${2:-$1}"
+
+  e2e_orcas_state_seed --input "$input" --output "$output"
+}
+
 e2e_orcasd() {
   local orcasd_bin="$e2e_repo_root/target/debug/orcasd"
   local xdg_data_home="${ORCAS_E2E_XDG_DATA_HOME:-$e2e_output_root/xdg/default/data}"

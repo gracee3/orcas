@@ -136,6 +136,10 @@ Seeded proposal scenarios remain model-free:
 - `proposals-decisions`
 - `phased-fibonacci`
 
+These seeded scenarios now round-trip their `state.json` inputs through the same `StoredState`
+serializer/deserializer path the daemon uses, so deterministic fixtures stay aligned with the
+live persisted collaboration shape.
+
 For live supervisor proposal scenarios, export:
 
 ```bash

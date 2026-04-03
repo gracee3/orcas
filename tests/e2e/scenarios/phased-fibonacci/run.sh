@@ -264,6 +264,7 @@ state = {
 
 output_path.write_text(json.dumps(state, indent=2) + "\n")
 PY
+  e2e_normalize_state_json "$output_file"
 }
 
 write_phase_1_skeleton() {
@@ -627,6 +628,7 @@ if worker_id in coll["workers"]:
 
 state_path.write_text(json.dumps(obj, indent=2) + "\n")
 PY
+  e2e_normalize_state_json "$state_json"
 }
 
 seed_open_proposal() {
@@ -867,6 +869,7 @@ context_pack["worker_session"]["updated_at"] = now
 state["collaboration"]["supervisor_proposals"][proposal_id] = proposal
 state_path.write_text(json.dumps(state, indent=2) + "\n")
 PY
+  e2e_normalize_state_json "$state_json"
 }
 
 phase_titles=(

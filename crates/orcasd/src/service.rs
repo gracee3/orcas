@@ -415,7 +415,11 @@ impl OrcasDaemonService {
 
     async fn initialize_state(&self) -> OrcasResult<()> {
         debug!("initializing daemon state from persisted store");
-        let stored = self.store.load().await.unwrap_or_default();
+        let (stored, needs_normalization) = self
+            .store
+            .load_with_normalization_flag()
+            .await
+            .unwrap_or((StoredState::default(), false));
         let bootstrap_persist;
         {
             let mut state = self.state.write().await;
@@ -452,7 +456,7 @@ impl OrcasDaemonService {
         }
         self.reconcile_worker_session_tracked_thread_bindings()
             .await?;
-        if bootstrap_persist {
+        if bootstrap_persist || needs_normalization {
             self.persist_collaboration_state().await?;
         }
         Ok(())
@@ -6167,13 +6171,13 @@ impl OrcasDaemonService {
                         plan.workspace_report.as_ref(),
                     )
                 {
-                    let completed_disposition =
-                        if plan.parsed_report.validation.parse_result == ReportParseResult::Invalid
-                        {
-                            Some(ReportDisposition::Completed)
-                        } else {
-                            Some(plan.parsed_report.disposition)
-                        };
+                    let completed_disposition = if plan.parsed_report.validation.parse_result
+                        == ReportParseResult::Invalid
+                    {
+                        Some(ReportDisposition::Completed)
+                    } else {
+                        Some(plan.parsed_report.disposition)
+                    };
                     self.mark_workspace_operation_completed(
                         &plan.assignment_id,
                         Some(core.report.id.clone()),
@@ -12182,11 +12186,8 @@ impl OrcasDaemonService {
             let state = self.state.read().await;
             Self::assignment_summary(&state.collaboration, assignment)
         };
-        self.emit(ipc::DaemonEvent::AssignmentLifecycle {
-            action,
-            assignment,
-        })
-        .await;
+        self.emit(ipc::DaemonEvent::AssignmentLifecycle { action, assignment })
+            .await;
     }
 
     async fn emit_codex_assignment_lifecycle(
@@ -16109,7 +16110,7 @@ mod tests {
         CodexTurnEvent, CollaborationState, DecisionType, DraftAssignment, EventEnvelope,
         ImplementModeSpec, JsonSessionStore, OrcasError, OrcasEvent, OrcasResult,
         OrcasSessionStore, PlanExecutionKind, PlanRevisionProposalStatus, ProposedDecision, Report,
-        ReportConfidence, ReportDisposition, ReportParseResult, SupervisorContextPack,
+        ReportConfidence, ReportDisposition, ReportParseResult, StoredState, SupervisorContextPack,
         SupervisorProposal, SupervisorProposalEdits, SupervisorProposalFailureStage,
         SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorSummary,
         SupervisorTurnDecision, SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus,
@@ -16474,12 +16475,12 @@ worker epilogue"#;
             rebase_succeeded: Some(false),
         };
 
-        assert!(OrcasDaemonService::workspace_operation_recovery_suggests_success(
-            Some(&workspace_report)
-        ));
         assert!(
-            !OrcasDaemonService::workspace_operation_recovery_suggests_success(None)
+            OrcasDaemonService::workspace_operation_recovery_suggests_success(Some(
+                &workspace_report
+            ))
         );
+        assert!(!OrcasDaemonService::workspace_operation_recovery_suggests_success(None));
     }
 
     fn sample_planning_session(
@@ -27387,7 +27388,10 @@ ORCAS_REPORT_END"#
             Some(thread_id.as_str())
         );
         assert_eq!(tracked_thread.title, "auto-worker");
-        assert_eq!(tracked_thread.preferred_cwd.as_deref(), Some("/tmp/orcas-auto"));
+        assert_eq!(
+            tracked_thread.preferred_cwd.as_deref(),
+            Some("/tmp/orcas-auto")
+        );
         assert_eq!(tracked_thread.preferred_model.as_deref(), Some("gpt-5.4"));
 
         let snapshot = service.state_get().await.expect("state snapshot");
@@ -27514,7 +27518,10 @@ ORCAS_REPORT_END"#
             .await
             .expect("tracked thread")
             .tracked_thread;
-        assert_eq!(rebound.binding_state, orcas_core::authority::TrackedThreadBindingState::Bound);
+        assert_eq!(
+            rebound.binding_state,
+            orcas_core::authority::TrackedThreadBindingState::Bound
+        );
         assert_eq!(
             rebound.upstream_thread_id.as_deref(),
             worker_session.thread_id.as_deref()
@@ -27927,6 +27934,43 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             stored.collaboration.workstreams[&workstream.id].status,
             WorkstreamStatus::Active
         );
+    }
+
+    #[tokio::test]
+    async fn initialize_state_rewrites_seeded_state_into_canonical_shape() {
+        let base = std::env::temp_dir().join(format!("orcas-collab-test-{}", Uuid::new_v4()));
+        let state_file = base.join("data/state.json");
+        tokio::fs::create_dir_all(state_file.parent().expect("state dir"))
+            .await
+            .expect("create data dir");
+        tokio::fs::write(
+            &state_file,
+            r#"{
+  "registry": {
+    "threads": {},
+    "last_connected_endpoint": null
+  }
+}
+"#,
+        )
+        .await
+        .expect("seed state");
+
+        let service = test_service_at_with_reasoner(
+            base.clone(),
+            Arc::new(StaticSupervisorReasoner::default()),
+        )
+        .await;
+
+        let stored = service.store.load().await.expect("stored state");
+        assert!(stored.thread_views.is_empty());
+
+        let raw = tokio::fs::read_to_string(&state_file)
+            .await
+            .expect("read rewritten state");
+        let (_, needs_normalization) = StoredState::from_json_str_with_normalization(&raw)
+            .expect("canonical state should deserialize");
+        assert!(!needs_normalization);
     }
 
     #[tokio::test]
@@ -28550,7 +28594,11 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             Some("/tmp/refreshed-cwd")
         );
         assert_eq!(
-            refreshed_record.packet.execution_context.repo_root.as_deref(),
+            refreshed_record
+                .packet
+                .execution_context
+                .repo_root
+                .as_deref(),
             Some("/tmp/refreshed-cwd")
         );
     }

@@ -9,6 +9,10 @@ rust-version.workspace = true
 name = "orcasd"
 path = "src/main.rs"
 
+[[bin]]
+name = "orcas-state-seed"
+path = "src/bin/orcas-state-seed.rs"
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

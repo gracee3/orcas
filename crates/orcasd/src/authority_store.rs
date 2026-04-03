@@ -1294,7 +1294,7 @@ impl AuthoritySqliteStore {
             "bootstrapping authority store from legacy state.json"
         );
         let raw = fs::read_to_string(&paths.state_file).map_err(OrcasError::Io)?;
-        let stored: StoredState = serde_json::from_str(&raw)?;
+        let stored = StoredState::from_json_str(&raw)?;
         let transaction = connection
             .transaction()
             .map_err(|error| store_error(format!("start authority import transaction: {error}")))?;
@@ -3709,7 +3709,7 @@ mod tests {
         };
         std::fs::write(
             &paths.state_file,
-            serde_json::to_string_pretty(&state).expect("serialize state"),
+            state.to_pretty_json().expect("serialize state"),
         )
         .expect("write state");
 
