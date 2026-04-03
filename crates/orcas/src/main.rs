@@ -102,10 +102,6 @@ enum TopCommand {
         #[command(subcommand)]
         command: ThreadsCommand,
     },
-    Turns {
-        #[command(subcommand)]
-        command: TurnsCommand,
-    },
     Events {
         #[command(subcommand)]
         command: EventsCommand,
@@ -178,13 +174,6 @@ enum CodexThreadsCommand {
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
     Active,
-}
-
-#[derive(Debug, Subcommand)]
-enum TurnsCommand {
-    ListActive,
-    Recent(TurnsRecentArgs),
-    Get(TurnRefArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -298,6 +287,17 @@ enum CodexCommand {
         #[command(subcommand)]
         command: CodexThreadsCommand,
     },
+    Turns {
+        #[command(subcommand)]
+        command: TurnsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TurnsCommand {
+    ListActive,
+    Recent(TurnsRecentArgs),
+    Get(TurnRefArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1395,16 +1395,6 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        TopCommand::Turns { command } => {
-            let service = SupervisorService::load(&overrides).await?;
-            match command {
-                TurnsCommand::ListActive => service.turns_list_active().await?,
-                TurnsCommand::Recent(args) => {
-                    service.turns_recent(&args.thread, args.limit).await?
-                }
-                TurnsCommand::Get(args) => service.turn_get(&args.thread, &args.turn).await?,
-            }
-        }
         TopCommand::Events { command } => {
             let service = SupervisorService::load(&overrides).await?;
             match command {
@@ -1723,6 +1713,13 @@ async fn main() -> Result<()> {
                             .await?;
                     }
                 },
+                CodexCommand::Turns { command } => match command {
+                    TurnsCommand::ListActive => service.turns_list_active().await?,
+                    TurnsCommand::Recent(args) => {
+                        service.turns_recent(&args.thread, args.limit).await?
+                    }
+                    TurnsCommand::Get(args) => service.turn_get(&args.thread, &args.turn).await?,
+                },
             }
         }
         TopCommand::Review { command } => {
@@ -1985,12 +1982,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_turns_recent_command() {
-        let cli = Cli::parse_from(["orcas", "turns", "recent", "--thread", "thread-1"]);
+    fn parses_codex_turns_recent_command() {
+        let cli = Cli::parse_from(["orcas", "codex", "turns", "recent", "--thread", "thread-1"]);
 
         match cli.command {
-            TopCommand::Turns {
-                command: TurnsCommand::Recent(args),
+            TopCommand::Codex {
+                command:
+                    CodexCommand::Turns {
+                        command: TurnsCommand::Recent(args),
+                    },
             } => {
                 assert_eq!(args.thread, "thread-1");
                 assert_eq!(args.limit, 10);
@@ -2320,6 +2320,18 @@ mod tests {
             Cli::try_parse_from(["orcas", "threads", "resume", "--thread", "thread-1"]).is_err()
         );
         assert!(Cli::try_parse_from(["orcas", "threads", "list-loaded"]).is_err());
+    }
+
+    #[test]
+    fn rejects_removed_top_level_turns_namespace() {
+        assert!(Cli::try_parse_from(["orcas", "turns", "recent", "--thread", "thread-1"]).is_err());
+        assert!(Cli::try_parse_from(["orcas", "turns", "list-active"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "orcas", "turns", "get", "--thread", "thread-1", "--turn", "t-1"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

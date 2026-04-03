@@ -211,7 +211,7 @@ grep -q "status: AwaitingDecision" "$assignment_after_get_stdout"
 grep -Eq "parse_result: (Parsed|Ambiguous)" "$report_get_stdout"
 grep -q "lifecycle: completed" "$turn_get_after_stdout"
 grep -q "terminal: true" "$turn_get_after_stdout"
-e2e_orcas turns list-active >"$turns_active_after_stdout"
+e2e_orcas codex turns list-active >"$turns_active_after_stdout"
 ! grep -q "$turn_id" "$turns_active_after_stdout"
 
 wait "$assignment_start_pid" >/dev/null 2>&1 || true
