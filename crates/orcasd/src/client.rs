@@ -209,28 +209,67 @@ impl OrcasIpcClient {
         self.request(ipc::methods::MODELS_LIST, params).await
     }
 
-    pub async fn threads_list(&self) -> OrcasResult<ipc::ThreadsListResponse> {
+    pub async fn threads_list(
+        &self,
+        params: &ipc::ThreadsListRequest,
+    ) -> OrcasResult<ipc::ThreadsListResponse> {
+        self.request(ipc::methods::THREADS_LIST, params).await
+    }
+
+    pub async fn threads_list_scoped(
+        &self,
+        params: &ipc::ThreadsListScopedRequest,
+    ) -> OrcasResult<ipc::ThreadsListResponse> {
+        self.request(ipc::methods::THREADS_LIST_SCOPED, params)
+            .await
+    }
+
+    pub async fn threads_list_loaded(
+        &self,
+        params: &ipc::ThreadsListLoadedRequest,
+    ) -> OrcasResult<ipc::ThreadsListResponse> {
+        self.request(ipc::methods::THREADS_LIST_LOADED, params)
+            .await
+    }
+
+    pub async fn workstream_runtime_list(&self) -> OrcasResult<ipc::WorkstreamRuntimeListResponse> {
         self.request(
-            ipc::methods::THREADS_LIST,
-            &ipc::ThreadsListRequest::default(),
+            ipc::methods::WORKSTREAM_RUNTIME_LIST,
+            &ipc::Empty::default(),
         )
         .await
     }
 
-    pub async fn threads_list_scoped(&self) -> OrcasResult<ipc::ThreadsListResponse> {
-        self.request(
-            ipc::methods::THREADS_LIST_SCOPED,
-            &ipc::ThreadsListScopedRequest::default(),
-        )
-        .await
+    pub async fn workstream_runtime_get(
+        &self,
+        params: &ipc::WorkstreamRuntimeRefRequest,
+    ) -> OrcasResult<ipc::WorkstreamRuntimeGetResponse> {
+        self.request(ipc::methods::WORKSTREAM_RUNTIME_GET, params)
+            .await
     }
 
-    pub async fn threads_list_loaded(&self) -> OrcasResult<ipc::ThreadsListResponse> {
-        self.request(
-            ipc::methods::THREADS_LIST_LOADED,
-            &ipc::ThreadsListLoadedRequest::default(),
-        )
-        .await
+    pub async fn workstream_runtime_start(
+        &self,
+        params: &ipc::WorkstreamRuntimeRefRequest,
+    ) -> OrcasResult<ipc::WorkstreamRuntimeControlResponse> {
+        self.request(ipc::methods::WORKSTREAM_RUNTIME_START, params)
+            .await
+    }
+
+    pub async fn workstream_runtime_stop(
+        &self,
+        params: &ipc::WorkstreamRuntimeRefRequest,
+    ) -> OrcasResult<ipc::WorkstreamRuntimeControlResponse> {
+        self.request(ipc::methods::WORKSTREAM_RUNTIME_STOP, params)
+            .await
+    }
+
+    pub async fn workstream_runtime_restart(
+        &self,
+        params: &ipc::WorkstreamRuntimeRefRequest,
+    ) -> OrcasResult<ipc::WorkstreamRuntimeControlResponse> {
+        self.request(ipc::methods::WORKSTREAM_RUNTIME_RESTART, params)
+            .await
     }
 
     pub async fn thread_start(

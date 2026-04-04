@@ -904,16 +904,26 @@ impl SupervisorService {
         Ok(())
     }
 
-    pub async fn threads_list(&self) -> Result<()> {
+    pub async fn threads_list(&self, workstream_id: &str) -> Result<()> {
         let client = self.ready_client().await?;
-        let response = client.threads_list_scoped().await?;
+        let response = client
+            .threads_list(&ipc::ThreadsListRequest {
+                workstream_id: workstream_id.to_string(),
+            })
+            .await?;
+        println!("workstream_id: {workstream_id}");
         Self::print_thread_list(response.data);
         Ok(())
     }
 
-    pub async fn threads_list_loaded(&self) -> Result<()> {
+    pub async fn threads_list_loaded(&self, workstream_id: &str) -> Result<()> {
         let client = self.ready_client().await?;
-        let response = client.threads_list_loaded().await?;
+        let response = client
+            .threads_list_loaded(&ipc::ThreadsListLoadedRequest {
+                workstream_id: workstream_id.to_string(),
+            })
+            .await?;
+        println!("workstream_id: {workstream_id}");
         Self::print_thread_list(response.data);
         Ok(())
     }
@@ -1291,6 +1301,14 @@ impl SupervisorService {
         println!("status: {:?}", response.workstream.status);
         println!("priority: {}", response.workstream.priority);
         print_workstream_execution_scope(response.workstream.execution_scope.as_ref());
+        if let Ok(runtime) = client
+            .workstream_runtime_get(&ipc::WorkstreamRuntimeRefRequest {
+                workstream_id: workstream_id.to_string(),
+            })
+            .await
+        {
+            print_workstream_runtime(&runtime.runtime);
+        }
         println!("revision: {}", response.workstream.revision.get());
         println!("origin_node_id: {}", response.workstream.origin_node_id);
         println!("work_units: {}", response.work_units.len());
@@ -1303,6 +1321,63 @@ impl SupervisorService {
                 work_unit.title
             );
         }
+        Ok(())
+    }
+
+    pub async fn workstream_runtime_list(&self) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client.workstream_runtime_list().await?;
+        println!("workstream_runtimes: {}", response.runtimes.len());
+        for runtime in response.runtimes {
+            print_workstream_runtime(&runtime);
+        }
+        Ok(())
+    }
+
+    pub async fn workstream_runtime_get(&self, workstream_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .workstream_runtime_get(&ipc::WorkstreamRuntimeRefRequest {
+                workstream_id: workstream_id.to_string(),
+            })
+            .await?;
+        print_workstream_runtime(&response.runtime);
+        Ok(())
+    }
+
+    pub async fn workstream_runtime_start(&self, workstream_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .workstream_runtime_start(&ipc::WorkstreamRuntimeRefRequest {
+                workstream_id: workstream_id.to_string(),
+            })
+            .await?;
+        println!("action: {}", response.action);
+        print_workstream_runtime(&response.runtime);
+        Ok(())
+    }
+
+    pub async fn workstream_runtime_stop(&self, workstream_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .workstream_runtime_stop(&ipc::WorkstreamRuntimeRefRequest {
+                workstream_id: workstream_id.to_string(),
+            })
+            .await?;
+        println!("action: {}", response.action);
+        print_workstream_runtime(&response.runtime);
+        Ok(())
+    }
+
+    pub async fn workstream_runtime_restart(&self, workstream_id: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .workstream_runtime_restart(&ipc::WorkstreamRuntimeRefRequest {
+                workstream_id: workstream_id.to_string(),
+            })
+            .await?;
+        println!("action: {}", response.action);
+        print_workstream_runtime(&response.runtime);
         Ok(())
     }
 
@@ -5288,6 +5363,60 @@ fn print_workstream_execution_scope(scope: Option<&authority::WorkstreamExecutio
     println!(
         "execution_scope_connection_mode: {}",
         format!("{:?}", scope.connection_mode).to_ascii_lowercase()
+    );
+}
+
+fn print_workstream_runtime(runtime: &ipc::WorkstreamRuntimeSummary) {
+    println!("runtime_workstream_id: {}", runtime.workstream_id);
+    println!("runtime_status: {}", runtime.status);
+    println!(
+        "runtime_transport_kind: {}",
+        format!("{:?}", runtime.transport_kind).to_ascii_lowercase()
+    );
+    println!(
+        "runtime_app_server_policy: {}",
+        format!("{:?}", runtime.app_server_policy).to_ascii_lowercase()
+    );
+    println!(
+        "runtime_connection_mode: {}",
+        format!("{:?}", runtime.connection_mode).to_ascii_lowercase()
+    );
+    println!(
+        "runtime_desired_listen_url: {}",
+        runtime.desired_listen_url.as_deref().unwrap_or("-")
+    );
+    println!(
+        "runtime_effective_listen_url: {}",
+        runtime.effective_listen_url.as_deref().unwrap_or("-")
+    );
+    println!("runtime_codex_home: {}", runtime.codex_home);
+    println!(
+        "runtime_sqlite_home: {}",
+        runtime.sqlite_home.as_deref().unwrap_or("-")
+    );
+    println!(
+        "runtime_owner_kind: {}",
+        runtime.owner_kind.as_deref().unwrap_or("-")
+    );
+    println!(
+        "runtime_owner_pid: {}",
+        runtime
+            .owner_pid
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!("runtime_thread_count: {}", runtime.thread_count);
+    println!(
+        "runtime_started_at: {}",
+        runtime
+            .started_at
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!("runtime_updated_at: {}", runtime.updated_at.to_rfc3339());
+    println!(
+        "runtime_last_error: {}",
+        runtime.last_error.as_deref().unwrap_or("-")
     );
 }
 

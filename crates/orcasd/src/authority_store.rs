@@ -1484,6 +1484,27 @@ impl AuthoritySqliteStore {
         })
     }
 
+    pub async fn get_workstream_runtime(
+        &self,
+        workstream_id: &authority::WorkstreamId,
+    ) -> OrcasResult<Option<ipc::WorkstreamRuntimeSummary>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "select workstream_id, transport_kind, app_server_policy, connection_mode,
+                            desired_listen_url, effective_listen_url, codex_home, sqlite_home,
+                            owner_kind, owner_pid, status, last_error, started_at, thread_count,
+                            updated_at
+                     from workstream_runtimes
+                     where workstream_id = ?1",
+                    params![workstream_id.as_str()],
+                    read_workstream_runtime_row,
+                )
+                .optional()
+                .map_err(map_sql_error)
+        })
+    }
+
     pub async fn list_workstream_runtimes(
         &self,
     ) -> OrcasResult<Vec<ipc::WorkstreamRuntimeSummary>> {

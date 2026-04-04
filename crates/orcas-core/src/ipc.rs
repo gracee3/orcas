@@ -56,6 +56,11 @@ pub mod methods {
     pub const THREADS_LIST: &str = "threads/list";
     pub const THREADS_LIST_SCOPED: &str = "threads/list_scoped";
     pub const THREADS_LIST_LOADED: &str = "threads/list_loaded";
+    pub const WORKSTREAM_RUNTIME_LIST: &str = "workstream_runtime/list";
+    pub const WORKSTREAM_RUNTIME_GET: &str = "workstream_runtime/get";
+    pub const WORKSTREAM_RUNTIME_START: &str = "workstream_runtime/start";
+    pub const WORKSTREAM_RUNTIME_STOP: &str = "workstream_runtime/stop";
+    pub const WORKSTREAM_RUNTIME_RESTART: &str = "workstream_runtime/restart";
     pub const THREAD_START: &str = "thread/start";
     pub const THREAD_READ: &str = "thread/read";
     pub const THREAD_READ_HISTORY: &str = "thread/read_history";
@@ -227,6 +232,27 @@ pub struct WorkstreamRuntimeSummary {
     #[serde(default)]
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkstreamRuntimeRefRequest {
+    pub workstream_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkstreamRuntimeListResponse {
+    pub runtimes: Vec<WorkstreamRuntimeSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkstreamRuntimeGetResponse {
+    pub runtime: WorkstreamRuntimeSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkstreamRuntimeControlResponse {
+    pub runtime: WorkstreamRuntimeSummary,
+    pub action: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2000,14 +2026,18 @@ pub enum ThreadMonitorState {
     Errored,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ThreadsListRequest {}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadsListRequest {
+    pub workstream_id: String,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThreadsListScopedRequest {}
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ThreadsListLoadedRequest {}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadsListLoadedRequest {
+    pub workstream_id: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadsListResponse {

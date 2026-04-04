@@ -190,6 +190,24 @@ impl CodexClient {
         result
     }
 
+    pub async fn disconnect(&self) {
+        if let Some(task) = self.connection_task.lock().await.take() {
+            task.abort();
+        }
+        *self.outbound.lock().await = None;
+        *self.initialized.lock().await = false;
+        self.fail_pending("transport disconnected").await;
+        self.threads.lock().await.clear();
+        self.emit(EventEnvelope::new(
+            self.transport.endpoint(),
+            OrcasEvent::ConnectionStateChanged(ConnectionState {
+                endpoint: self.transport.endpoint().to_string(),
+                status: "disconnected".to_string(),
+                detail: Some("disconnected by client".to_string()),
+            }),
+        ));
+    }
+
     pub async fn is_ready(&self) -> bool {
         self.outbound.lock().await.is_some() && *self.initialized.lock().await
     }

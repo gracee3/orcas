@@ -146,8 +146,8 @@ enum ModelsCommand {
 
 #[derive(Debug, Subcommand)]
 enum CodexThreadsCommand {
-    List,
-    ListLoaded,
+    List(ThreadListArgs),
+    ListLoaded(ThreadListArgs),
     Read(ThreadRefArgs),
     Start(ThreadStartArgs),
     Resume(ThreadResumeArgs),
@@ -172,6 +172,19 @@ enum WorkstreamsCommand {
     Delete(WorkstreamRefArgs),
     List,
     Get(WorkstreamRefArgs),
+    Runtime {
+        #[command(subcommand)]
+        command: WorkstreamRuntimeCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkstreamRuntimeCommand {
+    List,
+    Get(WorkstreamRefArgs),
+    Start(WorkstreamRefArgs),
+    Stop(WorkstreamRefArgs),
+    Restart(WorkstreamRefArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -351,6 +364,12 @@ enum ReviewCommand {
 
 #[derive(Debug, Clone, Args)]
 struct ModelsListArgs {
+    #[arg(long)]
+    workstream: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ThreadListArgs {
     #[arg(long)]
     workstream: String,
 }
@@ -1478,6 +1497,21 @@ async fn main() -> Result<()> {
                 }
                 WorkstreamsCommand::List => service.workstream_list().await?,
                 WorkstreamsCommand::Get(args) => service.workstream_get(&args.workstream).await?,
+                WorkstreamsCommand::Runtime { command } => match command {
+                    WorkstreamRuntimeCommand::List => service.workstream_runtime_list().await?,
+                    WorkstreamRuntimeCommand::Get(args) => {
+                        service.workstream_runtime_get(&args.workstream).await?
+                    }
+                    WorkstreamRuntimeCommand::Start(args) => {
+                        service.workstream_runtime_start(&args.workstream).await?
+                    }
+                    WorkstreamRuntimeCommand::Stop(args) => {
+                        service.workstream_runtime_stop(&args.workstream).await?
+                    }
+                    WorkstreamRuntimeCommand::Restart(args) => {
+                        service.workstream_runtime_restart(&args.workstream).await?
+                    }
+                },
             }
         }
         TopCommand::Workunit { command } => {
@@ -1950,8 +1984,12 @@ async fn main() -> Result<()> {
                     ModelsCommand::List(args) => service.models_list(&args.workstream).await?,
                 },
                 CodexCommand::Threads { command } => match command {
-                    CodexThreadsCommand::List => service.threads_list().await?,
-                    CodexThreadsCommand::ListLoaded => service.threads_list_loaded().await?,
+                    CodexThreadsCommand::List(args) => {
+                        service.threads_list(&args.workstream).await?
+                    }
+                    CodexThreadsCommand::ListLoaded(args) => {
+                        service.threads_list_loaded(&args.workstream).await?
+                    }
                     CodexThreadsCommand::Read(args) => service.thread_read(&args.thread).await?,
                     CodexThreadsCommand::Start(args) => {
                         service

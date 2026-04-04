@@ -314,6 +314,10 @@ impl CodexDaemonManager for EndpointOnlyCodexDaemonManager {
     async fn spawn_background(&self) -> OrcasResult<orcas_codex::DaemonStatus> {
         self.status().await
     }
+
+    async fn stop_background(&self) -> OrcasResult<orcas_codex::DaemonStatus> {
+        self.status().await
+    }
 }
 
 async fn runtime_endpoint_reachable(endpoint: &str) -> OrcasResult<bool> {
@@ -480,6 +484,7 @@ impl OrcasDaemonService {
             }
         }
 
+        self.shutdown_workstream_runtimes().await;
         Ok(())
     }
 
@@ -874,6 +879,188 @@ impl OrcasDaemonService {
         }
         self.ensure_workstream_runtime_handle(&workstream, None)
             .await
+    }
+
+    async fn workstream_runtime_list(&self) -> OrcasResult<ipc::WorkstreamRuntimeListResponse> {
+        Ok(ipc::WorkstreamRuntimeListResponse {
+            runtimes: self.reconcile_workstream_runtimes().await?,
+        })
+    }
+
+    async fn workstream_runtime_get(
+        &self,
+        params: ipc::WorkstreamRuntimeRefRequest,
+    ) -> OrcasResult<ipc::WorkstreamRuntimeGetResponse> {
+        let workstream_id = authority::WorkstreamId::parse(params.workstream_id)?;
+        let runtime = self
+            .reconcile_workstream_runtimes()
+            .await?
+            .into_iter()
+            .find(|runtime| runtime.workstream_id == workstream_id.as_str())
+            .ok_or_else(|| OrcasError::Protocol(format!("unknown workstream `{workstream_id}`")))?;
+        Ok(ipc::WorkstreamRuntimeGetResponse { runtime })
+    }
+
+    async fn workstream_runtime_start(
+        &self,
+        params: ipc::WorkstreamRuntimeRefRequest,
+    ) -> OrcasResult<ipc::WorkstreamRuntimeControlResponse> {
+        let workstream_id = authority::WorkstreamId::parse(params.workstream_id)?;
+        let runtime = self.start_workstream_runtime(&workstream_id).await?;
+        Ok(ipc::WorkstreamRuntimeControlResponse {
+            runtime,
+            action: "start".to_string(),
+        })
+    }
+
+    async fn workstream_runtime_stop(
+        &self,
+        params: ipc::WorkstreamRuntimeRefRequest,
+    ) -> OrcasResult<ipc::WorkstreamRuntimeControlResponse> {
+        let workstream_id = authority::WorkstreamId::parse(params.workstream_id)?;
+        let runtime = self.stop_workstream_runtime(&workstream_id).await?;
+        Ok(ipc::WorkstreamRuntimeControlResponse {
+            runtime,
+            action: "stop".to_string(),
+        })
+    }
+
+    async fn workstream_runtime_restart(
+        &self,
+        params: ipc::WorkstreamRuntimeRefRequest,
+    ) -> OrcasResult<ipc::WorkstreamRuntimeControlResponse> {
+        let workstream_id = authority::WorkstreamId::parse(params.workstream_id)?;
+        let runtime = self.restart_workstream_runtime(&workstream_id).await?;
+        Ok(ipc::WorkstreamRuntimeControlResponse {
+            runtime,
+            action: "restart".to_string(),
+        })
+    }
+
+    async fn start_workstream_runtime(
+        &self,
+        workstream_id: &authority::WorkstreamId,
+    ) -> OrcasResult<ipc::WorkstreamRuntimeSummary> {
+        let workstream = self.load_workstream_summary(workstream_id).await?;
+        let app_server_policy = workstream
+            .execution_scope
+            .as_ref()
+            .map(|scope| scope.app_server_policy)
+            .unwrap_or(authority::WorkstreamAppServerPolicy::SharedCurrentDaemon);
+        if app_server_policy == authority::WorkstreamAppServerPolicy::SharedCurrentDaemon {
+            return Err(OrcasError::Protocol(format!(
+                "workstream `{workstream_id}` uses the shared daemon runtime; control it with `orcas daemon ...`"
+            )));
+        }
+        self.persist_workstream_runtime_status(
+            workstream_id,
+            "dedicated_starting",
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let handle = self.resolve_runtime_for_workstream(workstream_id).await?;
+        self.connect_runtime_handle(&handle).await?;
+        Ok(handle.summary.lock().await.clone())
+    }
+
+    async fn stop_workstream_runtime(
+        &self,
+        workstream_id: &authority::WorkstreamId,
+    ) -> OrcasResult<ipc::WorkstreamRuntimeSummary> {
+        let workstream = self.load_workstream_summary(workstream_id).await?;
+        let app_server_policy = workstream
+            .execution_scope
+            .as_ref()
+            .map(|scope| scope.app_server_policy)
+            .unwrap_or(authority::WorkstreamAppServerPolicy::SharedCurrentDaemon);
+        if app_server_policy == authority::WorkstreamAppServerPolicy::SharedCurrentDaemon {
+            return Err(OrcasError::Protocol(format!(
+                "workstream `{workstream_id}` uses the shared daemon runtime; control it with `orcas daemon ...`"
+            )));
+        }
+        let handle = self
+            .ensure_workstream_runtime_handle(
+                &workstream,
+                self.authority_store
+                    .get_workstream_runtime(workstream_id)
+                    .await?,
+            )
+            .await?;
+        self.persist_workstream_runtime_status(
+            workstream_id,
+            "dedicated_stopping",
+            Some(handle.route_info.endpoint.clone()),
+            None,
+            None,
+        )
+        .await?;
+        self.disconnect_runtime_handle(&handle).await;
+
+        let stopped_status = handle.daemon.stop_background().await?;
+        let next_status = match workstream
+            .execution_scope
+            .as_ref()
+            .map(|scope| scope.transport_kind)
+            .unwrap_or(authority::WorkstreamTransportKind::LocalAppServer)
+        {
+            authority::WorkstreamTransportKind::LocalAppServer => "dedicated_stopped",
+            authority::WorkstreamTransportKind::RemoteWebsocket => "dedicated_configured",
+        };
+        self.persist_workstream_runtime_status(
+            workstream_id,
+            next_status,
+            Some(stopped_status.endpoint),
+            None,
+            None,
+        )
+        .await?;
+        Ok(handle.summary.lock().await.clone())
+    }
+
+    async fn restart_workstream_runtime(
+        &self,
+        workstream_id: &authority::WorkstreamId,
+    ) -> OrcasResult<ipc::WorkstreamRuntimeSummary> {
+        let _ = self.stop_workstream_runtime(workstream_id).await?;
+        self.start_workstream_runtime(workstream_id).await
+    }
+
+    async fn disconnect_runtime_handle(&self, handle: &Arc<WorkstreamRuntimeHandle>) {
+        handle.client.disconnect().await;
+    }
+
+    async fn remove_dedicated_runtime_handle(
+        &self,
+        workstream_id: &authority::WorkstreamId,
+        stop_runtime: bool,
+    ) -> OrcasResult<()> {
+        let key = Self::runtime_handle_key(&RuntimeRouteKey::Workstream(workstream_id.clone()));
+        let handle = self.workstream_runtimes.lock().await.remove(&key);
+        if let Some(handle) = handle {
+            self.disconnect_runtime_handle(&handle).await;
+            if stop_runtime {
+                let _ = handle.daemon.stop_background().await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn shutdown_workstream_runtimes(&self) {
+        let handles = self
+            .workstream_runtimes
+            .lock()
+            .await
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect::<Vec<_>>();
+        for handle in handles {
+            self.disconnect_runtime_handle(&handle).await;
+            if handle.route_key != RuntimeRouteKey::Shared {
+                let _ = handle.daemon.stop_background().await;
+            }
+        }
     }
 
     async fn ensure_workstream_runtime_handle(
@@ -1694,16 +1881,42 @@ impl OrcasDaemonService {
                 serde_json::to_value(self.models_list(params).await?)?
             }
             ipc::methods::THREADS_LIST => {
-                let _: ipc::ThreadsListRequest = Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.threads_list().await?)?
+                let params: ipc::ThreadsListRequest = Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.threads_list(params).await?)?
             }
             ipc::methods::THREADS_LIST_SCOPED => {
-                let _: ipc::ThreadsListScopedRequest = Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.threads_list_scoped().await?)?
+                let params: ipc::ThreadsListScopedRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.threads_list_scoped(params).await?)?
             }
             ipc::methods::THREADS_LIST_LOADED => {
-                let _: ipc::ThreadsListLoadedRequest = Self::decode_params(request.params.clone())?;
-                serde_json::to_value(self.threads_list_loaded().await?)?
+                let params: ipc::ThreadsListLoadedRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.threads_list_loaded(params).await?)?
+            }
+            ipc::methods::WORKSTREAM_RUNTIME_LIST => {
+                let _: ipc::Empty = Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.workstream_runtime_list().await?)?
+            }
+            ipc::methods::WORKSTREAM_RUNTIME_GET => {
+                let params: ipc::WorkstreamRuntimeRefRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.workstream_runtime_get(params).await?)?
+            }
+            ipc::methods::WORKSTREAM_RUNTIME_START => {
+                let params: ipc::WorkstreamRuntimeRefRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.workstream_runtime_start(params).await?)?
+            }
+            ipc::methods::WORKSTREAM_RUNTIME_STOP => {
+                let params: ipc::WorkstreamRuntimeRefRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.workstream_runtime_stop(params).await?)?
+            }
+            ipc::methods::WORKSTREAM_RUNTIME_RESTART => {
+                let params: ipc::WorkstreamRuntimeRefRequest =
+                    Self::decode_params(request.params.clone())?;
+                serde_json::to_value(self.workstream_runtime_restart(params).await?)?
             }
             ipc::methods::THREAD_START => {
                 let params: ipc::ThreadStartRequest = Self::decode_params(request.params.clone())?;
@@ -2236,43 +2449,67 @@ impl OrcasDaemonService {
         })
     }
 
-    async fn threads_list(&self) -> OrcasResult<ipc::ThreadsListResponse> {
-        self.connect_upstream().await?;
-        let response = self
-            .codex_client
+    async fn threads_list(
+        &self,
+        params: ipc::ThreadsListRequest,
+    ) -> OrcasResult<ipc::ThreadsListResponse> {
+        let workstream_id = authority::WorkstreamId::parse(params.workstream_id)?;
+        let runtime = self.resolve_runtime_for_workstream(&workstream_id).await?;
+        self.connect_runtime_handle(&runtime).await?;
+        let response = runtime
+            .client
             .thread_list(types::ThreadListParams::default())
             .await?;
         self.sync_threads(
             &response.data,
             Some("upstream_discovered"),
-            Some(&self.shared_runtime_route_info()),
+            Some(&runtime.route_info),
         )
         .await?;
         Ok(ipc::ThreadsListResponse {
-            data: self.known_thread_summaries().await,
+            data: self
+                .workstream_thread_summaries(
+                    runtime.route_info.runtime_workstream_id.as_ref(),
+                    false,
+                )
+                .await,
         })
     }
 
-    async fn threads_list_scoped(&self) -> OrcasResult<ipc::ThreadsListResponse> {
+    async fn threads_list_scoped(
+        &self,
+        _params: ipc::ThreadsListScopedRequest,
+    ) -> OrcasResult<ipc::ThreadsListResponse> {
+        Err(OrcasError::Protocol(
+            "`threads/list_scoped` is deprecated; use `threads/list --workstream <id>`".to_string(),
+        ))
+    }
+
+    async fn threads_list_loaded(
+        &self,
+        params: ipc::ThreadsListLoadedRequest,
+    ) -> OrcasResult<ipc::ThreadsListResponse> {
+        let workstream_id = authority::WorkstreamId::parse(params.workstream_id)?;
+        let runtime = self.resolve_runtime_for_workstream(&workstream_id).await?;
+        self.connect_runtime_handle(&runtime).await?;
+        let response = runtime
+            .client
+            .thread_list(types::ThreadListParams::default())
+            .await?;
+        self.sync_threads(
+            &response.data,
+            Some("upstream_discovered"),
+            Some(&runtime.route_info),
+        )
+        .await?;
         Ok(ipc::ThreadsListResponse {
-            data: self.scoped_known_thread_summaries().await,
+            data: self
+                .workstream_thread_summaries(
+                    runtime.route_info.runtime_workstream_id.as_ref(),
+                    true,
+                )
+                .await,
         })
-    }
-
-    async fn threads_list_loaded(&self) -> OrcasResult<ipc::ThreadsListResponse> {
-        let mut data = self
-            .known_thread_summaries()
-            .await
-            .into_iter()
-            .filter(|thread| thread.loaded_status != ipc::ThreadLoadedStatus::NotLoaded)
-            .collect::<Vec<_>>();
-        data.sort_by(|left, right| {
-            right
-                .last_sync_at
-                .cmp(&left.last_sync_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        Ok(ipc::ThreadsListResponse { data })
     }
 
     async fn thread_start(
@@ -3182,12 +3419,23 @@ impl OrcasDaemonService {
         &self,
         params: ipc::AuthorityWorkstreamEditRequest,
     ) -> OrcasResult<ipc::AuthorityWorkstreamEditResponse> {
+        let existing = self
+            .authority_store
+            .get_workstream(&params.command.workstream_id)
+            .await?;
         match self
             .authority_store
             .execute_command(AuthorityCommand::EditWorkstream(params.command))
             .await?
         {
             AuthorityMutationResult::Workstream(workstream) => {
+                let previous_execution_scope = existing
+                    .as_ref()
+                    .and_then(|workstream| workstream.execution_scope.clone());
+                if previous_execution_scope != workstream.execution_scope {
+                    self.remove_dedicated_runtime_handle(&workstream.id, true)
+                        .await?;
+                }
                 let workstream_summary = authority::WorkstreamSummary::from(&workstream);
                 let upstream = self.state.read().await.upstream.clone();
                 let summary = self.derive_workstream_runtime_summary(
@@ -3218,6 +3466,8 @@ impl OrcasDaemonService {
         &self,
         params: ipc::AuthorityWorkstreamDeleteRequest,
     ) -> OrcasResult<ipc::AuthorityWorkstreamDeleteResponse> {
+        self.remove_dedicated_runtime_handle(&params.command.workstream_id, true)
+            .await?;
         let affected_work_units = self
             .authority_store
             .list_work_units(Some(&params.command.workstream_id), false)
@@ -15278,6 +15528,33 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         Self::sorted_thread_summaries(&state.threads)
     }
 
+    async fn workstream_thread_summaries(
+        &self,
+        runtime_workstream_id: Option<&authority::WorkstreamId>,
+        loaded_only: bool,
+    ) -> Vec<ipc::ThreadSummary> {
+        let state = self.state.read().await;
+        let mut summaries = Self::sorted_thread_summaries(&state.threads)
+            .into_iter()
+            .filter(|thread| match runtime_workstream_id {
+                Some(workstream_id) => {
+                    thread.runtime_workstream_id.as_deref() == Some(workstream_id.as_str())
+                }
+                None => thread.runtime_workstream_id.is_none(),
+            })
+            .filter(|thread| {
+                !loaded_only || thread.loaded_status != ipc::ThreadLoadedStatus::NotLoaded
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| {
+            right
+                .last_sync_at
+                .cmp(&left.last_sync_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        summaries
+    }
+
     async fn scoped_known_thread_summaries(&self) -> Vec<ipc::ThreadSummary> {
         let state = self.state.read().await;
         Self::scoped_thread_summaries(&state.threads)
@@ -17559,6 +17836,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workstream_runtime_queries_return_runtime_summary() {
+        let service = test_service().await;
+        create_authority_workstream(&service, "runtime-query-ws", None).await;
+
+        let listed = service
+            .workstream_runtime_list()
+            .await
+            .expect("runtime list");
+        assert_eq!(listed.runtimes.len(), 1);
+        assert_eq!(listed.runtimes[0].workstream_id, "runtime-query-ws");
+
+        let fetched = service
+            .workstream_runtime_get(ipc::WorkstreamRuntimeRefRequest {
+                workstream_id: "runtime-query-ws".to_string(),
+            })
+            .await
+            .expect("runtime get");
+        assert_eq!(fetched.runtime.workstream_id, "runtime-query-ws");
+    }
+
+    #[tokio::test]
+    async fn workstream_runtime_controls_reject_shared_runtime_policy() {
+        let service = test_service().await;
+        create_authority_workstream(&service, "runtime-shared-ws", None).await;
+
+        let start_error = service
+            .workstream_runtime_start(ipc::WorkstreamRuntimeRefRequest {
+                workstream_id: "runtime-shared-ws".to_string(),
+            })
+            .await
+            .expect_err("shared runtime start should be rejected");
+        assert!(start_error.to_string().contains("shared daemon runtime"));
+
+        let stop_error = service
+            .workstream_runtime_stop(ipc::WorkstreamRuntimeRefRequest {
+                workstream_id: "runtime-shared-ws".to_string(),
+            })
+            .await
+            .expect_err("shared runtime stop should be rejected");
+        assert!(stop_error.to_string().contains("shared daemon runtime"));
+
+        let restart_error = service
+            .workstream_runtime_restart(ipc::WorkstreamRuntimeRefRequest {
+                workstream_id: "runtime-shared-ws".to_string(),
+            })
+            .await
+            .expect_err("shared runtime restart should be rejected");
+        assert!(restart_error.to_string().contains("shared daemon runtime"));
+    }
+
+    #[tokio::test]
     async fn models_list_uses_requested_workstream_runtime() {
         let service = test_service_with_fake_codex_runtime(
             AppConfig::default(),
@@ -18200,6 +18528,10 @@ worker epilogue"#;
         }
 
         async fn spawn_background(&self) -> OrcasResult<DaemonStatus> {
+            self.status().await
+        }
+
+        async fn stop_background(&self) -> OrcasResult<DaemonStatus> {
             self.status().await
         }
     }
@@ -19423,6 +19755,39 @@ worker epilogue"#;
         )
         .await;
         (service, fake_runtime_state)
+    }
+
+    async fn create_authority_workstream(
+        service: &Arc<OrcasDaemonService>,
+        id: &str,
+        execution_scope: Option<orcas_core::authority::WorkstreamExecutionScope>,
+    ) {
+        let origin_node_id = service.authority_store.origin_node_id().expect("origin");
+        service
+            .authority_workstream_create(ipc::AuthorityWorkstreamCreateRequest {
+                command: orcas_core::authority::CreateWorkstream {
+                    metadata: orcas_core::authority::CommandMetadata {
+                        command_id: orcas_core::authority::CommandId::new(),
+                        issued_at: Utc::now(),
+                        origin_node_id,
+                        actor: orcas_core::authority::CommandActor::parse("service_test")
+                            .expect("command actor"),
+                        correlation_id: Some(
+                            orcas_core::authority::CorrelationId::parse(format!("corr-{id}"))
+                                .expect("correlation id"),
+                        ),
+                    },
+                    workstream_id: orcas_core::authority::WorkstreamId::parse(id)
+                        .expect("workstream id"),
+                    title: format!("Workstream {id}"),
+                    objective: "Exercise workstream runtime routing".to_string(),
+                    status: WorkstreamStatus::Active,
+                    priority: "medium".to_string(),
+                    execution_scope,
+                },
+            })
+            .await
+            .expect("authority workstream create");
     }
 
     async fn seed_awaiting_decision_fixture(
@@ -24386,6 +24751,7 @@ ORCAS_REPORT_END"#
             FakeCodexTerminalOutcome::Completed,
         )
         .await;
+        create_authority_workstream(&service, "ws-headless", None).await;
         runtime.lock().await.threads.insert(
             "thread-headless".to_string(),
             types::Thread {
@@ -24418,7 +24784,12 @@ ORCAS_REPORT_END"#
             },
         );
 
-        let listed = service.threads_list().await.expect("list threads");
+        let listed = service
+            .threads_list(ipc::ThreadsListRequest {
+                workstream_id: "ws-headless".to_string(),
+            })
+            .await
+            .expect("list threads");
         assert!(
             listed
                 .data
@@ -24465,6 +24836,7 @@ ORCAS_REPORT_END"#
             FakeCodexTerminalOutcome::Completed,
         )
         .await;
+        create_authority_workstream(&service, "ws-headless", None).await;
         runtime.lock().await.threads.insert(
             "thread-headless".to_string(),
             types::Thread {
@@ -24485,7 +24857,12 @@ ORCAS_REPORT_END"#
             },
         );
 
-        service.threads_list().await.expect("discover thread");
+        service
+            .threads_list(ipc::ThreadsListRequest {
+                workstream_id: "ws-headless".to_string(),
+            })
+            .await
+            .expect("discover thread");
         let attached = service
             .thread_attach(ipc::ThreadAttachRequest {
                 thread_id: "thread-headless".to_string(),
@@ -24541,6 +24918,7 @@ ORCAS_REPORT_END"#
             FakeCodexTerminalOutcome::Completed,
         )
         .await;
+        create_authority_workstream(&service, "ws-headless", None).await;
         runtime.lock().await.threads.insert(
             "thread-headless".to_string(),
             types::Thread {
@@ -24561,7 +24939,12 @@ ORCAS_REPORT_END"#
             },
         );
 
-        service.threads_list().await.expect("discover thread");
+        service
+            .threads_list(ipc::ThreadsListRequest {
+                workstream_id: "ws-headless".to_string(),
+            })
+            .await
+            .expect("discover thread");
         service
             .thread_attach(ipc::ThreadAttachRequest {
                 thread_id: "thread-headless".to_string(),

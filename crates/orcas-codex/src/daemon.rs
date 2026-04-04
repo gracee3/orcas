@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::SystemTime;
@@ -38,6 +39,7 @@ pub trait CodexDaemonManager: Send + Sync {
     async fn status(&self) -> OrcasResult<DaemonStatus>;
     async fn ensure_running(&self, launch: DaemonLaunch) -> OrcasResult<DaemonStatus>;
     async fn spawn_background(&self) -> OrcasResult<DaemonStatus>;
+    async fn stop_background(&self) -> OrcasResult<DaemonStatus>;
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +274,55 @@ impl CodexDaemonManager for LocalCodexDaemonManager {
         );
         self.status().await
     }
+
+    async fn stop_background(&self) -> OrcasResult<DaemonStatus> {
+        let processes = self.discover_managed_processes().await?;
+        if processes.is_empty() {
+            return self.status().await;
+        }
+
+        for pid in processes.iter().map(|process| process.pid) {
+            let status = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status()
+                .await
+                .map_err(|error| {
+                    OrcasError::Transport(format!(
+                        "failed to send SIGTERM to Codex app-server pid {pid}: {error}"
+                    ))
+                })?;
+            if !status.success() {
+                warn!(pid, %status, "SIGTERM returned non-zero status for Codex app-server");
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !Self::endpoint_reachable(&self.config.listen_url).await? {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        if Self::endpoint_reachable(&self.config.listen_url).await? {
+            for pid in processes.iter().map(|process| process.pid) {
+                let status = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status()
+                    .await
+                    .map_err(|error| {
+                        OrcasError::Transport(format!(
+                            "failed to send SIGKILL to Codex app-server pid {pid}: {error}"
+                        ))
+                    })?;
+                if !status.success() {
+                    warn!(pid, %status, "SIGKILL returned non-zero status for Codex app-server");
+                }
+            }
+        }
+
+        self.status().await
+    }
 }
 
 impl LocalCodexDaemonManager {
@@ -306,4 +357,130 @@ impl LocalCodexDaemonManager {
 
         Ok(())
     }
+
+    async fn discover_managed_processes(&self) -> OrcasResult<Vec<ManagedCodexProcess>> {
+        let output = Command::new("ss")
+            .args(["-ltnpH"])
+            .output()
+            .await
+            .map_err(|error| {
+                OrcasError::Transport(format!(
+                    "failed to run `ss -ltnpH` while stopping runtime: {error}"
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(OrcasError::Transport(format!(
+                "`ss -ltnpH` failed with status {} while stopping runtime",
+                output.status
+            )));
+        }
+
+        let stdout = String::from_utf8(output.stdout).map_err(|error| {
+            OrcasError::Transport(format!("failed to decode `ss` output as utf-8: {error}"))
+        })?;
+        let mut processes = Vec::new();
+        for line in stdout.lines() {
+            if let Some(process) = self.parse_listener_process(line).await? {
+                processes.push(process);
+            }
+        }
+        Ok(processes)
+    }
+
+    async fn parse_listener_process(&self, line: &str) -> OrcasResult<Option<ManagedCodexProcess>> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.contains("users:(") {
+            return Ok(None);
+        }
+
+        let columns = trimmed.split_whitespace().collect::<Vec<_>>();
+        if columns.len() < 6 {
+            return Ok(None);
+        }
+        let listen_address = columns[3];
+        let users_index = match trimmed.find("users:(") {
+            Some(index) => index,
+            None => return Ok(None),
+        };
+        let users = &trimmed[users_index..];
+        let Some(process_name) = Self::extract_quoted_value(users) else {
+            return Ok(None);
+        };
+        if process_name != "codex" {
+            return Ok(None);
+        }
+        let Some(pid) = Self::extract_pid(users) else {
+            return Ok(None);
+        };
+
+        let environment = Self::read_process_environment(pid)
+            .await
+            .unwrap_or_default();
+        let managed = environment
+            .get(ORCAS_APP_SERVER_TAG_ENV)
+            .is_some_and(|value| value == ORCAS_APP_SERVER_TAG_VALUE);
+        if !managed {
+            return Ok(None);
+        }
+
+        let owner_kind = environment.get(ORCAS_APP_SERVER_OWNER_KIND_ENV).cloned();
+        let owner_pid = environment
+            .get(ORCAS_APP_SERVER_OWNER_PID_ENV)
+            .and_then(|value| value.parse::<u32>().ok());
+        let listen_url = environment.get(ORCAS_APP_SERVER_LISTEN_URL_ENV).cloned();
+        let endpoint = format!("ws://{listen_address}");
+        if endpoint != self.config.listen_url {
+            return Ok(None);
+        }
+        if owner_kind.as_deref() != Some(self.owner_kind.as_str()) {
+            return Ok(None);
+        }
+        if owner_pid != Some(self.owner_pid) {
+            return Ok(None);
+        }
+        if listen_url.as_deref() != Some(self.config.listen_url.as_str()) {
+            return Ok(None);
+        }
+
+        Ok(Some(ManagedCodexProcess { pid }))
+    }
+
+    fn extract_quoted_value(text: &str) -> Option<&str> {
+        let start = text.find('"')?;
+        let rest = &text[start + 1..];
+        let end = rest.find('"')?;
+        Some(&rest[..end])
+    }
+
+    fn extract_pid(text: &str) -> Option<u32> {
+        let pid_marker = "pid=";
+        let start = text.find(pid_marker)? + pid_marker.len();
+        let digits = text[start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        digits.parse().ok()
+    }
+
+    async fn read_process_environment(pid: u32) -> Option<HashMap<String, String>> {
+        let path = format!("/proc/{pid}/environ");
+        let bytes = tokio::fs::read(path).await.ok()?;
+        let mut env = HashMap::new();
+        for entry in bytes
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let text = String::from_utf8_lossy(entry);
+            let mut parts = text.splitn(2, '=');
+            let key = parts.next()?.trim();
+            let value = parts.next().unwrap_or_default();
+            env.insert(key.to_string(), value.to_string());
+        }
+        Some(env)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManagedCodexProcess {
+    pid: u32,
 }
