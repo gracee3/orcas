@@ -1301,6 +1301,7 @@ mod tests {
                 metadata_path: "/tmp/orcas.json".to_string(),
                 git_commit: Some("deadbeef".to_string()),
             },
+            workstream_runtimes: Vec::new(),
         }
     }
 

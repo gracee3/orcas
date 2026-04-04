@@ -709,6 +709,16 @@ impl SupervisorService {
             }
             println!("client_count: {}", status.client_count);
             println!("known_threads: {}", status.known_threads);
+            println!("workstream_runtimes: {}", status.workstream_runtimes.len());
+            for runtime in &status.workstream_runtimes {
+                println!(
+                    "workstream_runtime: {}\t{}\t{}\t{}",
+                    runtime.workstream_id,
+                    runtime.status,
+                    runtime.effective_listen_url.as_deref().unwrap_or("-"),
+                    runtime.codex_home
+                );
+            }
         }
         Ok(())
     }
@@ -833,6 +843,7 @@ impl SupervisorService {
         println!("log_file: {}", socket_status.log_path.display());
         println!("upstream_status: {}", status.upstream.status);
         println!("codex_endpoint: {}", status.codex_endpoint);
+        println!("workstream_runtimes: {}", status.workstream_runtimes.len());
         println!("daemon_pid: {}", status.runtime.pid);
         println!("daemon_version: {}", status.runtime.version);
         println!("daemon_fingerprint: {}", status.runtime.build_fingerprint);
@@ -850,6 +861,7 @@ impl SupervisorService {
         println!("log_file: {}", socket_status.log_path.display());
         println!("upstream_status: {}", status.upstream.status);
         println!("codex_endpoint: {}", status.codex_endpoint);
+        println!("workstream_runtimes: {}", status.workstream_runtimes.len());
         println!("daemon_pid: {}", status.runtime.pid);
         println!("daemon_version: {}", status.runtime.version);
         println!("daemon_fingerprint: {}", status.runtime.build_fingerprint);

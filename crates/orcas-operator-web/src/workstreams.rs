@@ -423,6 +423,7 @@ mod tests {
                     metadata_path: "/tmp/orcasd.json".to_string(),
                     git_commit: None,
                 },
+                workstream_runtimes: Vec::new(),
             },
             session: SessionState {
                 active_thread_id: None,

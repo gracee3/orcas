@@ -198,6 +198,35 @@ pub struct DaemonStatusResponse {
     pub client_count: usize,
     pub known_threads: usize,
     pub runtime: DaemonRuntimeMetadata,
+    #[serde(default)]
+    pub workstream_runtimes: Vec<WorkstreamRuntimeSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkstreamRuntimeSummary {
+    pub workstream_id: String,
+    pub status: String,
+    pub transport_kind: crate::authority::WorkstreamTransportKind,
+    pub app_server_policy: crate::authority::WorkstreamAppServerPolicy,
+    pub connection_mode: crate::authority::WorkstreamExecutionConnectionMode,
+    #[serde(default)]
+    pub desired_listen_url: Option<String>,
+    #[serde(default)]
+    pub effective_listen_url: Option<String>,
+    pub codex_home: String,
+    #[serde(default)]
+    pub sqlite_home: Option<String>,
+    #[serde(default)]
+    pub owner_kind: Option<String>,
+    #[serde(default)]
+    pub owner_pid: Option<u32>,
+    #[serde(default)]
+    pub thread_count: usize,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

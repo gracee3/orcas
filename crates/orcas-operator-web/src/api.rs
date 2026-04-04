@@ -312,6 +312,7 @@ pub async fn create_workstream(
                 objective,
                 status,
                 priority,
+                execution_scope: None,
             },
         })
         .await
@@ -340,6 +341,7 @@ pub async fn edit_workstream(
                     objective: Some(objective),
                     status: Some(status),
                     priority: Some(priority),
+                    execution_scope: None,
                 },
             },
         })

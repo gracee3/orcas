@@ -19,7 +19,7 @@ use orcas_core::authority::{
     WorkUnitNode, WorkUnitRecord, WorkUnitSummary, WorkstreamExecutionScope, WorkstreamNode,
     WorkstreamRecord, WorkstreamSummary,
 };
-use orcas_core::{AppPaths, OrcasError, OrcasResult, StoredState};
+use orcas_core::{AppPaths, OrcasError, OrcasResult, StoredState, ipc};
 
 const AUTHORITY_PROJECTION: &str = "authority_current";
 const AUTHORITY_REPLICATION_CHECKPOINT_TABLE: &str = "authority_replication_checkpoint";
@@ -1408,6 +1408,101 @@ impl AuthoritySqliteStore {
 
     pub async fn save_runtime_state(&self, state: &StoredState) -> OrcasResult<()> {
         self.with_connection(|connection| Self::save_runtime_state_sync(connection, state))
+    }
+
+    pub async fn upsert_workstream_runtime(
+        &self,
+        runtime: &ipc::WorkstreamRuntimeSummary,
+    ) -> OrcasResult<()> {
+        self.with_connection(|connection| {
+            connection
+                .execute(
+                    "insert into workstream_runtimes (
+                         workstream_id, desired_scope_revision, transport_kind, app_server_policy,
+                         connection_mode, desired_listen_url, effective_listen_url, codex_home,
+                         sqlite_home, owner_kind, owner_pid, status, last_error, started_at,
+                         last_heartbeat_at, thread_count, updated_at
+                     ) values (
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+                     )
+                     on conflict(workstream_id) do update set
+                         desired_scope_revision = excluded.desired_scope_revision,
+                         transport_kind = excluded.transport_kind,
+                         app_server_policy = excluded.app_server_policy,
+                         connection_mode = excluded.connection_mode,
+                         desired_listen_url = excluded.desired_listen_url,
+                         effective_listen_url = excluded.effective_listen_url,
+                         codex_home = excluded.codex_home,
+                         sqlite_home = excluded.sqlite_home,
+                         owner_kind = excluded.owner_kind,
+                         owner_pid = excluded.owner_pid,
+                         status = excluded.status,
+                         last_error = excluded.last_error,
+                         started_at = excluded.started_at,
+                         last_heartbeat_at = excluded.last_heartbeat_at,
+                         thread_count = excluded.thread_count,
+                         updated_at = excluded.updated_at",
+                    params![
+                        runtime.workstream_id.as_str(),
+                        Option::<i64>::None,
+                        enum_to_storage(runtime.transport_kind)?,
+                        enum_to_storage(runtime.app_server_policy)?,
+                        enum_to_storage(runtime.connection_mode)?,
+                        runtime.desired_listen_url.as_deref(),
+                        runtime.effective_listen_url.as_deref(),
+                        runtime.codex_home.as_str(),
+                        runtime.sqlite_home.as_deref(),
+                        runtime.owner_kind.as_deref(),
+                        runtime.owner_pid.map(i64::from),
+                        runtime.status.as_str(),
+                        runtime.last_error.as_deref(),
+                        option_datetime(runtime.started_at.clone()),
+                        Option::<String>::None,
+                        i64::try_from(runtime.thread_count).map_err(|error| store_error(
+                            format!("thread_count overflow: {error}")
+                        ))?,
+                        encode_datetime(runtime.updated_at),
+                    ],
+                )
+                .map_err(map_sql_error)?;
+            Ok(())
+        })
+    }
+
+    pub async fn delete_workstream_runtime(
+        &self,
+        workstream_id: &authority::WorkstreamId,
+    ) -> OrcasResult<()> {
+        self.with_connection(|connection| {
+            connection
+                .execute(
+                    "delete from workstream_runtimes where workstream_id = ?1",
+                    params![workstream_id.as_str()],
+                )
+                .map_err(map_sql_error)?;
+            Ok(())
+        })
+    }
+
+    pub async fn list_workstream_runtimes(
+        &self,
+    ) -> OrcasResult<Vec<ipc::WorkstreamRuntimeSummary>> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "select workstream_id, transport_kind, app_server_policy, connection_mode,
+                            desired_listen_url, effective_listen_url, codex_home, sqlite_home,
+                            owner_kind, owner_pid, status, last_error, started_at, thread_count,
+                            updated_at
+                     from workstream_runtimes
+                     order by workstream_id asc",
+                )
+                .map_err(map_sql_error)?;
+            let rows = statement
+                .query_map([], read_workstream_runtime_row)
+                .map_err(map_sql_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(map_sql_error)
+        })
     }
 
     fn load_runtime_state_sync(connection: &mut Connection) -> OrcasResult<StoredState> {
@@ -3233,6 +3328,50 @@ fn read_workstream_row(row: &Row<'_>) -> rusqlite::Result<WorkstreamRecord> {
     })
 }
 
+fn read_workstream_runtime_row(row: &Row<'_>) -> rusqlite::Result<ipc::WorkstreamRuntimeSummary> {
+    Ok(ipc::WorkstreamRuntimeSummary {
+        workstream_id: row.get(0)?,
+        transport_kind: enum_from_storage(&row.get::<_, String>(1)?)
+            .map_err(protocol_to_sql_error(1))?,
+        app_server_policy: enum_from_storage(&row.get::<_, String>(2)?)
+            .map_err(protocol_to_sql_error(2))?,
+        connection_mode: enum_from_storage(&row.get::<_, String>(3)?)
+            .map_err(protocol_to_sql_error(3))?,
+        desired_listen_url: row.get(4)?,
+        effective_listen_url: row.get(5)?,
+        codex_home: row.get(6)?,
+        sqlite_home: row.get(7)?,
+        owner_kind: row.get(8)?,
+        owner_pid: row
+            .get::<_, Option<i64>>(9)?
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?,
+        status: row.get(10)?,
+        last_error: row.get(11)?,
+        started_at: row
+            .get::<_, Option<String>>(12)?
+            .map(|value| decode_datetime(&value))
+            .transpose()
+            .map_err(protocol_to_sql_error(12))?,
+        thread_count: usize::try_from(row.get::<_, i64>(13)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
+        updated_at: decode_datetime(&row.get::<_, String>(14)?)
+            .map_err(protocol_to_sql_error(14))?,
+    })
+}
+
 fn read_work_unit_row(row: &Row<'_>) -> rusqlite::Result<WorkUnitRecord> {
     Ok(WorkUnitRecord {
         id: authority::WorkUnitId::parse(row.get::<_, String>(0)?)
@@ -4295,6 +4434,59 @@ mod tests {
                 .collaboration
                 .workstreams
                 .contains_key("ws-runtime-import")
+        );
+    }
+
+    #[test]
+    fn workstream_runtime_summary_round_trips_through_sqlite() {
+        let store = fresh_store("workstream-runtime");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let origin = store.origin_node_id().expect("origin");
+        runtime
+            .block_on(
+                store.execute_command(AuthorityCommand::CreateWorkstream(CreateWorkstream {
+                    metadata: metadata(&origin, "runtime-ws"),
+                    workstream_id: authority::WorkstreamId::parse("runtime-ws")
+                        .expect("workstream id"),
+                    title: "Runtime stream".to_string(),
+                    objective: "Persist runtime row".to_string(),
+                    status: WorkstreamStatus::Active,
+                    priority: "normal".to_string(),
+                    execution_scope: None,
+                })),
+            )
+            .expect("create workstream");
+        let summary = ipc::WorkstreamRuntimeSummary {
+            workstream_id: "runtime-ws".to_string(),
+            status: "shared_connected".to_string(),
+            transport_kind: authority::WorkstreamTransportKind::LocalAppServer,
+            app_server_policy: authority::WorkstreamAppServerPolicy::SharedCurrentDaemon,
+            connection_mode: authority::WorkstreamExecutionConnectionMode::SpawnIfNeeded,
+            desired_listen_url: None,
+            effective_listen_url: Some("ws://127.0.0.1:4500".to_string()),
+            codex_home: "/tmp/orcas/runtime-ws/codex-home".to_string(),
+            sqlite_home: Some("/tmp/orcas/runtime-ws/sqlite".to_string()),
+            owner_kind: Some("orcasd_shared_runtime".to_string()),
+            owner_pid: Some(42),
+            thread_count: 3,
+            last_error: None,
+            started_at: Some(Utc::now()),
+            updated_at: Utc::now(),
+        };
+
+        runtime
+            .block_on(store.upsert_workstream_runtime(&summary))
+            .expect("upsert workstream runtime");
+        let listed = runtime
+            .block_on(store.list_workstream_runtimes())
+            .expect("list workstream runtimes");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].workstream_id, "runtime-ws");
+        assert_eq!(listed[0].owner_pid, Some(42));
+        assert_eq!(
+            listed[0].effective_listen_url.as_deref(),
+            Some("ws://127.0.0.1:4500")
         );
     }
 }

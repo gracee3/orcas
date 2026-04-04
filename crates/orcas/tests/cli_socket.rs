@@ -353,6 +353,7 @@ fn serve_fake_planning_session_connection(
                         metadata_path: metadata_path.display().to_string(),
                         git_commit: Some("deadbeef".to_string()),
                     },
+                    workstream_runtimes: Vec::new(),
                 };
                 let _ = send_jsonrpc_response(&mut write_half, id, response);
             }

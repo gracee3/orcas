@@ -452,10 +452,151 @@ impl OrcasDaemonService {
         }
         self.reconcile_worker_session_tracked_thread_bindings()
             .await?;
+        let _ = self.reconcile_workstream_runtimes().await;
         if bootstrap_persist {
             self.persist_collaboration_state().await?;
         }
         Ok(())
+    }
+
+    async fn reconcile_workstream_runtimes(
+        &self,
+    ) -> OrcasResult<Vec<ipc::WorkstreamRuntimeSummary>> {
+        let workstreams = self.authority_store.list_workstreams(false).await?;
+        let (upstream, shared_live_thread_count) = {
+            let state = self.state.read().await;
+            (
+                state.upstream.clone(),
+                state
+                    .threads
+                    .values()
+                    .filter(|thread| {
+                        thread.summary.source_kind.as_deref() == Some("orcas_managed")
+                            || thread.summary.scope == "live_observed"
+                    })
+                    .count(),
+            )
+        };
+        let now = Utc::now();
+        let summaries = workstreams
+            .iter()
+            .map(|workstream| {
+                self.derive_workstream_runtime_summary(
+                    workstream,
+                    &upstream,
+                    shared_live_thread_count,
+                    now,
+                )
+            })
+            .collect::<Vec<_>>();
+        for summary in &summaries {
+            self.authority_store
+                .upsert_workstream_runtime(summary)
+                .await?;
+        }
+        Ok(summaries)
+    }
+
+    fn derive_workstream_runtime_summary(
+        &self,
+        workstream: &authority::WorkstreamSummary,
+        upstream: &ConnectionState,
+        shared_live_thread_count: usize,
+        now: DateTime<Utc>,
+    ) -> ipc::WorkstreamRuntimeSummary {
+        let transport_kind = workstream
+            .execution_scope
+            .as_ref()
+            .map(|scope| scope.transport_kind)
+            .unwrap_or(authority::WorkstreamTransportKind::LocalAppServer);
+        let app_server_policy = workstream
+            .execution_scope
+            .as_ref()
+            .map(|scope| scope.app_server_policy)
+            .unwrap_or(authority::WorkstreamAppServerPolicy::SharedCurrentDaemon);
+        let connection_mode = workstream
+            .execution_scope
+            .as_ref()
+            .map(|scope| scope.connection_mode)
+            .unwrap_or_else(|| Self::workstream_connection_mode_from_config(&self.config));
+        let desired_listen_url = workstream
+            .execution_scope
+            .as_ref()
+            .and_then(|scope| scope.listen_url.clone());
+        let codex_home = workstream
+            .execution_scope
+            .as_ref()
+            .map(|scope| scope.codex_home.clone())
+            .unwrap_or_else(|| {
+                self.paths
+                    .data_dir
+                    .join("workstreams")
+                    .join(workstream.id.as_str())
+                    .join("codex-home")
+                    .display()
+                    .to_string()
+            });
+        let sqlite_home = workstream
+            .execution_scope
+            .as_ref()
+            .and_then(|scope| scope.sqlite_home.clone());
+        let live_thread_count =
+            if app_server_policy == authority::WorkstreamAppServerPolicy::SharedCurrentDaemon {
+                shared_live_thread_count
+            } else {
+                0
+            };
+        let (status, effective_listen_url, owner_kind, owner_pid, started_at) =
+            match app_server_policy {
+                authority::WorkstreamAppServerPolicy::SharedCurrentDaemon => (
+                    format!("shared_{}", upstream.status),
+                    Some(self.config.codex.listen_url.clone()),
+                    Some("orcasd_shared_runtime".to_string()),
+                    Some(self.runtime.pid),
+                    Some(self.runtime.started_at),
+                ),
+                authority::WorkstreamAppServerPolicy::DedicatedPerWorkstream => (
+                    "dedicated_configured".to_string(),
+                    desired_listen_url.clone(),
+                    Some("orcasd_workstream_runtime".to_string()),
+                    None,
+                    None,
+                ),
+            };
+
+        ipc::WorkstreamRuntimeSummary {
+            workstream_id: workstream.id.to_string(),
+            status,
+            transport_kind,
+            app_server_policy,
+            connection_mode,
+            desired_listen_url,
+            effective_listen_url,
+            codex_home,
+            sqlite_home,
+            owner_kind,
+            owner_pid,
+            thread_count: live_thread_count,
+            last_error: None,
+            started_at,
+            updated_at: now,
+        }
+    }
+
+    fn workstream_connection_mode_from_config(
+        config: &AppConfig,
+    ) -> authority::WorkstreamExecutionConnectionMode {
+        match config.codex.connection_mode {
+            CodexConnectionMode::ConnectOnly => {
+                authority::WorkstreamExecutionConnectionMode::ConnectOnly
+            }
+            CodexConnectionMode::SpawnIfNeeded => {
+                authority::WorkstreamExecutionConnectionMode::SpawnIfNeeded
+            }
+            CodexConnectionMode::SpawnAlways => {
+                authority::WorkstreamExecutionConnectionMode::SpawnAlways
+            }
+        }
     }
 
     fn bootstrap_planning_state(collaboration: &mut CollaborationState) -> bool {
@@ -1405,6 +1546,7 @@ impl OrcasDaemonService {
     async fn daemon_status(&self) -> OrcasResult<ipc::DaemonStatusResponse> {
         debug!("building daemon status response");
         let upstream = self.state.read().await.upstream.clone();
+        let workstream_runtimes = self.reconcile_workstream_runtimes().await?;
         Ok(ipc::DaemonStatusResponse {
             socket_path: self.paths.socket_file.display().to_string(),
             metadata_path: self.paths.daemon_metadata_file.display().to_string(),
@@ -1414,6 +1556,7 @@ impl OrcasDaemonService {
             client_count: self.client_count.load(Ordering::SeqCst),
             known_threads: self.known_thread_summaries().await.len(),
             runtime: self.runtime.clone(),
+            workstream_runtimes,
         })
     }
 
@@ -2225,6 +2368,17 @@ impl OrcasDaemonService {
             .await?
         {
             AuthorityMutationResult::Workstream(workstream) => {
+                let workstream_summary = authority::WorkstreamSummary::from(&workstream);
+                let upstream = self.state.read().await.upstream.clone();
+                let summary = self.derive_workstream_runtime_summary(
+                    &workstream_summary,
+                    &upstream,
+                    self.known_thread_summaries().await.len(),
+                    Utc::now(),
+                );
+                self.authority_store
+                    .upsert_workstream_runtime(&summary)
+                    .await?;
                 self.emit_authority_workstream_lifecycle(
                     ipc::CollaborationLifecycleAction::Created,
                     &workstream,
@@ -2250,6 +2404,17 @@ impl OrcasDaemonService {
             .await?
         {
             AuthorityMutationResult::Workstream(workstream) => {
+                let workstream_summary = authority::WorkstreamSummary::from(&workstream);
+                let upstream = self.state.read().await.upstream.clone();
+                let summary = self.derive_workstream_runtime_summary(
+                    &workstream_summary,
+                    &upstream,
+                    self.known_thread_summaries().await.len(),
+                    Utc::now(),
+                );
+                self.authority_store
+                    .upsert_workstream_runtime(&summary)
+                    .await?;
                 self.emit_authority_workstream_lifecycle(
                     ipc::CollaborationLifecycleAction::Updated,
                     &workstream,
@@ -2291,6 +2456,9 @@ impl OrcasDaemonService {
             .await?
         {
             AuthorityMutationResult::Workstream(workstream) => {
+                self.authority_store
+                    .delete_workstream_runtime(&workstream.id)
+                    .await?;
                 self.emit_authority_workstream_lifecycle(
                     ipc::CollaborationLifecycleAction::Deleted,
                     &workstream,
@@ -16277,6 +16445,59 @@ mod tests {
         assert_eq!(
             status.socket_path,
             service.paths.socket_file.display().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_status_includes_reconciled_workstream_runtimes() {
+        let service = test_service().await;
+        let metadata = |label: &str| orcas_core::authority::CommandMetadata {
+            command_id: orcas_core::authority::CommandId::new(),
+            issued_at: Utc::now(),
+            origin_node_id: orcas_core::authority::OriginNodeId::new(),
+            actor: orcas_core::authority::CommandActor::parse("test_operator").expect("actor"),
+            correlation_id: Some(
+                orcas_core::authority::CorrelationId::parse(format!("corr-{label}"))
+                    .expect("correlation id"),
+            ),
+        };
+        service
+            .authority_workstream_create(ipc::AuthorityWorkstreamCreateRequest {
+                command: orcas_core::authority::CreateWorkstream {
+                    metadata: metadata("runtime-status"),
+                    workstream_id: orcas_core::authority::WorkstreamId::parse("runtime-status-ws")
+                        .expect("workstream id"),
+                    title: "Runtime status".to_string(),
+                    objective: "Expose runtime ownership".to_string(),
+                    status: WorkstreamStatus::Active,
+                    priority: "high".to_string(),
+                    execution_scope: Some(orcas_core::authority::WorkstreamExecutionScope {
+                        codex_home: "/tmp/orcas/runtime-status/codex-home".to_string(),
+                        sqlite_home: Some("/tmp/orcas/runtime-status/sqlite".to_string()),
+                        listen_url: Some("ws://127.0.0.1:4900".to_string()),
+                        transport_kind: orcas_core::authority::WorkstreamTransportKind::LocalAppServer,
+                        app_server_policy:
+                            orcas_core::authority::WorkstreamAppServerPolicy::DedicatedPerWorkstream,
+                        connection_mode:
+                            orcas_core::authority::WorkstreamExecutionConnectionMode::SpawnIfNeeded,
+                    }),
+                },
+            })
+            .await
+            .expect("authority workstream");
+
+        let status = service.daemon_status().await.expect("daemon status");
+        assert_eq!(status.workstream_runtimes.len(), 1);
+        assert_eq!(
+            status.workstream_runtimes[0].workstream_id,
+            "runtime-status-ws"
+        );
+        assert_eq!(status.workstream_runtimes[0].status, "dedicated_configured");
+        assert_eq!(
+            status.workstream_runtimes[0]
+                .effective_listen_url
+                .as_deref(),
+            Some("ws://127.0.0.1:4900")
         );
     }
 
