@@ -137,7 +137,7 @@ These flags are accepted before any subcommand.
 
 ## Codex
 
-- `orcas codex models list`
+- `orcas codex models list --workstream <ID>`
 - `orcas codex threads list`
 - `orcas codex threads list-loaded`
 - `orcas codex threads read --thread <ID>`

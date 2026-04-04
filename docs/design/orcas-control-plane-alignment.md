@@ -122,7 +122,6 @@ Implemented in this slice:
 ## 9. Risks / Open Questions
 
 - Orcas still uses one global upstream Codex/app-server client at runtime. This slice adds the control-plane model but does not yet switch to real per-workstream routing.
-- Sandbox enforcement is still deferred. Orcas now derives the root contract, but it does not yet push sandbox policy into Codex.
 - Collaboration runtime state is still separate from authority state.
 - Stale worktrees, abandoned sessions, and merge conflicts still require explicit supervisor handling; this slice improves visibility and isolation but does not automate cleanup policy.
 - Remote WebSocket transport production posture still needs explicit security review.
@@ -131,5 +130,12 @@ Implemented in this slice:
 
 - spawning and supervising dedicated per-workstream app-server processes
 - moving collaboration runtime state into `state.db`
-- fully enforcing sandbox policy in Codex turn/thread creation
 - changing supervisor-to-worker communication away from the existing assignment/report envelope flow
+
+## Implementation Follow-Through
+
+- Workstream-scoped model listing now routes through the selected workstream runtime instead of the shared upstream client.
+- Worker thread start and resume now default to Codex `WorkspaceWrite` sandbox mode.
+- Worker turn dispatch now derives `WorkspaceWrite` writable roots from tracked-thread workspace state:
+  - normal worker turns use the worktree roots
+  - workspace lifecycle turns expand to the repository root and worktree parent as well

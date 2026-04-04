@@ -146,7 +146,7 @@ Current request families include:
   - `state/get`
   - `session/get_active`
 - models and thread views:
-  - `models/list`
+  - `models/list` requires a target `workstream_id` and resolves through that workstream's runtime
   - `threads/list`
   - `threads/list_scoped`
   - `threads/list_loaded`
@@ -165,6 +165,8 @@ Current request families include:
   - `turn/start`
   - `turn/steer`
   - `turn/interrupt`
+
+Worker execution now defaults to Codex `WorkspaceWrite` sandboxing. Orcas applies thread-level `WorkspaceWrite` mode on worker thread start and resume, and derives turn-level writable roots from the tracked-thread workspace when a worker lane is bound to a git worktree.
 - workflow and authority state:
   - `workunit/get`
   - `authority/hierarchy/get`
