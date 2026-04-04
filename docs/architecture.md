@@ -31,7 +31,7 @@ New planning behavior should land on the canonical authority surface rather than
 
 Recovery remains snapshot-first rather than replay-based. If a daemon connection drops or the daemon restarts, old event subscriptions close with that socket lifetime. Clients reconnect, reload current state, and then establish a fresh subscription; they do not assume missed history will be replayed.
 
-The daemon’s state model is Orcas-native, but it currently has two live local persistence systems. Legacy collaboration and thread/turn mirror state are loaded from and persisted to `state.json`. Authority-owned workstreams, work units, and tracked threads are stored in `state.db` with explicit commands, revisions, and tombstones. `state/get` is therefore a merged derived snapshot rather than a single-store read, while `authority/hierarchy/get` and authority detail RPCs remain the canonical planning hierarchy surfaces.
+The daemon’s state model is Orcas-native, and durable Orcas state now lives in one local SQLite store. Authority-owned workstreams, work units, and tracked threads are stored in `state.db` with explicit commands, revisions, and tombstones. Collaboration/runtime snapshots, live thread mirrors, live turn mirrors, and workstream runtime summaries are also persisted in `state.db`. `state/get` remains a merged derived snapshot rather than a raw table dump, while `authority/hierarchy/get` and authority detail RPCs remain the canonical planning hierarchy surfaces.
 
 ## Workflow Lifecycle
 
@@ -63,8 +63,8 @@ Orcas follows a small set of consistent rules:
 
 The SQLite-backed local-authority model is already live for authority workstreams, authority work units, and tracked threads. It runs alongside the legacy collaboration store rather than replacing it completely today. The current daemon therefore has a real boundary between:
 
-1. collaboration-owned state persisted in `state.json`
-2. authority-owned state persisted in `state.db`
+1. authority-owned state persisted in `state.db`
+2. runtime and collaboration snapshots persisted in `state.db`
 3. merged read models such as `state/get`
 4. client-side derived state inside operator clients
 

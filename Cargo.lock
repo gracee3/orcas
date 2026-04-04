@@ -2301,6 +2301,7 @@ dependencies = [
  "orcas-core",
  "orcas-server-client",
  "orcasd",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

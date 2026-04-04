@@ -28,6 +28,7 @@ use orcas_core::{
     },
     planning::PlanExecutionKind,
 };
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 fn run_orcas(daemon: &TestDaemon, args: &[&str]) -> std::process::Output {
@@ -56,6 +57,85 @@ fn stderr(output: &std::process::Output) -> String {
 fn field_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     text.lines()
         .find_map(|line| line.strip_prefix(&format!("{key}: ")))
+}
+
+fn save_runtime_state(paths: &orcas_core::AppPaths, state: &StoredState) {
+    let connection = Connection::open(&paths.state_db_file).expect("open runtime sqlite store");
+    let transaction = connection
+        .unchecked_transaction()
+        .expect("start runtime snapshot transaction");
+    for (key, value) in [
+        (
+            "thread_registry",
+            serde_json::to_string(&state.registry).expect("serialize registry"),
+        ),
+        (
+            "thread_views",
+            serde_json::to_string(&state.thread_views).expect("serialize views"),
+        ),
+        (
+            "turn_states",
+            serde_json::to_string(&state.turn_states).expect("serialize turns"),
+        ),
+        (
+            "collaboration_state",
+            serde_json::to_string(&state.collaboration).expect("serialize collaboration"),
+        ),
+        (
+            "operator_inbox_state",
+            serde_json::to_string(&state.operator_inbox).expect("serialize inbox"),
+        ),
+        (
+            "operator_inbox_mirrors",
+            serde_json::to_string(&state.operator_inbox_mirrors).expect("serialize mirrors"),
+        ),
+    ] {
+        transaction
+            .execute(
+                "insert into runtime_snapshots (snapshot_key, snapshot_json, updated_at)
+                 values (?1, ?2, ?3)
+                 on conflict(snapshot_key) do update set
+                     snapshot_json = excluded.snapshot_json,
+                     updated_at = excluded.updated_at",
+                params![key, value, Utc::now().to_rfc3339()],
+            )
+            .expect("write runtime snapshot");
+    }
+    transaction.commit().expect("commit runtime snapshot");
+}
+
+fn load_runtime_state(paths: &orcas_core::AppPaths) -> StoredState {
+    let connection = Connection::open(&paths.state_db_file).expect("open runtime sqlite store");
+    let load_json = |key: &str| -> Option<String> {
+        connection
+            .query_row(
+                "select snapshot_json from runtime_snapshots where snapshot_key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .expect("load runtime snapshot")
+    };
+    StoredState {
+        registry: load_json("thread_registry")
+            .map(|raw| serde_json::from_str(&raw).expect("parse registry"))
+            .unwrap_or_default(),
+        thread_views: load_json("thread_views")
+            .map(|raw| serde_json::from_str(&raw).expect("parse views"))
+            .unwrap_or_default(),
+        turn_states: load_json("turn_states")
+            .map(|raw| serde_json::from_str(&raw).expect("parse turns"))
+            .unwrap_or_default(),
+        collaboration: load_json("collaboration_state")
+            .map(|raw| serde_json::from_str(&raw).expect("parse collaboration"))
+            .unwrap_or_default(),
+        operator_inbox: load_json("operator_inbox_state")
+            .map(|raw| serde_json::from_str(&raw).expect("parse inbox"))
+            .unwrap_or_default(),
+        operator_inbox_mirrors: load_json("operator_inbox_mirrors")
+            .map(|raw| serde_json::from_str(&raw).expect("parse inbox mirrors"))
+            .unwrap_or_default(),
+    }
 }
 
 static PLANNING_SESSION_CLI_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -191,6 +271,7 @@ async fn create_authority_workstream(
                 objective: format!("Objective for {title}"),
                 status: orcas_core::WorkstreamStatus::Active,
                 priority: "high".to_string(),
+                execution_scope: None,
             },
         })
         .await
@@ -688,9 +769,7 @@ fn seed_cli_planning_session(
     ready_for_review: bool,
     include_active_plan: bool,
 ) {
-    let mut stored: StoredState = std::fs::read_to_string(&daemon.paths.state_file)
-        .map(|raw| serde_json::from_str(&raw).expect("parse stored state"))
-        .unwrap_or_default();
+    let mut stored = load_runtime_state(&daemon.paths);
     let now = Utc::now();
     let workstream = orcas_core::collaboration::Workstream {
         id: workstream_id.to_string(),
@@ -758,11 +837,7 @@ fn seed_cli_planning_session(
             superseded_by_session_id: None,
         },
     );
-    std::fs::write(
-        &daemon.paths.state_file,
-        serde_json::to_string_pretty(&stored).expect("serialize stored state"),
-    )
-    .expect("write state file");
+    save_runtime_state(&daemon.paths, &stored);
 }
 
 async fn spawn_assignment_ready_daemon(
@@ -1034,10 +1109,6 @@ async fn real_cli_doctor_reports_current_runtime_and_persistence_paths() {
     assert_eq!(
         field_value(&stdout, "config"),
         Some(daemon.paths.config_file.to_string_lossy().as_ref())
-    );
-    assert_eq!(
-        field_value(&stdout, "state"),
-        Some(daemon.paths.state_file.to_string_lossy().as_ref())
     );
     assert_eq!(
         field_value(&stdout, "state_db"),

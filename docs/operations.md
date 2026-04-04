@@ -36,7 +36,7 @@ orcas daemon status
 orcas doctor
 ```
 
-The doctor command reports the config path, `state.json`, `state.db`, runtime directory, socket path, daemon log path, and current Codex endpoint.
+The doctor command reports the config path, `state.db`, runtime directory, socket path, daemon log path, and current Codex endpoint.
 
 The current checked-in operator surface is CLI-first:
 

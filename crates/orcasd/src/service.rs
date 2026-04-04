@@ -29005,7 +29005,7 @@ Boundedness note: Stay within the legacy compatibility boundary."#
     }
 
     #[tokio::test]
-    async fn initialize_state_rewrites_seeded_state_into_canonical_shape() {
+    async fn initialize_state_imports_seeded_legacy_state_json_into_sqlite_only() {
         let base = std::env::temp_dir().join(format!("orcas-collab-test-{}", Uuid::new_v4()));
         let state_file = base.join("data/state.json");
         tokio::fs::create_dir_all(state_file.parent().expect("state dir"))
@@ -29036,24 +29036,10 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             .await
             .expect("stored state");
         assert!(stored.thread_views.is_empty());
-
-        let raw = tokio::fs::read_to_string(&state_file)
-            .await
-            .expect("read legacy state");
-        assert_eq!(
-            raw,
-            r#"{
-  "registry": {
-    "threads": {},
-    "last_connected_endpoint": null
-  }
-}
-"#
-        );
     }
 
     #[tokio::test]
-    async fn initialize_state_leaves_canonical_state_json_unchanged() {
+    async fn initialize_state_does_not_recreate_legacy_state_json_after_import() {
         let base = std::env::temp_dir().join(format!("orcas-collab-test-{}", Uuid::new_v4()));
         let state_file = base.join("data/state.json");
         tokio::fs::create_dir_all(state_file.parent().expect("state dir"))
@@ -29074,10 +29060,9 @@ Boundedness note: Stay within the legacy compatibility boundary."#
         )
         .await;
 
-        let rewritten = tokio::fs::read_to_string(&state_file)
+        tokio::fs::remove_file(&state_file)
             .await
-            .expect("read canonical state");
-        assert_eq!(rewritten, canonical_with_newline);
+            .expect("remove legacy state json");
 
         let stored = service
             .authority_store
@@ -29090,6 +29075,11 @@ Boundedness note: Stay within the legacy compatibility boundary."#
         assert!(stored.collaboration.workstreams.is_empty());
         assert!(stored.operator_inbox.items.is_empty());
         assert!(stored.operator_inbox_mirrors.is_empty());
+        assert!(
+            !tokio::fs::try_exists(&state_file)
+                .await
+                .expect("check legacy state file")
+        );
     }
 
     #[tokio::test]

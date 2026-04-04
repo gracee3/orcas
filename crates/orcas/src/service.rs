@@ -653,7 +653,6 @@ impl SupervisorService {
     pub async fn doctor(&self) -> Result<()> {
         let daemon_status = self.daemon.status().await?;
         println!("config: {}", self.paths.config_file.display());
-        println!("state: {}", self.paths.state_file.display());
         println!("state_db: {}", self.paths.state_db_file.display());
         println!("runtime_dir: {}", self.paths.runtime_dir.display());
         println!("socket: {}", daemon_status.socket_path.display());

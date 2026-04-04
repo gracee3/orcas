@@ -9,7 +9,7 @@ use orcas_core::StoredState;
 
 #[derive(Debug, Parser)]
 struct Args {
-    /// Seed or mutated state.json input to normalize through StoredState.
+    /// Legacy state.json input to normalize before one-time import into state.db.
     #[arg(long)]
     input: PathBuf,
     /// Destination file. Defaults to in-place rewrite of --input.
