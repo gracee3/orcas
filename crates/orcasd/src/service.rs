@@ -2293,6 +2293,7 @@ impl OrcasDaemonService {
                 }),
                 model: params.model.or_else(|| self.config.defaults.model.clone()),
                 ephemeral: Some(params.ephemeral),
+                sandbox: Some(types::SandboxMode::WorkspaceWrite),
                 service_name: Some("orcasd".to_string()),
                 ..types::ThreadStartParams::default()
             })
@@ -2331,6 +2332,7 @@ impl OrcasDaemonService {
                 }),
                 model: params.model.or_else(|| self.config.defaults.model.clone()),
                 ephemeral: Some(params.ephemeral),
+                sandbox: Some(types::SandboxMode::WorkspaceWrite),
                 service_name: Some("orcasd".to_string()),
                 ..types::ThreadStartParams::default()
             })
@@ -2444,7 +2446,7 @@ impl OrcasDaemonService {
                 model: params.model.or_else(|| self.config.defaults.model.clone()),
                 approval_policy: Some(types::AskForApproval::default()),
                 approvals_reviewer: None,
-                sandbox: None,
+                sandbox: Some(types::SandboxMode::WorkspaceWrite),
                 config: None,
                 base_instructions: None,
                 developer_instructions: None,
@@ -2499,7 +2501,7 @@ impl OrcasDaemonService {
                 model: params.model.or_else(|| self.config.defaults.model.clone()),
                 approval_policy: Some(types::AskForApproval::default()),
                 approvals_reviewer: None,
-                sandbox: None,
+                sandbox: Some(types::SandboxMode::WorkspaceWrite),
                 config: None,
                 base_instructions: None,
                 developer_instructions: None,
@@ -2637,12 +2639,95 @@ impl OrcasDaemonService {
         })
     }
 
+    async fn workspace_filesystem_scope_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> OrcasResult<Option<ipc::TrackedThreadWorkspaceFilesystemScope>> {
+        let tracked_thread_id = {
+            self.state
+                .read()
+                .await
+                .collaboration
+                .worker_sessions
+                .values()
+                .find(|session| session.thread_id.as_deref() == Some(thread_id))
+                .and_then(|session| session.tracked_thread_id.clone())
+        };
+        let Some(tracked_thread_id) = tracked_thread_id else {
+            return Ok(None);
+        };
+        Ok(self
+            .authority_store
+            .get_tracked_thread(&tracked_thread_id)
+            .await?
+            .and_then(|tracked_thread| tracked_thread.workspace)
+            .map(|workspace| {
+                crate::workspace_inspection::derive_workspace_filesystem_scope_sync(&workspace)
+            }))
+    }
+
+    async fn workspace_write_policy_for_turn(
+        &self,
+        thread_id: &str,
+        requested_cwd: Option<&str>,
+    ) -> OrcasResult<Option<types::SandboxPolicy>> {
+        if let Some(scope) = self
+            .workspace_filesystem_scope_for_thread(thread_id)
+            .await?
+        {
+            let cwd = requested_cwd
+                .map(ToOwned::to_owned)
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    self.state
+                        .try_read()
+                        .ok()
+                        .and_then(|state| {
+                            state
+                                .threads
+                                .get(thread_id)
+                                .map(|thread| thread.summary.cwd.clone())
+                        })
+                        .filter(|value| !value.is_empty())
+                });
+            let writable_roots = if cwd.as_deref() == Some(scope.repository_root.as_str()) {
+                scope.workspace_lifecycle_roots
+            } else {
+                scope.worker_turn_roots
+            };
+            return Ok(Self::workspace_write_policy(writable_roots));
+        }
+
+        let writable_roots = requested_cwd
+            .map(ToOwned::to_owned)
+            .filter(|value| !value.is_empty())
+            .into_iter()
+            .collect::<Vec<_>>();
+        Ok(Self::workspace_write_policy(writable_roots))
+    }
+
+    fn workspace_write_policy(writable_roots: Vec<String>) -> Option<types::SandboxPolicy> {
+        if writable_roots.is_empty() {
+            return None;
+        }
+        Some(types::SandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            read_only_access: Value::Null,
+            network_access: false,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: true,
+        })
+    }
+
     async fn turn_start(
         &self,
         params: ipc::TurnStartRequest,
     ) -> OrcasResult<ipc::TurnStartResponse> {
         let runtime = self.resolve_runtime_for_thread(&params.thread_id).await?;
         self.connect_runtime_handle(&runtime).await?;
+        let sandbox_policy = self
+            .workspace_write_policy_for_turn(&params.thread_id, params.cwd.as_deref())
+            .await?;
         info!(
             thread_id = %params.thread_id,
             has_cwd = params.cwd.is_some(),
@@ -2660,7 +2745,7 @@ impl OrcasDaemonService {
                 cwd: params.cwd,
                 approval_policy: Some(types::AskForApproval::default()),
                 approvals_reviewer: None,
-                sandbox_policy: None,
+                sandbox_policy,
                 model: params.model,
             })
             .await?;
@@ -18124,6 +18209,9 @@ worker epilogue"#;
         next_thread_id: usize,
         next_turn_id: usize,
         threads: HashMap<String, types::Thread>,
+        last_thread_start_sandbox: Option<types::SandboxMode>,
+        last_thread_resume_sandbox: Option<types::SandboxMode>,
+        last_turn_start_sandbox_policy: Option<types::SandboxPolicy>,
         last_turn_start_text: Option<String>,
         last_turn_steer_thread_id: Option<String>,
         last_turn_steer_expected_turn_id: Option<String>,
@@ -18213,6 +18301,7 @@ worker epilogue"#;
                         serde_json::from_value(request.params.unwrap_or(Value::Null))?;
                     let thread = {
                         let mut state = state.lock().await;
+                        state.last_thread_start_sandbox = params.sandbox.clone();
                         state.next_thread_id += 1;
                         let thread = types::Thread {
                             id: format!("thread-fake-{}", state.next_thread_id),
@@ -18273,6 +18362,7 @@ worker epilogue"#;
                         serde_json::from_value(request.params.unwrap_or(Value::Null))?;
                     let (thread, cwd) = {
                         let mut state = state.lock().await;
+                        state.last_thread_resume_sandbox = params.sandbox.clone();
                         let thread = state.threads.get_mut(&params.thread_id).ok_or_else(|| {
                             OrcasError::Protocol(format!(
                                 "fake codex runtime missing thread `{}`",
@@ -18306,6 +18396,7 @@ worker epilogue"#;
                     let turn = {
                         let mut state = state.lock().await;
                         state.next_turn_id += 1;
+                        state.last_turn_start_sandbox_policy = params.sandbox_policy.clone();
                         state.last_turn_start_text = turn_prompt.clone();
                         let turn = types::Turn {
                             id: format!("turn-fake-{}", state.next_turn_id),
@@ -28928,6 +29019,326 @@ ORCAS_REPORT_END"#
             Some("/tmp/orcas-bind-existing")
         );
         assert_eq!(rebound.preferred_model.as_deref(), Some("gpt-5.4-mini"));
+    }
+
+    #[tokio::test]
+    async fn ensure_worker_session_thread_uses_workspace_write_sandbox_mode() {
+        let (service, runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let origin_node_id = service.authority_store.origin_node_id().expect("origin");
+        let metadata = |label: &str| orcas_core::authority::CommandMetadata {
+            command_id: orcas_core::authority::CommandId::new(),
+            issued_at: Utc::now(),
+            origin_node_id: origin_node_id.clone(),
+            actor: orcas_core::authority::CommandActor::parse("workspace_test")
+                .expect("command actor"),
+            correlation_id: Some(
+                orcas_core::authority::CorrelationId::parse(format!("corr-{label}"))
+                    .expect("correlation id"),
+            ),
+        };
+
+        let workstream = service
+            .authority_workstream_create(ipc::AuthorityWorkstreamCreateRequest {
+                command: orcas_core::authority::CreateWorkstream {
+                    metadata: metadata("ws"),
+                    workstream_id: orcas_core::authority::WorkstreamId::parse("sandbox-ws")
+                        .expect("workstream id"),
+                    title: "Sandbox stream".to_string(),
+                    objective: "Verify worker thread sandbox defaults.".to_string(),
+                    status: WorkstreamStatus::Active,
+                    priority: "high".to_string(),
+                    execution_scope: None,
+                },
+            })
+            .await
+            .expect("authority workstream")
+            .workstream;
+        let work_unit = service
+            .authority_workunit_create(ipc::AuthorityWorkunitCreateRequest {
+                command: orcas_core::authority::CreateWorkUnit {
+                    metadata: metadata("wu"),
+                    work_unit_id: orcas_core::authority::WorkUnitId::parse("sandbox-wu")
+                        .expect("work unit id"),
+                    workstream_id: workstream.id.clone(),
+                    title: "Sandbox unit".to_string(),
+                    task_statement: "Exercise sandbox startup.".to_string(),
+                    status: WorkUnitStatus::Ready,
+                },
+            })
+            .await
+            .expect("authority work unit")
+            .work_unit;
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.to_string(),
+                worker_id: "worker-sandbox".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Create one worker lane.".to_string()),
+                model: None,
+                cwd: None,
+                ..Default::default()
+            })
+            .await
+            .expect("prepare assignment");
+
+        let worker_session = service
+            .ensure_worker_session_thread(
+                &prepared.assignment.worker_session_id,
+                None,
+                None,
+                Some(work_unit.id.as_str()),
+            )
+            .await
+            .expect("worker session thread");
+
+        assert!(worker_session.thread_id.is_some());
+        assert!(matches!(
+            runtime.lock().await.last_thread_start_sandbox,
+            Some(types::SandboxMode::WorkspaceWrite)
+        ));
+    }
+
+    #[tokio::test]
+    async fn thread_attach_uses_workspace_write_sandbox_mode() {
+        let (service, runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let thread = service
+            .thread_start(ipc::ThreadStartRequest {
+                cwd: Some("/tmp/orcas-attach".to_string()),
+                model: None,
+                ephemeral: false,
+            })
+            .await
+            .expect("thread start")
+            .thread;
+        service
+            .thread_detach(ipc::ThreadDetachRequest {
+                thread_id: thread.id.clone(),
+            })
+            .await
+            .expect("thread detach");
+
+        service
+            .thread_attach(ipc::ThreadAttachRequest {
+                thread_id: thread.id,
+                cwd: None,
+                model: None,
+            })
+            .await
+            .expect("thread attach");
+
+        assert!(matches!(
+            runtime.lock().await.last_thread_resume_sandbox,
+            Some(types::SandboxMode::WorkspaceWrite)
+        ));
+    }
+
+    #[tokio::test]
+    async fn turn_start_uses_workspace_specific_sandbox_roots() {
+        let (service, runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        let origin_node_id = service.authority_store.origin_node_id().expect("origin");
+        let metadata = |label: &str| orcas_core::authority::CommandMetadata {
+            command_id: orcas_core::authority::CommandId::new(),
+            issued_at: Utc::now(),
+            origin_node_id: origin_node_id.clone(),
+            actor: orcas_core::authority::CommandActor::parse("workspace_test")
+                .expect("command actor"),
+            correlation_id: Some(
+                orcas_core::authority::CorrelationId::parse(format!("corr-{label}"))
+                    .expect("correlation id"),
+            ),
+        };
+
+        let workstream = service
+            .authority_workstream_create(ipc::AuthorityWorkstreamCreateRequest {
+                command: orcas_core::authority::CreateWorkstream {
+                    metadata: metadata("ws"),
+                    workstream_id: orcas_core::authority::WorkstreamId::parse("turn-sandbox-ws")
+                        .expect("workstream id"),
+                    title: "Turn sandbox stream".to_string(),
+                    objective: "Verify worker turn sandbox roots.".to_string(),
+                    status: WorkstreamStatus::Active,
+                    priority: "high".to_string(),
+                    execution_scope: None,
+                },
+            })
+            .await
+            .expect("authority workstream")
+            .workstream;
+        let work_unit = service
+            .authority_workunit_create(ipc::AuthorityWorkunitCreateRequest {
+                command: orcas_core::authority::CreateWorkUnit {
+                    metadata: metadata("wu"),
+                    work_unit_id: orcas_core::authority::WorkUnitId::parse("turn-sandbox-wu")
+                        .expect("work unit id"),
+                    workstream_id: workstream.id.clone(),
+                    title: "Turn sandbox unit".to_string(),
+                    task_statement: "Exercise worker turn sandbox roots.".to_string(),
+                    status: WorkUnitStatus::Ready,
+                },
+            })
+            .await
+            .expect("authority work unit")
+            .work_unit;
+        let prepared = service
+            .prepare_assignment(ipc::AssignmentStartRequest {
+                work_unit_id: work_unit.id.to_string(),
+                worker_id: "worker-turn-sandbox".to_string(),
+                worker_kind: Some("codex".to_string()),
+                instructions: Some("Use the dedicated workspace.".to_string()),
+                model: None,
+                cwd: None,
+                ..Default::default()
+            })
+            .await
+            .expect("prepare assignment");
+        let worker_session = service
+            .ensure_worker_session_thread(
+                &prepared.assignment.worker_session_id,
+                None,
+                None,
+                Some(work_unit.id.as_str()),
+            )
+            .await
+            .expect("worker session thread");
+        let thread_id = worker_session.thread_id.clone().expect("thread id");
+        let tracked_thread_id = worker_session
+            .tracked_thread_id
+            .clone()
+            .expect("tracked thread id");
+        let tracked_thread = service
+            .authority_tracked_thread_get(ipc::AuthorityTrackedThreadGetRequest {
+                tracked_thread_id: tracked_thread_id.clone(),
+            })
+            .await
+            .expect("tracked thread")
+            .tracked_thread;
+        service
+            .authority_tracked_thread_edit(ipc::AuthorityTrackedThreadEditRequest {
+                command: orcas_core::authority::EditTrackedThread {
+                    metadata: metadata("tt"),
+                    tracked_thread_id: tracked_thread.id.clone(),
+                    expected_revision: tracked_thread.revision,
+                    changes: orcas_core::authority::TrackedThreadPatch {
+                        title: None,
+                        notes: None,
+                        backend_kind: None,
+                        upstream_thread_id: Some(Some(thread_id.clone())),
+                        binding_state: None,
+                        preferred_cwd: Some(Some("/home/emmy/git/worktree/orcas".to_string())),
+                        preferred_model: Some(Some("gpt-5.4".to_string())),
+                        last_seen_turn_id: None,
+                        workspace: Some(Some(orcas_core::authority::TrackedThreadWorkspace {
+                            repository_root: "/home/emmy/git/worktree/orcas".to_string(),
+                            owner_tracked_thread_id: tracked_thread_id,
+                            strategy:
+                                orcas_core::authority::TrackedThreadWorkspaceStrategy::DedicatedThreadWorktree,
+                            worktree_path: "/home/emmy/git/worktree/orcas-threads/turn-sandbox-tt"
+                                .to_string(),
+                            branch_name: "orcas/turn-sandbox-tt".to_string(),
+                            base_ref: "origin/main".to_string(),
+                            base_commit: Some("abc1234".to_string()),
+                            landing_target: "main".to_string(),
+                            landing_policy:
+                                orcas_core::authority::TrackedThreadWorkspaceLandingPolicy::MergeToMain,
+                            sync_policy:
+                                orcas_core::authority::TrackedThreadWorkspaceSyncPolicy::RebaseBeforeCompletion,
+                            cleanup_policy:
+                                orcas_core::authority::TrackedThreadWorkspaceCleanupPolicy::PruneAfterMerge,
+                            last_reported_head_commit: None,
+                            status: orcas_core::authority::TrackedThreadWorkspaceStatus::Requested,
+                        })),
+                    },
+                },
+            })
+            .await
+            .expect("tracked thread edit");
+        service
+            .sync_worker_session_tracked_thread_binding_for_assignment(
+                &prepared.assignment.worker_session_id,
+                work_unit.id.as_str(),
+            )
+            .await
+            .expect("bind tracked thread");
+
+        let worker_turn = service
+            .turn_start(ipc::TurnStartRequest {
+                thread_id: thread_id.clone(),
+                text: "Worker turn".to_string(),
+                cwd: Some("/home/emmy/git/worktree/orcas-threads/turn-sandbox-tt".to_string()),
+                model: None,
+            })
+            .await
+            .expect("worker turn");
+        let worker_policy = runtime
+            .lock()
+            .await
+            .last_turn_start_sandbox_policy
+            .clone()
+            .expect("worker sandbox policy");
+        match worker_policy {
+            types::SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
+                assert_eq!(
+                    writable_roots,
+                    vec!["/home/emmy/git/worktree/orcas-threads/turn-sandbox-tt".to_string()]
+                );
+            }
+            other => panic!("expected workspace-write sandbox policy, got {other:?}"),
+        }
+        service
+            .wait_for_turn_terminal(&thread_id, &worker_turn.turn_id)
+            .await
+            .expect("worker turn terminal");
+
+        let lifecycle_turn = service
+            .turn_start(ipc::TurnStartRequest {
+                thread_id,
+                text: "Lifecycle turn".to_string(),
+                cwd: Some("/home/emmy/git/worktree/orcas".to_string()),
+                model: None,
+            })
+            .await
+            .expect("lifecycle turn");
+        let lifecycle_policy = runtime
+            .lock()
+            .await
+            .last_turn_start_sandbox_policy
+            .clone()
+            .expect("lifecycle sandbox policy");
+        match lifecycle_policy {
+            types::SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
+                assert_eq!(
+                    writable_roots,
+                    vec![
+                        "/home/emmy/git/worktree/orcas-threads/turn-sandbox-tt".to_string(),
+                        "/home/emmy/git/worktree/orcas".to_string(),
+                        "/home/emmy/git/worktree/orcas-threads".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected workspace-write sandbox policy, got {other:?}"),
+        }
+        service
+            .wait_for_turn_terminal(&lifecycle_turn.thread_id, &lifecycle_turn.turn_id)
+            .await
+            .expect("lifecycle turn terminal");
     }
 
     #[test]
