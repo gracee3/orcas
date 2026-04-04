@@ -1312,9 +1312,7 @@ impl OrcasDaemonService {
             .collect::<Vec<_>>();
         for handle in handles {
             self.disconnect_runtime_handle(&handle).await;
-            if handle.route_key != RuntimeRouteKey::Shared {
-                let _ = handle.daemon.stop_background().await;
-            }
+            let _ = handle.daemon.stop_background().await;
         }
     }
 
@@ -19142,6 +19140,12 @@ worker epilogue"#;
         endpoint: String,
     }
 
+    #[derive(Debug)]
+    struct CountingCodexDaemonManager {
+        endpoint: String,
+        stop_calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl CodexDaemonManager for FakeCodexDaemonManager {
         async fn status(&self) -> OrcasResult<DaemonStatus> {
@@ -19162,6 +19166,32 @@ worker epilogue"#;
         }
 
         async fn stop_background(&self) -> OrcasResult<DaemonStatus> {
+            self.status().await
+        }
+    }
+
+    #[async_trait]
+    impl CodexDaemonManager for CountingCodexDaemonManager {
+        async fn status(&self) -> OrcasResult<DaemonStatus> {
+            Ok(DaemonStatus {
+                endpoint: self.endpoint.clone(),
+                reachable: true,
+                binary_path: PathBuf::from("fake-codex"),
+                log_path: PathBuf::from("/tmp/fake-codex.log"),
+            })
+        }
+
+        async fn ensure_running(&self, _launch: DaemonLaunch) -> OrcasResult<DaemonStatus> {
+            self.status().await
+        }
+
+        async fn spawn_background(&self) -> OrcasResult<DaemonStatus> {
+            self.status().await
+        }
+
+        async fn stop_background(&self) -> OrcasResult<DaemonStatus> {
+            self.stop_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.status().await
         }
     }
@@ -32350,6 +32380,58 @@ Boundedness note: Stay within the legacy compatibility boundary."#
         assert!(saw_assignment);
         assert!(saw_report);
         assert!(saw_decision);
+    }
+
+    #[tokio::test]
+    async fn shutdown_workstream_runtimes_stops_shared_handles_on_shutdown() {
+        let service = test_service().await;
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let handle = Arc::new(WorkstreamRuntimeHandle {
+            route_key: RuntimeRouteKey::Shared,
+            route_info: service.shared_runtime_route_info(),
+            daemon: Arc::new(CountingCodexDaemonManager {
+                endpoint: service.config.codex.listen_url.clone(),
+                stop_calls: Arc::clone(&stop_calls),
+            }),
+            client: Arc::clone(&service.codex_client),
+            connection_mode: OrcasDaemonService::workstream_connection_mode_from_config(
+                &service.config,
+            ),
+            summary: Mutex::new(ipc::WorkstreamRuntimeSummary {
+                workstream_id: String::new(),
+                status: "shared".to_string(),
+                transport_kind: orcas_core::authority::WorkstreamTransportKind::LocalAppServer,
+                app_server_policy:
+                    orcas_core::authority::WorkstreamAppServerPolicy::SharedCurrentDaemon,
+                connection_mode: OrcasDaemonService::workstream_connection_mode_from_config(
+                    &service.config,
+                ),
+                desired_listen_url: Some(service.config.codex.listen_url.clone()),
+                effective_listen_url: Some(service.config.codex.listen_url.clone()),
+                codex_home: String::new(),
+                sqlite_home: None,
+                owner_kind: Some("orcasd_shared_runtime".to_string()),
+                owner_pid: Some(service.runtime.pid),
+                thread_count: 0,
+                last_error: None,
+                started_at: Some(service.runtime.started_at),
+                updated_at: Utc::now(),
+            }),
+            connect_gate: Arc::new(Mutex::new(())),
+        });
+        service
+            .workstream_runtimes
+            .lock()
+            .await
+            .insert("__shared__".to_string(), handle);
+
+        service.shutdown_workstream_runtimes().await;
+
+        assert_eq!(
+            stop_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(service.workstream_runtimes.lock().await.is_empty());
     }
 
     #[tokio::test]
