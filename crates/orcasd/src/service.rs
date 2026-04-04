@@ -415,7 +415,11 @@ impl OrcasDaemonService {
 
     async fn initialize_state(&self) -> OrcasResult<()> {
         debug!("initializing daemon state from persisted store");
-        let stored = self.store.load().await.unwrap_or_default();
+        let (stored, needs_normalization) = self
+            .store
+            .load_with_normalization_flag()
+            .await
+            .unwrap_or((StoredState::default(), false));
         let bootstrap_persist;
         {
             let mut state = self.state.write().await;
@@ -452,7 +456,7 @@ impl OrcasDaemonService {
         }
         self.reconcile_worker_session_tracked_thread_bindings()
             .await?;
-        if bootstrap_persist {
+        if bootstrap_persist || needs_normalization {
             self.persist_collaboration_state().await?;
         }
         Ok(())
@@ -16106,7 +16110,7 @@ mod tests {
         CodexTurnEvent, CollaborationState, DecisionType, DraftAssignment, EventEnvelope,
         ImplementModeSpec, JsonSessionStore, OrcasError, OrcasEvent, OrcasResult,
         OrcasSessionStore, PlanExecutionKind, PlanRevisionProposalStatus, ProposedDecision, Report,
-        ReportConfidence, ReportDisposition, ReportParseResult, SupervisorContextPack,
+        ReportConfidence, ReportDisposition, ReportParseResult, StoredState, SupervisorContextPack,
         SupervisorProposal, SupervisorProposalEdits, SupervisorProposalFailureStage,
         SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorSummary,
         SupervisorTurnDecision, SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus,
@@ -27930,6 +27934,71 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             stored.collaboration.workstreams[&workstream.id].status,
             WorkstreamStatus::Active
         );
+    }
+
+    #[tokio::test]
+    async fn initialize_state_rewrites_seeded_state_into_canonical_shape() {
+        let base = std::env::temp_dir().join(format!("orcas-collab-test-{}", Uuid::new_v4()));
+        let state_file = base.join("data/state.json");
+        tokio::fs::create_dir_all(state_file.parent().expect("state dir"))
+            .await
+            .expect("create data dir");
+        tokio::fs::write(
+            &state_file,
+            r#"{
+  "registry": {
+    "threads": {},
+    "last_connected_endpoint": null
+  }
+}
+"#,
+        )
+        .await
+        .expect("seed state");
+
+        let service = test_service_at_with_reasoner(
+            base.clone(),
+            Arc::new(StaticSupervisorReasoner::default()),
+        )
+        .await;
+
+        let stored = service.store.load().await.expect("stored state");
+        assert!(stored.thread_views.is_empty());
+
+        let raw = tokio::fs::read_to_string(&state_file)
+            .await
+            .expect("read rewritten state");
+        let (_, needs_normalization) = StoredState::from_json_str_with_normalization(&raw)
+            .expect("canonical state should deserialize");
+        assert!(!needs_normalization);
+    }
+
+    #[tokio::test]
+    async fn initialize_state_leaves_canonical_state_json_unchanged() {
+        let base = std::env::temp_dir().join(format!("orcas-collab-test-{}", Uuid::new_v4()));
+        let state_file = base.join("data/state.json");
+        tokio::fs::create_dir_all(state_file.parent().expect("state dir"))
+            .await
+            .expect("create data dir");
+        let canonical = StoredState::default()
+            .to_pretty_json()
+            .expect("serialize canonical state");
+        let mut canonical_with_newline = canonical.clone();
+        canonical_with_newline.push('\n');
+        tokio::fs::write(&state_file, &canonical_with_newline)
+            .await
+            .expect("seed canonical state");
+
+        let _service = test_service_at_with_reasoner(
+            base.clone(),
+            Arc::new(StaticSupervisorReasoner::default()),
+        )
+        .await;
+
+        let rewritten = tokio::fs::read_to_string(&state_file)
+            .await
+            .expect("read canonical state");
+        assert_eq!(rewritten, canonical_with_newline);
     }
 
     #[tokio::test]

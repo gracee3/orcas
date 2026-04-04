@@ -1439,7 +1439,7 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
     let create_tracked_thread = run_orcas(
         &daemon,
         &[
-            "tracked-threads",
+            "threads",
             "create",
             "--workunit",
             &work_unit_id,
@@ -1470,12 +1470,7 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
 
     let get_output = run_orcas(
         &daemon,
-        &[
-            "tracked-threads",
-            "get",
-            "--tracked-thread",
-            &tracked_thread_id,
-        ],
+        &["threads", "get", "--tracked-thread", &tracked_thread_id],
     );
     assert!(
         get_output.status.success(),
@@ -1496,7 +1491,7 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
     let edit_output = run_orcas(
         &daemon,
         &[
-            "tracked-threads",
+            "threads",
             "edit",
             "--tracked-thread",
             &tracked_thread_id,
@@ -1537,12 +1532,7 @@ async fn real_cli_can_create_edit_and_delete_tracked_thread_via_canonical_cli() 
 
     let delete_output = run_orcas(
         &daemon,
-        &[
-            "tracked-threads",
-            "delete",
-            "--tracked-thread",
-            &tracked_thread_id,
-        ],
+        &["threads", "delete", "--tracked-thread", &tracked_thread_id],
     );
     assert!(
         delete_output.status.success(),
@@ -1640,7 +1630,7 @@ async fn real_cli_planning_session_approve_stages_revision_proposal_without_appl
     let approve_output = run_orcas(
         &daemon,
         &[
-            "planning-sessions",
+            "plan",
             "approve",
             "--session",
             &session_id,
@@ -1680,7 +1670,7 @@ async fn real_cli_planning_session_create_rejects_ready_for_review_shortcut_and_
 
     let invalid_create = run_orcas_with_env(
         &[
-            "planning-sessions",
+            "plan",
             "create",
             "--workstream",
             workstream_id,
@@ -1698,16 +1688,13 @@ async fn real_cli_planning_session_create_rejects_ready_for_review_shortcut_and_
     assert!(stdout(&invalid_create).is_empty());
     assert!(
         stderr(&invalid_create).contains(
-            "planning session create cannot mark a session ready for review; use planning-sessions mark-ready-for-review after creation"
+            "planning session create cannot mark a session ready for review; use plan mark-ready-for-review after creation"
         ),
         "stderr: {}",
         stderr(&invalid_create)
     );
 
-    let empty_list = run_orcas_with_env(
-        &["planning-sessions", "list", "--workstream", workstream_id],
-        &envs,
-    );
+    let empty_list = run_orcas_with_env(&["plan", "list", "--workstream", workstream_id], &envs);
     assert!(
         empty_list.status.success(),
         "stderr: {}",
@@ -1717,7 +1704,7 @@ async fn real_cli_planning_session_create_rejects_ready_for_review_shortcut_and_
 
     let valid_create = run_orcas_with_env(
         &[
-            "planning-sessions",
+            "plan",
             "create",
             "--workstream",
             workstream_id,
@@ -1755,10 +1742,7 @@ async fn real_cli_planning_session_create_rejects_ready_for_review_shortcut_and_
 
     let created_session_id =
         field_value(&valid_stdout, "planning_session_id").expect("create should print session id");
-    let created_list = run_orcas_with_env(
-        &["planning-sessions", "list", "--workstream", workstream_id],
-        &envs,
-    );
+    let created_list = run_orcas_with_env(&["plan", "list", "--workstream", workstream_id], &envs);
     assert!(
         created_list.status.success(),
         "stderr: {}",
@@ -1780,7 +1764,7 @@ async fn real_cli_planning_session_request_research_succeeds_once_and_rejects_re
 
     let first_output = run_orcas_with_env(
         &[
-            "planning-sessions",
+            "plan",
             "request-research",
             "--session",
             &session_id,
@@ -1812,7 +1796,7 @@ async fn real_cli_planning_session_request_research_succeeds_once_and_rejects_re
 
     let second_output = run_orcas_with_env(
         &[
-            "planning-sessions",
+            "plan",
             "request-research",
             "--session",
             &session_id,
@@ -1861,7 +1845,7 @@ async fn real_cli_planning_session_update_summary_stays_descriptive_and_rejects_
     let update_output = run_orcas(
         &daemon,
         &[
-            "planning-sessions",
+            "plan",
             "update-summary",
             "--session",
             &session_id,
@@ -1897,7 +1881,7 @@ async fn real_cli_planning_session_update_summary_stays_descriptive_and_rejects_
     let smuggle_output = run_orcas(
         &daemon,
         &[
-            "planning-sessions",
+            "plan",
             "update-summary",
             "--session",
             &session_id,
@@ -1954,7 +1938,7 @@ async fn real_cli_planning_session_mark_ready_for_review_explicitly_transitions_
     let ready_output = run_orcas(
         &daemon,
         &[
-            "planning-sessions",
+            "plan",
             "mark-ready-for-review",
             "--session",
             &ready_session_id,
@@ -1977,7 +1961,7 @@ async fn real_cli_planning_session_mark_ready_for_review_explicitly_transitions_
     let invalid_output = run_orcas(
         &daemon,
         &[
-            "planning-sessions",
+            "plan",
             "mark-ready-for-review",
             "--session",
             &invalid_session_id,
@@ -2003,7 +1987,7 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
     let _guard = planning_session_cli_test_lock().lock().await;
     let mut daemon = TestDaemon::spawn("cli-planning-help").await;
 
-    let root_help = run_orcas(&daemon, &["planning-sessions", "--help"]);
+    let root_help = run_orcas(&daemon, &["plan", "--help"]);
     assert!(root_help.status.success(), "stderr: {}", stderr(&root_help));
     let root_stdout = stdout(&root_help);
     assert!(root_stdout.contains("Supervisor-owned planning session orchestration"));
@@ -2013,7 +1997,7 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
     assert!(root_stdout.contains("update-summary"));
     assert!(root_stdout.contains("mark-ready-for-review"));
 
-    let create_help = run_orcas(&daemon, &["planning-sessions", "create", "--help"]);
+    let create_help = run_orcas(&daemon, &["plan", "create", "--help"]);
     assert!(
         create_help.status.success(),
         "stderr: {}",
@@ -2024,7 +2008,7 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
         "Create a draft planning session; readiness must be set later with mark-ready-for-review"
     ));
 
-    let approve_help = run_orcas(&daemon, &["planning-sessions", "approve", "--help"]);
+    let approve_help = run_orcas(&daemon, &["plan", "approve", "--help"]);
     assert!(
         approve_help.status.success(),
         "stderr: {}",
@@ -2036,10 +2020,7 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
             .contains("Stage a canonical plan revision proposal from the session summary")
     );
 
-    let research_help = run_orcas(
-        &daemon,
-        &["planning-sessions", "request-research", "--help"],
-    );
+    let research_help = run_orcas(&daemon, &["plan", "request-research", "--help"]);
     assert!(
         research_help.status.success(),
         "stderr: {}",
@@ -2048,7 +2029,7 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
     let research_stdout = stdout(&research_help);
     assert!(research_stdout.contains("bounded one-turn research assignment"));
 
-    let update_help = run_orcas(&daemon, &["planning-sessions", "update-summary", "--help"]);
+    let update_help = run_orcas(&daemon, &["plan", "update-summary", "--help"]);
     assert!(
         update_help.status.success(),
         "stderr: {}",
@@ -2059,10 +2040,7 @@ async fn real_cli_planning_session_help_mentions_lifecycle_boundaries() {
         "Update the descriptive planning summary only; use mark-ready-for-review for readiness"
     ));
 
-    let ready_help = run_orcas(
-        &daemon,
-        &["planning-sessions", "mark-ready-for-review", "--help"],
-    );
+    let ready_help = run_orcas(&daemon, &["plan", "mark-ready-for-review", "--help"]);
     assert!(
         ready_help.status.success(),
         "stderr: {}",
@@ -2240,7 +2218,6 @@ async fn real_cli_can_discover_pending_review_item_via_queue_and_history() {
     let queue_output = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "queue",
             "--assignment",
@@ -2265,7 +2242,6 @@ async fn real_cli_can_discover_pending_review_item_via_queue_and_history() {
     let history_output = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "history",
             "--assignment",
@@ -2298,7 +2274,7 @@ async fn real_cli_can_fetch_pending_review_item_detail_via_get() {
 
     let get_output = run_orcas(
         &daemon,
-        &["codex", "review", "get", "--decision", &pending_decision_id],
+        &["review", "get", "--decision", &pending_decision_id],
     );
     assert!(
         get_output.status.success(),
@@ -2340,7 +2316,6 @@ async fn real_cli_can_approve_pending_review_item() {
     let approve_output = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "approve",
             "--decision",
@@ -2372,7 +2347,7 @@ async fn real_cli_can_approve_pending_review_item() {
 
     let get_output = run_orcas(
         &daemon,
-        &["codex", "review", "get", "--decision", &pending_decision_id],
+        &["review", "get", "--decision", &pending_decision_id],
     );
     assert!(
         get_output.status.success(),
@@ -2401,7 +2376,6 @@ async fn real_cli_can_reject_pending_review_item() {
     let reject_output = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "reject",
             "--decision",
@@ -2432,7 +2406,7 @@ async fn real_cli_can_reject_pending_review_item() {
 
     let get_output = run_orcas(
         &daemon,
-        &["codex", "review", "get", "--decision", &pending_decision_id],
+        &["review", "get", "--decision", &pending_decision_id],
     );
     assert!(
         get_output.status.success(),
@@ -2460,7 +2434,6 @@ async fn real_cli_review_queue_and_history_reflect_approval_transition() {
     let queue_before = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "queue",
             "--assignment",
@@ -2479,7 +2452,6 @@ async fn real_cli_review_queue_and_history_reflect_approval_transition() {
     let approve_output = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "approve",
             "--decision",
@@ -2499,7 +2471,6 @@ async fn real_cli_review_queue_and_history_reflect_approval_transition() {
     let queue_after = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "queue",
             "--assignment",
@@ -2517,7 +2488,6 @@ async fn real_cli_review_queue_and_history_reflect_approval_transition() {
     let history_after = run_orcas(
         &daemon,
         &[
-            "codex",
             "review",
             "history",
             "--assignment",
@@ -2548,7 +2518,7 @@ async fn real_cli_reports_missing_review_item_with_nonzero_exit() {
 
     let output = run_orcas(
         &daemon,
-        &["codex", "review", "get", "--decision", "missing-decision"],
+        &["review", "get", "--decision", "missing-decision"],
     );
     assert!(!output.status.success());
     assert!(stdout(&output).is_empty());
