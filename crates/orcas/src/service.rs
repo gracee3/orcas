@@ -1047,8 +1047,22 @@ impl SupervisorService {
         title: String,
         objective: String,
         priority: Option<String>,
+        codex_home: Option<String>,
+        sqlite_home: Option<String>,
+        listen_url: Option<String>,
+        transport_kind: Option<authority::WorkstreamTransportKind>,
+        app_server_policy: Option<authority::WorkstreamAppServerPolicy>,
+        connection_mode: Option<authority::WorkstreamExecutionConnectionMode>,
     ) -> Result<()> {
         let client = self.daemon_state_client().await?;
+        let execution_scope = build_execution_scope(
+            codex_home,
+            sqlite_home,
+            listen_url,
+            transport_kind,
+            app_server_policy,
+            connection_mode,
+        )?;
         let response = client
             .authority_workstream_create(&ipc::AuthorityWorkstreamCreateRequest {
                 command: authority::CreateWorkstream {
@@ -1058,6 +1072,7 @@ impl SupervisorService {
                     objective,
                     status: WorkstreamStatus::Active,
                     priority: priority.unwrap_or_else(|| "medium".to_string()),
+                    execution_scope,
                 },
             })
             .await?;
@@ -1065,6 +1080,7 @@ impl SupervisorService {
         println!("workstream_id: {}", response.workstream.id);
         println!("revision: {}", response.workstream.revision.get());
         println!("status: {:?}", response.workstream.status);
+        print_workstream_execution_scope(response.workstream.execution_scope.as_ref());
         Ok(())
     }
 
@@ -1075,6 +1091,13 @@ impl SupervisorService {
         objective: Option<String>,
         status: Option<WorkstreamStatus>,
         priority: Option<String>,
+        codex_home: Option<String>,
+        sqlite_home: Option<String>,
+        listen_url: Option<String>,
+        transport_kind: Option<authority::WorkstreamTransportKind>,
+        app_server_policy: Option<authority::WorkstreamAppServerPolicy>,
+        connection_mode: Option<authority::WorkstreamExecutionConnectionMode>,
+        clear_execution_scope: bool,
     ) -> Result<()> {
         let client = self.daemon_state_client().await?;
         let existing = client
@@ -1082,11 +1105,22 @@ impl SupervisorService {
                 workstream_id: authority::WorkstreamId::parse(workstream_id.to_string())?,
             })
             .await?;
+        let execution_scope = build_execution_scope_patch(
+            clear_execution_scope,
+            codex_home,
+            sqlite_home,
+            listen_url,
+            transport_kind,
+            app_server_policy,
+            connection_mode,
+            existing.workstream.execution_scope.clone(),
+        )?;
         let patch = authority::WorkstreamPatch {
             title,
             objective,
             status,
             priority,
+            execution_scope,
         };
         if patch.is_empty() {
             bail!("supply at least one workstream field to edit");
@@ -1105,6 +1139,7 @@ impl SupervisorService {
         println!("workstream_id: {}", response.workstream.id);
         println!("revision: {}", response.workstream.revision.get());
         println!("status: {:?}", response.workstream.status);
+        print_workstream_execution_scope(response.workstream.execution_scope.as_ref());
         Ok(())
     }
 
@@ -1143,11 +1178,16 @@ impl SupervisorService {
             .await?;
         for workstream in response.workstreams {
             println!(
-                "{}\trev={}\t{:?}\t{}\t{}",
+                "{}\trev={}\t{:?}\t{}\t{}\t{}",
                 workstream.id,
                 workstream.revision.get(),
                 workstream.status,
                 workstream.priority,
+                workstream
+                    .execution_scope
+                    .as_ref()
+                    .map(|scope| format!("{:?}", scope.app_server_policy).to_ascii_lowercase())
+                    .unwrap_or_else(|| "unset".to_string()),
                 workstream.title
             );
         }
@@ -1234,6 +1274,7 @@ impl SupervisorService {
         println!("objective: {}", response.workstream.objective);
         println!("status: {:?}", response.workstream.status);
         println!("priority: {}", response.workstream.priority);
+        print_workstream_execution_scope(response.workstream.execution_scope.as_ref());
         println!("revision: {}", response.workstream.revision.get());
         println!("origin_node_id: {}", response.workstream.origin_node_id);
         println!("work_units: {}", response.work_units.len());
@@ -1649,6 +1690,26 @@ impl SupervisorService {
                 for warning in &inspection.warnings {
                     println!("workspace_local_warning: {:?}", warning);
                 }
+            }
+        }
+        if let Some(scope) = response.workspace_filesystem_scope.as_ref() {
+            println!("workspace_scope: filesystem_contract");
+            println!("workspace_fs_repository_root: {}", scope.repository_root);
+            println!("workspace_fs_worktree_path: {}", scope.worktree_path);
+            println!("workspace_fs_worktree_parent: {}", scope.worktree_parent);
+            println!(
+                "workspace_fs_git_dir: {}",
+                scope.git_dir.as_deref().unwrap_or("unset")
+            );
+            println!(
+                "workspace_fs_git_common_dir: {}",
+                scope.git_common_dir.as_deref().unwrap_or("unset")
+            );
+            for root in &scope.worker_turn_roots {
+                println!("workspace_fs_worker_turn_root: {root}");
+            }
+            for root in &scope.workspace_lifecycle_roots {
+                println!("workspace_fs_lifecycle_root: {root}");
             }
         }
         if let Some(operation) = response.workspace_operation.as_ref() {
@@ -5091,6 +5152,127 @@ impl SupervisorService {
             draft.boundedness_note
         );
     }
+}
+
+fn build_execution_scope(
+    codex_home: Option<String>,
+    sqlite_home: Option<String>,
+    listen_url: Option<String>,
+    transport_kind: Option<authority::WorkstreamTransportKind>,
+    app_server_policy: Option<authority::WorkstreamAppServerPolicy>,
+    connection_mode: Option<authority::WorkstreamExecutionConnectionMode>,
+) -> Result<Option<authority::WorkstreamExecutionScope>> {
+    Ok(
+        match (
+            codex_home,
+            sqlite_home,
+            listen_url,
+            transport_kind,
+            app_server_policy,
+            connection_mode,
+        ) {
+            (None, None, None, None, None, None) => None,
+            (
+                Some(codex_home),
+                sqlite_home,
+                listen_url,
+                transport_kind,
+                app_server_policy,
+                connection_mode,
+            ) => Some(authority::WorkstreamExecutionScope {
+                codex_home,
+                sqlite_home,
+                listen_url,
+                transport_kind: transport_kind.unwrap_or_default(),
+                app_server_policy: app_server_policy.unwrap_or_default(),
+                connection_mode: connection_mode.unwrap_or_default(),
+            }),
+            _ => bail!("`--codex-home` is required when setting workstream execution scope"),
+        },
+    )
+}
+
+fn build_execution_scope_patch(
+    clear_execution_scope: bool,
+    codex_home: Option<String>,
+    sqlite_home: Option<String>,
+    listen_url: Option<String>,
+    transport_kind: Option<authority::WorkstreamTransportKind>,
+    app_server_policy: Option<authority::WorkstreamAppServerPolicy>,
+    connection_mode: Option<authority::WorkstreamExecutionConnectionMode>,
+    existing: Option<authority::WorkstreamExecutionScope>,
+) -> Result<Option<Option<authority::WorkstreamExecutionScope>>> {
+    if clear_execution_scope {
+        return Ok(Some(None));
+    }
+    if codex_home.is_none()
+        && sqlite_home.is_none()
+        && listen_url.is_none()
+        && transport_kind.is_none()
+        && app_server_policy.is_none()
+        && connection_mode.is_none()
+    {
+        return Ok(None);
+    }
+    let mut scope = existing.unwrap_or_else(|| authority::WorkstreamExecutionScope {
+        codex_home: String::new(),
+        sqlite_home: None,
+        listen_url: None,
+        transport_kind: authority::WorkstreamTransportKind::default(),
+        app_server_policy: authority::WorkstreamAppServerPolicy::default(),
+        connection_mode: authority::WorkstreamExecutionConnectionMode::default(),
+    });
+    if let Some(value) = codex_home {
+        scope.codex_home = value;
+    }
+    if let Some(value) = sqlite_home {
+        scope.sqlite_home = Some(value);
+    }
+    if let Some(value) = listen_url {
+        scope.listen_url = Some(value);
+    }
+    if let Some(value) = transport_kind {
+        scope.transport_kind = value;
+    }
+    if let Some(value) = app_server_policy {
+        scope.app_server_policy = value;
+    }
+    if let Some(value) = connection_mode {
+        scope.connection_mode = value;
+    }
+    if scope.codex_home.is_empty() {
+        bail!("`--codex-home` is required when creating or updating workstream execution scope");
+    }
+    Ok(Some(Some(scope)))
+}
+
+fn print_workstream_execution_scope(scope: Option<&authority::WorkstreamExecutionScope>) {
+    let Some(scope) = scope else {
+        println!("execution_scope: unset");
+        return;
+    };
+    println!("execution_scope: set");
+    println!("execution_scope_codex_home: {}", scope.codex_home);
+    println!(
+        "execution_scope_sqlite_home: {}",
+        scope.sqlite_home.as_deref().unwrap_or("unset")
+    );
+    println!(
+        "execution_scope_listen_url: {}",
+        scope.listen_url.as_deref().unwrap_or("unset")
+    );
+    println!(
+        "execution_scope_transport_kind: {}",
+        format!("{:?}", scope.transport_kind).to_ascii_lowercase()
+    );
+    println!(
+        "execution_scope_app_server_policy: {}",
+        format!("{:?}", scope.app_server_policy).to_ascii_lowercase()
+    );
+    println!(
+        "execution_scope_connection_mode: {}",
+        format!("{:?}", scope.connection_mode).to_ascii_lowercase()
+    );
 }
 
 #[cfg(test)]

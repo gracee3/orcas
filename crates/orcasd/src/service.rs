@@ -2628,6 +2628,9 @@ impl OrcasDaemonService {
         } else {
             None
         };
+        let workspace_filesystem_scope = tracked_thread.workspace.as_ref().map(|workspace| {
+            crate::workspace_inspection::derive_workspace_filesystem_scope_sync(workspace)
+        });
         let workspace_operation = self
             .latest_workspace_operation_for_tracked_thread(&params.tracked_thread_id)
             .await?;
@@ -2663,6 +2666,7 @@ impl OrcasDaemonService {
         Ok(ipc::AuthorityTrackedThreadGetResponse {
             tracked_thread,
             workspace_inspection,
+            workspace_filesystem_scope,
             workspace_operation,
             prune_workspace_operation,
             merge_prep_assessment,
@@ -4508,19 +4512,26 @@ impl OrcasDaemonService {
                 .collaboration
                 .assignment_communications
                 .get(&assignment_id)
-                .map(|record| record.prompt_render.prompt_text.clone())
+                .map(|record| {
+                    (
+                        record.prompt_render.prompt_text.clone(),
+                        record.packet.execution_context.cwd.clone(),
+                        record.packet.execution_context.requested_model.clone(),
+                    )
+                })
                 .ok_or_else(|| {
                     OrcasError::Protocol(format!(
                         "missing assignment communication record for `{assignment_id}`"
                     ))
                 })?
         };
+        let (prompt, turn_cwd, turn_model) = prompt;
         let turn = match self
             .turn_start(ipc::TurnStartRequest {
                 thread_id: thread_id.clone(),
                 text: prompt,
-                cwd: None,
-                model: None,
+                cwd: turn_cwd,
+                model: turn_model,
             })
             .await
         {
@@ -10934,6 +10945,7 @@ impl OrcasDaemonService {
                         .unwrap_or_else(|| source_assignment.worker_id.clone());
                     let worker_session_id = Self::select_worker_session_for_assignment(
                         &mut state.collaboration,
+                        &params.work_unit_id,
                         &worker_id,
                         params
                             .worker_kind
@@ -11226,6 +11238,7 @@ impl OrcasDaemonService {
                 // protocol object. A new execution segment always gets its own explicit assignment id.
                 let worker_session_id = Self::select_worker_session_for_assignment(
                     &mut state.collaboration,
+                    &params.work_unit_id,
                     &params.worker_id,
                     params
                         .worker_kind
@@ -13728,6 +13741,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
 
     fn select_worker_session_for_assignment(
         collaboration: &mut CollaborationState,
+        work_unit_id: &str,
         worker_id: &str,
         worker_kind: String,
     ) -> String {
@@ -13742,18 +13756,23 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             });
 
         if let Some(session_id) = collaboration
-            .worker_sessions
+            .assignments
             .values()
-            .filter(|session| {
-                session.worker_id == worker_id
-                    && session.runtime_status != WorkerSessionRuntimeStatus::Lost
+            .filter(|assignment| {
+                assignment.work_unit_id == work_unit_id && assignment.worker_id == worker_id
             })
             .max_by(|left, right| {
-                left.updated_at
-                    .cmp(&right.updated_at)
-                    .then_with(|| left.id.cmp(&right.id))
+                left.attempt_number
+                    .cmp(&right.attempt_number)
+                    .then_with(|| left.updated_at.cmp(&right.updated_at))
             })
-            .map(|session| session.id.clone())
+            .and_then(|assignment| {
+                collaboration
+                    .worker_sessions
+                    .get(&assignment.worker_session_id)
+                    .filter(|session| session.runtime_status != WorkerSessionRuntimeStatus::Lost)
+                    .map(|session| session.id.clone())
+            })
         {
             return session_id;
         }
@@ -16140,6 +16159,104 @@ mod tests {
         }
     }
 
+    #[test]
+    fn select_worker_session_for_assignment_reuses_only_same_work_unit_lane() {
+        let mut collaboration = CollaborationState::default();
+        let now = Utc::now();
+        collaboration.assignments.insert(
+            "assignment-1".to_string(),
+            Assignment {
+                id: "assignment-1".to_string(),
+                work_unit_id: "wu-1".to_string(),
+                plan_id: None,
+                plan_version: None,
+                plan_item_id: None,
+                execution_kind: PlanExecutionKind::DirectExecution,
+                alignment_rationale: None,
+                worker_id: "worker-a".to_string(),
+                worker_session_id: "session-1".to_string(),
+                instructions: "one".to_string(),
+                communication_seed: None,
+                status: AssignmentStatus::Closed,
+                attempt_number: 1,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        collaboration.assignments.insert(
+            "assignment-2".to_string(),
+            Assignment {
+                id: "assignment-2".to_string(),
+                work_unit_id: "wu-2".to_string(),
+                plan_id: None,
+                plan_version: None,
+                plan_item_id: None,
+                execution_kind: PlanExecutionKind::DirectExecution,
+                alignment_rationale: None,
+                worker_id: "worker-a".to_string(),
+                worker_session_id: "session-2".to_string(),
+                instructions: "two".to_string(),
+                communication_seed: None,
+                status: AssignmentStatus::Closed,
+                attempt_number: 1,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        collaboration.worker_sessions.insert(
+            "session-1".to_string(),
+            orcas_core::WorkerSession {
+                id: "session-1".to_string(),
+                worker_id: "worker-a".to_string(),
+                backend_type: "codex_thread".to_string(),
+                thread_id: Some("thread-1".to_string()),
+                tracked_thread_id: Some(
+                    orcas_core::authority::TrackedThreadId::parse("tt-1")
+                        .expect("tracked thread id"),
+                ),
+                active_turn_id: None,
+                runtime_status: WorkerSessionRuntimeStatus::Idle,
+                attachability: WorkerSessionAttachability::Unknown,
+                updated_at: now,
+            },
+        );
+        collaboration.worker_sessions.insert(
+            "session-2".to_string(),
+            orcas_core::WorkerSession {
+                id: "session-2".to_string(),
+                worker_id: "worker-a".to_string(),
+                backend_type: "codex_thread".to_string(),
+                thread_id: Some("thread-2".to_string()),
+                tracked_thread_id: Some(
+                    orcas_core::authority::TrackedThreadId::parse("tt-2")
+                        .expect("tracked thread id"),
+                ),
+                active_turn_id: None,
+                runtime_status: WorkerSessionRuntimeStatus::Idle,
+                attachability: WorkerSessionAttachability::Unknown,
+                updated_at: now,
+            },
+        );
+
+        let reused = OrcasDaemonService::select_worker_session_for_assignment(
+            &mut collaboration,
+            "wu-1",
+            "worker-a",
+            "codex".to_string(),
+        );
+        let fresh = OrcasDaemonService::select_worker_session_for_assignment(
+            &mut collaboration,
+            "wu-3",
+            "worker-a",
+            "codex".to_string(),
+        );
+
+        assert_eq!(reused, "session-1");
+        assert_ne!(fresh, "session-1");
+        assert_ne!(fresh, "session-2");
+        assert!(collaboration.worker_sessions.contains_key(&fresh));
+    }
+
     #[tokio::test]
     async fn boxed_ipc_request_dispatch_handles_daemon_status() {
         let service = test_service().await;
@@ -18122,6 +18239,7 @@ worker epilogue"#;
                 .expect("plan item for work unit");
             let worker_session_id = OrcasDaemonService::select_worker_session_for_assignment(
                 &mut state.collaboration,
+                work_unit.id.as_str(),
                 &worker_id,
                 "codex".to_string(),
             );
@@ -26923,6 +27041,7 @@ ORCAS_REPORT_END"#
                     objective: "Exercise worker workspace contracts".to_string(),
                     status: WorkstreamStatus::Active,
                     priority: "high".to_string(),
+                    execution_scope: None,
                 },
             })
             .await
@@ -27084,6 +27203,25 @@ ORCAS_REPORT_END"#
                 .prompt_text
                 .contains("workspace_report")
         );
+        assert_eq!(
+            refreshed_record
+                .packet
+                .execution_context
+                .repo_root
+                .as_deref(),
+            Some("/home/emmy/git/worktree/orcas")
+        );
+        assert_eq!(
+            refreshed_record.packet.execution_context.cwd.as_deref(),
+            Some("/home/emmy/git/worktree/orcas-threads/workspace-tt")
+        );
+        assert!(
+            refreshed_record
+                .packet
+                .execution_context
+                .related_repo_roots
+                .contains(&"/home/emmy/git/worktree/orcas-threads/workspace-tt".to_string())
+        );
 
         let raw_output = wrap_report_envelope(
             &serde_json::to_string(&serde_json::json!({
@@ -27203,6 +27341,7 @@ ORCAS_REPORT_END"#
                     objective: "Exercise explicit binding timing".to_string(),
                     status: WorkstreamStatus::Active,
                     priority: "high".to_string(),
+                    execution_scope: None,
                 },
             })
             .await
@@ -27326,6 +27465,7 @@ ORCAS_REPORT_END"#
                     objective: "Exercise auto tracked thread binding".to_string(),
                     status: WorkstreamStatus::Active,
                     priority: "high".to_string(),
+                    execution_scope: None,
                 },
             })
             .await
@@ -27440,6 +27580,7 @@ ORCAS_REPORT_END"#
                     objective: "Bind one existing unbound lane".to_string(),
                     status: WorkstreamStatus::Active,
                     priority: "high".to_string(),
+                    execution_scope: None,
                 },
             })
             .await
@@ -29468,6 +29609,7 @@ Boundedness note: Stay within the legacy compatibility boundary."#
                     objective: "Exercise authority API".to_string(),
                     status: WorkstreamStatus::Active,
                     priority: "high".to_string(),
+                    execution_scope: None,
                 },
             })
             .await

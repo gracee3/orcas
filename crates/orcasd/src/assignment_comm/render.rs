@@ -24,6 +24,7 @@ use crate::assignment_comm::{
     REPORT_MARKER_BEGIN, REPORT_MARKER_END, WORKER_REPORT_CONTRACT_SCHEMA_VERSION,
     WORKER_REPORT_ENVELOPE_SCHEMA_VERSION, json_fingerprint,
 };
+use crate::workspace_inspection::derive_workspace_filesystem_scope_sync;
 
 const SECTION_ORDER: &[&str] = &[
     "worker_contract",
@@ -109,20 +110,13 @@ pub fn build_assignment_communication_record(
             ))
         })?;
 
-    let execution_context = AssignmentExecutionContext {
-        runtime_kind: "codex_app_server".to_string(),
-        repo_root: requested_cwd
-            .as_ref()
-            .map(|path| resolve_execution_path(Path::new(path)))
-            .or_else(|| default_cwd.map(|path| resolve_execution_path(path.as_path()))),
-        cwd: requested_cwd
-            .as_ref()
-            .map(|path| resolve_execution_path(Path::new(path)))
-            .or_else(|| default_cwd.map(|path| resolve_execution_path(path.as_path()))),
-        related_repo_roots: Vec::new(),
+    let execution_context = derive_execution_context(
         requested_model,
-        shell: std::env::var("SHELL").ok(),
-    };
+        requested_cwd,
+        default_cwd,
+        workspace_contract.as_ref(),
+        assignment.communication_seed.as_ref(),
+    );
 
     let response_contract = worker_report_contract();
     let packet = if let Some(seed) = assignment.communication_seed.as_ref() {
@@ -781,12 +775,15 @@ fn derive_legacy_stop_conditions(legacy: &LegacyInstructionSeed) -> Vec<Assignme
 fn derive_structured_allowed_scope(
     execution_context: &AssignmentExecutionContext,
 ) -> AssignmentScopeBoundary {
-    let allowed_write_paths = execution_context
+    let mut allowed_write_paths = execution_context
         .repo_root
         .clone()
-        .or_else(|| execution_context.cwd.clone())
         .into_iter()
+        .chain(execution_context.cwd.clone())
+        .chain(execution_context.related_repo_roots.iter().cloned())
         .collect::<Vec<_>>();
+    allowed_write_paths.sort();
+    allowed_write_paths.dedup();
     AssignmentScopeBoundary {
         change_policy: AssignmentChangePolicy::CodeAllowed,
         allowed_operations: vec![
@@ -813,6 +810,71 @@ fn resolve_execution_path(path: &Path) -> String {
         .unwrap_or(candidate)
         .display()
         .to_string()
+}
+
+fn derive_execution_context(
+    requested_model: Option<String>,
+    requested_cwd: Option<String>,
+    default_cwd: Option<&PathBuf>,
+    workspace_contract: Option<&AssignmentWorkspaceContract>,
+    communication_seed: Option<&AssignmentCommunicationSeed>,
+) -> AssignmentExecutionContext {
+    let default_cwd = requested_cwd
+        .as_ref()
+        .map(|path| resolve_execution_path(Path::new(path)))
+        .or_else(|| default_cwd.map(|path| resolve_execution_path(path.as_path())));
+
+    let workspace_scope = workspace_contract
+        .map(|contract| derive_workspace_filesystem_scope_sync(&contract.workspace));
+    let workspace_operation_kind = communication_seed
+        .and_then(|seed| seed.workspace_operation.as_ref())
+        .map(|operation| operation.kind);
+    let is_lifecycle_operation = matches!(
+        workspace_operation_kind,
+        Some(
+            TrackedThreadWorkspaceOperationKind::PrepareWorkspace
+                | TrackedThreadWorkspaceOperationKind::RefreshWorkspace
+                | TrackedThreadWorkspaceOperationKind::MergePrep
+                | TrackedThreadWorkspaceOperationKind::PruneWorkspace
+        )
+    ) || communication_seed
+        .is_some_and(|seed| seed.prune_workspace.is_some() || seed.landing_execution.is_some());
+
+    let repo_root = workspace_contract
+        .map(|contract| resolve_execution_path(Path::new(&contract.workspace.repository_root)))
+        .or_else(|| default_cwd.clone());
+    let cwd = if let Some(contract) = workspace_contract {
+        if is_lifecycle_operation {
+            Some(resolve_execution_path(Path::new(
+                &contract.workspace.repository_root,
+            )))
+        } else {
+            Some(resolve_execution_path(Path::new(
+                &contract.workspace.worktree_path,
+            )))
+        }
+    } else {
+        default_cwd.clone()
+    };
+
+    let related_repo_roots = workspace_scope
+        .map(|scope| {
+            if is_lifecycle_operation {
+                scope.workspace_lifecycle_roots
+            } else {
+                scope.worker_turn_roots
+            }
+        })
+        .unwrap_or_default();
+
+    AssignmentExecutionContext {
+        runtime_kind: "codex_app_server".to_string(),
+        repo_root,
+        cwd,
+        related_repo_roots,
+        requested_model,
+        shell: std::env::var("SHELL").ok(),
+    }
 }
 
 fn derive_legacy_allowed_scope(
@@ -1374,6 +1436,28 @@ mod tests {
         }
     }
 
+    fn sample_workspace_contract() -> orcas_core::AssignmentWorkspaceContract {
+        orcas_core::AssignmentWorkspaceContract {
+            tracked_thread_id: TrackedThreadId::parse("tt-1").expect("tracked thread id"),
+            tracked_thread_title: "Tracked thread".to_string(),
+            workspace: TrackedThreadWorkspace {
+                repository_root: "/repo".to_string(),
+                owner_tracked_thread_id: TrackedThreadId::parse("tt-1").expect("tracked thread id"),
+                strategy: TrackedThreadWorkspaceStrategy::DedicatedThreadWorktree,
+                worktree_path: "/repo/worktrees/tt-1".to_string(),
+                branch_name: "orcas/tt-1".to_string(),
+                base_ref: "origin/main".to_string(),
+                base_commit: Some("base-123".to_string()),
+                landing_target: "origin/main".to_string(),
+                landing_policy: TrackedThreadWorkspaceLandingPolicy::MergeToMain,
+                sync_policy: TrackedThreadWorkspaceSyncPolicy::Manual,
+                cleanup_policy: TrackedThreadWorkspaceCleanupPolicy::KeepUntilCampaignClosed,
+                last_reported_head_commit: None,
+                status: TrackedThreadWorkspaceStatus::Requested,
+            },
+        }
+    }
+
     #[test]
     fn worker_report_contract_uses_exact_markers_and_single_envelope_policy() {
         let contract = worker_report_contract();
@@ -1774,6 +1858,90 @@ mod tests {
                 .contains("Runtime kind: codex_app_server")
         );
         assert!(record.prompt_render.prompt_text.contains("Cwd:"));
+    }
+
+    #[test]
+    fn build_assignment_record_uses_workspace_worktree_for_normal_worker_turns() {
+        let collaboration = sample_collaboration();
+        let assignment = sample_assignment(Some(sample_seed()), "legacy instructions unused");
+        let workspace_contract = sample_workspace_contract();
+
+        let record = build_assignment_communication_record(
+            &collaboration,
+            &assignment,
+            Some("gpt-5".to_string()),
+            None,
+            None,
+            Some(workspace_contract.clone()),
+            fixed_now(),
+        )
+        .expect("build communication record");
+
+        assert_eq!(
+            record.packet.execution_context.repo_root.as_deref(),
+            Some("/repo")
+        );
+        assert_eq!(
+            record.packet.execution_context.cwd.as_deref(),
+            Some("/repo/worktrees/tt-1")
+        );
+        assert!(
+            record
+                .packet
+                .execution_context
+                .related_repo_roots
+                .contains(&"/repo/worktrees/tt-1".to_string())
+        );
+    }
+
+    #[test]
+    fn build_assignment_record_uses_repository_root_for_workspace_lifecycle_turns() {
+        let collaboration = sample_collaboration();
+        let mut seed = sample_seed();
+        let workspace_contract = sample_workspace_contract();
+        seed.workspace_operation = Some(TrackedThreadWorkspaceOperationContract {
+            kind: TrackedThreadWorkspaceOperationKind::PrepareWorkspace,
+            tracked_thread_id: workspace_contract.tracked_thread_id.clone(),
+            tracked_thread_title: workspace_contract.tracked_thread_title.clone(),
+            workspace: workspace_contract.workspace.clone(),
+            requested_by: Some("supervisor".to_string()),
+            request_note: None,
+        });
+        let assignment = sample_assignment(Some(seed), "legacy instructions unused");
+
+        let record = build_assignment_communication_record(
+            &collaboration,
+            &assignment,
+            Some("gpt-5".to_string()),
+            None,
+            None,
+            Some(workspace_contract),
+            fixed_now(),
+        )
+        .expect("build communication record");
+
+        assert_eq!(
+            record.packet.execution_context.repo_root.as_deref(),
+            Some("/repo")
+        );
+        assert_eq!(
+            record.packet.execution_context.cwd.as_deref(),
+            Some("/repo")
+        );
+        assert!(
+            record
+                .packet
+                .execution_context
+                .related_repo_roots
+                .contains(&"/repo".to_string())
+        );
+        assert!(
+            record
+                .packet
+                .execution_context
+                .related_repo_roots
+                .contains(&"/repo/worktrees".to_string())
+        );
     }
 
     #[test]

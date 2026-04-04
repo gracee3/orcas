@@ -2568,10 +2568,27 @@ pub struct AuthorityTrackedThreadGetRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackedThreadWorkspaceFilesystemScope {
+    pub repository_root: String,
+    pub worktree_path: String,
+    pub worktree_parent: String,
+    #[serde(default)]
+    pub git_dir: Option<String>,
+    #[serde(default)]
+    pub git_common_dir: Option<String>,
+    #[serde(default)]
+    pub worker_turn_roots: Vec<String>,
+    #[serde(default)]
+    pub workspace_lifecycle_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorityTrackedThreadGetResponse {
     pub tracked_thread: authority::TrackedThreadRecord,
     #[serde(default)]
     pub workspace_inspection: Option<TrackedThreadWorkspaceInspection>,
+    #[serde(default)]
+    pub workspace_filesystem_scope: Option<TrackedThreadWorkspaceFilesystemScope>,
     #[serde(default)]
     pub workspace_operation: Option<WorkspaceOperationRecord>,
     #[serde(default)]

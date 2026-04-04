@@ -52,6 +52,7 @@ async fn create_workstream(
                 objective: format!("Objective for {title}"),
                 status: WorkstreamStatus::Active,
                 priority: "high".to_string(),
+                execution_scope: None,
             },
         })
         .await
@@ -238,6 +239,7 @@ async fn authority_update_and_revision_behavior_over_real_socket() {
                     objective: Some("Updated objective".to_string()),
                     status: Some(WorkstreamStatus::Completed),
                     priority: Some("urgent".to_string()),
+                    execution_scope: None,
                 },
             },
         })
@@ -273,6 +275,7 @@ async fn authority_update_and_revision_behavior_over_real_socket() {
                     objective: None,
                     status: None,
                     priority: None,
+                    execution_scope: None,
                 },
             },
         })

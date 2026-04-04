@@ -52,6 +52,7 @@ async fn create_authority_workstream(
                 objective: format!("Objective for {title}"),
                 status: WorkstreamStatus::Active,
                 priority: "high".to_string(),
+                execution_scope: None,
             },
         })
         .await
@@ -357,6 +358,7 @@ async fn authority_mutations_emit_post_commit_events_for_all_authority_entities(
                     objective: None,
                     status: Some(WorkstreamStatus::Completed),
                     priority: None,
+                    execution_scope: None,
                 },
             },
         })
@@ -947,6 +949,7 @@ async fn failed_authority_mutation_does_not_emit_lifecycle_event() {
                     objective: None,
                     status: None,
                     priority: None,
+                    execution_scope: None,
                 },
             },
         })

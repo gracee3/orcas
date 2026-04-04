@@ -16,8 +16,8 @@ use orcas_core::authority::{
     CommandId, CommandReceipt, CorrelationId, DeletePlan, DeletePlanTarget, DeleteTarget,
     EventMetadata, HierarchySnapshot, OriginNodeId, ProjectionCheckpoint, Revision,
     StoredAuthorityEvent, TrackedThreadBindingState, TrackedThreadRecord, TrackedThreadSummary,
-    WorkUnitNode, WorkUnitRecord, WorkUnitSummary, WorkstreamNode, WorkstreamRecord,
-    WorkstreamSummary,
+    WorkUnitNode, WorkUnitRecord, WorkUnitSummary, WorkstreamExecutionScope, WorkstreamNode,
+    WorkstreamRecord, WorkstreamSummary,
 };
 use orcas_core::{AppPaths, OrcasError, OrcasResult, StoredState};
 
@@ -82,6 +82,12 @@ create table if not exists workstreams (
   objective text not null,
   status text not null,
   priority text not null,
+  execution_scope_codex_home text,
+  execution_scope_sqlite_home text,
+  execution_scope_listen_url text,
+  execution_scope_transport_kind text,
+  execution_scope_app_server_policy text,
+  execution_scope_connection_mode text,
   revision integer not null,
   origin_node_id text not null,
   created_at text not null,
@@ -320,12 +326,16 @@ impl AuthoritySqliteStore {
                     objective: require_non_empty(command.objective.clone(), "objective")?,
                     status: command.status,
                     priority: require_non_empty(command.priority.clone(), "priority")?,
+                    execution_scope: command.execution_scope.clone(),
                     revision: Revision::initial(),
                     origin_node_id: command.metadata.origin_node_id.clone(),
                     created_at: command.metadata.issued_at,
                     updated_at: command.metadata.issued_at,
                     deleted_at: None,
                 };
+                if let Some(scope) = record.execution_scope.as_ref() {
+                    scope.validate()?;
+                }
                 if Self::load_workstream_tx(transaction, &record.id)?.is_some() {
                     return Err(OrcasError::Protocol(format!(
                         "workstream `{}` already exists",
@@ -382,6 +392,12 @@ impl AuthoritySqliteStore {
                 }
                 if let Some(priority) = &command.changes.priority {
                     record.priority = require_non_empty(priority.clone(), "priority")?;
+                }
+                if let Some(execution_scope) = &command.changes.execution_scope {
+                    if let Some(scope) = execution_scope.as_ref() {
+                        scope.validate()?;
+                    }
+                    record.execution_scope = execution_scope.clone();
                 }
                 record.revision = record.revision.next();
                 record.updated_at = command.metadata.issued_at;
@@ -921,15 +937,45 @@ impl AuthoritySqliteStore {
                 transaction
                     .execute(
                         "insert into workstreams (
-                            id, title, objective, status, priority, revision, origin_node_id,
-                            created_at, updated_at, deleted_at
-                         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            id, title, objective, status, priority,
+                            execution_scope_codex_home, execution_scope_sqlite_home, execution_scope_listen_url,
+                            execution_scope_transport_kind, execution_scope_app_server_policy,
+                            execution_scope_connection_mode,
+                            revision, origin_node_id, created_at, updated_at, deleted_at
+                         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                         params![
                             record.id.as_str(),
                             record.title,
                             record.objective,
                             enum_to_storage(record.status)?,
                             record.priority,
+                            record
+                                .execution_scope
+                                .as_ref()
+                                .map(|scope| scope.codex_home.as_str()),
+                            record
+                                .execution_scope
+                                .as_ref()
+                                .and_then(|scope| scope.sqlite_home.as_deref()),
+                            record
+                                .execution_scope
+                                .as_ref()
+                                .and_then(|scope| scope.listen_url.as_deref()),
+                            record
+                                .execution_scope
+                                .as_ref()
+                                .map(|scope| enum_to_storage(scope.transport_kind))
+                                .transpose()?,
+                            record
+                                .execution_scope
+                                .as_ref()
+                                .map(|scope| enum_to_storage(scope.app_server_policy))
+                                .transpose()?,
+                            record
+                                .execution_scope
+                                .as_ref()
+                                .map(|scope| enum_to_storage(scope.connection_mode))
+                                .transpose()?,
                             i64::try_from(record.revision.get()).map_err(|error| store_error(
                                 format!("store revision overflow: {error}")
                             ))?,
@@ -1155,13 +1201,13 @@ impl AuthoritySqliteStore {
                     store_error(format!("initialize authority schema: {error}"))
                 })?;
                 connection
-                    .pragma_update(None, "user_version", 3_i64)
+                    .pragma_update(None, "user_version", 4_i64)
                     .map_err(|error| {
                         store_error(format!("set authority schema version: {error}"))
                     })?;
-                debug!(schema_version = 3_i64, "initialized authority schema");
+                debug!(schema_version = 4_i64, "initialized authority schema");
                 Ok(MigrationOutcome {
-                    schema_version: 3,
+                    schema_version: 4,
                     applied: true,
                 })
             }
@@ -1221,8 +1267,32 @@ impl AuthoritySqliteStore {
                     applied: true,
                 })
             }
-            3 => Ok(MigrationOutcome {
-                schema_version: 3,
+            3 => {
+                connection
+                    .execute_batch(
+                        "alter table workstreams add column execution_scope_codex_home text;
+                         alter table workstreams add column execution_scope_sqlite_home text;
+                         alter table workstreams add column execution_scope_listen_url text;
+                         alter table workstreams add column execution_scope_transport_kind text;
+                         alter table workstreams add column execution_scope_app_server_policy text;
+                         alter table workstreams add column execution_scope_connection_mode text;",
+                    )
+                    .map_err(|error| {
+                        store_error(format!("migrate authority schema to version 4: {error}"))
+                    })?;
+                connection
+                    .pragma_update(None, "user_version", 4_i64)
+                    .map_err(|error| {
+                        store_error(format!("set authority schema version: {error}"))
+                    })?;
+                debug!(schema_version = 4_i64, "migrated authority schema");
+                Ok(MigrationOutcome {
+                    schema_version: 4,
+                    applied: true,
+                })
+            }
+            4 => Ok(MigrationOutcome {
+                schema_version: 4,
                 applied: false,
             }),
             other => {
@@ -1316,6 +1386,7 @@ impl AuthoritySqliteStore {
                 objective: legacy.objective,
                 status: legacy.status,
                 priority: legacy.priority,
+                execution_scope: None,
                 revision: Revision::initial(),
                 origin_node_id: origin_node_id.clone(),
                 created_at: legacy.created_at,
@@ -1580,13 +1651,23 @@ impl AuthoritySqliteStore {
         transaction
             .execute(
                 "insert into workstreams (
-                    id, title, objective, status, priority, revision, origin_node_id, created_at, updated_at, deleted_at
-                 ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    id, title, objective, status, priority,
+                    execution_scope_codex_home, execution_scope_sqlite_home, execution_scope_listen_url,
+                    execution_scope_transport_kind, execution_scope_app_server_policy,
+                    execution_scope_connection_mode,
+                    revision, origin_node_id, created_at, updated_at, deleted_at
+                 ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  on conflict(id) do update set
                     title = excluded.title,
                     objective = excluded.objective,
                     status = excluded.status,
                     priority = excluded.priority,
+                    execution_scope_codex_home = excluded.execution_scope_codex_home,
+                    execution_scope_sqlite_home = excluded.execution_scope_sqlite_home,
+                    execution_scope_listen_url = excluded.execution_scope_listen_url,
+                    execution_scope_transport_kind = excluded.execution_scope_transport_kind,
+                    execution_scope_app_server_policy = excluded.execution_scope_app_server_policy,
+                    execution_scope_connection_mode = excluded.execution_scope_connection_mode,
                     revision = excluded.revision,
                     origin_node_id = excluded.origin_node_id,
                     created_at = excluded.created_at,
@@ -1598,6 +1679,33 @@ impl AuthoritySqliteStore {
                     record.objective,
                     enum_to_storage(record.status)?,
                     record.priority,
+                    record
+                        .execution_scope
+                        .as_ref()
+                        .map(|scope| scope.codex_home.as_str()),
+                    record
+                        .execution_scope
+                        .as_ref()
+                        .and_then(|scope| scope.sqlite_home.as_deref()),
+                    record
+                        .execution_scope
+                        .as_ref()
+                        .and_then(|scope| scope.listen_url.as_deref()),
+                    record
+                        .execution_scope
+                        .as_ref()
+                        .map(|scope| enum_to_storage(scope.transport_kind))
+                        .transpose()?,
+                    record
+                        .execution_scope
+                        .as_ref()
+                        .map(|scope| enum_to_storage(scope.app_server_policy))
+                        .transpose()?,
+                    record
+                        .execution_scope
+                        .as_ref()
+                        .map(|scope| enum_to_storage(scope.connection_mode))
+                        .transpose()?,
                     i64::try_from(record.revision.get())
                         .map_err(|error| store_error(format!("store revision overflow: {error}")))?,
                     record.origin_node_id.as_str(),
@@ -1778,6 +1886,9 @@ impl AuthoritySqliteStore {
         transaction
             .query_row(
                 "select id, title, objective, status, priority, revision, origin_node_id, created_at, updated_at, deleted_at
+                 , execution_scope_codex_home, execution_scope_sqlite_home, execution_scope_listen_url,
+                   execution_scope_transport_kind, execution_scope_app_server_policy,
+                   execution_scope_connection_mode
                  from workstreams where id = ?1",
                 params![id.as_str()],
                 read_workstream_row,
@@ -2367,11 +2478,17 @@ impl AuthorityQueryStore for AuthoritySqliteStore {
     async fn list_workstreams(&self, include_deleted: bool) -> OrcasResult<Vec<WorkstreamSummary>> {
         self.with_connection(|connection| {
             let sql = if include_deleted {
-                "select id, title, objective, status, priority, revision, origin_node_id, created_at, updated_at, deleted_at
+                "select id, title, objective, status, priority, revision, origin_node_id, created_at, updated_at, deleted_at,
+                        execution_scope_codex_home, execution_scope_sqlite_home, execution_scope_listen_url,
+                        execution_scope_transport_kind, execution_scope_app_server_policy,
+                        execution_scope_connection_mode
                  from workstreams
                  order by updated_at desc, id asc"
             } else {
-                "select id, title, objective, status, priority, revision, origin_node_id, created_at, updated_at, deleted_at
+                "select id, title, objective, status, priority, revision, origin_node_id, created_at, updated_at, deleted_at,
+                        execution_scope_codex_home, execution_scope_sqlite_home, execution_scope_listen_url,
+                        execution_scope_transport_kind, execution_scope_app_server_policy,
+                        execution_scope_connection_mode
                  from workstreams
                  where deleted_at is null
                  order by updated_at desc, id asc"
@@ -2393,7 +2510,10 @@ impl AuthorityQueryStore for AuthoritySqliteStore {
         self.with_connection(|connection| {
             connection
                 .query_row(
-                    "select id, title, objective, status, priority, revision, origin_node_id, created_at, updated_at, deleted_at
+                    "select id, title, objective, status, priority, revision, origin_node_id, created_at, updated_at, deleted_at,
+                            execution_scope_codex_home, execution_scope_sqlite_home, execution_scope_listen_url,
+                            execution_scope_transport_kind, execution_scope_app_server_policy,
+                            execution_scope_connection_mode
                      from workstreams where id = ?1",
                     params![id.as_str()],
                     read_workstream_row,
@@ -2709,6 +2829,12 @@ fn apply_workstream_patch(
     if let Some(priority) = &changes.priority {
         current.priority = require_non_empty(priority.clone(), "priority")?;
     }
+    if let Some(execution_scope) = &changes.execution_scope {
+        if let Some(scope) = execution_scope.as_ref() {
+            scope.validate()?;
+        }
+        current.execution_scope = execution_scope.clone();
+    }
     current.revision = revision;
     current.updated_at = updated_at;
     Ok(current)
@@ -2812,6 +2938,20 @@ fn require_non_empty(value: String, field: &str) -> OrcasResult<String> {
 }
 
 fn read_workstream_row(row: &Row<'_>) -> rusqlite::Result<WorkstreamRecord> {
+    let execution_scope = match row.get::<_, Option<String>>(10)? {
+        Some(codex_home) => Some(WorkstreamExecutionScope {
+            codex_home,
+            sqlite_home: row.get(11)?,
+            listen_url: row.get(12)?,
+            transport_kind: enum_from_storage(&row.get::<_, String>(13)?)
+                .map_err(protocol_to_sql_error(13))?,
+            app_server_policy: enum_from_storage(&row.get::<_, String>(14)?)
+                .map_err(protocol_to_sql_error(14))?,
+            connection_mode: enum_from_storage(&row.get::<_, String>(15)?)
+                .map_err(protocol_to_sql_error(15))?,
+        }),
+        None => None,
+    };
     Ok(WorkstreamRecord {
         id: authority::WorkstreamId::parse(row.get::<_, String>(0)?)
             .map_err(protocol_to_sql_error(0))?,
@@ -2819,6 +2959,7 @@ fn read_workstream_row(row: &Row<'_>) -> rusqlite::Result<WorkstreamRecord> {
         objective: row.get(2)?,
         status: enum_from_storage(&row.get::<_, String>(3)?).map_err(protocol_to_sql_error(3))?,
         priority: row.get(4)?,
+        execution_scope,
         revision: Revision::new(u64::try_from(row.get::<_, i64>(5)?).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 5,
@@ -3094,6 +3235,14 @@ mod tests {
                 objective: "Make state.db real".to_string(),
                 status: WorkstreamStatus::Active,
                 priority: "high".to_string(),
+                execution_scope: Some(WorkstreamExecutionScope {
+                    codex_home: "/tmp/orcas/ws-1/codex-home".to_string(),
+                    sqlite_home: Some("/tmp/orcas/ws-1/sqlite".to_string()),
+                    listen_url: Some("ws://127.0.0.1:9001".to_string()),
+                    transport_kind: authority::WorkstreamTransportKind::LocalAppServer,
+                    app_server_policy: authority::WorkstreamAppServerPolicy::DedicatedPerWorkstream,
+                    connection_mode: authority::WorkstreamExecutionConnectionMode::SpawnIfNeeded,
+                }),
             }))
             .await
             .expect("create workstream")
@@ -3112,6 +3261,7 @@ mod tests {
                     objective: None,
                     status: None,
                     priority: None,
+                    execution_scope: None,
                 },
             }))
             .await
@@ -3302,6 +3452,7 @@ mod tests {
                 objective: "Delete tree".to_string(),
                 status: WorkstreamStatus::Active,
                 priority: "normal".to_string(),
+                execution_scope: None,
             }))
             .await
             .expect("create workstream");
@@ -3386,6 +3537,7 @@ mod tests {
                 objective: "Reject stale edits".to_string(),
                 status: WorkstreamStatus::Active,
                 priority: "normal".to_string(),
+                execution_scope: None,
             }))
             .await
             .expect("create workstream")
@@ -3404,6 +3556,7 @@ mod tests {
                     objective: None,
                     status: None,
                     priority: None,
+                    execution_scope: None,
                 },
             }))
             .await
@@ -3426,6 +3579,7 @@ mod tests {
                 objective: "Persist".to_string(),
                 status: WorkstreamStatus::Active,
                 priority: "normal".to_string(),
+                execution_scope: None,
             }))
             .await
             .expect("create workstream");
@@ -3435,6 +3589,72 @@ mod tests {
         let workstreams = reopened.list_workstreams(false).await.expect("workstreams");
         assert_eq!(workstreams.len(), 1);
         assert_eq!(workstreams[0].id.as_str(), "ws-restart");
+    }
+
+    #[tokio::test]
+    async fn workstream_execution_scope_round_trips_through_sqlite() {
+        let paths = temp_paths("execution-scope");
+        std::fs::create_dir_all(&paths.data_dir).expect("data dir");
+        let store = AuthoritySqliteStore::open(paths.clone()).expect("store");
+        let origin_node_id = store.origin_node_id().expect("origin");
+        let created = store
+            .execute_command(AuthorityCommand::CreateWorkstream(CreateWorkstream {
+                metadata: metadata(&origin_node_id, "execution-scope-create"),
+                workstream_id: authority::WorkstreamId::parse("ws-scope").expect("workstream id"),
+                title: "Execution scope".to_string(),
+                objective: "Persist per-workstream execution config".to_string(),
+                status: WorkstreamStatus::Active,
+                priority: "normal".to_string(),
+                execution_scope: Some(WorkstreamExecutionScope {
+                    codex_home: "/tmp/orcas/ws-scope/codex-home".to_string(),
+                    sqlite_home: Some("/tmp/orcas/ws-scope/sqlite".to_string()),
+                    listen_url: Some("ws://127.0.0.1:9100".to_string()),
+                    transport_kind: authority::WorkstreamTransportKind::RemoteWebsocket,
+                    app_server_policy: authority::WorkstreamAppServerPolicy::DedicatedPerWorkstream,
+                    connection_mode: authority::WorkstreamExecutionConnectionMode::ConnectOnly,
+                }),
+            }))
+            .await
+            .expect("create workstream");
+        match created {
+            AuthorityMutationResult::Workstream(record) => {
+                assert_eq!(
+                    record
+                        .execution_scope
+                        .as_ref()
+                        .map(|scope| scope.codex_home.as_str()),
+                    Some("/tmp/orcas/ws-scope/codex-home")
+                );
+            }
+            _ => panic!("unexpected mutation result"),
+        }
+        drop(store);
+
+        let reopened = AuthoritySqliteStore::open(paths).expect("reopen store");
+        let loaded = reopened
+            .get_workstream(&authority::WorkstreamId::parse("ws-scope").expect("workstream id"))
+            .await
+            .expect("get workstream")
+            .expect("workstream");
+        let scope = loaded.execution_scope.expect("execution scope");
+        assert_eq!(scope.codex_home, "/tmp/orcas/ws-scope/codex-home");
+        assert_eq!(
+            scope.sqlite_home.as_deref(),
+            Some("/tmp/orcas/ws-scope/sqlite")
+        );
+        assert_eq!(scope.listen_url.as_deref(), Some("ws://127.0.0.1:9100"));
+        assert_eq!(
+            scope.transport_kind,
+            authority::WorkstreamTransportKind::RemoteWebsocket
+        );
+        assert_eq!(
+            scope.app_server_policy,
+            authority::WorkstreamAppServerPolicy::DedicatedPerWorkstream
+        );
+        assert_eq!(
+            scope.connection_mode,
+            authority::WorkstreamExecutionConnectionMode::ConnectOnly
+        );
     }
 
     #[tokio::test]
@@ -3451,6 +3671,7 @@ mod tests {
                 objective: "First".to_string(),
                 status: WorkstreamStatus::Active,
                 priority: "normal".to_string(),
+                execution_scope: None,
             }))
             .await
             .expect("create first")
@@ -3468,6 +3689,7 @@ mod tests {
                 objective: "Second".to_string(),
                 status: WorkstreamStatus::Active,
                 priority: "normal".to_string(),
+                execution_scope: None,
             }))
             .await
             .expect("create second")
@@ -3537,6 +3759,7 @@ mod tests {
                 objective: "Persist replication cursor".to_string(),
                 status: WorkstreamStatus::Active,
                 priority: "normal".to_string(),
+                execution_scope: None,
             }))
             .await
             .expect("create workstream");
@@ -3576,6 +3799,7 @@ mod tests {
                 objective: "First".to_string(),
                 status: WorkstreamStatus::Active,
                 priority: "normal".to_string(),
+                execution_scope: None,
             }))
             .await
             .expect("create first");
@@ -3639,6 +3863,7 @@ mod tests {
             objective: "Receipt should replay".to_string(),
             status: WorkstreamStatus::Active,
             priority: "normal".to_string(),
+            execution_scope: None,
         });
 
         let first = store.execute_command(command.clone()).await.expect("first");

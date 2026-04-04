@@ -300,6 +300,7 @@ pub struct WorkstreamPatch {
     pub objective: Option<String>,
     pub status: Option<WorkstreamStatus>,
     pub priority: Option<String>,
+    pub execution_scope: Option<Option<WorkstreamExecutionScope>>,
 }
 
 impl WorkstreamPatch {
@@ -309,6 +310,55 @@ impl WorkstreamPatch {
             && self.objective.is_none()
             && self.status.is_none()
             && self.priority.is_none()
+            && self.execution_scope.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkstreamTransportKind {
+    #[default]
+    LocalAppServer,
+    RemoteWebsocket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkstreamAppServerPolicy {
+    SharedCurrentDaemon,
+    #[default]
+    DedicatedPerWorkstream,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkstreamExecutionConnectionMode {
+    ConnectOnly,
+    #[default]
+    SpawnIfNeeded,
+    SpawnAlways,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorkstreamExecutionScope {
+    pub codex_home: String,
+    pub sqlite_home: Option<String>,
+    pub listen_url: Option<String>,
+    pub transport_kind: WorkstreamTransportKind,
+    pub app_server_policy: WorkstreamAppServerPolicy,
+    pub connection_mode: WorkstreamExecutionConnectionMode,
+}
+
+impl WorkstreamExecutionScope {
+    pub fn validate(&self) -> OrcasResult<()> {
+        require_non_empty(self.codex_home.clone(), "codex_home")?;
+        if let Some(sqlite_home) = self.sqlite_home.as_ref() {
+            require_non_empty(sqlite_home.clone(), "sqlite_home")?;
+        }
+        if let Some(listen_url) = self.listen_url.as_ref() {
+            require_non_empty(listen_url.clone(), "listen_url")?;
+        }
+        Ok(())
     }
 }
 
@@ -489,6 +539,7 @@ pub struct CreateWorkstream {
     pub objective: String,
     pub status: WorkstreamStatus,
     pub priority: String,
+    pub execution_scope: Option<WorkstreamExecutionScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -661,6 +712,7 @@ pub struct WorkstreamRecord {
     pub objective: String,
     pub status: WorkstreamStatus,
     pub priority: String,
+    pub execution_scope: Option<WorkstreamExecutionScope>,
     pub revision: Revision,
     pub origin_node_id: OriginNodeId,
     pub created_at: DateTime<Utc>,
@@ -676,6 +728,7 @@ pub struct WorkstreamSummary {
     pub objective: String,
     pub status: WorkstreamStatus,
     pub priority: String,
+    pub execution_scope: Option<WorkstreamExecutionScope>,
     pub revision: Revision,
     pub updated_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -689,6 +742,7 @@ impl From<&WorkstreamRecord> for WorkstreamSummary {
             objective: record.objective.clone(),
             status: record.status,
             priority: record.priority.clone(),
+            execution_scope: record.execution_scope.clone(),
             revision: record.revision,
             updated_at: record.updated_at,
             deleted_at: record.deleted_at,
@@ -1170,6 +1224,7 @@ mod tests {
             objective: "Prepare pass 2".to_string(),
             status: WorkstreamStatus::Active,
             priority: "high".to_string(),
+            execution_scope: None,
             revision: Revision::initial(),
             origin_node_id: origin(),
             created_at: Utc

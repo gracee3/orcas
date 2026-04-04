@@ -7,8 +7,8 @@ use orcas_core::{
     OrcasError, OrcasResult,
     authority::TrackedThreadWorkspace,
     ipc::{
-        TrackedThreadWorkspaceInspection, TrackedThreadWorkspaceInspectionWarning,
-        TrackedThreadWorkspaceRefComparison,
+        TrackedThreadWorkspaceFilesystemScope, TrackedThreadWorkspaceInspection,
+        TrackedThreadWorkspaceInspectionWarning, TrackedThreadWorkspaceRefComparison,
     },
 };
 
@@ -163,6 +163,51 @@ pub async fn inspect_tracked_thread_workspace(
     }
 }
 
+pub async fn derive_workspace_filesystem_scope(
+    workspace: &TrackedThreadWorkspace,
+) -> TrackedThreadWorkspaceFilesystemScope {
+    derive_workspace_filesystem_scope_sync(workspace)
+}
+
+pub fn derive_workspace_filesystem_scope_sync(
+    workspace: &TrackedThreadWorkspace,
+) -> TrackedThreadWorkspaceFilesystemScope {
+    let worktree_path = PathBuf::from(&workspace.worktree_path);
+    let repository_root = PathBuf::from(&workspace.repository_root);
+    let worktree_parent = worktree_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| worktree_path.clone());
+    let git_dir = git_output_sync(&worktree_path, &["rev-parse", "--git-dir"])
+        .map(|value| resolve_git_path(&worktree_path, &value));
+    let git_common_dir = git_output_sync(&worktree_path, &["rev-parse", "--git-common-dir"])
+        .map(|value| resolve_git_path(&worktree_path, &value));
+
+    let mut worker_turn_roots = vec![normalize_display_path(&worktree_path)];
+    if let Some(path) = git_dir.as_ref() {
+        worker_turn_roots.push(path.clone());
+    }
+    if let Some(path) = git_common_dir.as_ref() {
+        worker_turn_roots.push(path.clone());
+    }
+    dedupe_paths(&mut worker_turn_roots);
+
+    let mut workspace_lifecycle_roots = worker_turn_roots.clone();
+    workspace_lifecycle_roots.push(normalize_display_path(&repository_root));
+    workspace_lifecycle_roots.push(normalize_display_path(&worktree_parent));
+    dedupe_paths(&mut workspace_lifecycle_roots);
+
+    TrackedThreadWorkspaceFilesystemScope {
+        repository_root: normalize_display_path(&repository_root),
+        worktree_path: normalize_display_path(&worktree_path),
+        worktree_parent: normalize_display_path(&worktree_parent),
+        git_dir,
+        git_common_dir,
+        worker_turn_roots,
+        workspace_lifecycle_roots,
+    }
+}
+
 async fn git_bool(cwd: &Path, args: &[&str]) -> OrcasResult<bool> {
     Ok(git_stdout(cwd, args)
         .await?
@@ -265,6 +310,48 @@ fn paths_match(left: &Path, right: &Path) -> bool {
     left.is_some() && left == right
 }
 
+fn resolve_git_path(base: &Path, value: &str) -> String {
+    let candidate = PathBuf::from(value);
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        base.join(candidate)
+    };
+    normalize_display_path(&resolved)
+}
+
+fn normalize_display_path(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+fn dedupe_paths(paths: &mut Vec<String>) {
+    let mut deduped = Vec::with_capacity(paths.len());
+    for path in paths.drain(..) {
+        if !deduped.contains(&path) {
+            deduped.push(path);
+        }
+    }
+    *paths = deduped;
+}
+
+fn git_output_sync(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let trimmed = value.trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -276,7 +363,7 @@ mod tests {
         TrackedThreadWorkspaceStrategy, TrackedThreadWorkspaceSyncPolicy,
     };
 
-    use super::inspect_tracked_thread_workspace;
+    use super::{derive_workspace_filesystem_scope, inspect_tracked_thread_workspace};
 
     fn run_git(cwd: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -389,6 +476,42 @@ mod tests {
             inspection.warnings.contains(
                 &orcas_core::ipc::TrackedThreadWorkspaceInspectionWarning::MissingWorktree
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn derives_workspace_filesystem_scope_for_worktree() {
+        let (repo, worktree, _) = setup_repo();
+        let scope = derive_workspace_filesystem_scope(&workspace(&repo, &worktree, None)).await;
+
+        assert_eq!(scope.repository_root, repo.display().to_string());
+        assert_eq!(scope.worktree_path, worktree.display().to_string());
+        assert_eq!(
+            scope.worktree_parent,
+            worktree.parent().expect("parent").display().to_string()
+        );
+        assert!(
+            scope
+                .git_dir
+                .as_deref()
+                .is_some_and(|value| value.contains("/.git/worktrees/"))
+        );
+        assert!(
+            scope
+                .git_common_dir
+                .as_deref()
+                .is_some_and(|value| value.ends_with("/repo/.git"))
+        );
+        assert!(scope.worker_turn_roots.contains(&scope.worktree_path));
+        assert!(
+            scope
+                .workspace_lifecycle_roots
+                .contains(&scope.repository_root)
+        );
+        assert!(
+            scope
+                .workspace_lifecycle_roots
+                .contains(&scope.worktree_parent)
         );
     }
 }

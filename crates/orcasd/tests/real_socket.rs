@@ -56,6 +56,7 @@ async fn create_authority_workstream(
                 objective: format!("Objective for {title}"),
                 status: WorkstreamStatus::Active,
                 priority: "high".to_string(),
+                execution_scope: None,
             },
         })
         .await

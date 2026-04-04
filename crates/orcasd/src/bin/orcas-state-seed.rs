@@ -19,8 +19,8 @@ struct Args {
 
 fn normalize_state_file(input: &PathBuf, output: &PathBuf) -> anyhow::Result<()> {
     let raw = fs::read_to_string(input).with_context(|| format!("read {}", input.display()))?;
-    let state = StoredState::from_json_str(&raw)
-        .with_context(|| format!("parse {}", input.display()))?;
+    let state =
+        StoredState::from_json_str(&raw).with_context(|| format!("parse {}", input.display()))?;
     let mut encoded = state
         .to_pretty_json()
         .with_context(|| format!("serialize {}", input.display()))?;
@@ -49,7 +49,9 @@ mod tests {
     fn normalize_state_file_round_trips_seeded_fixture() {
         let dir = tempdir().expect("temp dir");
         let input = dir.path().join(format!("seed-{}.json", Uuid::new_v4()));
-        let output = dir.path().join(format!("normalized-{}.json", Uuid::new_v4()));
+        let output = dir
+            .path()
+            .join(format!("normalized-{}.json", Uuid::new_v4()));
         fs::write(
             &input,
             r#"{

@@ -425,6 +425,18 @@ struct WorkstreamCreateArgs {
     objective: String,
     #[arg(long)]
     priority: Option<String>,
+    #[arg(long)]
+    codex_home: Option<String>,
+    #[arg(long)]
+    sqlite_home: Option<String>,
+    #[arg(long)]
+    listen_url: Option<String>,
+    #[arg(long, value_enum)]
+    transport_kind: Option<WorkstreamTransportKindArg>,
+    #[arg(long, value_enum)]
+    app_server_policy: Option<WorkstreamAppServerPolicyArg>,
+    #[arg(long, value_enum)]
+    connection_mode: Option<WorkstreamExecutionConnectionModeArg>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -445,6 +457,20 @@ struct WorkstreamEditArgs {
     status: Option<WorkstreamStatusArg>,
     #[arg(long)]
     priority: Option<String>,
+    #[arg(long)]
+    codex_home: Option<String>,
+    #[arg(long)]
+    sqlite_home: Option<String>,
+    #[arg(long)]
+    listen_url: Option<String>,
+    #[arg(long, value_enum)]
+    transport_kind: Option<WorkstreamTransportKindArg>,
+    #[arg(long, value_enum)]
+    app_server_policy: Option<WorkstreamAppServerPolicyArg>,
+    #[arg(long, value_enum)]
+    connection_mode: Option<WorkstreamExecutionConnectionModeArg>,
+    #[arg(long)]
+    clear_execution_scope: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -950,6 +976,25 @@ enum WorkstreamStatusArg {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+enum WorkstreamTransportKindArg {
+    LocalAppServer,
+    RemoteWebsocket,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WorkstreamAppServerPolicyArg {
+    SharedCurrentDaemon,
+    DedicatedPerWorkstream,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WorkstreamExecutionConnectionModeArg {
+    ConnectOnly,
+    SpawnIfNeeded,
+    SpawnAlways,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum WorkUnitStatusArg {
     Ready,
     Blocked,
@@ -1024,6 +1069,34 @@ impl From<WorkstreamStatusArg> for WorkstreamStatus {
             WorkstreamStatusArg::Active => WorkstreamStatus::Active,
             WorkstreamStatusArg::Blocked => WorkstreamStatus::Blocked,
             WorkstreamStatusArg::Completed => WorkstreamStatus::Completed,
+        }
+    }
+}
+
+impl From<WorkstreamTransportKindArg> for authority::WorkstreamTransportKind {
+    fn from(value: WorkstreamTransportKindArg) -> Self {
+        match value {
+            WorkstreamTransportKindArg::LocalAppServer => Self::LocalAppServer,
+            WorkstreamTransportKindArg::RemoteWebsocket => Self::RemoteWebsocket,
+        }
+    }
+}
+
+impl From<WorkstreamAppServerPolicyArg> for authority::WorkstreamAppServerPolicy {
+    fn from(value: WorkstreamAppServerPolicyArg) -> Self {
+        match value {
+            WorkstreamAppServerPolicyArg::SharedCurrentDaemon => Self::SharedCurrentDaemon,
+            WorkstreamAppServerPolicyArg::DedicatedPerWorkstream => Self::DedicatedPerWorkstream,
+        }
+    }
+}
+
+impl From<WorkstreamExecutionConnectionModeArg> for authority::WorkstreamExecutionConnectionMode {
+    fn from(value: WorkstreamExecutionConnectionModeArg) -> Self {
+        match value {
+            WorkstreamExecutionConnectionModeArg::ConnectOnly => Self::ConnectOnly,
+            WorkstreamExecutionConnectionModeArg::SpawnIfNeeded => Self::SpawnIfNeeded,
+            WorkstreamExecutionConnectionModeArg::SpawnAlways => Self::SpawnAlways,
         }
     }
 }
@@ -1363,7 +1436,17 @@ async fn main() -> Result<()> {
             match command {
                 WorkstreamsCommand::Create(args) => {
                     service
-                        .workstream_create(args.title, args.objective, args.priority)
+                        .workstream_create(
+                            args.title,
+                            args.objective,
+                            args.priority,
+                            args.codex_home,
+                            args.sqlite_home,
+                            args.listen_url,
+                            args.transport_kind.map(Into::into),
+                            args.app_server_policy.map(Into::into),
+                            args.connection_mode.map(Into::into),
+                        )
                         .await?;
                 }
                 WorkstreamsCommand::Edit(args) => {
@@ -1374,6 +1457,13 @@ async fn main() -> Result<()> {
                             args.objective,
                             args.status.map(Into::into),
                             args.priority,
+                            args.codex_home,
+                            args.sqlite_home,
+                            args.listen_url,
+                            args.transport_kind.map(Into::into),
+                            args.app_server_policy.map(Into::into),
+                            args.connection_mode.map(Into::into),
+                            args.clear_execution_scope,
                         )
                         .await?;
                 }
