@@ -2016,6 +2016,10 @@ pub struct ThreadSummary {
     pub name: Option<String>,
     pub model_provider: String,
     pub cwd: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub runtime_workstream_id: Option<String>,
     pub status: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -2113,6 +2117,10 @@ pub enum TurnLifecycleState {
 pub struct TurnStateView {
     pub thread_id: String,
     pub turn_id: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub runtime_workstream_id: Option<String>,
     pub lifecycle: TurnLifecycleState,
     pub status: String,
     pub attachable: bool,

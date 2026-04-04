@@ -11,7 +11,10 @@ pub use contract::cli;
 pub use contract::config;
 pub use contract::protocol as codex_contract_protocol;
 pub use contract::{CodexContractSnapshot, ContractSource};
-pub use daemon::{CodexDaemonManager, DaemonLaunch, DaemonStatus, LocalCodexDaemonManager};
+pub use daemon::{
+    CodexDaemonManager, DaemonLaunch, DaemonStatus, LocalCodexDaemonLaunchSpec,
+    LocalCodexDaemonManager,
+};
 pub use protocol::methods;
 pub use protocol::types;
 pub use transport::{CodexTransport, ReconnectBackoff, WebSocketTransport};

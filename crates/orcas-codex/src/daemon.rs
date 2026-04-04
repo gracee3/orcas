@@ -45,14 +45,41 @@ pub struct LocalCodexDaemonManager {
     config: CodexDaemonConfig,
     cwd: Option<PathBuf>,
     log_path: PathBuf,
+    owner_kind: String,
+    owner_pid: u32,
+    extra_env: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalCodexDaemonLaunchSpec {
+    pub config: CodexDaemonConfig,
+    pub cwd: Option<PathBuf>,
+    pub log_path: PathBuf,
+    pub owner_kind: String,
+    pub owner_pid: u32,
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl LocalCodexDaemonManager {
     pub fn new(config: CodexDaemonConfig, paths: &AppPaths, cwd: Option<PathBuf>) -> Self {
-        Self {
+        Self::from_launch_spec(LocalCodexDaemonLaunchSpec {
             config,
             cwd,
             log_path: paths.logs_dir.join("codex-app-server.log"),
+            owner_kind: "orcasd".to_string(),
+            owner_pid: std::process::id(),
+            extra_env: Vec::new(),
+        })
+    }
+
+    pub fn from_launch_spec(spec: LocalCodexDaemonLaunchSpec) -> Self {
+        Self {
+            config: spec.config,
+            cwd: spec.cwd,
+            log_path: spec.log_path,
+            owner_kind: spec.owner_kind,
+            owner_pid: spec.owner_pid,
+            extra_env: spec.extra_env,
         }
     }
 
@@ -145,11 +172,8 @@ impl CodexDaemonManager for LocalCodexDaemonManager {
             .unwrap_or_else(|_| "0".to_string());
         command
             .env(ORCAS_APP_SERVER_TAG_ENV, ORCAS_APP_SERVER_TAG_VALUE)
-            .env(ORCAS_APP_SERVER_OWNER_KIND_ENV, "orcasd")
-            .env(
-                ORCAS_APP_SERVER_OWNER_PID_ENV,
-                std::process::id().to_string(),
-            )
+            .env(ORCAS_APP_SERVER_OWNER_KIND_ENV, &self.owner_kind)
+            .env(ORCAS_APP_SERVER_OWNER_PID_ENV, self.owner_pid.to_string())
             .env(ORCAS_APP_SERVER_LISTEN_URL_ENV, &self.config.listen_url)
             .env(ORCAS_APP_SERVER_STARTED_AT_ENV, started_at)
             .arg("app-server")
@@ -158,6 +182,9 @@ impl CodexDaemonManager for LocalCodexDaemonManager {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }

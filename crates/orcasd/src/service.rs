@@ -13,9 +13,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::net::TcpListener as StdTcpListener;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -31,8 +33,8 @@ use uuid::Uuid;
 
 use orcas_codex::types;
 use orcas_codex::{
-    CodexClient, CodexDaemonManager, DaemonLaunch as CodexDaemonLaunch, LocalCodexDaemonManager,
-    RejectingApprovalRouter, WebSocketTransport,
+    CodexClient, CodexDaemonManager, DaemonLaunch as CodexDaemonLaunch, LocalCodexDaemonLaunchSpec,
+    LocalCodexDaemonManager, RejectingApprovalRouter, WebSocketTransport,
 };
 use orcas_core::authority;
 use orcas_core::authority::{AuthorityCommand, AuthorityQueryStore};
@@ -249,6 +251,69 @@ impl Hash for TurnKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RuntimeRouteKey {
+    Shared,
+    Workstream(authority::WorkstreamId),
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeRouteInfo {
+    endpoint: String,
+    runtime_workstream_id: Option<authority::WorkstreamId>,
+}
+
+impl RuntimeRouteInfo {
+    fn from_thread_summary(thread: &ipc::ThreadSummary) -> Self {
+        Self {
+            endpoint: thread.endpoint.clone().unwrap_or_default(),
+            runtime_workstream_id: thread
+                .runtime_workstream_id
+                .as_ref()
+                .and_then(|id| authority::WorkstreamId::parse(id.clone()).ok()),
+        }
+    }
+}
+
+struct WorkstreamRuntimeHandle {
+    route_key: RuntimeRouteKey,
+    route_info: RuntimeRouteInfo,
+    daemon: Arc<dyn CodexDaemonManager>,
+    client: Arc<CodexClient>,
+    connection_mode: authority::WorkstreamExecutionConnectionMode,
+    connect_gate: Arc<Mutex<()>>,
+}
+
+#[derive(Debug)]
+struct EndpointOnlyCodexDaemonManager {
+    endpoint: String,
+    binary_path: PathBuf,
+    log_path: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl CodexDaemonManager for EndpointOnlyCodexDaemonManager {
+    async fn status(&self) -> OrcasResult<orcas_codex::DaemonStatus> {
+        Ok(orcas_codex::DaemonStatus {
+            endpoint: self.endpoint.clone(),
+            reachable: true,
+            binary_path: self.binary_path.clone(),
+            log_path: self.log_path.clone(),
+        })
+    }
+
+    async fn ensure_running(
+        &self,
+        _launch: orcas_codex::DaemonLaunch,
+    ) -> OrcasResult<orcas_codex::DaemonStatus> {
+        self.status().await
+    }
+
+    async fn spawn_background(&self) -> OrcasResult<orcas_codex::DaemonStatus> {
+        self.status().await
+    }
+}
+
 pub struct OrcasDaemonService {
     paths: AppPaths,
     config: AppConfig,
@@ -256,6 +321,8 @@ pub struct OrcasDaemonService {
     authority_store: Arc<AuthoritySqliteStore>,
     codex_daemon: Arc<dyn CodexDaemonManager>,
     codex_client: Arc<CodexClient>,
+    workstream_runtimes: Mutex<HashMap<String, Arc<WorkstreamRuntimeHandle>>>,
+    self_handle: OnceLock<std::sync::Weak<OrcasDaemonService>>,
     state: RwLock<DaemonState>,
     recent_events: Mutex<VecDeque<ipc::EventSummary>>,
     connect_gate: Mutex<()>,
@@ -302,6 +369,8 @@ impl OrcasDaemonService {
             authority_store,
             codex_daemon,
             codex_client,
+            workstream_runtimes: Mutex::new(HashMap::new()),
+            self_handle: std::sync::OnceLock::new(),
             state: RwLock::new(DaemonState::default()),
             recent_events: Mutex::new(VecDeque::with_capacity(RECENT_EVENT_LIMIT)),
             connect_gate: Mutex::new(()),
@@ -310,8 +379,12 @@ impl OrcasDaemonService {
             shutdown: Notify::new(),
         });
 
+        let _ = service.self_handle.set(Arc::downgrade(&service));
         service.initialize_state().await?;
-        service.spawn_codex_event_bridge();
+        service.spawn_codex_event_bridge(
+            Arc::clone(&service.codex_client),
+            service.shared_runtime_route_info(),
+        );
         service.spawn_operator_inbox_mirror_loop();
         debug!(pid = std::process::id(), "daemon service initialized");
 
@@ -463,32 +536,48 @@ impl OrcasDaemonService {
         &self,
     ) -> OrcasResult<Vec<ipc::WorkstreamRuntimeSummary>> {
         let workstreams = self.authority_store.list_workstreams(false).await?;
-        let (upstream, shared_live_thread_count) = {
+        let existing_rows = self
+            .authority_store
+            .list_workstream_runtimes()
+            .await?
+            .into_iter()
+            .map(|summary| (summary.workstream_id.clone(), summary))
+            .collect::<HashMap<_, _>>();
+        let upstream = {
             let state = self.state.read().await;
-            (
-                state.upstream.clone(),
-                state
-                    .threads
-                    .values()
-                    .filter(|thread| {
-                        thread.summary.source_kind.as_deref() == Some("orcas_managed")
-                            || thread.summary.scope == "live_observed"
-                    })
-                    .count(),
-            )
+            state.upstream.clone()
         };
         let now = Utc::now();
-        let summaries = workstreams
-            .iter()
-            .map(|workstream| {
-                self.derive_workstream_runtime_summary(
-                    workstream,
-                    &upstream,
-                    shared_live_thread_count,
-                    now,
-                )
-            })
-            .collect::<Vec<_>>();
+        let mut summaries = Vec::with_capacity(workstreams.len());
+        for workstream in &workstreams {
+            let state = self.state.read().await;
+            let shared_live_thread_count = Self::shared_runtime_thread_count(&state);
+            let mut summary = self.derive_workstream_runtime_summary(
+                workstream,
+                &upstream,
+                shared_live_thread_count,
+                now,
+            );
+            if summary.app_server_policy
+                == authority::WorkstreamAppServerPolicy::DedicatedPerWorkstream
+            {
+                summary.thread_count =
+                    Self::workstream_runtime_thread_count(&state, &workstream.id);
+                if let Some(existing) = existing_rows.get(workstream.id.as_str()) {
+                    summary.status = existing.status.clone();
+                    summary.effective_listen_url = existing
+                        .effective_listen_url
+                        .clone()
+                        .or(summary.effective_listen_url);
+                    summary.last_error = existing.last_error.clone();
+                    summary.started_at = existing.started_at.or(summary.started_at);
+                    summary.owner_kind = existing.owner_kind.clone().or(summary.owner_kind);
+                    summary.owner_pid = existing.owner_pid.or(summary.owner_pid);
+                }
+            }
+            drop(state);
+            summaries.push(summary);
+        }
         for summary in &summaries {
             self.authority_store
                 .upsert_workstream_runtime(summary)
@@ -597,6 +686,362 @@ impl OrcasDaemonService {
                 authority::WorkstreamExecutionConnectionMode::SpawnAlways
             }
         }
+    }
+
+    fn shared_runtime_route_info(&self) -> RuntimeRouteInfo {
+        RuntimeRouteInfo {
+            endpoint: self.config.codex.listen_url.clone(),
+            runtime_workstream_id: None,
+        }
+    }
+
+    fn runtime_handle_key(route_key: &RuntimeRouteKey) -> String {
+        match route_key {
+            RuntimeRouteKey::Shared => "__shared__".to_string(),
+            RuntimeRouteKey::Workstream(workstream_id) => workstream_id.to_string(),
+        }
+    }
+
+    fn local_workstream_runtime_endpoint(
+        &self,
+        workstream: &authority::WorkstreamSummary,
+    ) -> OrcasResult<String> {
+        if let Some(listen_url) = workstream
+            .execution_scope
+            .as_ref()
+            .and_then(|scope| scope.listen_url.clone())
+        {
+            return Ok(listen_url);
+        }
+        let listener = StdTcpListener::bind("127.0.0.1:0").map_err(|error| {
+            OrcasError::Transport(format!("failed to allocate runtime port: {error}"))
+        })?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| {
+                OrcasError::Transport(format!("failed to inspect runtime port: {error}"))
+            })?
+            .port();
+        Ok(format!("ws://127.0.0.1:{port}"))
+    }
+
+    fn workstream_runtime_log_path(&self, workstream_id: &authority::WorkstreamId) -> PathBuf {
+        self.paths
+            .logs_dir
+            .join("workstreams")
+            .join(workstream_id.as_str())
+            .join("codex-app-server.log")
+    }
+
+    fn workstream_runtime_thread_count(
+        state: &DaemonState,
+        workstream_id: &authority::WorkstreamId,
+    ) -> usize {
+        state
+            .threads
+            .values()
+            .filter(|thread| {
+                thread.summary.runtime_workstream_id.as_deref() == Some(workstream_id.as_str())
+            })
+            .count()
+    }
+
+    fn shared_runtime_thread_count(state: &DaemonState) -> usize {
+        state
+            .threads
+            .values()
+            .filter(|thread| {
+                thread.summary.runtime_workstream_id.is_none()
+                    && (thread.summary.source_kind.as_deref() == Some("orcas_managed")
+                        || thread.summary.scope == "live_observed")
+            })
+            .count()
+    }
+
+    fn codex_connection_mode_from_workstream(
+        mode: authority::WorkstreamExecutionConnectionMode,
+    ) -> CodexConnectionMode {
+        match mode {
+            authority::WorkstreamExecutionConnectionMode::ConnectOnly => {
+                CodexConnectionMode::ConnectOnly
+            }
+            authority::WorkstreamExecutionConnectionMode::SpawnIfNeeded => {
+                CodexConnectionMode::SpawnIfNeeded
+            }
+            authority::WorkstreamExecutionConnectionMode::SpawnAlways => {
+                CodexConnectionMode::SpawnAlways
+            }
+        }
+    }
+
+    async fn load_workstream_summary(
+        &self,
+        workstream_id: &authority::WorkstreamId,
+    ) -> OrcasResult<authority::WorkstreamSummary> {
+        let record = self
+            .authority_store
+            .get_workstream(workstream_id)
+            .await?
+            .ok_or_else(|| {
+                OrcasError::Protocol(format!("unknown workstream `{}`", workstream_id))
+            })?;
+        Ok(authority::WorkstreamSummary::from(&record))
+    }
+
+    async fn resolve_runtime_for_workstream(
+        &self,
+        workstream_id: &authority::WorkstreamId,
+    ) -> OrcasResult<Arc<WorkstreamRuntimeHandle>> {
+        let workstream = self.load_workstream_summary(workstream_id).await?;
+        let app_server_policy = workstream
+            .execution_scope
+            .as_ref()
+            .map(|scope| scope.app_server_policy)
+            .unwrap_or(authority::WorkstreamAppServerPolicy::SharedCurrentDaemon);
+        if app_server_policy == authority::WorkstreamAppServerPolicy::SharedCurrentDaemon {
+            return Ok(Arc::new(WorkstreamRuntimeHandle {
+                route_key: RuntimeRouteKey::Shared,
+                route_info: self.shared_runtime_route_info(),
+                daemon: Arc::clone(&self.codex_daemon),
+                client: Arc::clone(&self.codex_client),
+                connection_mode: Self::workstream_connection_mode_from_config(&self.config),
+                connect_gate: Arc::new(Mutex::new(())),
+            }));
+        }
+        self.ensure_workstream_runtime_handle(&workstream).await
+    }
+
+    async fn ensure_workstream_runtime_handle(
+        &self,
+        workstream: &authority::WorkstreamSummary,
+    ) -> OrcasResult<Arc<WorkstreamRuntimeHandle>> {
+        let route_key = RuntimeRouteKey::Workstream(workstream.id.clone());
+        let key = Self::runtime_handle_key(&route_key);
+        if let Some(handle) = self.workstream_runtimes.lock().await.get(&key).cloned() {
+            return Ok(handle);
+        }
+
+        let transport_kind = workstream
+            .execution_scope
+            .as_ref()
+            .map(|scope| scope.transport_kind)
+            .unwrap_or(authority::WorkstreamTransportKind::LocalAppServer);
+        let connection_mode = workstream
+            .execution_scope
+            .as_ref()
+            .map(|scope| scope.connection_mode)
+            .unwrap_or(authority::WorkstreamExecutionConnectionMode::SpawnIfNeeded);
+        let endpoint = self.local_workstream_runtime_endpoint(workstream)?;
+        let log_path = self.workstream_runtime_log_path(&workstream.id);
+
+        let daemon: Arc<dyn CodexDaemonManager> = match transport_kind {
+            authority::WorkstreamTransportKind::LocalAppServer => {
+                let mut config = self.config.codex.clone();
+                config.listen_url = endpoint.clone();
+                config.connection_mode =
+                    Self::codex_connection_mode_from_workstream(connection_mode);
+                Arc::new(LocalCodexDaemonManager::from_launch_spec(
+                    LocalCodexDaemonLaunchSpec {
+                        config,
+                        cwd: self.config.defaults.cwd.clone(),
+                        log_path,
+                        owner_kind: format!("orcasd_workstream:{}", workstream.id),
+                        owner_pid: self.runtime.pid,
+                        extra_env: {
+                            let mut env = vec![(
+                                "CODEX_HOME".to_string(),
+                                workstream
+                                    .execution_scope
+                                    .as_ref()
+                                    .map(|scope| scope.codex_home.clone())
+                                    .unwrap_or_default(),
+                            )];
+                            if let Some(sqlite_home) = workstream
+                                .execution_scope
+                                .as_ref()
+                                .and_then(|scope| scope.sqlite_home.clone())
+                            {
+                                env.push(("CODEX_SQLITE_HOME".to_string(), sqlite_home));
+                            }
+                            env
+                        },
+                    },
+                ))
+            }
+            authority::WorkstreamTransportKind::RemoteWebsocket => {
+                Arc::new(EndpointOnlyCodexDaemonManager {
+                    endpoint: endpoint.clone(),
+                    binary_path: self.config.codex.binary_path.clone(),
+                    log_path,
+                })
+            }
+        };
+        let client = CodexClient::new(
+            Arc::new(WebSocketTransport::new(endpoint.clone())),
+            self.config.codex.reconnect.clone(),
+            Arc::new(RejectingApprovalRouter),
+        );
+        let handle = Arc::new(WorkstreamRuntimeHandle {
+            route_key,
+            route_info: RuntimeRouteInfo {
+                endpoint,
+                runtime_workstream_id: Some(workstream.id.clone()),
+            },
+            daemon,
+            client,
+            connection_mode,
+            connect_gate: Arc::new(Mutex::new(())),
+        });
+        self.workstream_runtimes
+            .lock()
+            .await
+            .insert(key, Arc::clone(&handle));
+        self.spawn_codex_event_bridge(Arc::clone(&handle.client), handle.route_info.clone());
+        Ok(handle)
+    }
+
+    async fn connect_runtime_handle(
+        &self,
+        handle: &Arc<WorkstreamRuntimeHandle>,
+    ) -> OrcasResult<()> {
+        if handle.route_key == RuntimeRouteKey::Shared {
+            return self.connect_upstream().await;
+        }
+
+        let _guard = handle.connect_gate.lock().await;
+        if handle.client.is_ready().await {
+            return Ok(());
+        }
+        let launch = Self::codex_launch_for_upstream_connect(
+            Self::codex_connection_mode_from_workstream(handle.connection_mode),
+        );
+        let status = handle.daemon.ensure_running(launch).await?;
+        let workstream_id = match &handle.route_key {
+            RuntimeRouteKey::Shared => None,
+            RuntimeRouteKey::Workstream(id) => Some(id.clone()),
+        };
+        if let Some(workstream_id) = workstream_id.as_ref() {
+            self.persist_workstream_runtime_status(
+                workstream_id,
+                "dedicated_connecting",
+                Some(status.endpoint.clone()),
+                None,
+                None,
+            )
+            .await?;
+        }
+        match handle.client.connect().await {
+            Ok(()) => {
+                let _ = handle
+                    .client
+                    .initialize(types::InitializeParams {
+                        client_info: types::ClientInfo {
+                            name: "orcasd".to_string(),
+                            title: Some(format!("Orcas Daemon {}", handle.route_info.endpoint)),
+                            version: env!("CARGO_PKG_VERSION").to_string(),
+                        },
+                        capabilities: Some(types::InitializeCapabilities {
+                            experimental_api: true,
+                            opt_out_notification_methods: None,
+                        }),
+                    })
+                    .await?;
+                if let Ok(response) = handle
+                    .client
+                    .thread_list(types::ThreadListParams::default())
+                    .await
+                {
+                    let _ = self
+                        .sync_threads(
+                            &response.data,
+                            Some("upstream_discovered"),
+                            Some(&handle.route_info),
+                        )
+                        .await;
+                }
+                if let Some(workstream_id) = workstream_id.as_ref() {
+                    self.persist_workstream_runtime_status(
+                        workstream_id,
+                        "dedicated_connected",
+                        Some(status.endpoint),
+                        None,
+                        Some(Utc::now()),
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(workstream_id) = workstream_id.as_ref() {
+                    let _ = self
+                        .persist_workstream_runtime_status(
+                            workstream_id,
+                            "dedicated_error",
+                            Some(status.endpoint),
+                            Some(error.to_string()),
+                            None,
+                        )
+                        .await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn resolve_runtime_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> OrcasResult<Arc<WorkstreamRuntimeHandle>> {
+        if let Some(thread) = self.thread_from_state(thread_id).await
+            && let Some(workstream_id) = thread
+                .summary
+                .runtime_workstream_id
+                .as_ref()
+                .and_then(|id| authority::WorkstreamId::parse(id.clone()).ok())
+        {
+            return self.resolve_runtime_for_workstream(&workstream_id).await;
+        }
+        Ok(Arc::new(WorkstreamRuntimeHandle {
+            route_key: RuntimeRouteKey::Shared,
+            route_info: self.shared_runtime_route_info(),
+            daemon: Arc::clone(&self.codex_daemon),
+            client: Arc::clone(&self.codex_client),
+            connection_mode: Self::workstream_connection_mode_from_config(&self.config),
+            connect_gate: Arc::new(Mutex::new(())),
+        }))
+    }
+
+    async fn persist_workstream_runtime_status(
+        &self,
+        workstream_id: &authority::WorkstreamId,
+        status: &str,
+        effective_listen_url: Option<String>,
+        last_error: Option<String>,
+        started_at: Option<DateTime<Utc>>,
+    ) -> OrcasResult<()> {
+        let workstream = self.load_workstream_summary(workstream_id).await?;
+        let upstream = self.state.read().await.upstream.clone();
+        let shared_live_thread_count = {
+            let state = self.state.read().await;
+            Self::shared_runtime_thread_count(&state)
+        };
+        let mut summary = self.derive_workstream_runtime_summary(
+            &workstream,
+            &upstream,
+            shared_live_thread_count,
+            Utc::now(),
+        );
+        summary.status = status.to_string();
+        if let Some(value) = effective_listen_url {
+            summary.effective_listen_url = Some(value);
+        }
+        summary.last_error = last_error;
+        if started_at.is_some() {
+            summary.started_at = started_at;
+        }
+        self.authority_store
+            .upsert_workstream_runtime(&summary)
+            .await
     }
 
     fn bootstrap_planning_state(collaboration: &mut CollaborationState) -> bool {
@@ -797,14 +1242,16 @@ impl OrcasDaemonService {
         true
     }
 
-    fn spawn_codex_event_bridge(self: &Arc<Self>) {
-        let service = Arc::clone(self);
+    fn spawn_codex_event_bridge(&self, client: Arc<CodexClient>, runtime: RuntimeRouteInfo) {
+        let Some(service) = self.self_handle.get().and_then(|weak| weak.upgrade()) else {
+            return;
+        };
         tokio::spawn(async move {
-            let mut subscription = service.codex_client.subscribe();
+            let mut subscription = client.subscribe();
             loop {
                 match subscription.recv().await {
                     Ok(event) => {
-                        service.apply_codex_event(event).await;
+                        service.apply_codex_event(&client, &runtime, event).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         service
@@ -1614,8 +2061,12 @@ impl OrcasDaemonService {
             .codex_client
             .thread_list(types::ThreadListParams::default())
             .await?;
-        self.sync_threads(&response.data, Some("upstream_discovered"))
-            .await?;
+        self.sync_threads(
+            &response.data,
+            Some("upstream_discovered"),
+            Some(&self.shared_runtime_route_info()),
+        )
+        .await?;
         Ok(ipc::ThreadsListResponse {
             data: self.known_thread_summaries().await,
         })
@@ -1647,9 +2098,17 @@ impl OrcasDaemonService {
         &self,
         params: ipc::ThreadStartRequest,
     ) -> OrcasResult<ipc::ThreadStartResponse> {
-        self.connect_upstream().await?;
-        let response = self
-            .codex_client
+        let runtime = Arc::new(WorkstreamRuntimeHandle {
+            route_key: RuntimeRouteKey::Shared,
+            route_info: self.shared_runtime_route_info(),
+            daemon: Arc::clone(&self.codex_daemon),
+            client: Arc::clone(&self.codex_client),
+            connection_mode: Self::workstream_connection_mode_from_config(&self.config),
+            connect_gate: Arc::new(Mutex::new(())),
+        });
+        self.connect_runtime_handle(&runtime).await?;
+        let response = runtime
+            .client
             .thread_start(types::ThreadStartParams {
                 cwd: params.cwd.or_else(|| {
                     self.config
@@ -1665,7 +2124,49 @@ impl OrcasDaemonService {
             })
             .await?;
         let view = self
-            .sync_thread(&response.thread, Some("orcas_managed"))
+            .sync_thread(
+                &response.thread,
+                Some("orcas_managed"),
+                Some(&runtime.route_info),
+            )
+            .await?;
+        self.set_thread_monitor_state(&view.summary.id, ipc::ThreadMonitorState::Attached)
+            .await?;
+        self.set_active_thread(&view.summary.id).await;
+        Ok(ipc::ThreadStartResponse {
+            thread: view.summary,
+        })
+    }
+
+    async fn thread_start_for_workstream(
+        &self,
+        workstream_id: &authority::WorkstreamId,
+        params: ipc::ThreadStartRequest,
+    ) -> OrcasResult<ipc::ThreadStartResponse> {
+        let runtime = self.resolve_runtime_for_workstream(workstream_id).await?;
+        self.connect_runtime_handle(&runtime).await?;
+        let response = runtime
+            .client
+            .thread_start(types::ThreadStartParams {
+                cwd: params.cwd.or_else(|| {
+                    self.config
+                        .defaults
+                        .cwd
+                        .clone()
+                        .map(|path| path.display().to_string())
+                }),
+                model: params.model.or_else(|| self.config.defaults.model.clone()),
+                ephemeral: Some(params.ephemeral),
+                service_name: Some("orcasd".to_string()),
+                ..types::ThreadStartParams::default()
+            })
+            .await?;
+        let view = self
+            .sync_thread(
+                &response.thread,
+                Some("orcas_managed"),
+                Some(&runtime.route_info),
+            )
             .await?;
         self.set_thread_monitor_state(&view.summary.id, ipc::ThreadMonitorState::Attached)
             .await?;
@@ -1679,16 +2180,21 @@ impl OrcasDaemonService {
         &self,
         params: ipc::ThreadReadRequest,
     ) -> OrcasResult<ipc::ThreadReadResponse> {
-        self.connect_upstream().await?;
-        let response = self
-            .codex_client
+        let runtime = self.resolve_runtime_for_thread(&params.thread_id).await?;
+        self.connect_runtime_handle(&runtime).await?;
+        let response = runtime
+            .client
             .thread_read(types::ThreadReadParams {
                 thread_id: params.thread_id,
                 include_turns: params.include_turns,
             })
             .await?;
         let view = self
-            .sync_thread(&response.thread, Some("live_observed"))
+            .sync_thread(
+                &response.thread,
+                Some("live_observed"),
+                Some(&runtime.route_info),
+            )
             .await?;
         Ok(ipc::ThreadReadResponse { thread: view })
     }
@@ -1725,16 +2231,21 @@ impl OrcasDaemonService {
         &self,
         params: ipc::ThreadGetRequest,
     ) -> OrcasResult<ipc::ThreadGetResponse> {
-        self.connect_upstream().await?;
-        let response = self
-            .codex_client
+        let runtime = self.resolve_runtime_for_thread(&params.thread_id).await?;
+        self.connect_runtime_handle(&runtime).await?;
+        let response = runtime
+            .client
             .thread_read(types::ThreadReadParams {
                 thread_id: params.thread_id,
                 include_turns: true,
             })
             .await?;
         let view = self
-            .sync_thread(&response.thread, Some("live_observed"))
+            .sync_thread(
+                &response.thread,
+                Some("live_observed"),
+                Some(&runtime.route_info),
+            )
             .await?;
         Ok(ipc::ThreadGetResponse { thread: view })
     }
@@ -1743,9 +2254,10 @@ impl OrcasDaemonService {
         &self,
         params: ipc::ThreadResumeRequest,
     ) -> OrcasResult<ipc::ThreadResumeResponse> {
-        self.connect_upstream().await?;
-        let response = self
-            .codex_client
+        let runtime = self.resolve_runtime_for_thread(&params.thread_id).await?;
+        self.connect_runtime_handle(&runtime).await?;
+        let response = runtime
+            .client
             .thread_resume(types::ThreadResumeParams {
                 thread_id: params.thread_id,
                 cwd: params.cwd.or_else(|| {
@@ -1766,7 +2278,11 @@ impl OrcasDaemonService {
             })
             .await?;
         let view = self
-            .sync_thread(&response.thread, Some("orcas_managed"))
+            .sync_thread(
+                &response.thread,
+                Some("orcas_managed"),
+                Some(&runtime.route_info),
+            )
             .await?;
         self.set_thread_monitor_state(&view.summary.id, ipc::ThreadMonitorState::Attached)
             .await?;
@@ -1792,10 +2308,11 @@ impl OrcasDaemonService {
 
         self.set_thread_monitor_state(&params.thread_id, ipc::ThreadMonitorState::Attaching)
             .await?;
-        self.connect_upstream().await?;
+        let runtime = self.resolve_runtime_for_thread(&params.thread_id).await?;
+        self.connect_runtime_handle(&runtime).await?;
 
-        let response = self
-            .codex_client
+        let response = runtime
+            .client
             .thread_resume(types::ThreadResumeParams {
                 thread_id: params.thread_id.clone(),
                 cwd: params.cwd.or_else(|| {
@@ -1819,7 +2336,11 @@ impl OrcasDaemonService {
         match response {
             Ok(response) => {
                 let view = self
-                    .sync_thread(&response.thread, Some("live_observed"))
+                    .sync_thread(
+                        &response.thread,
+                        Some("live_observed"),
+                        Some(&runtime.route_info),
+                    )
                     .await?;
                 self.set_thread_monitor_state(&view.summary.id, ipc::ThreadMonitorState::Attached)
                     .await?;
@@ -1946,15 +2467,16 @@ impl OrcasDaemonService {
         &self,
         params: ipc::TurnStartRequest,
     ) -> OrcasResult<ipc::TurnStartResponse> {
-        self.connect_upstream().await?;
+        let runtime = self.resolve_runtime_for_thread(&params.thread_id).await?;
+        self.connect_runtime_handle(&runtime).await?;
         info!(
             thread_id = %params.thread_id,
             has_cwd = params.cwd.is_some(),
             has_model = params.model.is_some(),
             "starting upstream Codex turn"
         );
-        let response = self
-            .codex_client
+        let response = runtime
+            .client
             .turn_start(types::TurnStartParams {
                 thread_id: params.thread_id.clone(),
                 input: vec![types::UserInput::Text {
@@ -1995,9 +2517,10 @@ impl OrcasDaemonService {
                 "turn/steer requires non-empty text".to_string(),
             ));
         }
-        self.connect_upstream().await?;
-        let response = self
-            .codex_client
+        let runtime = self.resolve_runtime_for_thread(&params.thread_id).await?;
+        self.connect_runtime_handle(&runtime).await?;
+        let response = runtime
+            .client
             .turn_steer(types::TurnSteerParams {
                 thread_id: params.thread_id.clone(),
                 input: vec![types::UserInput::Text {
@@ -2014,8 +2537,10 @@ impl OrcasDaemonService {
     }
 
     async fn turn_interrupt(&self, params: ipc::TurnInterruptRequest) -> OrcasResult<()> {
-        self.connect_upstream().await?;
-        self.codex_client
+        let runtime = self.resolve_runtime_for_thread(&params.thread_id).await?;
+        self.connect_runtime_handle(&runtime).await?;
+        runtime
+            .client
             .turn_interrupt(types::TurnInterruptParams {
                 thread_id: params.thread_id,
                 turn_id: params.turn_id,
@@ -3891,11 +4416,19 @@ impl OrcasDaemonService {
                 })?;
             planning_thread_id
         } else {
-            self.thread_start(ipc::ThreadStartRequest {
-                cwd: params.cwd.clone(),
-                model: params.model.clone(),
-                ephemeral: false,
-            })
+            self.thread_start_for_workstream(
+                &authority::WorkstreamId::parse(params.workstream_id.clone()).map_err(|error| {
+                    OrcasError::Protocol(format!(
+                        "invalid planning workstream id `{}`: {error}",
+                        params.workstream_id
+                    ))
+                })?,
+                ipc::ThreadStartRequest {
+                    cwd: params.cwd.clone(),
+                    model: params.model.clone(),
+                    ephemeral: false,
+                },
+            )
             .await?
             .thread
             .id
@@ -12181,13 +12714,39 @@ impl OrcasDaemonService {
             return Ok(existing);
         }
 
-        let thread = self
-            .thread_start(ipc::ThreadStartRequest {
+        let thread = if let Some(work_unit_id) = work_unit_id {
+            let workstream_id = self
+                .state
+                .read()
+                .await
+                .collaboration
+                .work_units
+                .get(work_unit_id)
+                .map(|work_unit| work_unit.workstream_id.clone())
+                .ok_or_else(|| {
+                    OrcasError::Protocol(format!("unknown work unit `{work_unit_id}`"))
+                })?;
+            self.thread_start_for_workstream(
+                &authority::WorkstreamId::parse(workstream_id).map_err(|error| {
+                    OrcasError::Protocol(format!(
+                        "invalid workstream id for work unit `{work_unit_id}`: {error}"
+                    ))
+                })?,
+                ipc::ThreadStartRequest {
+                    cwd,
+                    model,
+                    ephemeral: false,
+                },
+            )
+            .await?
+        } else {
+            self.thread_start(ipc::ThreadStartRequest {
                 cwd,
                 model,
                 ephemeral: false,
             })
-            .await?;
+            .await?
+        };
         let session = {
             let now = Utc::now();
             let mut state = self.state.write().await;
@@ -14105,7 +14664,11 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             .await
         {
             let _ = self
-                .sync_threads(&response.data, Some("upstream_discovered"))
+                .sync_threads(
+                    &response.data,
+                    Some("upstream_discovered"),
+                    Some(&self.shared_runtime_route_info()),
+                )
                 .await;
         }
         Ok(())
@@ -14128,9 +14691,10 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         &self,
         threads: &[types::Thread],
         scope: Option<&str>,
+        runtime: Option<&RuntimeRouteInfo>,
     ) -> OrcasResult<()> {
         for thread in threads {
-            self.sync_thread(thread, scope).await?;
+            self.sync_thread(thread, scope, runtime).await?;
         }
         Ok(())
     }
@@ -14139,9 +14703,10 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         &self,
         thread: &types::Thread,
         scope: Option<&str>,
+        runtime: Option<&RuntimeRouteInfo>,
     ) -> OrcasResult<ipc::ThreadView> {
         let existing = self.thread_from_state(&thread.id).await;
-        let view = Self::thread_view_from_codex(thread.clone(), existing.as_ref(), scope);
+        let view = Self::thread_view_from_codex(thread.clone(), existing.as_ref(), scope, runtime);
         self.persist_thread_view(&view).await?;
         let mut state = self.state.write().await;
         state.recent_thread_id = Some(view.summary.id.clone());
@@ -14171,7 +14736,6 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
 
     fn thread_metadata_from_view(
         thread: &ipc::ThreadView,
-        endpoint: &str,
         model: Option<String>,
     ) -> ThreadMetadata {
         let created_at = Utc
@@ -14189,7 +14753,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             model,
             model_provider: Some(thread.summary.model_provider.clone()),
             cwd: (!thread.summary.cwd.is_empty()).then(|| PathBuf::from(&thread.summary.cwd)),
-            endpoint: Some(endpoint.to_string()),
+            endpoint: thread.summary.endpoint.clone(),
+            runtime_workstream_id: thread.summary.runtime_workstream_id.clone(),
             created_at,
             updated_at,
             status: thread.summary.status.clone(),
@@ -14217,11 +14782,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     .threads
                     .values()
                     .map(|thread| {
-                        let metadata = Self::thread_metadata_from_view(
-                            thread,
-                            &self.config.codex.listen_url,
-                            None,
-                        );
+                        let metadata = Self::thread_metadata_from_view(thread, None);
                         (metadata.id.clone(), metadata)
                     })
                     .collect(),
@@ -14509,6 +15070,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     ipc::TurnStateView {
                         thread_id: thread_id.to_string(),
                         turn_id: turn_id.to_string(),
+                        endpoint: thread.summary.endpoint.clone(),
+                        runtime_workstream_id: thread.summary.runtime_workstream_id.clone(),
                         lifecycle: ipc::TurnLifecycleState::Active,
                         status: status.to_string(),
                         attachable: true,
@@ -14544,23 +15107,76 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             .await;
     }
 
-    async fn apply_codex_connection_state_changed(&self, upstream: ConnectionState) {
+    async fn apply_codex_connection_state_changed(
+        &self,
+        runtime: &RuntimeRouteInfo,
+        upstream: ConnectionState,
+    ) {
+        let is_shared = runtime.runtime_workstream_id.is_none();
         let (maybe_session, threads_to_persist, turns_to_persist) = {
             let mut state = self.state.write().await;
-            state.upstream = upstream.clone();
+            if is_shared {
+                state.upstream = upstream.clone();
+            }
             if upstream.status != "connected" {
                 info!(
                     endpoint = %upstream.endpoint,
                     status = %upstream.status,
                     "codex transport disconnected; detaching active turns without overwriting execution outcome"
                 );
-                Self::mark_turns_lost(&mut state);
+                if is_shared {
+                    Self::mark_turns_lost(&mut state);
+                } else {
+                    for turn in state.turns.values_mut() {
+                        let matches_runtime = turn.runtime_workstream_id
+                            == runtime
+                                .runtime_workstream_id
+                                .as_ref()
+                                .map(ToString::to_string)
+                            || turn.endpoint.as_deref() == Some(runtime.endpoint.as_str());
+                        if matches_runtime
+                            && matches!(turn.lifecycle, ipc::TurnLifecycleState::Active)
+                        {
+                            turn.lifecycle = ipc::TurnLifecycleState::Lost;
+                            turn.status = "lost".to_string();
+                            turn.attachable = false;
+                            turn.live_stream = false;
+                            turn.updated_at = Utc::now();
+                        }
+                    }
+                }
             }
             Self::refresh_session_from_turns(&mut state);
             (
                 state.session.clone(),
-                state.threads.values().cloned().collect::<Vec<_>>(),
-                state.turns.values().cloned().collect::<Vec<_>>(),
+                state
+                    .threads
+                    .values()
+                    .filter(|thread| {
+                        is_shared
+                            || thread.summary.runtime_workstream_id
+                                == runtime
+                                    .runtime_workstream_id
+                                    .as_ref()
+                                    .map(ToString::to_string)
+                            || thread.summary.endpoint.as_deref() == Some(runtime.endpoint.as_str())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                state
+                    .turns
+                    .values()
+                    .filter(|turn| {
+                        is_shared
+                            || turn.runtime_workstream_id
+                                == runtime
+                                    .runtime_workstream_id
+                                    .as_ref()
+                                    .map(ToString::to_string)
+                            || turn.endpoint.as_deref() == Some(runtime.endpoint.as_str())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
             )
         };
         if upstream.status != "connected" {
@@ -14571,20 +15187,44 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 let _ = self.persist_turn_state_view(turn).await;
             }
         }
-        self.emit(ipc::DaemonEvent::UpstreamStatusChanged { upstream })
+        if is_shared {
+            self.emit(ipc::DaemonEvent::UpstreamStatusChanged {
+                upstream: upstream.clone(),
+            })
             .await;
+        } else if let Some(workstream_id) = runtime.runtime_workstream_id.as_ref() {
+            let _ = self
+                .persist_workstream_runtime_status(
+                    workstream_id,
+                    &format!("dedicated_{}", upstream.status),
+                    Some(runtime.endpoint.clone()),
+                    upstream.detail.clone(),
+                    None,
+                )
+                .await;
+        }
         self.emit(ipc::DaemonEvent::SessionChanged {
             session: maybe_session,
         })
         .await;
     }
 
-    async fn apply_codex_thread_started(&self, thread_id: String, preview: String) {
-        let maybe_thread = self.codex_client.snapshot_thread(&thread_id).await;
+    async fn apply_codex_thread_started(
+        &self,
+        client: &Arc<CodexClient>,
+        runtime: &RuntimeRouteInfo,
+        thread_id: String,
+        preview: String,
+    ) {
+        let maybe_thread = client.snapshot_thread(&thread_id).await;
         let summary = if let Some(thread) = maybe_thread {
             let existing = self.thread_from_state(&thread_id).await;
-            let view =
-                Self::thread_view_from_codex(thread, existing.as_ref(), Some("live_observed"));
+            let view = Self::thread_view_from_codex(
+                thread,
+                existing.as_ref(),
+                Some("live_observed"),
+                Some(runtime),
+            );
             let _ = self.persist_thread_view(&view).await;
             let mut state = self.state.write().await;
             state.recent_thread_id = Some(view.summary.id.clone());
@@ -14596,6 +15236,11 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 let thread = Self::ensure_thread_entry(&mut state, &thread_id);
                 thread.summary.preview = preview;
                 thread.summary.status = "started".to_string();
+                thread.summary.endpoint = Some(runtime.endpoint.clone());
+                thread.summary.runtime_workstream_id = runtime
+                    .runtime_workstream_id
+                    .as_ref()
+                    .map(ToString::to_string);
                 thread.summary.scope = Self::prefer_scope(&thread.summary.scope, "live_observed");
                 thread.summary.recent_event = Some("thread started".to_string());
                 Self::touch_thread(thread);
@@ -14662,6 +15307,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     ipc::TurnStateView {
                         thread_id: thread_id.clone(),
                         turn_id: turn_id.clone(),
+                        endpoint: thread.summary.endpoint.clone(),
+                        runtime_workstream_id: thread.summary.runtime_workstream_id.clone(),
                         lifecycle: Self::turn_lifecycle_from_status(&status),
                         status: status.clone(),
                         attachable: false,
@@ -14724,6 +15371,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     ipc::TurnStateView {
                         thread_id: thread_id.clone(),
                         turn_id: turn_id.clone(),
+                        endpoint: thread.summary.endpoint.clone(),
+                        runtime_workstream_id: thread.summary.runtime_workstream_id.clone(),
                         lifecycle: Self::turn_lifecycle_from_status(&status),
                         status: status.clone(),
                         attachable: !Self::is_terminal_status(&status),
@@ -14916,14 +15565,20 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         .await;
     }
 
-    async fn apply_codex_event(&self, envelope: EventEnvelope) {
+    async fn apply_codex_event(
+        &self,
+        client: &Arc<CodexClient>,
+        runtime: &RuntimeRouteInfo,
+        envelope: EventEnvelope,
+    ) {
         debug!(event = ?envelope.event, "processing codex event");
         match envelope.event {
             OrcasEvent::ConnectionStateChanged(upstream) => {
-                Box::pin(self.apply_codex_connection_state_changed(upstream)).await;
+                Box::pin(self.apply_codex_connection_state_changed(runtime, upstream)).await;
             }
             OrcasEvent::ThreadStarted { thread_id, preview } => {
-                Box::pin(self.apply_codex_thread_started(thread_id, preview)).await;
+                Box::pin(self.apply_codex_thread_started(client, runtime, thread_id, preview))
+                    .await;
             }
             OrcasEvent::ThreadStatusChanged { thread_id, status } => {
                 Box::pin(self.apply_codex_thread_status_changed(thread_id, status)).await;
@@ -15168,6 +15823,16 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         }
     }
 
+    #[cfg(test)]
+    async fn apply_shared_codex_event(&self, envelope: EventEnvelope) {
+        self.apply_codex_event(
+            &Arc::clone(&self.codex_client),
+            &self.shared_runtime_route_info(),
+            envelope,
+        )
+        .await;
+    }
+
     async fn update_item_state(
         &self,
         thread_id: &str,
@@ -15233,6 +15898,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         let turn_state = ipc::TurnStateView {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.to_string(),
+            endpoint: thread.summary.endpoint.clone(),
+            runtime_workstream_id: thread.summary.runtime_workstream_id.clone(),
             lifecycle,
             status: turn_status.clone(),
             attachable,
@@ -15289,6 +15956,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         let turn_state = ipc::TurnStateView {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.to_string(),
+            endpoint: thread.summary.endpoint.clone(),
+            runtime_workstream_id: thread.summary.runtime_workstream_id.clone(),
             lifecycle,
             status: turn_status.clone(),
             attachable,
@@ -15533,6 +16202,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 name: None,
                 model_provider: String::new(),
                 cwd: String::new(),
+                endpoint: None,
+                runtime_workstream_id: None,
                 status: "pending".to_string(),
                 created_at: now,
                 updated_at: now,
@@ -15567,6 +16238,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_default(),
+                endpoint: metadata.endpoint.clone(),
+                runtime_workstream_id: metadata.runtime_workstream_id.clone(),
                 status: metadata.status.clone(),
                 created_at: metadata.created_at.timestamp(),
                 updated_at: metadata.updated_at.timestamp(),
@@ -15597,6 +16270,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         thread: types::Thread,
         existing: Option<&ipc::ThreadView>,
         scope: Option<&str>,
+        runtime: Option<&RuntimeRouteInfo>,
     ) -> ipc::ThreadView {
         let loaded_status = Self::thread_loaded_status_from_codex(&thread.status);
         let active_flags = Self::thread_active_flags(&thread.status);
@@ -15609,6 +16283,15 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 name: thread.name,
                 model_provider: thread.model_provider,
                 cwd: thread.cwd,
+                endpoint: runtime
+                    .map(|value| value.endpoint.clone())
+                    .or_else(|| existing.and_then(|thread| thread.summary.endpoint.clone())),
+                runtime_workstream_id: runtime
+                    .and_then(|value| value.runtime_workstream_id.as_ref())
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        existing.and_then(|thread| thread.summary.runtime_workstream_id.clone())
+                    }),
                 status: thread.status.label().to_string(),
                 created_at: thread.created_at,
                 updated_at: thread.updated_at,
@@ -16125,6 +16808,8 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
         Some(ipc::TurnStateView {
             thread_id: thread.summary.id.clone(),
             turn_id: turn.id.clone(),
+            endpoint: thread.summary.endpoint.clone(),
+            runtime_workstream_id: thread.summary.runtime_workstream_id.clone(),
             lifecycle,
             status: turn.status.clone(),
             attachable: false,
@@ -18042,6 +18727,8 @@ worker epilogue"#;
                 name: None,
                 model_provider: "openai".to_string(),
                 cwd: "/tmp/orcas".to_string(),
+                endpoint: None,
+                runtime_workstream_id: None,
                 status: "idle".to_string(),
                 created_at: updated_at - 10,
                 updated_at,
@@ -18231,6 +18918,8 @@ worker epilogue"#;
             authority_store,
             codex_daemon,
             codex_client,
+            workstream_runtimes: Mutex::new(HashMap::new()),
+            self_handle: std::sync::OnceLock::new(),
             state: RwLock::new(DaemonState::default()),
             recent_events: Mutex::new(std::collections::VecDeque::new()),
             connect_gate: Mutex::new(()),
@@ -18239,9 +18928,13 @@ worker epilogue"#;
             shutdown: Notify::new(),
             supervisor_reasoner,
         });
+        let _ = service.self_handle.set(Arc::downgrade(&service));
         service.initialize_state().await.expect("initialize state");
         if spawn_codex_bridge {
-            service.spawn_codex_event_bridge();
+            service.spawn_codex_event_bridge(
+                Arc::clone(&service.codex_client),
+                service.shared_runtime_route_info(),
+            );
         }
         service
     }
@@ -18614,6 +19307,8 @@ worker epilogue"#;
         let turn_state = ipc::TurnStateView {
             thread_id: format!("thread-{label}"),
             turn_id: format!("turn-{label}"),
+            endpoint: None,
+            runtime_workstream_id: None,
             lifecycle: ipc::TurnLifecycleState::Completed,
             status: "completed".to_string(),
             attachable: false,
@@ -22746,6 +23441,8 @@ ORCAS_REPORT_END"#
             ipc::TurnStateView {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
+                endpoint: None,
+                runtime_workstream_id: None,
                 lifecycle: ipc::TurnLifecycleState::Active,
                 status: "in_progress".to_string(),
                 attachable: true,
@@ -22798,6 +23495,8 @@ ORCAS_REPORT_END"#
                 ipc::TurnStateView {
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
+                    endpoint: None,
+                    runtime_workstream_id: None,
                     lifecycle: ipc::TurnLifecycleState::Active,
                     status: "in_progress".to_string(),
                     attachable: false,
@@ -22937,6 +23636,8 @@ ORCAS_REPORT_END"#
                 ipc::TurnStateView {
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
+                    endpoint: None,
+                    runtime_workstream_id: None,
                     lifecycle: ipc::TurnLifecycleState::Active,
                     status: "in_progress".to_string(),
                     attachable: false,
@@ -23114,6 +23815,8 @@ ORCAS_REPORT_END"#
                 ipc::TurnStateView {
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
+                    endpoint: None,
+                    runtime_workstream_id: None,
                     lifecycle: ipc::TurnLifecycleState::Active,
                     status: "in_progress".to_string(),
                     attachable: false,
@@ -23445,7 +24148,7 @@ ORCAS_REPORT_END"#
             .expect("attach");
 
         service
-            .apply_codex_event(EventEnvelope::new(
+            .apply_shared_codex_event(EventEnvelope::new(
                 "test",
                 OrcasEvent::TurnStarted {
                     thread_id: "thread-headless".to_string(),
@@ -23465,7 +24168,7 @@ ORCAS_REPORT_END"#
             ))
             .await;
         service
-            .apply_codex_event(EventEnvelope::new(
+            .apply_shared_codex_event(EventEnvelope::new(
                 "test",
                 OrcasEvent::ItemStarted {
                     thread_id: "thread-headless".to_string(),
@@ -23484,7 +24187,7 @@ ORCAS_REPORT_END"#
             ))
             .await;
         service
-            .apply_codex_event(EventEnvelope::new(
+            .apply_shared_codex_event(EventEnvelope::new(
                 "test",
                 OrcasEvent::AgentMessageDelta {
                     thread_id: "thread-headless".to_string(),
@@ -23495,7 +24198,7 @@ ORCAS_REPORT_END"#
             ))
             .await;
         service
-            .apply_codex_event(EventEnvelope::new(
+            .apply_shared_codex_event(EventEnvelope::new(
                 "test",
                 OrcasEvent::ItemCompleted {
                     thread_id: "thread-headless".to_string(),
@@ -23514,7 +24217,7 @@ ORCAS_REPORT_END"#
             ))
             .await;
         service
-            .apply_codex_event(EventEnvelope::new(
+            .apply_shared_codex_event(EventEnvelope::new(
                 "test",
                 OrcasEvent::TurnCompleted {
                     thread_id: "thread-headless".to_string(),
@@ -23916,7 +24619,7 @@ ORCAS_REPORT_END"#
         assert!(decisions.decisions.is_empty());
 
         service
-            .apply_codex_event(EventEnvelope::new(
+            .apply_shared_codex_event(EventEnvelope::new(
                 "test",
                 OrcasEvent::TurnCompleted {
                     thread_id: thread.summary.id.clone(),
@@ -26632,7 +27335,7 @@ ORCAS_REPORT_END"#
             .decision;
 
         service
-            .apply_codex_event(EventEnvelope::new(
+            .apply_shared_codex_event(EventEnvelope::new(
                 "test",
                 OrcasEvent::TurnCompleted {
                     thread_id: thread.summary.id.clone(),
@@ -26693,7 +27396,7 @@ ORCAS_REPORT_END"#
             .decision;
 
         service
-            .apply_codex_event(EventEnvelope::new(
+            .apply_shared_codex_event(EventEnvelope::new(
                 "test",
                 OrcasEvent::TurnCompleted {
                     thread_id: thread.summary.id.clone(),
@@ -27492,6 +28195,8 @@ ORCAS_REPORT_END"#
         let turn_state = ipc::TurnStateView {
             thread_id: thread_id.clone(),
             turn_id: "turn-workspace-report".to_string(),
+            endpoint: None,
+            runtime_workstream_id: None,
             lifecycle: ipc::TurnLifecycleState::Completed,
             status: "completed".to_string(),
             attachable: false,
@@ -28656,6 +29361,8 @@ Boundedness note: Stay within the legacy compatibility boundary."#
         let turn_state = ipc::TurnStateView {
             thread_id: "thread-interrupted".to_string(),
             turn_id: "turn-interrupted".to_string(),
+            endpoint: None,
+            runtime_workstream_id: None,
             lifecycle: ipc::TurnLifecycleState::Interrupted,
             status: "interrupted".to_string(),
             attachable: false,

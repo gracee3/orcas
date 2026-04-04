@@ -28,6 +28,8 @@ pub struct ThreadMetadata {
     pub model_provider: Option<String>,
     pub cwd: Option<PathBuf>,
     pub endpoint: Option<String>,
+    #[serde(default)]
+    pub runtime_workstream_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub status: String,

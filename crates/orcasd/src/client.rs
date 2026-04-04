@@ -1312,6 +1312,8 @@ mod tests {
             name: Some("Thread".to_string()),
             model_provider: "openai".to_string(),
             cwd: "/tmp".to_string(),
+            endpoint: None,
+            runtime_workstream_id: None,
             status: "idle".to_string(),
             created_at: 1,
             updated_at: 2,
