@@ -142,13 +142,26 @@ e2e_prepare_output_dirs() {
     "$e2e_output_root/xdg/$e2e_run_id"
 }
 
+e2e_ensure_symlink() {
+  local target="$1"
+  local link_path="$2"
+
+  mkdir -p "$(dirname "$link_path")"
+  if [[ -L "$link_path" && "$(readlink "$link_path")" == "$target" ]]; then
+    return 0
+  fi
+  if [[ -e "$link_path" && ! -L "$link_path" ]]; then
+    rm -rf "$link_path"
+  fi
+  ln -sfn "$target" "$link_path"
+}
+
 e2e_link_legacy_xdg_views() {
   mkdir -p "$E2E_SCENARIO_XDG_DATA_HOME" "$E2E_SCENARIO_XDG_CONFIG_HOME" "$E2E_SCENARIO_XDG_RUNTIME_HOME"
   mkdir -p "$E2E_SCENARIO_ORCAS_HOME/logs" "$E2E_SCENARIO_ORCAS_HOME/runtime"
-  rm -rf "$E2E_SCENARIO_XDG_DATA_HOME/orcas" "$E2E_SCENARIO_XDG_CONFIG_HOME/orcas" "$E2E_SCENARIO_XDG_RUNTIME_HOME/orcas"
-  ln -s "$E2E_SCENARIO_ORCAS_HOME" "$E2E_SCENARIO_XDG_DATA_HOME/orcas"
-  ln -s "$E2E_SCENARIO_ORCAS_HOME" "$E2E_SCENARIO_XDG_CONFIG_HOME/orcas"
-  ln -s "$E2E_SCENARIO_ORCAS_HOME/runtime" "$E2E_SCENARIO_XDG_RUNTIME_HOME/orcas"
+  e2e_ensure_symlink "$E2E_SCENARIO_ORCAS_HOME" "$E2E_SCENARIO_XDG_DATA_HOME/orcas"
+  e2e_ensure_symlink "$E2E_SCENARIO_ORCAS_HOME" "$E2E_SCENARIO_XDG_CONFIG_HOME/orcas"
+  e2e_ensure_symlink "$E2E_SCENARIO_ORCAS_HOME/runtime" "$E2E_SCENARIO_XDG_RUNTIME_HOME/orcas"
 }
 
 e2e_sync_legacy_xdg_into_orcas_home() {
@@ -169,10 +182,9 @@ e2e_sync_legacy_xdg_into_orcas_home() {
     cp -a "$xdg_runtime_home/orcas/." "$orcas_home/runtime/"
   fi
 
-  rm -rf "$xdg_data_home/orcas" "$xdg_config_home/orcas" "$xdg_runtime_home/orcas"
-  ln -s "$orcas_home" "$xdg_data_home/orcas"
-  ln -s "$orcas_home" "$xdg_config_home/orcas"
-  ln -s "$orcas_home/runtime" "$xdg_runtime_home/orcas"
+  e2e_ensure_symlink "$orcas_home" "$xdg_data_home/orcas"
+  e2e_ensure_symlink "$orcas_home" "$xdg_config_home/orcas"
+  e2e_ensure_symlink "$orcas_home/runtime" "$xdg_runtime_home/orcas"
 }
 
 e2e_prepare_scenario_dirs() {
