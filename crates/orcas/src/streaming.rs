@@ -731,6 +731,7 @@ mod tests {
                     ipc::ThreadMonitorState::Detached
                 },
                 last_sync_at: Utc::now(),
+                management_state: ipc::ThreadManagementState::Managed,
                 source_kind: None,
                 raw_summary: None,
             }],

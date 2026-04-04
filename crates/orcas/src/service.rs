@@ -931,11 +931,12 @@ impl SupervisorService {
     fn print_thread_list(threads: Vec<ipc::ThreadSummary>) {
         for thread in threads {
             println!(
-                "{}\t{}\t{}\t{}\tloaded={:?}\tmonitor={:?}\tin_flight={}\tactive_turn={}\t{}\t{}",
+                "{}\t{}\t{}\t{}\tmanagement={}\tloaded={:?}\tmonitor={:?}\tin_flight={}\tactive_turn={}\t{}\t{}",
                 thread.id,
                 thread.status,
                 thread.model_provider,
                 thread.scope,
+                thread.management_state.label(),
                 thread.loaded_status,
                 thread.monitor_state,
                 thread.turn_in_flight,
@@ -960,6 +961,10 @@ impl SupervisorService {
         println!("thread: {}", response.thread.summary.id);
         println!("status: {}", response.thread.summary.status);
         println!("scope: {}", response.thread.summary.scope);
+        println!(
+            "management_state: {}",
+            response.thread.summary.management_state.label()
+        );
         println!("cwd: {}", response.thread.summary.cwd);
         println!("preview: {}", response.thread.summary.preview);
         if let Some(snippet) = response.thread.summary.recent_output.as_ref() {

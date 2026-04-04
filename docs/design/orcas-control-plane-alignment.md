@@ -26,6 +26,7 @@
 - Keep merge, prune, and landing authority in Orcas supervisor flows.
 - Use `state.db` as the source of truth for workstream, work unit, tracked thread, workspace intent, and workstream execution scope.
 - Keep runtime mirrors in SQLite runtime snapshots inside `state.db`.
+- Keep externally created Codex threads visible but `observed_unmanaged` until Orcas explicitly adopts them into a managed lane.
 
 ## 4. Lifecycle
 
@@ -39,10 +40,12 @@
    Persist workspace intent on the tracked-thread record and trigger explicit workspace operations.
 5. Start Codex thread in that workspace.
    Resolve turn `cwd`, repo root, related git-admin roots, and requested model from the workspace and assignment contract.
+   Threads discovered on the same runtime but not adopted into Orcas remain visible as `observed_unmanaged` and do not become tracked-thread lanes automatically.
 6. Collect results.
    Continue using assignment communication packets plus reports, workspace operations, and landing/prune records.
 7. Supervisor decides merge, prune, or follow-up.
    Orcas remains the only merge/prune authority.
+   Dedicated runtime stop, restart, and idle retirement must refuse while unmanaged external threads are still present on that runtime.
 
 ## 5. State Model
 

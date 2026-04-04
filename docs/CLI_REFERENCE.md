@@ -147,6 +147,8 @@ These flags are accepted before any subcommand.
 - `orcas codex turns recent --thread <ID> [--limit <N>]`
 - `orcas codex turns get --thread <ID> --turn <ID>`
 
+`threads list` and `threads read` include a `management_state` field. Threads discovered on the runtime but not adopted into Orcas are shown as `observed_unmanaged`.
+
 ## Workstream Runtimes
 
 - `orcas workstreams runtime list`
@@ -154,6 +156,8 @@ These flags are accepted before any subcommand.
 - `orcas workstreams runtime start --workstream <ID>`
 - `orcas workstreams runtime stop --workstream <ID>`
 - `orcas workstreams runtime restart --workstream <ID>`
+
+Dedicated runtime stop and restart are blocked while the runtime still exposes unmanaged external threads. Orcas only auto-retires an idle dedicated runtime when the runtime can be refreshed and reports zero observed threads.
 
 ## Prompt
 

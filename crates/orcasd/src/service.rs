@@ -200,6 +200,30 @@ struct ProposalGenerationRequest {
     trigger_kind: SupervisorProposalTriggerKind,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RuntimeThreadInventory {
+    observed_thread_ids: Vec<String>,
+    unmanaged_thread_ids: Vec<String>,
+}
+
+impl RuntimeThreadInventory {
+    fn observed_thread_count(&self) -> usize {
+        self.observed_thread_ids.len()
+    }
+
+    fn unmanaged_thread_count(&self) -> usize {
+        self.unmanaged_thread_ids.len()
+    }
+
+    fn sample_unmanaged_thread_ids(&self, limit: usize) -> Vec<String> {
+        self.unmanaged_thread_ids
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ProposalDuplicatePolicy {
     Manual { supersede_open: bool },
@@ -580,6 +604,7 @@ impl OrcasDaemonService {
         }
         self.reconcile_worker_session_tracked_thread_bindings()
             .await?;
+        self.refresh_all_thread_management_states().await?;
         let _ = self.reconcile_workstream_runtimes().await;
         if bootstrap_persist {
             self.persist_collaboration_state().await?;
@@ -834,6 +859,59 @@ impl OrcasDaemonService {
             .count()
     }
 
+    fn thread_is_orcas_managed(state: &DaemonState, thread_id: &str, scope: &str) -> bool {
+        if scope == "orcas_managed" {
+            return true;
+        }
+
+        if state
+            .collaboration
+            .worker_sessions
+            .values()
+            .any(|session| session.thread_id.as_deref() == Some(thread_id))
+        {
+            return true;
+        }
+
+        if state
+            .collaboration
+            .planning_sessions
+            .values()
+            .any(|session| session.planning_thread_id == thread_id)
+        {
+            return true;
+        }
+
+        if state
+            .collaboration
+            .codex_thread_assignments
+            .values()
+            .any(|assignment| assignment.codex_thread_id == thread_id)
+        {
+            return true;
+        }
+
+        state
+            .collaboration
+            .supervisor_turn_decisions
+            .values()
+            .any(|decision| decision.codex_thread_id == thread_id)
+    }
+
+    fn desired_thread_management_state(
+        state: &DaemonState,
+        thread_id: &str,
+        scope: &str,
+    ) -> ipc::ThreadManagementState {
+        if Self::thread_is_orcas_managed(state, thread_id, scope) {
+            ipc::ThreadManagementState::Managed
+        } else if scope.is_empty() {
+            ipc::ThreadManagementState::Unknown
+        } else {
+            ipc::ThreadManagementState::ObservedUnmanaged
+        }
+    }
+
     fn codex_connection_mode_from_workstream(
         mode: authority::WorkstreamExecutionConnectionMode,
     ) -> CodexConnectionMode {
@@ -988,6 +1066,14 @@ impl OrcasDaemonService {
                     .await?,
             )
             .await?;
+        let inventory = self.runtime_thread_inventory(&handle).await?;
+        if inventory.unmanaged_thread_count() > 0 {
+            let sample = inventory.sample_unmanaged_thread_ids(3).join(", ");
+            return Err(OrcasError::Protocol(format!(
+                "workstream `{workstream_id}` runtime still has {} observed_unmanaged external thread(s): {sample}",
+                inventory.unmanaged_thread_count(),
+            )));
+        }
         self.persist_workstream_runtime_status(
             workstream_id,
             "dedicated_stopping",
@@ -1031,6 +1117,50 @@ impl OrcasDaemonService {
         handle.client.disconnect().await;
     }
 
+    async fn runtime_thread_inventory(
+        &self,
+        handle: &Arc<WorkstreamRuntimeHandle>,
+    ) -> OrcasResult<RuntimeThreadInventory> {
+        self.connect_runtime_handle(handle).await?;
+        let response = handle
+            .client
+            .thread_list(types::ThreadListParams::default())
+            .await?;
+        self.sync_threads(
+            &response.data,
+            Some("upstream_discovered"),
+            Some(&handle.route_info),
+        )
+        .await?;
+        let observed_thread_ids = response
+            .data
+            .iter()
+            .map(|thread| thread.id.clone())
+            .collect::<Vec<_>>();
+        let state = self.state.read().await;
+        let unmanaged_thread_ids = observed_thread_ids
+            .iter()
+            .filter(|thread_id| {
+                state
+                    .threads
+                    .get(thread_id.as_str())
+                    .map(|thread| {
+                        matches!(
+                            thread.summary.management_state,
+                            ipc::ThreadManagementState::ObservedUnmanaged
+                                | ipc::ThreadManagementState::Unknown
+                        )
+                    })
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(RuntimeThreadInventory {
+            observed_thread_ids,
+            unmanaged_thread_ids,
+        })
+    }
+
     async fn remove_dedicated_runtime_handle(
         &self,
         workstream_id: &authority::WorkstreamId,
@@ -1043,6 +1173,71 @@ impl OrcasDaemonService {
             if stop_runtime {
                 let _ = handle.daemon.stop_background().await;
             }
+        }
+        Ok(())
+    }
+
+    async fn refresh_all_thread_management_states(&self) -> OrcasResult<()> {
+        let thread_ids = {
+            self.state
+                .read()
+                .await
+                .threads
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        self.refresh_thread_management_states(&thread_ids).await
+    }
+
+    async fn refresh_thread_management_states(&self, thread_ids: &[String]) -> OrcasResult<()> {
+        if thread_ids.is_empty() {
+            return Ok(());
+        }
+
+        let desired_states = {
+            let state = self.state.read().await;
+            thread_ids
+                .iter()
+                .filter_map(|thread_id| {
+                    state.threads.get(thread_id).map(|thread| {
+                        (
+                            thread_id.clone(),
+                            Self::desired_thread_management_state(
+                                &state,
+                                thread_id,
+                                &thread.summary.scope,
+                            ),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        if desired_states.is_empty() {
+            return Ok(());
+        }
+
+        let mut changed_threads = Vec::new();
+        {
+            let mut state = self.state.write().await;
+            for (thread_id, management_state) in desired_states {
+                let Some(thread) = state.threads.get_mut(&thread_id) else {
+                    continue;
+                };
+                if thread.summary.management_state == management_state {
+                    continue;
+                }
+                thread.summary.management_state = management_state;
+                changed_threads.push(thread.summary.clone());
+            }
+        }
+        if changed_threads.is_empty() {
+            return Ok(());
+        }
+
+        self.persist_state_snapshot().await?;
+        for thread in changed_threads {
+            self.emit(ipc::DaemonEvent::ThreadUpdated { thread }).await;
         }
         Ok(())
     }
@@ -1080,23 +1275,6 @@ impl OrcasDaemonService {
             return Ok(());
         }
 
-        let (live_threads, active_turns) = {
-            let state = self.state.read().await;
-            let live_threads = Self::workstream_runtime_thread_count(&state, workstream_id);
-            let active_turns = state
-                .turns
-                .values()
-                .filter(|turn| {
-                    turn.runtime_workstream_id.as_deref() == Some(workstream_id.as_str())
-                        && turn.lifecycle == ipc::TurnLifecycleState::Active
-                })
-                .count();
-            (live_threads, active_turns)
-        };
-        if live_threads > 0 || active_turns > 0 {
-            return Ok(());
-        }
-
         let current = self
             .authority_store
             .get_workstream_runtime(workstream_id)
@@ -1108,6 +1286,35 @@ impl OrcasDaemonService {
             )
         });
         if already_stopped {
+            return Ok(());
+        }
+
+        let handle = self
+            .ensure_workstream_runtime_handle(&workstream, current.clone())
+            .await?;
+        let inventory = match self.runtime_thread_inventory(&handle).await {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                warn!(
+                    workstream_id = %workstream_id,
+                    error = %error,
+                    "skipping idle runtime retirement because the runtime thread inventory could not be refreshed"
+                );
+                return Ok(());
+            }
+        };
+        let active_turns = {
+            let state = self.state.read().await;
+            state
+                .turns
+                .values()
+                .filter(|turn| {
+                    turn.runtime_workstream_id.as_deref() == Some(workstream_id.as_str())
+                        && turn.lifecycle == ipc::TurnLifecycleState::Active
+                })
+                .count()
+        };
+        if inventory.observed_thread_count() > 0 || active_turns > 0 {
             return Ok(());
         }
 
@@ -12994,6 +13201,7 @@ impl OrcasDaemonService {
             upstream_thread_id
         };
         let mut changed = false;
+        let mut affected_thread_ids = Vec::new();
         {
             let now = Utc::now();
             let mut state = self.state.write().await;
@@ -13003,6 +13211,9 @@ impl OrcasDaemonService {
                 if worker_session.tracked_thread_id.as_ref() == Some(tracked_thread_id)
                     && !matches_desired_thread
                 {
+                    if let Some(thread_id) = worker_session.thread_id.clone() {
+                        affected_thread_ids.push(thread_id);
+                    }
                     worker_session.tracked_thread_id = None;
                     worker_session.updated_at = now;
                     changed = true;
@@ -13010,6 +13221,9 @@ impl OrcasDaemonService {
                 if matches_desired_thread
                     && worker_session.tracked_thread_id.as_ref() != Some(tracked_thread_id)
                 {
+                    if let Some(thread_id) = worker_session.thread_id.clone() {
+                        affected_thread_ids.push(thread_id);
+                    }
                     worker_session.tracked_thread_id = Some(tracked_thread_id.clone());
                     worker_session.updated_at = now;
                     changed = true;
@@ -13018,6 +13232,8 @@ impl OrcasDaemonService {
         }
         if changed {
             self.persist_collaboration_state().await?;
+            self.refresh_thread_management_states(&affected_thread_ids)
+                .await?;
         }
         Ok(())
     }
@@ -13055,6 +13271,7 @@ impl OrcasDaemonService {
             return Ok(());
         };
         let mut changed = false;
+        let mut affected_thread_ids = Vec::new();
         {
             let now = Utc::now();
             let mut state = self.state.write().await;
@@ -13065,6 +13282,7 @@ impl OrcasDaemonService {
                 .filter(|session| session.thread_id.as_deref() == Some(worker_thread_id))
                 .filter(|session| session.tracked_thread_id.as_ref() != Some(&tracked_thread_id))
             {
+                affected_thread_ids.push(worker_thread_id.to_string());
                 worker_session.tracked_thread_id = Some(tracked_thread_id);
                 worker_session.updated_at = now;
                 changed = true;
@@ -13072,6 +13290,8 @@ impl OrcasDaemonService {
         }
         if changed {
             self.persist_collaboration_state().await?;
+            self.refresh_thread_management_states(&affected_thread_ids)
+                .await?;
         }
         Ok(())
     }
@@ -15306,11 +15526,16 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
     ) -> OrcasResult<ipc::ThreadView> {
         let existing = self.thread_from_state(&thread.id).await;
         let view = Self::thread_view_from_codex(thread.clone(), existing.as_ref(), scope, runtime);
+        let thread_id = view.summary.id.clone();
         self.persist_thread_view(&view).await?;
-        let mut state = self.state.write().await;
-        state.recent_thread_id = Some(view.summary.id.clone());
-        state.threads.insert(view.summary.id.clone(), view.clone());
-        Ok(view)
+        {
+            let mut state = self.state.write().await;
+            state.recent_thread_id = Some(thread_id.clone());
+            state.threads.insert(thread_id.clone(), view.clone());
+        }
+        self.refresh_thread_management_states(std::slice::from_ref(&thread_id))
+            .await?;
+        Ok(self.thread_from_state(&thread_id).await.unwrap_or(view))
     }
 
     async fn persist_thread_view(&self, thread: &ipc::ThreadView) -> OrcasResult<()> {
@@ -15368,6 +15593,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
             turn_in_flight: thread.summary.turn_in_flight,
             monitor_state: thread.summary.monitor_state,
             last_sync_at: thread.summary.last_sync_at,
+            management_state: thread.summary.management_state,
             source_kind: thread.summary.source_kind.clone(),
             raw_summary: thread.summary.raw_summary.clone(),
         }
@@ -16844,6 +17070,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 turn_in_flight: false,
                 monitor_state: ipc::ThreadMonitorState::Detached,
                 last_sync_at: Utc::now(),
+                management_state: ipc::ThreadManagementState::ObservedUnmanaged,
                 source_kind: None,
                 raw_summary: None,
             },
@@ -16884,6 +17111,19 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 turn_in_flight: metadata.turn_in_flight,
                 monitor_state: metadata.monitor_state,
                 last_sync_at: metadata.last_sync_at,
+                management_state: if metadata.management_state
+                    == ipc::ThreadManagementState::Unknown
+                {
+                    if metadata.scope == "orcas_managed" {
+                        ipc::ThreadManagementState::Managed
+                    } else if metadata.scope.is_empty() {
+                        ipc::ThreadManagementState::Unknown
+                    } else {
+                        ipc::ThreadManagementState::ObservedUnmanaged
+                    }
+                } else {
+                    metadata.management_state
+                },
                 source_kind: metadata.source_kind.clone(),
                 raw_summary: metadata.raw_summary.clone(),
             },
@@ -16946,6 +17186,22 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                     .map(|thread| thread.summary.monitor_state)
                     .unwrap_or(ipc::ThreadMonitorState::Detached),
                 last_sync_at: Utc::now(),
+                management_state: if scope == Some("orcas_managed") {
+                    ipc::ThreadManagementState::Managed
+                } else if let Some(existing) = existing {
+                    match existing.summary.management_state {
+                        ipc::ThreadManagementState::Unknown => {
+                            if existing.summary.scope == "orcas_managed" {
+                                ipc::ThreadManagementState::Managed
+                            } else {
+                                ipc::ThreadManagementState::ObservedUnmanaged
+                            }
+                        }
+                        state => state,
+                    }
+                } else {
+                    ipc::ThreadManagementState::ObservedUnmanaged
+                },
                 source_kind: source_kind
                     .or_else(|| existing.and_then(|thread| thread.summary.source_kind.clone())),
                 raw_summary: raw_summary
@@ -17583,8 +17839,10 @@ mod tests {
     use tokio::time::Duration;
     use uuid::Uuid;
 
-    use super::{CodexConnectionMode, CodexDaemonLaunch, OrcasDaemonService};
-    use super::{DaemonState, TurnKey};
+    use super::{
+        CodexConnectionMode, CodexDaemonLaunch, DaemonState, OrcasDaemonService, RuntimeRouteInfo,
+        RuntimeRouteKey, TurnKey, WorkstreamRuntimeHandle,
+    };
     use crate::assignment_comm::parse::{parse_worker_report, parse_worker_report_for_turn};
     use crate::assignment_comm::render::{build_assignment_communication_record, render_prompt};
     use crate::authority_store::AuthoritySqliteStore;
@@ -17977,7 +18235,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maybe_stop_idle_runtime_resets_idle_dedicated_remote_runtime() {
+    async fn maybe_stop_idle_runtime_leaves_dedicated_remote_runtime_running_when_inventory_cannot_be_refreshed()
+     {
         let service = test_service().await;
         create_authority_workstream(
             &service,
@@ -18011,7 +18270,154 @@ mod tests {
             .await
             .expect("runtime row")
             .expect("persisted runtime row");
-        assert_eq!(runtime.status, "dedicated_configured");
+        assert!(matches!(
+            runtime.status.as_str(),
+            "dedicated_degraded" | "dedicated_error"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_workstream_runtime_refuses_when_unmanaged_external_threads_exist() {
+        let (service, runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        create_authority_workstream(
+            &service,
+            "runtime-stop-ws",
+            Some(orcas_core::authority::WorkstreamExecutionScope {
+                codex_home: "/tmp/orcas/runtime-stop/codex-home".to_string(),
+                sqlite_home: None,
+                listen_url: Some("ws://127.0.0.1:4511".to_string()),
+                transport_kind: orcas_core::authority::WorkstreamTransportKind::LocalAppServer,
+                app_server_policy:
+                    orcas_core::authority::WorkstreamAppServerPolicy::DedicatedPerWorkstream,
+                connection_mode:
+                    orcas_core::authority::WorkstreamExecutionConnectionMode::SpawnIfNeeded,
+            }),
+        )
+        .await;
+        install_fake_workstream_runtime_handle(
+            &service,
+            "runtime-stop-ws",
+            "ws://127.0.0.1:4511",
+            Arc::clone(&runtime),
+        )
+        .await;
+        runtime.lock().await.threads.insert(
+            "thread-external-stop".to_string(),
+            types::Thread {
+                id: "thread-external-stop".to_string(),
+                preview: "external runtime thread".to_string(),
+                ephemeral: false,
+                model_provider: "openai".to_string(),
+                created_at: 10,
+                updated_at: 20,
+                status: types::ThreadStatus::Idle,
+                path: None,
+                cwd: "/tmp/headless".to_string(),
+                cli_version: "test".to_string(),
+                source: Some(serde_json::json!({ "kind": "headless" })),
+                name: Some("External".to_string()),
+                turns: Vec::new(),
+                extra: Map::new(),
+            },
+        );
+
+        let error = service
+            .stop_workstream_runtime(
+                &orcas_core::authority::WorkstreamId::parse("runtime-stop-ws")
+                    .expect("workstream id"),
+            )
+            .await
+            .expect_err("unmanaged external threads should block runtime stop");
+        assert!(
+            error
+                .to_string()
+                .contains("observed_unmanaged external thread")
+        );
+        assert!(error.to_string().contains("thread-external-stop"));
+    }
+
+    #[tokio::test]
+    async fn maybe_stop_idle_runtime_does_not_stop_when_unmanaged_external_threads_exist() {
+        let (service, runtime) = test_service_with_fake_codex_runtime_capture(
+            AppConfig::default(),
+            Arc::new(StaticSupervisorReasoner::default()),
+            "unused",
+            FakeCodexTerminalOutcome::Completed,
+        )
+        .await;
+        create_authority_workstream(
+            &service,
+            "runtime-idle-external-ws",
+            Some(orcas_core::authority::WorkstreamExecutionScope {
+                codex_home: "/tmp/orcas/runtime-idle-external/codex-home".to_string(),
+                sqlite_home: None,
+                listen_url: Some("ws://127.0.0.1:4512".to_string()),
+                transport_kind: orcas_core::authority::WorkstreamTransportKind::LocalAppServer,
+                app_server_policy:
+                    orcas_core::authority::WorkstreamAppServerPolicy::DedicatedPerWorkstream,
+                connection_mode:
+                    orcas_core::authority::WorkstreamExecutionConnectionMode::SpawnIfNeeded,
+            }),
+        )
+        .await;
+        install_fake_workstream_runtime_handle(
+            &service,
+            "runtime-idle-external-ws",
+            "ws://127.0.0.1:4512",
+            Arc::clone(&runtime),
+        )
+        .await;
+        runtime.lock().await.threads.insert(
+            "thread-external-idle".to_string(),
+            types::Thread {
+                id: "thread-external-idle".to_string(),
+                preview: "external runtime thread".to_string(),
+                ephemeral: false,
+                model_provider: "openai".to_string(),
+                created_at: 10,
+                updated_at: 20,
+                status: types::ThreadStatus::Idle,
+                path: None,
+                cwd: "/tmp/headless".to_string(),
+                cli_version: "test".to_string(),
+                source: Some(serde_json::json!({ "kind": "headless" })),
+                name: Some("External".to_string()),
+                turns: Vec::new(),
+                extra: Map::new(),
+            },
+        );
+
+        service
+            .start_workstream_runtime(
+                &orcas_core::authority::WorkstreamId::parse("runtime-idle-external-ws")
+                    .expect("workstream id"),
+            )
+            .await
+            .expect("start runtime");
+        service
+            .maybe_stop_idle_runtime_for_workstream(
+                &orcas_core::authority::WorkstreamId::parse("runtime-idle-external-ws")
+                    .expect("workstream id"),
+            )
+            .await
+            .expect("check idle runtime");
+
+        let runtime = service
+            .authority_store
+            .get_workstream_runtime(
+                &orcas_core::authority::WorkstreamId::parse("runtime-idle-external-ws")
+                    .expect("workstream id"),
+            )
+            .await
+            .expect("runtime row")
+            .expect("persisted runtime row");
+        assert_eq!(runtime.status, "dedicated_connected");
     }
 
     #[tokio::test]
@@ -19627,6 +20033,7 @@ worker epilogue"#;
                 turn_in_flight: false,
                 monitor_state: ipc::ThreadMonitorState::Detached,
                 last_sync_at: Utc::now(),
+                management_state: ipc::ThreadManagementState::Managed,
                 source_kind: None,
                 raw_summary: None,
             },
@@ -19916,6 +20323,65 @@ worker epilogue"#;
             })
             .await
             .expect("authority workstream create");
+    }
+
+    async fn install_fake_workstream_runtime_handle(
+        service: &Arc<OrcasDaemonService>,
+        workstream_id: &str,
+        endpoint: &str,
+        runtime_state: Arc<Mutex<FakeCodexRuntimeState>>,
+    ) {
+        let workstream_id =
+            orcas_core::authority::WorkstreamId::parse(workstream_id).expect("workstream id");
+        let route_key = RuntimeRouteKey::Workstream(workstream_id.clone());
+        let client = CodexClient::new(
+            Arc::new(FakeCodexTransport {
+                endpoint: endpoint.to_string(),
+                turn_output: "unused".to_string(),
+                terminal_outcome: FakeCodexTerminalOutcome::Completed,
+                state: runtime_state,
+            }),
+            AppConfig::default().codex.reconnect,
+            Arc::new(RejectingApprovalRouter),
+        );
+        let summary = ipc::WorkstreamRuntimeSummary {
+            workstream_id: workstream_id.to_string(),
+            status: "dedicated_ready".to_string(),
+            transport_kind: orcas_core::authority::WorkstreamTransportKind::LocalAppServer,
+            app_server_policy:
+                orcas_core::authority::WorkstreamAppServerPolicy::DedicatedPerWorkstream,
+            connection_mode:
+                orcas_core::authority::WorkstreamExecutionConnectionMode::SpawnIfNeeded,
+            desired_listen_url: Some(endpoint.to_string()),
+            effective_listen_url: Some(endpoint.to_string()),
+            codex_home: format!("/tmp/{workstream_id}/codex-home"),
+            sqlite_home: None,
+            owner_kind: Some("orcasd_workstream_runtime".to_string()),
+            owner_pid: Some(service.runtime.pid),
+            thread_count: 0,
+            last_error: None,
+            started_at: Some(Utc::now()),
+            updated_at: Utc::now(),
+        };
+        let handle = Arc::new(WorkstreamRuntimeHandle {
+            route_key: route_key.clone(),
+            route_info: RuntimeRouteInfo {
+                endpoint: endpoint.to_string(),
+                runtime_workstream_id: Some(workstream_id.clone()),
+            },
+            daemon: Arc::new(FakeCodexDaemonManager {
+                endpoint: endpoint.to_string(),
+            }),
+            client,
+            connection_mode:
+                orcas_core::authority::WorkstreamExecutionConnectionMode::SpawnIfNeeded,
+            summary: Mutex::new(summary),
+            connect_gate: Arc::new(Mutex::new(())),
+        });
+        service.workstream_runtimes.lock().await.insert(
+            OrcasDaemonService::runtime_handle_key(&route_key),
+            Arc::clone(&handle),
+        );
     }
 
     async fn seed_awaiting_decision_fixture(
@@ -24924,6 +25390,15 @@ ORCAS_REPORT_END"#
                 .iter()
                 .any(|thread| thread.id == "thread-headless")
         );
+        assert_eq!(
+            listed
+                .data
+                .iter()
+                .find(|thread| thread.id == "thread-headless")
+                .expect("headless summary")
+                .management_state,
+            ipc::ThreadManagementState::ObservedUnmanaged
+        );
 
         let response = service
             .thread_read_history(ipc::ThreadReadHistoryRequest {
@@ -24940,6 +25415,10 @@ ORCAS_REPORT_END"#
         assert_eq!(
             response.thread.summary.source_kind.as_deref(),
             Some("headless")
+        );
+        assert_eq!(
+            response.thread.summary.management_state,
+            ipc::ThreadManagementState::ObservedUnmanaged
         );
 
         let stored = service
@@ -25035,6 +25514,10 @@ ORCAS_REPORT_END"#
             .expect("thread still queryable")
             .thread;
         assert_eq!(persisted.summary.id, "thread-headless");
+        assert_eq!(
+            persisted.summary.management_state,
+            ipc::ThreadManagementState::ObservedUnmanaged
+        );
     }
 
     #[tokio::test]
@@ -29293,6 +29776,14 @@ ORCAS_REPORT_END"#
                 .map(|tracked_thread_id| tracked_thread_id.as_str()),
             Some("binding-tt")
         );
+        let thread = service
+            .thread_from_state(&thread_id)
+            .await
+            .expect("thread summary");
+        assert_eq!(
+            thread.summary.management_state,
+            ipc::ThreadManagementState::Managed
+        );
     }
 
     #[tokio::test]
@@ -29407,6 +29898,14 @@ ORCAS_REPORT_END"#
         assert_eq!(
             assignment_summary.tracked_thread_id.as_deref(),
             Some(tracked_thread_id.as_str())
+        );
+        let thread = service
+            .thread_from_state(&thread_id)
+            .await
+            .expect("thread summary");
+        assert_eq!(
+            thread.summary.management_state,
+            ipc::ThreadManagementState::Managed
         );
     }
 

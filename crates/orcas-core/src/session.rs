@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ipc::{ThreadLoadedStatus, ThreadMonitorState};
+use crate::ipc::{ThreadLoadedStatus, ThreadManagementState, ThreadMonitorState};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ThreadRegistry {
@@ -56,6 +56,8 @@ pub struct ThreadMetadata {
     #[serde(default = "Utc::now")]
     pub last_sync_at: DateTime<Utc>,
     #[serde(default)]
+    pub management_state: ThreadManagementState,
+    #[serde(default)]
     pub source_kind: Option<String>,
     #[serde(default)]
     pub raw_summary: Option<Value>,
@@ -83,7 +85,7 @@ mod tests {
     use serde_json::json;
 
     use super::{ThreadDescriptor, ThreadMetadata, ThreadRegistry, TurnDescriptor};
-    use crate::ipc::{ThreadLoadedStatus, ThreadMonitorState};
+    use crate::ipc::{ThreadLoadedStatus, ThreadManagementState, ThreadMonitorState};
 
     fn fixed_now() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2025, 6, 7, 8, 9, 10)
@@ -128,6 +130,10 @@ mod tests {
         assert!(metadata.recent_event.is_none());
         assert!(!metadata.turn_in_flight);
         assert_eq!(metadata.monitor_state, ThreadMonitorState::Detached);
+        assert_eq!(
+            metadata.management_state,
+            ThreadManagementState::ObservedUnmanaged
+        );
         assert!(metadata.source_kind.is_none());
         assert!(metadata.raw_summary.is_none());
     }
@@ -156,6 +162,7 @@ mod tests {
             turn_in_flight: true,
             monitor_state: ThreadMonitorState::Attached,
             last_sync_at: fixed_now(),
+            management_state: ThreadManagementState::Managed,
             source_kind: Some("cli".to_string()),
             raw_summary: Some(json!({"extra": true})),
         };
@@ -170,6 +177,7 @@ mod tests {
             serde_json::from_value::<ThreadMetadata>(value).expect("deserialize metadata");
         assert_eq!(round_trip.loaded_status, ThreadLoadedStatus::Active);
         assert_eq!(round_trip.monitor_state, ThreadMonitorState::Attached);
+        assert_eq!(round_trip.management_state, ThreadManagementState::Managed);
         assert_eq!(round_trip.cwd, Some(PathBuf::from("/repo")));
         assert_eq!(round_trip.source_kind.as_deref(), Some("cli"));
         assert_eq!(round_trip.raw_summary, Some(json!({"extra": true})));

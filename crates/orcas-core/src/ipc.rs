@@ -2044,6 +2044,26 @@ pub struct ThreadsListResponse {
     pub data: Vec<ThreadSummary>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadManagementState {
+    Managed,
+    #[default]
+    ObservedUnmanaged,
+    Unknown,
+}
+
+impl ThreadManagementState {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::ObservedUnmanaged => "observed_unmanaged",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadSummary {
     pub id: String,
@@ -2076,6 +2096,8 @@ pub struct ThreadSummary {
     pub monitor_state: ThreadMonitorState,
     #[serde(default = "default_sync_timestamp")]
     pub last_sync_at: DateTime<Utc>,
+    #[serde(default)]
+    pub management_state: ThreadManagementState,
     #[serde(default)]
     pub source_kind: Option<String>,
     #[serde(default)]

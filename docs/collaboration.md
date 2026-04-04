@@ -149,6 +149,7 @@ Current request families include:
   - `models/list` requires a target `workstream_id` and resolves through that workstream's runtime
   - `threads/list` requires a target `workstream_id` and resolves through that workstream's runtime
   - `threads/list_loaded` requires a target `workstream_id` and resolves through that workstream's runtime
+  - thread summaries surface a `management_state` so externally created Codex threads can remain visible as `observed_unmanaged` until Orcas explicitly adopts them into a managed lane
   - `threads/list_scoped` is deprecated
   - `thread/start`
   - `thread/read`
@@ -173,6 +174,8 @@ Current request families include:
   - `turn/interrupt`
 
 Worker execution now defaults to Codex `WorkspaceWrite` sandboxing. Orcas applies thread-level `WorkspaceWrite` mode on worker thread start and resume, and derives turn-level writable roots from the tracked-thread workspace when a worker lane is bound to a git worktree.
+
+Dedicated runtime stop and restart are conservative. Orcas refuses `workstream_runtime/stop` and `workstream_runtime/restart` when the runtime still reports any `observed_unmanaged` external threads, and idle-runtime retirement only stops a dedicated runtime when the runtime can be refreshed and reports zero observed threads.
 - workflow and authority state:
   - `workunit/get`
   - `authority/hierarchy/get`

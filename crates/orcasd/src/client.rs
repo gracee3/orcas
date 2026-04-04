@@ -1369,6 +1369,7 @@ mod tests {
             turn_in_flight: false,
             monitor_state: ipc::ThreadMonitorState::Detached,
             last_sync_at: Utc::now(),
+            management_state: ipc::ThreadManagementState::Managed,
             source_kind: Some("workspace".to_string()),
             raw_summary: None,
         }
