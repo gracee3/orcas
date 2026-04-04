@@ -2,10 +2,12 @@
 
 ## 1. Findings
 
+The initial investigation found:
+
 - Orcas already has canonical authority records for `workstream`, `work_unit`, and `tracked_thread` in `state.db`.
 - `tracked_thread.workspace` already models most of the intended workspace shape: repo root, worktree path, base ref, landing target, and lifecycle policy.
 - Runtime state persists in SQLite runtime snapshots inside `state.db`: assignments, reports, worker sessions, workspace operations, thread mirrors, and landing/prune execution records.
-- The daemon currently owns one global upstream Codex/app-server connection policy. There is no explicit workstream-scoped execution owner yet.
+- The daemon originally owned one global upstream Codex/app-server connection policy. The current branch now persists workstream execution scope and reconciles dedicated runtime handles per workstream, while keeping a shared daemon runtime as a compatibility/default path.
 - Assignment packets already have an `execution_context`, but Orcas was not using it to start turns; `cwd` and `model` were being dropped at dispatch time.
 - Worker-session reuse was broad. Reuse was keyed only by `worker_id`, which allowed session/thread reuse to bleed across unrelated work units.
 - Git worktree inspection already existed for read-side status checks, but not for deriving the filesystem roots needed to express a future sandbox contract.
@@ -127,20 +129,21 @@ Implemented in this slice:
 
 ## 9. Risks / Open Questions
 
-- Orcas still uses one global upstream Codex/app-server client at runtime. This slice adds the control-plane model but does not yet switch to real per-workstream routing.
-- Collaboration runtime state is still separate from authority state.
+- Shared-runtime workstream attribution remains intentionally owner-scoped rather than runtime-membership-scoped. Unmanaged external threads on a shared app-server are protected from Orcas ownership, but they are also not shown in any workstream-scoped list.
 - Stale worktrees, abandoned sessions, and merge conflicts still require explicit supervisor handling; this slice improves visibility and isolation but does not automate cleanup policy.
 - Remote WebSocket transport production posture still needs explicit security review.
 
 ## Out of Scope
 
-- spawning and supervising dedicated per-workstream app-server processes
-- moving collaboration runtime state into `state.db`
+- forced runtime stop or restart while unmanaged external threads still exist
+- remote WebSocket authentication, TLS hardening, and secret-distribution policy
 - changing supervisor-to-worker communication away from the existing assignment/report envelope flow
 
 ## Implementation Follow-Through
 
 - Workstream-scoped model listing now routes through the selected workstream runtime instead of the shared upstream client.
+- Workstream-scoped thread listing is now owner-scoped on shared runtimes and runtime-scoped on dedicated runtimes.
+- Thread summaries now carry both `owner_workstream_id` and `runtime_workstream_id` so Orcas can distinguish local ownership from runtime placement.
 - Worker thread start and resume now default to Codex `WorkspaceWrite` sandbox mode.
 - Worker turn dispatch now derives `WorkspaceWrite` writable roots from tracked-thread workspace state:
   - normal worker turns use the worktree roots

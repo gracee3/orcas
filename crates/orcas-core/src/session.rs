@@ -30,6 +30,8 @@ pub struct ThreadMetadata {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub runtime_workstream_id: Option<String>,
+    #[serde(default)]
+    pub owner_workstream_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub status: String,
@@ -134,6 +136,7 @@ mod tests {
             metadata.management_state,
             ThreadManagementState::ObservedUnmanaged
         );
+        assert!(metadata.owner_workstream_id.is_none());
         assert!(metadata.source_kind.is_none());
         assert!(metadata.raw_summary.is_none());
     }
@@ -148,6 +151,8 @@ mod tests {
             model_provider: Some("openai".to_string()),
             cwd: Some(PathBuf::from("/repo")),
             endpoint: Some("ws://127.0.0.1:4500".to_string()),
+            runtime_workstream_id: Some("runtime-ws".to_string()),
+            owner_workstream_id: Some("owner-ws".to_string()),
             created_at: fixed_now(),
             updated_at: fixed_now(),
             status: "active".to_string(),
@@ -179,6 +184,11 @@ mod tests {
         assert_eq!(round_trip.monitor_state, ThreadMonitorState::Attached);
         assert_eq!(round_trip.management_state, ThreadManagementState::Managed);
         assert_eq!(round_trip.cwd, Some(PathBuf::from("/repo")));
+        assert_eq!(
+            round_trip.runtime_workstream_id.as_deref(),
+            Some("runtime-ws")
+        );
+        assert_eq!(round_trip.owner_workstream_id.as_deref(), Some("owner-ws"));
         assert_eq!(round_trip.source_kind.as_deref(), Some("cli"));
         assert_eq!(round_trip.raw_summary, Some(json!({"extra": true})));
     }

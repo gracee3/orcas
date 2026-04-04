@@ -147,7 +147,10 @@ These flags are accepted before any subcommand.
 - `orcas codex turns recent --thread <ID> [--limit <N>]`
 - `orcas codex turns get --thread <ID> --turn <ID>`
 
-`threads list` and `threads read` include a `management_state` field. Threads discovered on the runtime but not adopted into Orcas are shown as `observed_unmanaged`.
+`threads list` and `threads read` include `management_state`, `owner_workstream_id`, and `runtime_workstream_id`.
+
+- On shared runtimes, `threads list --workstream <ID>` is owner-scoped. It shows only threads Orcas has explicitly bound to that workstream.
+- On dedicated runtimes, `threads list --workstream <ID>` can also show `observed_unmanaged` external threads that exist on that dedicated runtime but have not been adopted into Orcas.
 
 ## Workstream Runtimes
 

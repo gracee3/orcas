@@ -684,14 +684,14 @@ Because writes are transactional, a crash should leave the database at the last 
 
 ### Migration From Current JSON State
 
-The repo currently persists state to `state.json`. The MVP implementation should add a one-time import path:
+Earlier Orcas revisions persisted runtime state to `state.json`. The MVP implementation added a one-time import path:
 
 - if `state.db` does not exist and `state.json` does
 - import the current JSON snapshot into SQLite
 - generate creation events for imported active rows
 - preserve the JSON file as a backup during rollout
 
-That keeps the design grounded in the current repo rather than assuming a greenfield store.
+That kept the design grounded in the repo’s pre-SQLite state rather than assuming a greenfield store. Current Orcas durability now lives in `state.db`; `state.json` is only a legacy import source when present.
 
 ## 12. Explicit Future-Sync Seams Reserved For Later
 
@@ -736,7 +736,7 @@ The intended later evolution is straightforward:
 - introduce a minimal SQLite dependency, preferably `rusqlite`
 - add migrations
 - create `event_log`, `command_receipts`, and projection tables
-- add one-time import from existing `state.json`
+- add one-time import from legacy `state.json`
 
 ### Pass 3: Command Handlers And Projector
 

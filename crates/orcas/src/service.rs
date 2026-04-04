@@ -931,12 +931,14 @@ impl SupervisorService {
     fn print_thread_list(threads: Vec<ipc::ThreadSummary>) {
         for thread in threads {
             println!(
-                "{}\t{}\t{}\t{}\tmanagement={}\tloaded={:?}\tmonitor={:?}\tin_flight={}\tactive_turn={}\t{}\t{}",
+                "{}\t{}\t{}\t{}\tmanagement={}\towner_workstream={}\truntime_workstream={}\tloaded={:?}\tmonitor={:?}\tin_flight={}\tactive_turn={}\t{}\t{}",
                 thread.id,
                 thread.status,
                 thread.model_provider,
                 thread.scope,
                 thread.management_state.label(),
+                thread.owner_workstream_id.as_deref().unwrap_or("-"),
+                thread.runtime_workstream_id.as_deref().unwrap_or("-"),
                 thread.loaded_status,
                 thread.monitor_state,
                 thread.turn_in_flight,
@@ -964,6 +966,24 @@ impl SupervisorService {
         println!(
             "management_state: {}",
             response.thread.summary.management_state.label()
+        );
+        println!(
+            "owner_workstream_id: {}",
+            response
+                .thread
+                .summary
+                .owner_workstream_id
+                .as_deref()
+                .unwrap_or("-")
+        );
+        println!(
+            "runtime_workstream_id: {}",
+            response
+                .thread
+                .summary
+                .runtime_workstream_id
+                .as_deref()
+                .unwrap_or("-")
         );
         println!("cwd: {}", response.thread.summary.cwd);
         println!("preview: {}", response.thread.summary.preview);
