@@ -48,7 +48,7 @@ Aligned live lane contract for the current tracked-thread/workspace migration:
 - lane-centric live scenarios create the workstream first, then declare the tracked-thread workspace before the first live assignment
 - the harness inspects the workstream runtime through `orcas workstreams runtime get` and `orcas codex threads list --workstream`
 - the first live assignment must auto-bind into the declared tracked-thread lane; the harness must not repair binding manually after the report appears
-- the currently aligned scenarios are `live-worker-direct-patch`, `live-worktree-lifecycle`, `live-multi-phase-lane`, and `live-concurrent-lanes`
+- the currently aligned scenarios are `git-worktrees`, `phased-fibonacci`, `live-worker-direct-patch`, `live-supervisor-micro-proposal`, `live-reject-redirect`, `live-restart-resume`, `live-worktree-lifecycle`, `live-multi-phase-lane`, and `live-concurrent-lanes`
 
 ## Running Scenarios
 
@@ -143,7 +143,6 @@ These scenarios are opt-in. They are not part of the default daily deterministic
 Seeded proposal scenarios remain model-free:
 
 - `proposals-decisions`
-- `phased-fibonacci`
 
 These seeded scenarios now round-trip their `state.json` inputs through the same `StoredState`
 serializer/deserializer path the daemon uses, so deterministic fixtures stay aligned with the
@@ -189,4 +188,4 @@ That removes `target/e2e/` and nothing else.
 - `live-multi-phase-lane`
 - `live-concurrent-lanes`
 
-The current migration now treats the workstream runtime as the app-server ownership unit and the tracked-thread workspace as the execution lane. The aligned live scenarios prove first-assignment lane binding, tracked-thread/worktree continuity, tracked-thread lifecycle transitions, and concurrent lane isolation on top of that model. Other live proposal/redirect/restart scenarios still follow as a separate migration slice.
+The current migration now treats the workstream runtime as the app-server ownership unit and the tracked-thread workspace as the execution lane. The aligned live scenarios prove first-assignment lane binding, tracked-thread/worktree continuity, tracked-thread lifecycle transitions, and concurrent lane isolation on top of that model, including the phased Fibonacci lane and the full git-worktrees lifecycle lane.
