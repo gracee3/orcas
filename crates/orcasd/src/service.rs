@@ -50,16 +50,15 @@ use orcas_core::{
     AssignmentCommunicationSeed, AssignmentModeSpec, AssignmentStatus, AssignmentWorkspaceContract,
     CodexConnectionMode, CodexItemEvent, CodexThreadAssignment, CodexThreadAssignmentStatus,
     CodexThreadBootstrapState, CodexTurnEvent, CollaborationState, ConnectionState, Decision,
-    DecisionType, DraftAssignment, EventEnvelope, ImplementModeSpec, JsonSessionStore,
-    LandingAuthorizationRecord, LandingAuthorizationStatus, LandingExecutionRecord,
-    LandingExecutionStatus, OrcasError, OrcasEvent, OrcasResult, OrcasSessionStore, PlanAssessment,
-    PlanAssessmentId, PlanExecutionKind, PlanId, PlanItemId, PlanRevisionApplyFailureKind,
-    PlanRevisionApplyPhase, PlanRevisionProposalStatus, Report, ReportDisposition,
-    ReportParseResult, StoredState, SupervisorContextPack, SupervisorProposal,
-    SupervisorProposalFailure, SupervisorProposalFailureStage, SupervisorProposalRecord,
-    SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorReasonerUsage,
-    SupervisorTurnDecision, SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus,
-    SupervisorTurnProposalKind, ThreadMetadata, ThreadRegistry,
+    DecisionType, DraftAssignment, EventEnvelope, ImplementModeSpec, LandingAuthorizationRecord,
+    LandingAuthorizationStatus, LandingExecutionRecord, LandingExecutionStatus, OrcasError,
+    OrcasEvent, OrcasResult, PlanAssessment, PlanAssessmentId, PlanExecutionKind, PlanId,
+    PlanItemId, PlanRevisionApplyFailureKind, PlanRevisionApplyPhase, PlanRevisionProposalStatus,
+    Report, ReportDisposition, ReportParseResult, StoredState, SupervisorContextPack,
+    SupervisorProposal, SupervisorProposalFailure, SupervisorProposalFailureStage,
+    SupervisorProposalRecord, SupervisorProposalStatus, SupervisorProposalTriggerKind,
+    SupervisorReasonerUsage, SupervisorTurnDecision, SupervisorTurnDecisionKind,
+    SupervisorTurnDecisionStatus, SupervisorTurnProposalKind, ThreadMetadata, ThreadRegistry,
     TrackedThreadLandingExecutionContract, TrackedThreadLandingExecutionResultStatus,
     TrackedThreadPruneWorkspaceContract, TrackedThreadPruneWorkspaceResultStatus,
     TrackedThreadWorkspaceOperationContract, TrackedThreadWorkspaceOperationKind,
@@ -254,7 +253,6 @@ pub struct OrcasDaemonService {
     paths: AppPaths,
     config: AppConfig,
     runtime: ipc::DaemonRuntimeMetadata,
-    store: Arc<JsonSessionStore>,
     authority_store: Arc<AuthoritySqliteStore>,
     codex_daemon: Arc<dyn CodexDaemonManager>,
     codex_client: Arc<CodexClient>,
@@ -283,7 +281,6 @@ impl OrcasDaemonService {
         let runtime =
             OrcasDaemonProcessManager::runtime_metadata_for_current_process(&paths).await?;
 
-        let store = Arc::new(JsonSessionStore::new(paths.clone(), config.clone()));
         let authority_store = Arc::new(AuthoritySqliteStore::open(paths.clone())?);
         let codex_daemon: Arc<dyn CodexDaemonManager> = Arc::new(LocalCodexDaemonManager::new(
             config.codex.clone(),
@@ -302,7 +299,6 @@ impl OrcasDaemonService {
             supervisor_reasoner: Arc::new(ResponsesApiReasoner::new(config.clone())),
             config,
             runtime,
-            store,
             authority_store,
             codex_daemon,
             codex_client,
@@ -415,11 +411,11 @@ impl OrcasDaemonService {
 
     async fn initialize_state(&self) -> OrcasResult<()> {
         debug!("initializing daemon state from persisted store");
-        let (stored, needs_normalization) = self
-            .store
-            .load_with_normalization_flag()
+        let stored = self
+            .authority_store
+            .load_runtime_state()
             .await
-            .unwrap_or((StoredState::default(), false));
+            .unwrap_or_else(|_| StoredState::default());
         let bootstrap_persist;
         {
             let mut state = self.state.write().await;
@@ -456,7 +452,7 @@ impl OrcasDaemonService {
         }
         self.reconcile_worker_session_tracked_thread_bindings()
             .await?;
-        if bootstrap_persist || needs_normalization {
+        if bootstrap_persist {
             self.persist_collaboration_state().await?;
         }
         Ok(())
@@ -14082,8 +14078,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                 operator_inbox_mirrors: Default::default(),
             }
         };
-        let result = self.store.save(&stored).await;
-        result
+        self.authority_store.save_runtime_state(&stored).await
     }
 
     async fn set_thread_monitor_state(
@@ -16127,14 +16122,14 @@ mod tests {
         AppConfig, AppPaths, Assignment, AssignmentCommunicationSeed, AssignmentModeSpec,
         AssignmentStatus, CodexItemEvent, CodexThreadAssignmentStatus, CodexThreadBootstrapState,
         CodexTurnEvent, CollaborationState, DecisionType, DraftAssignment, EventEnvelope,
-        ImplementModeSpec, JsonSessionStore, OrcasError, OrcasEvent, OrcasResult,
-        OrcasSessionStore, PlanExecutionKind, PlanRevisionProposalStatus, ProposedDecision, Report,
-        ReportConfidence, ReportDisposition, ReportParseResult, StoredState, SupervisorContextPack,
-        SupervisorProposal, SupervisorProposalEdits, SupervisorProposalFailureStage,
-        SupervisorProposalStatus, SupervisorProposalTriggerKind, SupervisorSummary,
-        SupervisorTurnDecision, SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus,
-        SupervisorTurnProposalKind, WorkUnit, WorkUnitStatus, WorkerSessionAttachability,
-        WorkerSessionRuntimeStatus, WorkerStatus, Workstream, WorkstreamStatus, ipc,
+        ImplementModeSpec, OrcasError, OrcasEvent, OrcasResult, PlanExecutionKind,
+        PlanRevisionProposalStatus, ProposedDecision, Report, ReportConfidence, ReportDisposition,
+        ReportParseResult, StoredState, SupervisorContextPack, SupervisorProposal,
+        SupervisorProposalEdits, SupervisorProposalFailureStage, SupervisorProposalStatus,
+        SupervisorProposalTriggerKind, SupervisorSummary, SupervisorTurnDecision,
+        SupervisorTurnDecisionKind, SupervisorTurnDecisionStatus, SupervisorTurnProposalKind,
+        WorkUnit, WorkUnitStatus, WorkerSessionAttachability, WorkerSessionRuntimeStatus,
+        WorkerStatus, Workstream, WorkstreamStatus, ipc,
     };
 
     #[test]
@@ -17996,7 +17991,6 @@ worker epilogue"#;
         codex_client: Arc<CodexClient>,
         spawn_codex_bridge: bool,
     ) -> Arc<OrcasDaemonService> {
-        let store = Arc::new(JsonSessionStore::new(paths.clone(), config.clone()));
         let authority_store =
             Arc::new(AuthoritySqliteStore::open(paths.clone()).expect("authority"));
         let (event_tx, _) = broadcast::channel(32);
@@ -18013,7 +18007,6 @@ worker epilogue"#;
                 metadata_path: "/tmp/test.json".to_string(),
                 git_commit: None,
             },
-            store,
             authority_store,
             codex_daemon,
             codex_client,
@@ -23102,7 +23095,11 @@ ORCAS_REPORT_END"#
             Some("headless")
         );
 
-        let stored = service.store.load().await.expect("stored thread mirror");
+        let stored = service
+            .authority_store
+            .load_runtime_state()
+            .await
+            .expect("stored thread mirror");
         let persisted = stored
             .thread_views
             .get("thread-headless")
@@ -28068,7 +28065,11 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             .await
             .expect("work unit");
 
-        let stored = service.store.load().await.expect("stored state");
+        let stored = service
+            .authority_store
+            .load_runtime_state()
+            .await
+            .expect("stored state");
         assert_eq!(stored.collaboration.workstreams.len(), 1);
         assert_eq!(stored.collaboration.work_units.len(), 1);
         assert_eq!(
@@ -28103,15 +28104,26 @@ Boundedness note: Stay within the legacy compatibility boundary."#
         )
         .await;
 
-        let stored = service.store.load().await.expect("stored state");
+        let stored = service
+            .authority_store
+            .load_runtime_state()
+            .await
+            .expect("stored state");
         assert!(stored.thread_views.is_empty());
 
         let raw = tokio::fs::read_to_string(&state_file)
             .await
-            .expect("read rewritten state");
-        let (_, needs_normalization) = StoredState::from_json_str_with_normalization(&raw)
-            .expect("canonical state should deserialize");
-        assert!(!needs_normalization);
+            .expect("read legacy state");
+        assert_eq!(
+            raw,
+            r#"{
+  "registry": {
+    "threads": {},
+    "last_connected_endpoint": null
+  }
+}
+"#
+        );
     }
 
     #[tokio::test]
@@ -28130,7 +28142,7 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             .await
             .expect("seed canonical state");
 
-        let _service = test_service_at_with_reasoner(
+        let service = test_service_at_with_reasoner(
             base.clone(),
             Arc::new(StaticSupervisorReasoner::default()),
         )
@@ -28140,6 +28152,18 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             .await
             .expect("read canonical state");
         assert_eq!(rewritten, canonical_with_newline);
+
+        let stored = service
+            .authority_store
+            .load_runtime_state()
+            .await
+            .expect("load imported runtime state");
+        assert!(stored.registry.threads.is_empty());
+        assert!(stored.thread_views.is_empty());
+        assert!(stored.turn_states.is_empty());
+        assert!(stored.collaboration.workstreams.is_empty());
+        assert!(stored.operator_inbox.items.is_empty());
+        assert!(stored.operator_inbox_mirrors.is_empty());
     }
 
     #[tokio::test]

@@ -26,6 +26,15 @@ const AUTHORITY_REPLICATION_CHECKPOINT_TABLE: &str = "authority_replication_chec
 const META_ORIGIN_NODE_ID: &str = "origin_node_id";
 const META_JSON_IMPORT_STATUS: &str = "json_import_status";
 const META_JSON_IMPORT_COMPLETED_AT: &str = "json_import_completed_at";
+const META_RUNTIME_JSON_IMPORT_STATUS: &str = "runtime_json_import_status";
+const META_RUNTIME_JSON_IMPORT_COMPLETED_AT: &str = "runtime_json_import_completed_at";
+
+const SNAPSHOT_COLLABORATION_STATE: &str = "collaboration_state";
+const SNAPSHOT_THREAD_REGISTRY: &str = "thread_registry";
+const SNAPSHOT_THREAD_VIEWS: &str = "thread_views";
+const SNAPSHOT_TURN_STATES: &str = "turn_states";
+const SNAPSHOT_OPERATOR_INBOX_STATE: &str = "operator_inbox_state";
+const SNAPSHOT_OPERATOR_INBOX_MIRRORS: &str = "operator_inbox_mirrors";
 
 const INITIAL_SCHEMA: &str = r#"
 create table if not exists store_meta (
@@ -150,6 +159,33 @@ create index if not exists idx_tracked_threads_work_unit
 create unique index if not exists idx_tracked_threads_upstream_active
   on tracked_threads (upstream_thread_id)
   where upstream_thread_id is not null and deleted_at is null;
+
+create table if not exists runtime_snapshots (
+  snapshot_key text primary key,
+  snapshot_json text not null,
+  updated_at text not null
+);
+
+create table if not exists workstream_runtimes (
+  workstream_id text primary key,
+  desired_scope_revision integer,
+  transport_kind text not null,
+  app_server_policy text not null,
+  connection_mode text not null,
+  desired_listen_url text,
+  effective_listen_url text,
+  codex_home text not null,
+  sqlite_home text,
+  owner_kind text,
+  owner_pid integer,
+  status text not null,
+  last_error text,
+  started_at text,
+  last_heartbeat_at text,
+  thread_count integer not null default 0,
+  updated_at text not null,
+  foreign key (workstream_id) references workstreams(id)
+);
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -183,14 +219,20 @@ impl AuthoritySqliteStore {
             .map_err(|error| store_error(format!("configure authority db: {error}")))?;
         let migration = Self::migrate(&mut connection)?;
         let origin_node_id = Self::ensure_origin_node_id(&connection)?;
-        let import_status =
-            Self::bootstrap_from_json_if_needed(&paths, &mut connection, &origin_node_id)?;
+        let authority_import_status = Self::bootstrap_authority_from_json_if_needed(
+            &paths,
+            &mut connection,
+            &origin_node_id,
+        )?;
+        let runtime_import_status =
+            Self::bootstrap_runtime_from_json_if_needed(&paths, &mut connection)?;
         info!(
             db_path,
             schema_version = migration.schema_version,
             migration_applied = migration.applied,
             origin_node_id = origin_node_id.as_str(),
-            import_status,
+            authority_import_status,
+            runtime_import_status,
             duration_ms = start.elapsed().as_millis() as u64,
             "authority store ready"
         );
@@ -1201,13 +1243,13 @@ impl AuthoritySqliteStore {
                     store_error(format!("initialize authority schema: {error}"))
                 })?;
                 connection
-                    .pragma_update(None, "user_version", 4_i64)
+                    .pragma_update(None, "user_version", 5_i64)
                     .map_err(|error| {
                         store_error(format!("set authority schema version: {error}"))
                     })?;
-                debug!(schema_version = 4_i64, "initialized authority schema");
+                debug!(schema_version = 5_i64, "initialized authority schema");
                 Ok(MigrationOutcome {
-                    schema_version: 4,
+                    schema_version: 5,
                     applied: true,
                 })
             }
@@ -1291,8 +1333,51 @@ impl AuthoritySqliteStore {
                     applied: true,
                 })
             }
-            4 => Ok(MigrationOutcome {
-                schema_version: 4,
+            4 => {
+                connection
+                    .execute_batch(
+                        "create table if not exists runtime_snapshots (
+                             snapshot_key text primary key,
+                             snapshot_json text not null,
+                             updated_at text not null
+                         );
+                         create table if not exists workstream_runtimes (
+                             workstream_id text primary key,
+                             desired_scope_revision integer,
+                             transport_kind text not null,
+                             app_server_policy text not null,
+                             connection_mode text not null,
+                             desired_listen_url text,
+                             effective_listen_url text,
+                             codex_home text not null,
+                             sqlite_home text,
+                             owner_kind text,
+                             owner_pid integer,
+                             status text not null,
+                             last_error text,
+                             started_at text,
+                             last_heartbeat_at text,
+                             thread_count integer not null default 0,
+                             updated_at text not null,
+                             foreign key (workstream_id) references workstreams(id)
+                         );",
+                    )
+                    .map_err(|error| {
+                        store_error(format!("migrate authority schema to version 5: {error}"))
+                    })?;
+                connection
+                    .pragma_update(None, "user_version", 5_i64)
+                    .map_err(|error| {
+                        store_error(format!("set authority schema version: {error}"))
+                    })?;
+                debug!(schema_version = 5_i64, "migrated authority schema");
+                Ok(MigrationOutcome {
+                    schema_version: 5,
+                    applied: true,
+                })
+            }
+            5 => Ok(MigrationOutcome {
+                schema_version: 5,
                 applied: false,
             }),
             other => {
@@ -1317,7 +1402,134 @@ impl AuthoritySqliteStore {
         Ok(origin_node_id)
     }
 
-    fn bootstrap_from_json_if_needed(
+    pub async fn load_runtime_state(&self) -> OrcasResult<StoredState> {
+        self.with_connection(Self::load_runtime_state_sync)
+    }
+
+    pub async fn save_runtime_state(&self, state: &StoredState) -> OrcasResult<()> {
+        self.with_connection(|connection| Self::save_runtime_state_sync(connection, state))
+    }
+
+    fn load_runtime_state_sync(connection: &mut Connection) -> OrcasResult<StoredState> {
+        Ok(StoredState {
+            registry: Self::load_runtime_snapshot_with_default(
+                connection,
+                SNAPSHOT_THREAD_REGISTRY,
+            )?,
+            thread_views: Self::load_runtime_snapshot_with_default(
+                connection,
+                SNAPSHOT_THREAD_VIEWS,
+            )?,
+            turn_states: Self::load_runtime_snapshot_with_default(
+                connection,
+                SNAPSHOT_TURN_STATES,
+            )?,
+            collaboration: Self::load_runtime_snapshot_with_default(
+                connection,
+                SNAPSHOT_COLLABORATION_STATE,
+            )?,
+            operator_inbox: Self::load_runtime_snapshot_with_default(
+                connection,
+                SNAPSHOT_OPERATOR_INBOX_STATE,
+            )?,
+            operator_inbox_mirrors: Self::load_runtime_snapshot_with_default(
+                connection,
+                SNAPSHOT_OPERATOR_INBOX_MIRRORS,
+            )?,
+        })
+    }
+
+    fn save_runtime_state_sync(
+        connection: &mut Connection,
+        state: &StoredState,
+    ) -> OrcasResult<()> {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| store_error(format!("start runtime snapshot transaction: {error}")))?;
+        Self::save_runtime_snapshot_tx(&transaction, SNAPSHOT_THREAD_REGISTRY, &state.registry)?;
+        Self::save_runtime_snapshot_tx(&transaction, SNAPSHOT_THREAD_VIEWS, &state.thread_views)?;
+        Self::save_runtime_snapshot_tx(&transaction, SNAPSHOT_TURN_STATES, &state.turn_states)?;
+        Self::save_runtime_snapshot_tx(
+            &transaction,
+            SNAPSHOT_COLLABORATION_STATE,
+            &state.collaboration,
+        )?;
+        Self::save_runtime_snapshot_tx(
+            &transaction,
+            SNAPSHOT_OPERATOR_INBOX_STATE,
+            &state.operator_inbox,
+        )?;
+        Self::save_runtime_snapshot_tx(
+            &transaction,
+            SNAPSHOT_OPERATOR_INBOX_MIRRORS,
+            &state.operator_inbox_mirrors,
+        )?;
+        transaction.commit().map_err(|error| {
+            store_error(format!("commit runtime snapshot transaction: {error}"))
+        })?;
+        Ok(())
+    }
+
+    fn load_runtime_snapshot_with_default<T>(connection: &Connection, key: &str) -> OrcasResult<T>
+    where
+        T: DeserializeOwned + Default,
+    {
+        Self::load_runtime_snapshot(connection, key)?.map_or_else(|| Ok(T::default()), Ok)
+    }
+
+    fn load_runtime_snapshot<T>(connection: &Connection, key: &str) -> OrcasResult<Option<T>>
+    where
+        T: DeserializeOwned,
+    {
+        connection
+            .query_row(
+                "select snapshot_json from runtime_snapshots where snapshot_key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sql_error)?
+            .map(|raw| {
+                serde_json::from_str(&raw).map_err(|error| {
+                    store_error(format!("decode runtime snapshot `{key}`: {error}"))
+                })
+            })
+            .transpose()
+    }
+
+    fn save_runtime_snapshot_tx<T>(
+        transaction: &Transaction<'_>,
+        key: &str,
+        value: &T,
+    ) -> OrcasResult<()>
+    where
+        T: Serialize,
+    {
+        let raw = serde_json::to_string(value)
+            .map_err(|error| store_error(format!("encode runtime snapshot `{key}`: {error}")))?;
+        transaction
+            .execute(
+                "insert into runtime_snapshots (snapshot_key, snapshot_json, updated_at)
+                 values (?1, ?2, ?3)
+                 on conflict(snapshot_key) do update set
+                     snapshot_json = excluded.snapshot_json,
+                     updated_at = excluded.updated_at",
+                params![key, raw, Utc::now().to_rfc3339()],
+            )
+            .map_err(map_sql_error)?;
+        Ok(())
+    }
+
+    fn has_runtime_snapshot_data(connection: &Connection) -> OrcasResult<bool> {
+        let count: i64 = connection
+            .query_row("select count(*) from runtime_snapshots", [], |row| {
+                row.get(0)
+            })
+            .map_err(map_sql_error)?;
+        Ok(count > 0)
+    }
+
+    fn bootstrap_authority_from_json_if_needed(
         paths: &AppPaths,
         connection: &mut Connection,
         origin_node_id: &OriginNodeId,
@@ -1474,6 +1686,48 @@ impl AuthoritySqliteStore {
             "authority bootstrap completed"
         );
         Ok("imported_workstreams_work_units".to_string())
+    }
+
+    fn bootstrap_runtime_from_json_if_needed(
+        paths: &AppPaths,
+        connection: &mut Connection,
+    ) -> OrcasResult<String> {
+        if let Some(status) = Self::meta_value(connection, META_RUNTIME_JSON_IMPORT_STATUS)? {
+            debug!(
+                runtime_import_status = status,
+                "runtime bootstrap already recorded"
+            );
+            return Ok(status);
+        }
+        if Self::has_runtime_snapshot_data(connection)? {
+            Self::set_meta(connection, META_RUNTIME_JSON_IMPORT_STATUS, "existing_db")?;
+            Self::set_meta(
+                connection,
+                META_RUNTIME_JSON_IMPORT_COMPLETED_AT,
+                &Utc::now().to_rfc3339(),
+            )?;
+            return Ok("existing_db".to_string());
+        }
+        if !paths.state_file.exists() {
+            Self::set_meta(connection, META_RUNTIME_JSON_IMPORT_STATUS, "no_state_json")?;
+            Self::set_meta(
+                connection,
+                META_RUNTIME_JSON_IMPORT_COMPLETED_AT,
+                &Utc::now().to_rfc3339(),
+            )?;
+            return Ok("no_state_json".to_string());
+        }
+
+        let raw = fs::read_to_string(&paths.state_file).map_err(OrcasError::Io)?;
+        let stored = StoredState::from_json_str(&raw)?;
+        Self::save_runtime_state_sync(connection, &stored)?;
+        Self::set_meta(connection, META_RUNTIME_JSON_IMPORT_STATUS, "imported")?;
+        Self::set_meta(
+            connection,
+            META_RUNTIME_JSON_IMPORT_COMPLETED_AT,
+            &Utc::now().to_rfc3339(),
+        )?;
+        Ok("imported".to_string())
     }
 
     fn has_existing_authority_data(connection: &Connection) -> OrcasResult<bool> {
@@ -3966,5 +4220,81 @@ mod tests {
             .block_on(reopened.list_workstreams(false))
             .expect("workstreams after reopen");
         assert_eq!(workstreams.len(), 1);
+    }
+
+    #[test]
+    fn runtime_state_round_trips_through_sqlite_snapshots() {
+        let store = fresh_store("runtime-snapshots");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let mut state = StoredState::default();
+        state.registry.last_connected_endpoint = Some("ws://127.0.0.1:4510".to_string());
+        state.collaboration.workstreams.insert(
+            "ws-runtime".to_string(),
+            Workstream {
+                id: "ws-runtime".to_string(),
+                title: "Runtime".to_string(),
+                objective: "Persist runtime state".to_string(),
+                status: WorkstreamStatus::Active,
+                priority: "normal".to_string(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        );
+
+        runtime
+            .block_on(store.save_runtime_state(&state))
+            .expect("save runtime state");
+        let loaded = runtime
+            .block_on(store.load_runtime_state())
+            .expect("load runtime state");
+
+        assert_eq!(
+            loaded.registry.last_connected_endpoint,
+            state.registry.last_connected_endpoint
+        );
+        assert_eq!(loaded.collaboration.workstreams.len(), 1);
+        assert!(loaded.thread_views.is_empty());
+    }
+
+    #[test]
+    fn one_time_import_bootstraps_runtime_snapshots_from_state_json() {
+        let paths = temp_paths("runtime-import");
+        std::fs::create_dir_all(&paths.data_dir).expect("data dir");
+        let mut state = StoredState::default();
+        state.registry.last_connected_endpoint = Some("ws://127.0.0.1:4700".to_string());
+        state.collaboration.workstreams.insert(
+            "ws-runtime-import".to_string(),
+            Workstream {
+                id: "ws-runtime-import".to_string(),
+                title: "Imported runtime".to_string(),
+                objective: "Bootstrap runtime".to_string(),
+                status: WorkstreamStatus::Active,
+                priority: "normal".to_string(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        );
+        std::fs::write(
+            &paths.state_file,
+            state.to_pretty_json().expect("serialize state"),
+        )
+        .expect("write state");
+
+        let store = AuthoritySqliteStore::open(paths).expect("store");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let loaded = runtime
+            .block_on(store.load_runtime_state())
+            .expect("load runtime state");
+
+        assert_eq!(
+            loaded.registry.last_connected_endpoint.as_deref(),
+            Some("ws://127.0.0.1:4700")
+        );
+        assert!(
+            loaded
+                .collaboration
+                .workstreams
+                .contains_key("ws-runtime-import")
+        );
     }
 }
