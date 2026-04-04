@@ -1,33 +1,40 @@
 # Phased Fibonacci
 
-This scenario simulates a longer operator workflow:
+This scenario verifies a real multi-phase tracked-thread workflow on one live Codex lane.
 
-1. The supervisor starts with a vague implementation idea.
-2. The operator approves the plan.
-3. The harness turns that plan into code in phases and seeds the matching report state.
-4. After each phase, the supervisor creates a proposal from the current report.
-5. The operator approves the next path.
-6. The same worktree lane is used from start to finish.
+## What Is Seeded
 
-The harness also exports each phase's prompts to disk so the workflow can be inspected after the run.
+1. The harness creates an isolated git repository and dedicated worktree lane under `target/e2e/worktrees/...`.
+2. The harness commits `plan.md` into that worktree before execution begins.
+3. The workstream, work unit, and tracked-thread workspace contract are created before the first live assignment.
+4. The harness exports `plan.md` plus per-phase operator, supervisor, and agent prompts under `target/e2e/artifacts/...`.
+5. The harness inspects the workstream runtime before execution and expects zero active managed threads.
 
-## Source of Truth
+## What Is Live
 
-- [`plan.md`](./plan.md) defines the phase gates, scope, and acceptance criteria.
-- The harness exports the prompts and reports to disk for inspection.
-- The local `state.json` in the scenario-local XDG data directory under `target/e2e/xdg/` is updated between phases so the proposal/report loop stays coherent.
-- The final result is expected to be a buildable Fibonacci C project in a real git worktree.
+- Phase 1 is a real scoping/report turn on the declared tracked-thread worktree lane.
+- Phase 2 is a real implementation turn that builds the Fibonacci CLI core on that same lane.
+- Phase 3 is a real completion turn that adds repeatable tests and final polish on that same lane.
+- The phase gates use real operator `Continue` and `MarkComplete` decisions rather than seeded proposal state.
+- Orcas binds the tracked-thread automatically on the first live assignment and keeps the same lane attached across all three phases.
 
-## Outputs
+## Pass Conditions
 
-- `target/e2e/artifacts/<run-id>/phased-fibonacci/plan.md`
-- `target/e2e/artifacts/<run-id>/phased-fibonacci/phases/*/agent-prompt.txt`
-- `target/e2e/artifacts/<run-id>/phased-fibonacci/phases/*/supervisor-prompt.txt`
-- `target/e2e/artifacts/<run-id>/phased-fibonacci/phases/*/operator-prompt.txt`
-- `target/e2e/artifacts/<run-id>/phased-fibonacci/phases/*/proposal.md`
-- `target/e2e/reports/<run-id>/phased-fibonacci/phases/*/*.txt`
-- `target/e2e/worktrees/<run-id>/phased-fibonacci/lane`
+- The tracked-thread workspace contract exists before phase 1.
+- The workstream runtime exists before execution with zero managed lane threads.
+- Phase 1 reports without editing files and binds the tracked thread automatically.
+- The runtime shows exactly one managed lane thread and no unmanaged external thread leak after phase 1.
+- Phase 2 produces a buildable Fibonacci CLI with `main.c`, `fib.c`, `fib.h`, and `Makefile`.
+- Phase 3 adds repeatable tests and leaves `make test` passing in the declared worktree.
+- The same tracked-thread lane and upstream thread stay attached across all three phases.
+- Two `Continue` decisions reopen the same work unit for the next bounded phase.
+- A final `MarkComplete` decision closes the work unit after the finished project is on disk.
 
-## Cleanup
+## Fail Conditions
 
-Use `make clean-e2e` from the repository root to remove generated XDG state, logs, artifacts, reports, and worktrees.
+- The tracked-thread workspace contract is missing or mismatched.
+- The first live assignment does not auto-bind the lane.
+- The runtime shows unmanaged thread leakage or loses lane continuity between phases.
+- A phase edits files outside the declared worktree or drifts beyond its bounded objective.
+- The final Fibonacci project is missing required files or `make test` fails.
+- Final persisted work-unit or tracked-thread state contradicts the executed lane.

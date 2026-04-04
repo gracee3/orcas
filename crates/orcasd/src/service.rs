@@ -968,6 +968,62 @@ impl OrcasDaemonService {
         }
     }
 
+    fn desired_thread_owner_workstream_id(state: &DaemonState, thread_id: &str) -> Option<String> {
+        let mut workstream_ids = BTreeSet::new();
+
+        for planning_session in state.collaboration.planning_sessions.values() {
+            if planning_session.planning_thread_id == thread_id {
+                workstream_ids.insert(planning_session.workstream_id.clone());
+            }
+        }
+
+        for codex_assignment in state.collaboration.codex_thread_assignments.values() {
+            if codex_assignment.codex_thread_id == thread_id {
+                workstream_ids.insert(codex_assignment.workstream_id.clone());
+            }
+        }
+
+        for worker_session in state.collaboration.worker_sessions.values() {
+            if worker_session.thread_id.as_deref() != Some(thread_id) {
+                continue;
+            }
+            let Some(assignment) = state
+                .collaboration
+                .assignments
+                .values()
+                .find(|assignment| assignment.worker_session_id == worker_session.id)
+            else {
+                continue;
+            };
+            let Some(work_unit) = state.collaboration.work_units.get(&assignment.work_unit_id)
+            else {
+                continue;
+            };
+            workstream_ids.insert(work_unit.workstream_id.clone());
+        }
+
+        for decision in state.collaboration.supervisor_turn_decisions.values() {
+            if decision.codex_thread_id != thread_id {
+                continue;
+            }
+            let Some(assignment) = state.collaboration.assignments.get(&decision.assignment_id)
+            else {
+                continue;
+            };
+            let Some(work_unit) = state.collaboration.work_units.get(&assignment.work_unit_id)
+            else {
+                continue;
+            };
+            workstream_ids.insert(work_unit.workstream_id.clone());
+        }
+
+        if workstream_ids.len() == 1 {
+            workstream_ids.into_iter().next()
+        } else {
+            None
+        }
+    }
+
     fn codex_connection_mode_from_workstream(
         mode: authority::WorkstreamExecutionConnectionMode,
     ) -> CodexConnectionMode {
@@ -3406,6 +3462,18 @@ impl OrcasDaemonService {
             workstream
         };
         self.persist_collaboration_state().await?;
+        self.authority_workstream_create(ipc::AuthorityWorkstreamCreateRequest {
+            command: orcas_core::authority::CreateWorkstream {
+                metadata: self.authority_command_metadata("service_test")?,
+                workstream_id: orcas_core::authority::WorkstreamId::parse(workstream.id.clone())?,
+                title: workstream.title.clone(),
+                objective: workstream.objective.clone(),
+                status: workstream.status,
+                priority: workstream.priority.clone(),
+                execution_scope: None,
+            },
+        })
+        .await?;
         self.emit_workstream_lifecycle(ipc::CollaborationLifecycleAction::Created, &workstream)
             .await;
         Ok(ipc::WorkstreamCreateResponse { workstream })
@@ -3558,6 +3626,19 @@ impl OrcasDaemonService {
             (work_unit, workstream)
         };
         self.persist_collaboration_state().await?;
+        self.authority_workunit_create(ipc::AuthorityWorkunitCreateRequest {
+            command: orcas_core::authority::CreateWorkUnit {
+                metadata: self.authority_command_metadata("service_test")?,
+                work_unit_id: orcas_core::authority::WorkUnitId::parse(work_unit.id.clone())?,
+                workstream_id: orcas_core::authority::WorkstreamId::parse(
+                    work_unit.workstream_id.clone(),
+                )?,
+                title: work_unit.title.clone(),
+                task_statement: work_unit.task_statement.clone(),
+                status: work_unit.status,
+            },
+        })
+        .await?;
         self.emit_work_unit_lifecycle(ipc::CollaborationLifecycleAction::Created, &work_unit)
             .await;
         self.emit_workstream_lifecycle(ipc::CollaborationLifecycleAction::Updated, &workstream)
@@ -29672,48 +29753,60 @@ ORCAS_REPORT_END"#
             .await
             .expect("worker session thread");
         let thread_id = worker_session.thread_id.expect("backing thread id");
+        let auto_tracked_thread = service
+            .authority_tracked_thread_list(ipc::AuthorityTrackedThreadListRequest {
+                work_unit_id: orcas_core::authority::WorkUnitId::parse(work_unit.id.clone())
+                    .expect("work unit id"),
+                include_deleted: false,
+            })
+            .await
+            .expect("tracked threads")
+            .tracked_threads
+            .into_iter()
+            .next()
+            .expect("auto-created tracked thread");
         service
-            .authority_tracked_thread_create(ipc::AuthorityTrackedThreadCreateRequest {
-                command: orcas_core::authority::CreateTrackedThread {
+            .authority_tracked_thread_edit(ipc::AuthorityTrackedThreadEditRequest {
+                command: orcas_core::authority::EditTrackedThread {
                     metadata: metadata("tt"),
-                    tracked_thread_id: orcas_core::authority::TrackedThreadId::parse(
-                        "workspace-tt",
-                    )
-                    .expect("tracked thread id"),
-                    work_unit_id: work_unit.id.clone(),
-                    title: "Workspace lane".to_string(),
-                    notes: Some("Dedicated worktree lane".to_string()),
-                    backend_kind: orcas_core::authority::TrackedThreadBackendKind::Codex,
-                    upstream_thread_id: Some(thread_id.clone()),
-                    preferred_cwd: Some("/home/emmy/git/worktree/orcas".to_string()),
-                    preferred_model: Some("gpt-5.4".to_string()),
-                    workspace: Some(orcas_core::authority::TrackedThreadWorkspace {
-                        repository_root: "/home/emmy/git/worktree/orcas".to_string(),
-                        owner_tracked_thread_id: orcas_core::authority::TrackedThreadId::parse(
-                            "workspace-tt",
-                        )
-                        .expect("tracked thread id"),
-                        strategy:
-                            orcas_core::authority::TrackedThreadWorkspaceStrategy::DedicatedThreadWorktree,
-                        worktree_path: "/home/emmy/git/worktree/orcas-threads/workspace-tt"
-                            .to_string(),
-                        branch_name: "orcas/workspace-tt".to_string(),
-                        base_ref: "origin/main".to_string(),
-                        base_commit: Some("abc1234".to_string()),
-                        landing_target: "main".to_string(),
-                        landing_policy:
-                            orcas_core::authority::TrackedThreadWorkspaceLandingPolicy::MergeToMain,
-                        sync_policy:
-                            orcas_core::authority::TrackedThreadWorkspaceSyncPolicy::RebaseBeforeCompletion,
-                        cleanup_policy:
-                            orcas_core::authority::TrackedThreadWorkspaceCleanupPolicy::PruneAfterMerge,
-                        last_reported_head_commit: None,
-                        status: orcas_core::authority::TrackedThreadWorkspaceStatus::Requested,
-                    }),
+                    tracked_thread_id: auto_tracked_thread.id.clone(),
+                    expected_revision: auto_tracked_thread.revision,
+                    changes: orcas_core::authority::TrackedThreadPatch {
+                        title: Some("Workspace lane".to_string()),
+                        notes: Some(Some("Dedicated worktree lane".to_string())),
+                        backend_kind: None,
+                        upstream_thread_id: Some(Some(thread_id.clone())),
+                        binding_state: None,
+                        preferred_cwd: Some(Some("/home/emmy/git/worktree/orcas".to_string())),
+                        preferred_model: Some(Some("gpt-5.4".to_string())),
+                        last_seen_turn_id: None,
+                        workspace: Some(Some(orcas_core::authority::TrackedThreadWorkspace {
+                            repository_root: "/home/emmy/git/worktree/orcas".to_string(),
+                            owner_tracked_thread_id: auto_tracked_thread.id.clone(),
+                            strategy:
+                                orcas_core::authority::TrackedThreadWorkspaceStrategy::DedicatedThreadWorktree,
+                            worktree_path: format!(
+                                "/home/emmy/git/worktree/orcas-threads/{}",
+                                auto_tracked_thread.id
+                            ),
+                            branch_name: format!("orcas/{}", auto_tracked_thread.id),
+                            base_ref: "origin/main".to_string(),
+                            base_commit: Some("abc1234".to_string()),
+                            landing_target: "main".to_string(),
+                            landing_policy:
+                                orcas_core::authority::TrackedThreadWorkspaceLandingPolicy::MergeToMain,
+                            sync_policy:
+                                orcas_core::authority::TrackedThreadWorkspaceSyncPolicy::RebaseBeforeCompletion,
+                            cleanup_policy:
+                                orcas_core::authority::TrackedThreadWorkspaceCleanupPolicy::PruneAfterMerge,
+                            last_reported_head_commit: None,
+                            status: orcas_core::authority::TrackedThreadWorkspaceStatus::Requested,
+                        })),
+                    },
                 },
             })
             .await
-            .expect("tracked thread create");
+            .expect("tracked thread edit");
 
         let bound_session = service
             .state
@@ -29729,7 +29822,7 @@ ORCAS_REPORT_END"#
                 .tracked_thread_id
                 .as_ref()
                 .map(|tracked_thread_id| tracked_thread_id.as_str()),
-            Some("workspace-tt")
+            Some(auto_tracked_thread.id.as_str())
         );
 
         service
@@ -29754,7 +29847,10 @@ ORCAS_REPORT_END"#
         assert_eq!(workspace_contract.tracked_thread_title, "Workspace lane");
         assert_eq!(
             workspace_contract.workspace.worktree_path,
-            "/home/emmy/git/worktree/orcas-threads/workspace-tt"
+            format!(
+                "/home/emmy/git/worktree/orcas-threads/{}",
+                auto_tracked_thread.id
+            )
         );
         assert!(
             refreshed_record
@@ -29784,14 +29880,23 @@ ORCAS_REPORT_END"#
         );
         assert_eq!(
             refreshed_record.packet.execution_context.cwd.as_deref(),
-            Some("/home/emmy/git/worktree/orcas-threads/workspace-tt")
+            Some(
+                format!(
+                    "/home/emmy/git/worktree/orcas-threads/{}",
+                    auto_tracked_thread.id
+                )
+                .as_str()
+            )
         );
         assert!(
             refreshed_record
                 .packet
                 .execution_context
                 .related_repo_roots
-                .contains(&"/home/emmy/git/worktree/orcas-threads/workspace-tt".to_string())
+                .contains(&format!(
+                    "/home/emmy/git/worktree/orcas-threads/{}",
+                    auto_tracked_thread.id
+                ))
         );
 
         let raw_output = wrap_report_envelope(
@@ -29818,10 +29923,13 @@ ORCAS_REPORT_END"#
                     "focus": []
                 },
                 "workspace_report": {
-                    "tracked_thread_id": "workspace-tt",
+                    "tracked_thread_id": auto_tracked_thread.id.clone(),
                     "repository_root": "/home/emmy/git/worktree/orcas",
-                    "worktree_path": "/home/emmy/git/worktree/orcas-threads/workspace-tt",
-                    "branch_name": "orcas/workspace-tt",
+                    "worktree_path": format!(
+                        "/home/emmy/git/worktree/orcas-threads/{}",
+                        auto_tracked_thread.id
+                    ),
+                    "branch_name": format!("orcas/{}", auto_tracked_thread.id),
                     "base_ref": "origin/main",
                     "base_commit": "abc1234",
                     "head_commit": "def5678",
@@ -29870,8 +29978,7 @@ ORCAS_REPORT_END"#
 
         let tracked_thread = service
             .authority_tracked_thread_get(ipc::AuthorityTrackedThreadGetRequest {
-                tracked_thread_id: orcas_core::authority::TrackedThreadId::parse("workspace-tt")
-                    .expect("tracked thread id"),
+                tracked_thread_id: auto_tracked_thread.id.clone(),
             })
             .await
             .expect("tracked thread")
@@ -32308,26 +32415,64 @@ Boundedness note: Stay within the legacy compatibility boundary."#
             needs_supervisor_review: false,
             created_at: Utc::now(),
         };
+        {
+            let mut state = service.state.write().await;
+            state
+                .collaboration
+                .reports
+                .insert(report.id.clone(), report.clone());
+            state
+                .collaboration
+                .assignments
+                .get_mut(&prepared.assignment.id)
+                .expect("assignment")
+                .status = AssignmentStatus::AwaitingDecision;
+            state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .expect("work unit")
+                .status = WorkUnitStatus::AwaitingDecision;
+            state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .expect("work unit")
+                .latest_report_id = Some(report.id.clone());
+            state
+                .collaboration
+                .work_units
+                .get_mut(&work_unit.id)
+                .expect("work unit")
+                .current_assignment_id = Some(prepared.assignment.id.clone());
+        }
+        service
+            .persist_collaboration_state()
+            .await
+            .expect("persist");
         service.emit_report_recorded(&report).await;
-        let _ = service
+        service
             .decision_apply(ipc::DecisionApplyRequest {
                 work_unit_id: work_unit.id.clone(),
-                report_id: None,
+                report_id: Some(report.id),
                 decision_type: DecisionType::EscalateToHuman,
                 rationale: "need review".to_string(),
                 instructions: None,
                 worker_id: None,
                 worker_kind: None,
             })
-            .await;
+            .await
+            .expect("decision");
 
         let mut saw_workstream = false;
         let mut saw_work_unit = false;
         let mut saw_assignment = false;
         let mut saw_report = false;
         let mut saw_decision = false;
-        for _ in 0..8 {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !(saw_workstream && saw_work_unit && saw_assignment && saw_report && saw_decision) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, events.recv())
                 .await
                 .expect("event timeout")
                 .expect("event");

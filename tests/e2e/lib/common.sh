@@ -142,13 +142,26 @@ e2e_prepare_output_dirs() {
     "$e2e_output_root/xdg/$e2e_run_id"
 }
 
+e2e_ensure_symlink() {
+  local target="$1"
+  local link_path="$2"
+
+  mkdir -p "$(dirname "$link_path")"
+  if [[ -L "$link_path" && "$(readlink "$link_path")" == "$target" ]]; then
+    return 0
+  fi
+  if [[ -e "$link_path" && ! -L "$link_path" ]]; then
+    rm -rf "$link_path"
+  fi
+  ln -sfn "$target" "$link_path"
+}
+
 e2e_link_legacy_xdg_views() {
   mkdir -p "$E2E_SCENARIO_XDG_DATA_HOME" "$E2E_SCENARIO_XDG_CONFIG_HOME" "$E2E_SCENARIO_XDG_RUNTIME_HOME"
   mkdir -p "$E2E_SCENARIO_ORCAS_HOME/logs" "$E2E_SCENARIO_ORCAS_HOME/runtime"
-  rm -rf "$E2E_SCENARIO_XDG_DATA_HOME/orcas" "$E2E_SCENARIO_XDG_CONFIG_HOME/orcas" "$E2E_SCENARIO_XDG_RUNTIME_HOME/orcas"
-  ln -s "$E2E_SCENARIO_ORCAS_HOME" "$E2E_SCENARIO_XDG_DATA_HOME/orcas"
-  ln -s "$E2E_SCENARIO_ORCAS_HOME" "$E2E_SCENARIO_XDG_CONFIG_HOME/orcas"
-  ln -s "$E2E_SCENARIO_ORCAS_HOME/runtime" "$E2E_SCENARIO_XDG_RUNTIME_HOME/orcas"
+  e2e_ensure_symlink "$E2E_SCENARIO_ORCAS_HOME" "$E2E_SCENARIO_XDG_DATA_HOME/orcas"
+  e2e_ensure_symlink "$E2E_SCENARIO_ORCAS_HOME" "$E2E_SCENARIO_XDG_CONFIG_HOME/orcas"
+  e2e_ensure_symlink "$E2E_SCENARIO_ORCAS_HOME/runtime" "$E2E_SCENARIO_XDG_RUNTIME_HOME/orcas"
 }
 
 e2e_sync_legacy_xdg_into_orcas_home() {
@@ -169,10 +182,9 @@ e2e_sync_legacy_xdg_into_orcas_home() {
     cp -a "$xdg_runtime_home/orcas/." "$orcas_home/runtime/"
   fi
 
-  rm -rf "$xdg_data_home/orcas" "$xdg_config_home/orcas" "$xdg_runtime_home/orcas"
-  ln -s "$orcas_home" "$xdg_data_home/orcas"
-  ln -s "$orcas_home" "$xdg_config_home/orcas"
-  ln -s "$orcas_home/runtime" "$xdg_runtime_home/orcas"
+  e2e_ensure_symlink "$orcas_home" "$xdg_data_home/orcas"
+  e2e_ensure_symlink "$orcas_home" "$xdg_config_home/orcas"
+  e2e_ensure_symlink "$orcas_home/runtime" "$xdg_runtime_home/orcas"
 }
 
 e2e_prepare_scenario_dirs() {
@@ -246,11 +258,14 @@ e2e_use_short_xdg_paths() {
   local suffix="$1"
   [[ -n "$suffix" ]] || e2e_fail "short XDG path suffix is required"
 
-  local short_xdg_root="$e2e_output_root/xdg/$E2E_RUN_ID/$suffix"
+  local run_hash
+  run_hash="$(printf '%s' "$E2E_RUN_ID" | cksum | awk '{print $1}')"
+  local short_root_base="${TMPDIR:-/tmp}/orcas-e2e"
+  local short_xdg_root="$short_root_base/${suffix}-${run_hash}"
   local short_xdg_data_home="$short_xdg_root/data"
   local short_xdg_config_home="$short_xdg_root/config"
   local short_xdg_runtime_home="$short_xdg_root/runtime"
-  local short_orcas_home="$e2e_output_root/orcas/$E2E_RUN_ID/$suffix"
+  local short_orcas_home="$short_root_base/${suffix}-${run_hash}-orcas"
 
   rm -rf "$short_xdg_root" "$short_orcas_home"
   mkdir -p \
@@ -461,6 +476,32 @@ e2e_prepare_fixture_repo_with_worktree() {
   git -C "$repo_root" worktree add -b "$branch_name" "$worktree_path" "$base_ref" >"$reports_dir/${prefix}-git-worktree-add.txt" 2>&1
 }
 
+e2e_prepare_empty_repo_with_worktree() {
+  local repo_root="$1"
+  local worktree_path="$2"
+  local branch_name="$3"
+  local base_ref="$4"
+  local reports_dir="$5"
+  local prefix="${6:-git}"
+
+  rm -rf "$repo_root" "$worktree_path"
+  mkdir -p "$repo_root" "$(dirname "$worktree_path")"
+
+  git -C "$repo_root" init -b "$base_ref" >"$reports_dir/${prefix}-git-init.txt" 2>&1
+  git -C "$repo_root" config user.name "Orcas E2E"
+  git -C "$repo_root" config user.email "orcas-e2e@example.com"
+
+  cat >"$repo_root/README.md" <<EOF
+# ${E2E_SCENARIO_NAME:-orcas-e2e}
+
+Scenario seed repository for the tracked-thread worktree lane.
+EOF
+
+  git -C "$repo_root" add README.md
+  git -C "$repo_root" commit -m "Initial tracked-thread seed" >"$reports_dir/${prefix}-git-initial-commit.txt" 2>&1
+  git -C "$repo_root" worktree add -b "$branch_name" "$worktree_path" "$base_ref" >"$reports_dir/${prefix}-git-worktree-add.txt" 2>&1
+}
+
 e2e_add_tracked_thread_workspace() {
   local workunit_id="$1"
   local title="$2"
@@ -503,8 +544,27 @@ e2e_wait_for_report_id() {
   local report_id=""
 
   for _ in $(seq 1 "$attempts"); do
-    reports_output="$("$e2e_bin_dir/orcas.sh" reports list-for-workunit --workunit "$workunit_id" 2>/dev/null || true)"
+    reports_output="$("$e2e_bin_dir/orcas.sh" supervisor work reports list-for-workunit --workunit "$workunit_id" 2>/dev/null || true)"
     report_id="$(printf '%s\n' "$reports_output" | awk -F'\t' '/^report-/ {print $1; exit}')"
+    [[ -n "$report_id" ]] && break
+    sleep "$delay_seconds"
+  done
+
+  test -n "$report_id"
+  printf -v "$output_var" '%s' "$report_id"
+}
+
+e2e_wait_for_assignment_report_id() {
+  local assignment_id="$1"
+  local output_var="$2"
+  local attempts="${3:-120}"
+  local delay_seconds="${4:-5}"
+  local assignment_output=""
+  local report_id=""
+
+  for _ in $(seq 1 "$attempts"); do
+    assignment_output="$("$e2e_bin_dir/orcas.sh" supervisor work assignments get --assignment "$assignment_id" 2>/dev/null || true)"
+    report_id="$(printf '%s\n' "$assignment_output" | awk -F': ' '/^report_id:/ {print $2; exit}')"
     [[ -n "$report_id" ]] && break
     sleep "$delay_seconds"
   done
