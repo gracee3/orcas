@@ -166,7 +166,7 @@ Use bounded integration branches when merging validated repair stacks back towar
 
 ## Read more
 
-For a fuller technical picture, see [Architecture](docs/architecture.md), [Collaboration](docs/collaboration.md), [Local-Authority MVP Backend Design](docs/design/local-authority-mvp-backend.md), [Installation](docs/install.md), [Configuration](docs/configuration.md), [Logging](docs/logging.md), [Operations](docs/operations.md), and [Testing](docs/testing.md).
+For a fuller technical picture, see [Architecture](docs/architecture.md), [CLI Reference](docs/CLI_REFERENCE.md), [Collaboration](docs/collaboration.md), [Local-Authority MVP Backend Design](docs/design/local-authority-mvp-backend.md), [Installation](docs/install.md), [Configuration](docs/configuration.md), [Logging](docs/logging.md), [Operations](docs/operations.md), and [Testing](docs/testing.md).
 
 ## License
 
