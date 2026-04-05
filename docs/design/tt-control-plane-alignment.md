@@ -1,34 +1,34 @@
-# Orcas Control-Plane Alignment
+# TT Control-Plane Alignment
 
 ## 1. Findings
 
 The initial investigation found:
 
-- Orcas already has canonical authority records for `workstream`, `work_unit`, and `tracked_thread` in `state.db`.
+- TT already has canonical authority records for `workstream`, `work_unit`, and `tracked_thread` in `state.db`.
 - `tracked_thread.workspace` already models most of the intended workspace shape: repo root, worktree path, base ref, landing target, and lifecycle policy.
 - Runtime state persists in SQLite runtime snapshots inside `state.db`: assignments, reports, worker sessions, workspace operations, thread mirrors, and landing/prune execution records.
-- The daemon originally owned one global upstream Codex/app-server connection policy. The current branch now persists workstream execution scope and reconciles dedicated runtime handles per workstream, while keeping a shared daemon runtime as a compatibility/default path.
-- Assignment packets already have an `execution_context`, but Orcas was not using it to start turns; `cwd` and `model` were being dropped at dispatch time.
+- The daemon originally owned one global upstream TT/app-server connection policy. The current branch now persists workstream execution scope and reconciles dedicated runtime handles per workstream, while keeping a shared daemon runtime as a compatibility/default path.
+- Assignment packets already have an `execution_context`, but TT was not using it to start turns; `cwd` and `model` were being dropped at dispatch time.
 - Worker-session reuse was broad. Reuse was keyed only by `worker_id`, which allowed session/thread reuse to bleed across unrelated work units.
 - Git worktree inspection already existed for read-side status checks, but not for deriving the filesystem roots needed to express a future sandbox contract.
 
 ## 2. Gap Analysis
 
-- Missing durable workstream execution scope: no place to persist `CODEX_HOME`, optional sqlite path, transport policy, or intended app-server ownership.
+- Missing durable workstream execution scope: no place to persist `RUNTIME_HOME`, optional sqlite path, transport policy, or intended app-server ownership.
 - Missing execution enforcement: workspace-aware `cwd` and requested `model` were not being forwarded into worker turns.
 - Missing isolation boundary: worker-session reuse could cross work-unit or workspace boundaries.
 - Missing read model: tracked-thread detail did not expose the concrete filesystem roots needed for workspace/thread-level sandboxing with git worktrees.
-- Missing ownership clarity: Orcas had no explicit split between what it persists versus what remains app-server or Codex local state.
+- Missing ownership clarity: TT had no explicit split between what it persists versus what remains app-server or TT local state.
 
 ## 3. Recommended Architecture
 
-- Keep Orcas as the supervisor and control plane.
+- Keep TT as the supervisor and control plane.
 - Treat one persistent app-server per workstream as the long-term ownership unit.
 - Attach filesystem sandboxing to the workspace/thread, not to the workstream.
-- Keep merge, prune, and landing authority in Orcas supervisor flows.
+- Keep merge, prune, and landing authority in TT supervisor flows.
 - Use `state.db` as the source of truth for workstream, work unit, tracked thread, workspace intent, and workstream execution scope.
 - Keep runtime mirrors in SQLite runtime snapshots inside `state.db`.
-- Keep externally created Codex threads visible but `observed_unmanaged` until Orcas explicitly adopts them into a managed lane.
+- Keep externally created TT threads visible but `observed_unmanaged` until TT explicitly adopts them into a managed lane.
 
 ## 4. Lifecycle
 
@@ -40,30 +40,30 @@ The initial investigation found:
    Persist the supervisor-managed task grouping under the workstream.
 4. Allocate workspace/worktree.
    Persist workspace intent on the tracked-thread record and trigger explicit workspace operations.
-5. Start Codex thread in that workspace.
+5. Start TT thread in that workspace.
    Resolve turn `cwd`, repo root, related git-admin roots, and requested model from the workspace and assignment contract.
-   Threads discovered on the same runtime but not adopted into Orcas remain visible as `observed_unmanaged` and do not become tracked-thread lanes automatically.
+   Threads discovered on the same runtime but not adopted into TT remain visible as `observed_unmanaged` and do not become tracked-thread lanes automatically.
 6. Collect results.
    Continue using assignment communication packets plus reports, workspace operations, and landing/prune records.
 7. Supervisor decides merge, prune, or follow-up.
-   Orcas remains the only merge/prune authority.
+   TT remains the only merge/prune authority.
    Dedicated runtime stop, restart, and idle retirement must refuse while unmanaged external threads are still present on that runtime.
 
 ## 5. State Model
 
-Persist in Orcas:
+Persist in TT:
 
 - Workstream: title, objective, status, priority, execution scope.
 - Work unit: task grouping and status.
 - Workspace: tracked-thread workspace intent and lifecycle status.
-- Codex thread binding: tracked-thread upstream binding, preferred `cwd`, preferred model, last seen turn.
+- TT thread binding: tracked-thread upstream binding, preferred `cwd`, preferred model, last seen turn.
 - Worker runtime mirrors: assignments, worker sessions, reports, workspace operations, landing/prune execution state.
 
-Delegate to Codex/app-server:
+Delegate to TT/app-server:
 
 - Actual thread transcript/history storage.
-- `CODEX_HOME` local state and sqlite-local state.
-- Live thread runtime state outside Orcas mirrors.
+- `RUNTIME_HOME` local state and sqlite-local state.
+- Live thread runtime state outside TT mirrors.
 
 Single source of truth:
 
@@ -110,7 +110,7 @@ Phase 3:
 
 - enforce per-workspace sandbox policy using the derived filesystem root contract
 - route daemon app-server ownership by workstream execution scope
-- add explicit workstream runtime lifecycle control at the Orcas RPC and CLI layer
+- add explicit workstream runtime lifecycle control at the TT RPC and CLI layer
 
 ## 8. Code Changes
 
@@ -121,15 +121,15 @@ Implemented in this slice:
 - Added tracked-thread filesystem scope reads, including worktree path, worktree parent, git dir, common git dir, worker-turn roots, and workspace-lifecycle roots.
 - Changed assignment communication rendering to derive execution context from workspace intent.
 - Changed turn dispatch to use the rendered assignment `cwd` and requested model instead of dropping both.
-- Tightened worker-session reuse so reuse only happens within the same work-unit lane; otherwise Orcas allocates a fresh session.
+- Tightened worker-session reuse so reuse only happens within the same work-unit lane; otherwise TT allocates a fresh session.
 - Added focused tests for execution-scope persistence, workspace filesystem-scope derivation, execution-context routing, and session reuse.
-- Added explicit `workstream_runtime/{list,get,start,stop,restart}` RPCs and `orcas workstreams runtime ...` CLI commands.
-- Added client disconnect and app-server stop hooks so Orcas can stop dedicated local runtimes and disconnect remote runtime clients.
+- Added explicit `workstream_runtime/{list,get,start,stop,restart}` RPCs and `tt workstreams runtime ...` CLI commands.
+- Added client disconnect and app-server stop hooks so TT can stop dedicated local runtimes and disconnect remote runtime clients.
 - Scoped `threads/list` and `threads/list_loaded` to an explicit `workstream_id`.
 
 ## 9. Risks / Open Questions
 
-- Shared-runtime workstream attribution remains intentionally owner-scoped rather than runtime-membership-scoped. Unmanaged external threads on a shared app-server are protected from Orcas ownership, but they are also not shown in any workstream-scoped list.
+- Shared-runtime workstream attribution remains intentionally owner-scoped rather than runtime-membership-scoped. Unmanaged external threads on a shared app-server are protected from TT ownership, but they are also not shown in any workstream-scoped list.
 - Stale worktrees, abandoned sessions, and merge conflicts still require explicit supervisor handling; this slice improves visibility and isolation but does not automate cleanup policy.
 - Remote WebSocket transport production posture still needs explicit security review.
 
@@ -143,8 +143,8 @@ Implemented in this slice:
 
 - Workstream-scoped model listing now routes through the selected workstream runtime instead of the shared upstream client.
 - Workstream-scoped thread listing is now owner-scoped on shared runtimes and runtime-scoped on dedicated runtimes.
-- Thread summaries now carry both `owner_workstream_id` and `runtime_workstream_id` so Orcas can distinguish local ownership from runtime placement.
-- Worker thread start and resume now default to Codex `WorkspaceWrite` sandbox mode.
+- Thread summaries now carry both `owner_workstream_id` and `runtime_workstream_id` so TT can distinguish local ownership from runtime placement.
+- Worker thread start and resume now default to TT `WorkspaceWrite` sandbox mode.
 - Worker turn dispatch now derives `WorkspaceWrite` writable roots from tracked-thread workspace state:
   - normal worker turns use the worktree roots
   - workspace lifecycle turns expand to the repository root and worktree parent as well

@@ -2,12 +2,12 @@
 
 ## Overview
 
-Testing in Orcas is intentionally layered. Most logic should be covered at the lightest layer that gives confidence, with heavier real-daemon and real-CLI tests reserved for the workflows that matter most at process and operator boundaries.
+Testing in TT is intentionally layered. Most logic should be covered at the lightest layer that gives confidence, with heavier real-daemon and real-CLI tests reserved for the workflows that matter most at process and operator boundaries.
 
 The current test stack covers:
 - fast unit and contract tests
 - client and protocol boundary tests
-- integration tests against a spawned real `orcasd`
+- integration tests against a spawned real `ttd`
 - bounded real CLI and operator workflow tests
 - regression tests for previously tricky behavior
 
@@ -18,17 +18,17 @@ The current test stack covers:
 Use these for pure logic, serde contracts, parsing, rendering, validation, defaults, and backward-compat behavior.
 
 Typical examples:
-- `orcasd/src/assignment_comm/*`
-- `orcasd/src/supervisor.rs`
-- `orcas-core` shared schema modules
-- `orcas-codex/src/protocol/types.rs`
+- `ttd/src/assignment_comm/*`
+- `ttd/src/supervisor.rs`
+- `tt-core` shared schema modules
+- `tt-runtime/src/protocol/types.rs`
 
 ### Integration Tests
 
 Use these when confidence depends on a real boundary but not a full end-to-end campaign.
 
 Typical examples:
-- direct client-boundary tests for `CodexClient` and `OrcasIpcClient`
+- direct client-boundary tests for `TTClient` and `TTIpcClient`
 - real Unix-socket tests against a spawned daemon
 - persistence and reconnect coverage across restart
 
@@ -82,21 +82,20 @@ When a bug or ambiguity is found, add a targeted regression test close to the se
 ## Important Harnesses And Seams
 
 High-value existing patterns:
-- direct protocol/client tests in `orcas-codex` and `orcasd`
-- spawned-daemon harness in `crates/orcasd/tests/harness.rs`
-- fake Codex helper for bounded upstream behavior
+- direct protocol/client tests in `tt-runtime` and `ttd`
+- spawned-daemon harness in `crates/ttd/tests/harness.rs`
+- fake TT helper for bounded upstream behavior
 - fake supervisor `/responses` helper for deterministic proposal generation
-- CLI integration tests in `crates/orcas/tests/cli_socket.rs`
+- CLI integration tests in `crates/tt/tests/cli_socket.rs`
 
-The Codex contract inventory is checked in under `crates/orcas-codex/contracts/` and is regenerated with:
+The TT contract inventory is checked in under `crates/tt-runtime/contracts/` and is regenerated with:
 
 ```bash
-cargo run -p orcas-codex --bin codex-contract-sync -- \
-  --root /home/emmy/openai/codex/codex-rs \
-  --out crates/orcas-codex/contracts/codex-contract-index.json
+cargo run -p tt-runtime --bin tt-contract-sync -- \
+  --out crates/tt-runtime/contracts/tt-contract-index.json
 ```
 
-The matching drift test is `contract::tests::contract_index_matches_current_codex_checkout` in `orcas-codex`.
+The matching drift test is `contract::tests::contract_index_matches_current_tt_checkout` in `tt-runtime`.
 
 These are enough for most future additions. Prefer extending an existing harness over creating a new one.
 
@@ -128,12 +127,12 @@ make clean-e2e
 Useful focused examples:
 
 ```bash
-cargo test -p orcasd --lib
-cargo test -p orcasd --test real_socket -- --nocapture
-cargo test -p orcas --test cli_socket -- --nocapture
-cargo test -p orcas-codex --lib
-cargo test -p orcasd parse_worker_report_recovers_when_live_worker_corrupts_identity_line -- --nocapture
-cargo test -p orcasd assignment_start_refreshes_persisted_packet_when_cwd_changes -- --nocapture
+cargo test -p ttd --lib
+cargo test -p ttd --test real_socket -- --nocapture
+cargo test -p tt --test cli_socket -- --nocapture
+cargo test -p tt-runtime --lib
+cargo test -p ttd parse_worker_report_recovers_when_live_worker_corrupts_identity_line -- --nocapture
+cargo test -p ttd assignment_start_refreshes_persisted_packet_when_cwd_changes -- --nocapture
 ```
 
 Coverage:

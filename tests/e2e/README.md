@@ -1,12 +1,12 @@
-# Orcas E2E Harness
+# TT E2E Harness
 
-This directory holds the checked-in end-to-end harness for Orcas.
+This directory holds the checked-in end-to-end harness for TT.
 
 The goal is to keep the normal developer path fast while still making the operator workflows reproducible and inspectable when you want them.
 
 ## Layout
 
-- `tests/e2e/bin/orcas.sh` wraps the local Orcas CLI with a repo-local `ORCAS_HOME`.
+- `tests/e2e/bin/tt.sh` wraps the local TT CLI with a repo-local `TT_HOME`.
 - `tests/e2e/lib/common.sh` centralizes path setup, scenario metadata loading, selection, shared helpers, and legacy XDG shim paths for older scenarios.
 - `tests/e2e/run_all.sh` discovers and runs scenarios by metadata.
 - `tests/e2e/run_scenario.sh` runs one scenario by name or path.
@@ -20,7 +20,7 @@ Generated output is written only under `target/e2e/`:
 - `target/e2e/reports/<run-id>/<scenario>/`
 - `target/e2e/artifacts/<run-id>/<scenario>/`
 - `target/e2e/worktrees/<run-id>/<scenario>/`
-- `target/e2e/orcas/<run-id>/<scenario>/`
+- `target/e2e/tt/<run-id>/<scenario>/`
 - `target/e2e/xdg/<run-id>/<scenario>/`
 
 ## Scenario Metadata
@@ -32,7 +32,7 @@ Each scenario must provide `scenario.env` with shell-friendly key/value pairs:
 - `TAGS` as a comma-separated list
 - `DEFAULT_ENABLED` as `true` or `false`
 - `TIMEOUT_SECONDS`
-- `REQUIRES_CODEX`
+- `REQUIRES_RUNTIME`
 - `REQUIRES_NETWORK`
 - `REQUIRES_CLEAN_GIT`
 
@@ -46,7 +46,7 @@ Lane contract:
 Aligned live lane contract for the current tracked-thread/workspace migration:
 
 - lane-centric live scenarios create the workstream first, then declare the tracked-thread workspace before the first live assignment
-- the harness inspects the workstream runtime through `orcas workstreams runtime get` and `orcas codex threads list --workstream`
+- the harness inspects the workstream runtime through `tt workstreams runtime get` and `tt tt threads list --workstream`
 - the first live assignment must auto-bind into the declared tracked-thread lane; the harness must not repair binding manually after the report appears
 - the currently aligned scenarios are `git-worktrees`, `phased-fibonacci`, `live-worker-direct-patch`, `live-supervisor-micro-proposal`, `live-reject-redirect`, `live-restart-resume`, `live-worktree-lifecycle`, `live-multi-phase-lane`, and `live-concurrent-lanes`
 
@@ -95,7 +95,7 @@ tests/e2e/run_scenario.sh tests/e2e/scenarios/hello
 
 If you want to launch live scenarios from the terminal and inspect them immediately in the operator web UI, use the shared UI lab instead of the default scenario-local XDG roots.
 
-The lab uses a dedicated Orcas state under `target/ui-e2e-lab/`, so it does not overwrite your normal `~/.orcas` state.
+The lab uses a dedicated TT state under `target/ui-e2e-lab/`, so it does not overwrite your normal `~/.tt` state.
 
 Reset and start the lab:
 
@@ -151,16 +151,16 @@ live persisted collaboration shape.
 For live supervisor proposal scenarios, export:
 
 ```bash
-export ORCAS_E2E_SUPERVISOR_BASE_URL="http://127.0.0.1:8000/v1"
-export ORCAS_E2E_SUPERVISOR_MODEL="gpt-oss-20b"
-export ORCAS_E2E_SUPERVISOR_API_KEY_ENV=""
-export ORCAS_E2E_SUPERVISOR_REASONING_EFFORT=""
-export ORCAS_E2E_SUPERVISOR_MAX_OUTPUT_TOKENS="2048"
+export TT_E2E_SUPERVISOR_BASE_URL="http://127.0.0.1:8000/v1"
+export TT_E2E_SUPERVISOR_MODEL="gpt-oss-20b"
+export TT_E2E_SUPERVISOR_API_KEY_ENV=""
+export TT_E2E_SUPERVISOR_REASONING_EFFORT=""
+export TT_E2E_SUPERVISOR_MAX_OUTPUT_TOKENS="2048"
 ```
 
 The scenario runner probes `.../models` before it starts. If those variables are unset, or if the endpoint is unreachable, the scenario fails immediately with an actionable message instead of silently depending on a hidden local model setup.
 
-The harness still accepts the older `ORCAS_E2E_QWEN_*` variable names as a fallback, but the intended contract is provider-neutral: any local OpenAI-compatible endpoint is acceptable for these opt-in proposal scenarios.
+The harness still accepts the older `TT_E2E_QWEN_*` variable names as a fallback, but the intended contract is provider-neutral: any local OpenAI-compatible endpoint is acceptable for these opt-in proposal scenarios.
 
 ## Cleanup
 

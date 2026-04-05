@@ -50,7 +50,7 @@ e2e_load_scenario_metadata() {
   local scenario_env="$scenario_dir/scenario.env"
   [[ -f "$scenario_env" ]] || e2e_fail "missing scenario metadata: $scenario_env"
 
-  unset NAME MODE TAGS DEFAULT_ENABLED TIMEOUT_SECONDS REQUIRES_CODEX REQUIRES_NETWORK REQUIRES_CLEAN_GIT
+  unset NAME MODE TAGS DEFAULT_ENABLED TIMEOUT_SECONDS REQUIRES_RUNTIME REQUIRES_NETWORK REQUIRES_CLEAN_GIT
   # shellcheck disable=SC1090
   source "$scenario_env"
 
@@ -66,9 +66,9 @@ e2e_load_scenario_metadata() {
     true|false) ;;
     *) e2e_fail "scenario $scenario_name has invalid DEFAULT_ENABLED=${DEFAULT_ENABLED:-<unset>}" ;;
   esac
-  case "${REQUIRES_CODEX:-}" in
+  case "${REQUIRES_RUNTIME:-}" in
     true|false) ;;
-    *) e2e_fail "scenario $scenario_name has invalid REQUIRES_CODEX=${REQUIRES_CODEX:-<unset>}" ;;
+    *) e2e_fail "scenario $scenario_name has invalid REQUIRES_RUNTIME=${REQUIRES_RUNTIME:-<unset>}" ;;
   esac
   case "${REQUIRES_NETWORK:-}" in
     true|false) ;;
@@ -138,7 +138,7 @@ e2e_prepare_output_dirs() {
     "$e2e_output_root/reports/$e2e_run_id" \
     "$e2e_output_root/artifacts/$e2e_run_id" \
     "$e2e_output_root/worktrees/$e2e_run_id" \
-    "$e2e_output_root/orcas/$e2e_run_id" \
+    "$e2e_output_root/tt/$e2e_run_id" \
     "$e2e_output_root/xdg/$e2e_run_id"
 }
 
@@ -158,33 +158,33 @@ e2e_ensure_symlink() {
 
 e2e_link_legacy_xdg_views() {
   mkdir -p "$E2E_SCENARIO_XDG_DATA_HOME" "$E2E_SCENARIO_XDG_CONFIG_HOME" "$E2E_SCENARIO_XDG_RUNTIME_HOME"
-  mkdir -p "$E2E_SCENARIO_ORCAS_HOME/logs" "$E2E_SCENARIO_ORCAS_HOME/runtime"
-  e2e_ensure_symlink "$E2E_SCENARIO_ORCAS_HOME" "$E2E_SCENARIO_XDG_DATA_HOME/orcas"
-  e2e_ensure_symlink "$E2E_SCENARIO_ORCAS_HOME" "$E2E_SCENARIO_XDG_CONFIG_HOME/orcas"
-  e2e_ensure_symlink "$E2E_SCENARIO_ORCAS_HOME/runtime" "$E2E_SCENARIO_XDG_RUNTIME_HOME/orcas"
+  mkdir -p "$E2E_SCENARIO_TT_HOME/logs" "$E2E_SCENARIO_TT_HOME/runtime"
+  e2e_ensure_symlink "$E2E_SCENARIO_TT_HOME" "$E2E_SCENARIO_XDG_DATA_HOME/tt"
+  e2e_ensure_symlink "$E2E_SCENARIO_TT_HOME" "$E2E_SCENARIO_XDG_CONFIG_HOME/tt"
+  e2e_ensure_symlink "$E2E_SCENARIO_TT_HOME/runtime" "$E2E_SCENARIO_XDG_RUNTIME_HOME/tt"
 }
 
-e2e_sync_legacy_xdg_into_orcas_home() {
+e2e_sync_legacy_xdg_into_tt_home() {
   local xdg_data_home="$1"
   local xdg_config_home="$2"
   local xdg_runtime_home="$3"
-  local orcas_home="$4"
+  local tt_home="$4"
 
-  mkdir -p "$orcas_home/logs" "$orcas_home/runtime"
+  mkdir -p "$tt_home/logs" "$tt_home/runtime"
 
-  if [[ -d "$xdg_data_home/orcas" && ! -L "$xdg_data_home/orcas" ]]; then
-    cp -a "$xdg_data_home/orcas/." "$orcas_home/"
+  if [[ -d "$xdg_data_home/tt" && ! -L "$xdg_data_home/tt" ]]; then
+    cp -a "$xdg_data_home/tt/." "$tt_home/"
   fi
-  if [[ -d "$xdg_config_home/orcas" && ! -L "$xdg_config_home/orcas" ]]; then
-    cp -a "$xdg_config_home/orcas/." "$orcas_home/"
+  if [[ -d "$xdg_config_home/tt" && ! -L "$xdg_config_home/tt" ]]; then
+    cp -a "$xdg_config_home/tt/." "$tt_home/"
   fi
-  if [[ -d "$xdg_runtime_home/orcas" && ! -L "$xdg_runtime_home/orcas" ]]; then
-    cp -a "$xdg_runtime_home/orcas/." "$orcas_home/runtime/"
+  if [[ -d "$xdg_runtime_home/tt" && ! -L "$xdg_runtime_home/tt" ]]; then
+    cp -a "$xdg_runtime_home/tt/." "$tt_home/runtime/"
   fi
 
-  e2e_ensure_symlink "$orcas_home" "$xdg_data_home/orcas"
-  e2e_ensure_symlink "$orcas_home" "$xdg_config_home/orcas"
-  e2e_ensure_symlink "$orcas_home/runtime" "$xdg_runtime_home/orcas"
+  e2e_ensure_symlink "$tt_home" "$xdg_data_home/tt"
+  e2e_ensure_symlink "$tt_home" "$xdg_config_home/tt"
+  e2e_ensure_symlink "$tt_home/runtime" "$xdg_runtime_home/tt"
 }
 
 e2e_prepare_scenario_dirs() {
@@ -199,23 +199,23 @@ e2e_prepare_scenario_dirs() {
   E2E_SCENARIO_REPORTS_DIR="$e2e_output_root/reports/$e2e_run_id/$scenario_name"
   E2E_SCENARIO_ARTIFACTS_DIR="$e2e_output_root/artifacts/$e2e_run_id/$scenario_name"
   E2E_SCENARIO_WORKTREES_DIR="$e2e_output_root/worktrees/$e2e_run_id/$scenario_name"
-  if e2e_is_true "${ORCAS_E2E_REUSE_CURRENT_XDG:-false}"; then
-    [[ -n "${ORCAS_E2E_SHARED_XDG_DIR:-}" ]] || e2e_fail "ORCAS_E2E_SHARED_XDG_DIR is required when ORCAS_E2E_REUSE_CURRENT_XDG=true"
-    [[ -n "${ORCAS_E2E_SHARED_ORCAS_HOME:-}" ]] || e2e_fail "ORCAS_E2E_SHARED_ORCAS_HOME is required when ORCAS_E2E_REUSE_CURRENT_XDG=true"
-    [[ -n "${ORCAS_E2E_SHARED_XDG_DATA_HOME:-}" ]] || e2e_fail "ORCAS_E2E_SHARED_XDG_DATA_HOME is required when ORCAS_E2E_REUSE_CURRENT_XDG=true"
-    [[ -n "${ORCAS_E2E_SHARED_XDG_CONFIG_HOME:-}" ]] || e2e_fail "ORCAS_E2E_SHARED_XDG_CONFIG_HOME is required when ORCAS_E2E_REUSE_CURRENT_XDG=true"
-    [[ -n "${ORCAS_E2E_SHARED_XDG_RUNTIME_HOME:-}" ]] || e2e_fail "ORCAS_E2E_SHARED_XDG_RUNTIME_HOME is required when ORCAS_E2E_REUSE_CURRENT_XDG=true"
-    E2E_SCENARIO_XDG_DIR="$ORCAS_E2E_SHARED_XDG_DIR"
-    E2E_SCENARIO_XDG_DATA_HOME="$ORCAS_E2E_SHARED_XDG_DATA_HOME"
-    E2E_SCENARIO_XDG_CONFIG_HOME="$ORCAS_E2E_SHARED_XDG_CONFIG_HOME"
-    E2E_SCENARIO_XDG_RUNTIME_HOME="$ORCAS_E2E_SHARED_XDG_RUNTIME_HOME"
-    E2E_SCENARIO_ORCAS_HOME="$ORCAS_E2E_SHARED_ORCAS_HOME"
+  if e2e_is_true "${TT_E2E_REUSE_CURRENT_XDG:-false}"; then
+    [[ -n "${TT_E2E_SHARED_XDG_DIR:-}" ]] || e2e_fail "TT_E2E_SHARED_XDG_DIR is required when TT_E2E_REUSE_CURRENT_XDG=true"
+    [[ -n "${TT_E2E_SHARED_TT_HOME:-}" ]] || e2e_fail "TT_E2E_SHARED_TT_HOME is required when TT_E2E_REUSE_CURRENT_XDG=true"
+    [[ -n "${TT_E2E_SHARED_XDG_DATA_HOME:-}" ]] || e2e_fail "TT_E2E_SHARED_XDG_DATA_HOME is required when TT_E2E_REUSE_CURRENT_XDG=true"
+    [[ -n "${TT_E2E_SHARED_XDG_CONFIG_HOME:-}" ]] || e2e_fail "TT_E2E_SHARED_XDG_CONFIG_HOME is required when TT_E2E_REUSE_CURRENT_XDG=true"
+    [[ -n "${TT_E2E_SHARED_XDG_RUNTIME_HOME:-}" ]] || e2e_fail "TT_E2E_SHARED_XDG_RUNTIME_HOME is required when TT_E2E_REUSE_CURRENT_XDG=true"
+    E2E_SCENARIO_XDG_DIR="$TT_E2E_SHARED_XDG_DIR"
+    E2E_SCENARIO_XDG_DATA_HOME="$TT_E2E_SHARED_XDG_DATA_HOME"
+    E2E_SCENARIO_XDG_CONFIG_HOME="$TT_E2E_SHARED_XDG_CONFIG_HOME"
+    E2E_SCENARIO_XDG_RUNTIME_HOME="$TT_E2E_SHARED_XDG_RUNTIME_HOME"
+    E2E_SCENARIO_TT_HOME="$TT_E2E_SHARED_TT_HOME"
   else
     E2E_SCENARIO_XDG_DIR="$e2e_output_root/xdg/$e2e_run_id/$scenario_name"
     E2E_SCENARIO_XDG_DATA_HOME="$E2E_SCENARIO_XDG_DIR/data"
     E2E_SCENARIO_XDG_CONFIG_HOME="$E2E_SCENARIO_XDG_DIR/config"
     E2E_SCENARIO_XDG_RUNTIME_HOME="$E2E_SCENARIO_XDG_DIR/runtime"
-    E2E_SCENARIO_ORCAS_HOME="$e2e_output_root/orcas/$e2e_run_id/$scenario_name"
+    E2E_SCENARIO_TT_HOME="$e2e_output_root/tt/$e2e_run_id/$scenario_name"
   fi
 
   export E2E_SCENARIO_NAME \
@@ -229,12 +229,12 @@ e2e_prepare_scenario_dirs() {
     E2E_SCENARIO_XDG_DATA_HOME \
     E2E_SCENARIO_XDG_CONFIG_HOME \
     E2E_SCENARIO_XDG_RUNTIME_HOME \
-    E2E_SCENARIO_ORCAS_HOME \
-    ORCAS_HOME="$E2E_SCENARIO_ORCAS_HOME" \
-    ORCAS_E2E_ORCAS_HOME="$E2E_SCENARIO_ORCAS_HOME" \
-    ORCAS_E2E_XDG_DATA_HOME="$E2E_SCENARIO_XDG_DATA_HOME" \
-    ORCAS_E2E_XDG_CONFIG_HOME="$E2E_SCENARIO_XDG_CONFIG_HOME" \
-    ORCAS_E2E_XDG_RUNTIME_HOME="$E2E_SCENARIO_XDG_RUNTIME_HOME"
+    E2E_SCENARIO_TT_HOME \
+    TT_HOME="$E2E_SCENARIO_TT_HOME" \
+    TT_E2E_TT_HOME="$E2E_SCENARIO_TT_HOME" \
+    TT_E2E_XDG_DATA_HOME="$E2E_SCENARIO_XDG_DATA_HOME" \
+    TT_E2E_XDG_CONFIG_HOME="$E2E_SCENARIO_XDG_CONFIG_HOME" \
+    TT_E2E_XDG_RUNTIME_HOME="$E2E_SCENARIO_XDG_RUNTIME_HOME"
 
   mkdir -p \
     "$E2E_SCENARIO_LOGS_DIR" \
@@ -244,14 +244,14 @@ e2e_prepare_scenario_dirs() {
     "$E2E_SCENARIO_XDG_DATA_HOME" \
     "$E2E_SCENARIO_XDG_CONFIG_HOME" \
     "$E2E_SCENARIO_XDG_RUNTIME_HOME" \
-    "$E2E_SCENARIO_ORCAS_HOME/logs" \
-    "$E2E_SCENARIO_ORCAS_HOME/runtime"
+    "$E2E_SCENARIO_TT_HOME/logs" \
+    "$E2E_SCENARIO_TT_HOME/runtime"
   chmod 700 "$E2E_SCENARIO_XDG_RUNTIME_HOME" || true
   e2e_link_legacy_xdg_views
 }
 
 e2e_using_shared_lab() {
-  e2e_is_true "${ORCAS_E2E_REUSE_CURRENT_XDG:-false}"
+  e2e_is_true "${TT_E2E_REUSE_CURRENT_XDG:-false}"
 }
 
 e2e_use_short_xdg_paths() {
@@ -260,14 +260,14 @@ e2e_use_short_xdg_paths() {
 
   local run_hash
   run_hash="$(printf '%s' "$E2E_RUN_ID" | cksum | awk '{print $1}')"
-  local short_root_base="${TMPDIR:-/tmp}/orcas-e2e"
+  local short_root_base="${TMPDIR:-/tmp}/tt-e2e"
   local short_xdg_root="$short_root_base/${suffix}-${run_hash}"
   local short_xdg_data_home="$short_xdg_root/data"
   local short_xdg_config_home="$short_xdg_root/config"
   local short_xdg_runtime_home="$short_xdg_root/runtime"
-  local short_orcas_home="$short_root_base/${suffix}-${run_hash}-orcas"
+  local short_tt_home="$short_root_base/${suffix}-${run_hash}-tt"
 
-  rm -rf "$short_xdg_root" "$short_orcas_home"
+  rm -rf "$short_xdg_root" "$short_tt_home"
   mkdir -p \
     "$short_xdg_data_home" \
     "$short_xdg_config_home" \
@@ -278,54 +278,54 @@ e2e_use_short_xdg_paths() {
   E2E_SCENARIO_XDG_DATA_HOME="$short_xdg_data_home"
   E2E_SCENARIO_XDG_CONFIG_HOME="$short_xdg_config_home"
   E2E_SCENARIO_XDG_RUNTIME_HOME="$short_xdg_runtime_home"
-  E2E_SCENARIO_ORCAS_HOME="$short_orcas_home"
+  E2E_SCENARIO_TT_HOME="$short_tt_home"
 
   export E2E_SCENARIO_XDG_DIR \
     E2E_SCENARIO_XDG_DATA_HOME \
     E2E_SCENARIO_XDG_CONFIG_HOME \
     E2E_SCENARIO_XDG_RUNTIME_HOME \
-    E2E_SCENARIO_ORCAS_HOME \
-    ORCAS_HOME="$short_orcas_home" \
-    ORCAS_E2E_ORCAS_HOME="$short_orcas_home" \
-    ORCAS_E2E_XDG_DATA_HOME="$short_xdg_data_home" \
-    ORCAS_E2E_XDG_CONFIG_HOME="$short_xdg_config_home" \
-    ORCAS_E2E_XDG_RUNTIME_HOME="$short_xdg_runtime_home"
+    E2E_SCENARIO_TT_HOME \
+    TT_HOME="$short_tt_home" \
+    TT_E2E_TT_HOME="$short_tt_home" \
+    TT_E2E_XDG_DATA_HOME="$short_xdg_data_home" \
+    TT_E2E_XDG_CONFIG_HOME="$short_xdg_config_home" \
+    TT_E2E_XDG_RUNTIME_HOME="$short_xdg_runtime_home"
   e2e_link_legacy_xdg_views
 }
 
 e2e_require_local_supervisor_endpoint() {
-  local base_url="${ORCAS_E2E_SUPERVISOR_BASE_URL:-${ORCAS_E2E_QWEN_BASE_URL:-}}"
-  local model="${ORCAS_E2E_SUPERVISOR_MODEL:-${ORCAS_E2E_QWEN_MODEL:-}}"
+  local base_url="${TT_E2E_SUPERVISOR_BASE_URL:-${TT_E2E_QWEN_BASE_URL:-}}"
+  local model="${TT_E2E_SUPERVISOR_MODEL:-${TT_E2E_QWEN_MODEL:-}}"
 
-  [[ -n "$base_url" ]] || e2e_fail "scenario $E2E_SCENARIO_NAME requires a local OpenAI-compatible supervisor endpoint; export ORCAS_E2E_SUPERVISOR_BASE_URL=http://127.0.0.1:8000/v1"
-  [[ -n "$model" ]] || e2e_fail "scenario $E2E_SCENARIO_NAME requires a served supervisor model name; export ORCAS_E2E_SUPERVISOR_MODEL=<served-model-name>"
+  [[ -n "$base_url" ]] || e2e_fail "scenario $E2E_SCENARIO_NAME requires a local OpenAI-compatible supervisor endpoint; export TT_E2E_SUPERVISOR_BASE_URL=http://127.0.0.1:8000/v1"
+  [[ -n "$model" ]] || e2e_fail "scenario $E2E_SCENARIO_NAME requires a served supervisor model name; export TT_E2E_SUPERVISOR_MODEL=<served-model-name>"
 
   local models_url="${base_url%/}/models"
   curl -sf "$models_url" >/dev/null 2>&1 || e2e_fail "scenario $E2E_SCENARIO_NAME could not reach the local supervisor endpoint at $models_url"
 
-  export ORCAS_SUPERVISOR_BASE_URL="$base_url"
-  export ORCAS_SUPERVISOR_MODEL="$model"
-  export ORCAS_SUPERVISOR_API_KEY_ENV="${ORCAS_E2E_SUPERVISOR_API_KEY_ENV:-${ORCAS_E2E_QWEN_API_KEY_ENV:-}}"
-  export ORCAS_SUPERVISOR_REASONING_EFFORT="${ORCAS_E2E_SUPERVISOR_REASONING_EFFORT:-${ORCAS_E2E_QWEN_REASONING_EFFORT:-}}"
-  export ORCAS_SUPERVISOR_MAX_OUTPUT_TOKENS="${ORCAS_E2E_SUPERVISOR_MAX_OUTPUT_TOKENS:-${ORCAS_E2E_QWEN_MAX_OUTPUT_TOKENS:-4096}}"
-  export ORCAS_SUPERVISOR_TEMPERATURE="${ORCAS_E2E_SUPERVISOR_TEMPERATURE:-${ORCAS_E2E_QWEN_TEMPERATURE:-0.0}}"
+  export TT_SUPERVISOR_BASE_URL="$base_url"
+  export TT_SUPERVISOR_MODEL="$model"
+  export TT_SUPERVISOR_API_KEY_ENV="${TT_E2E_SUPERVISOR_API_KEY_ENV:-${TT_E2E_QWEN_API_KEY_ENV:-}}"
+  export TT_SUPERVISOR_REASONING_EFFORT="${TT_E2E_SUPERVISOR_REASONING_EFFORT:-${TT_E2E_QWEN_REASONING_EFFORT:-}}"
+  export TT_SUPERVISOR_MAX_OUTPUT_TOKENS="${TT_E2E_SUPERVISOR_MAX_OUTPUT_TOKENS:-${TT_E2E_QWEN_MAX_OUTPUT_TOKENS:-4096}}"
+  export TT_SUPERVISOR_TEMPERATURE="${TT_E2E_SUPERVISOR_TEMPERATURE:-${TT_E2E_QWEN_TEMPERATURE:-0.0}}"
 }
 
 e2e_start_managed_daemon() {
   local daemon_log="$1"
-  if e2e_is_true "${ORCAS_E2E_REUSE_CURRENT_DAEMON:-false}"; then
-    [[ -n "${ORCAS_E2E_SHARED_SOCKET_FILE:-}" ]] || e2e_fail "ORCAS_E2E_SHARED_SOCKET_FILE is required when ORCAS_E2E_REUSE_CURRENT_DAEMON=true"
-    e2e_orcas daemon status >"$daemon_log" 2>&1 || e2e_fail "shared lab daemon is not responsive"
-    printf 'shared lab daemon reused via %s\n' "$ORCAS_E2E_SHARED_SOCKET_FILE" >>"$daemon_log"
+  if e2e_is_true "${TT_E2E_REUSE_CURRENT_DAEMON:-false}"; then
+    [[ -n "${TT_E2E_SHARED_SOCKET_FILE:-}" ]] || e2e_fail "TT_E2E_SHARED_SOCKET_FILE is required when TT_E2E_REUSE_CURRENT_DAEMON=true"
+    e2e_tt daemon status >"$daemon_log" 2>&1 || e2e_fail "shared lab daemon is not responsive"
+    printf 'shared lab daemon reused via %s\n' "$TT_E2E_SHARED_SOCKET_FILE" >>"$daemon_log"
     e2e_daemon_pid=""
     return 0
   fi
-  e2e_orcas daemon start --force-spawn >"$daemon_log" 2>&1 &
+  e2e_tt daemon start --force-spawn >"$daemon_log" 2>&1 &
   e2e_daemon_pid=$!
 }
 
 e2e_stop_managed_daemon() {
-  if e2e_is_true "${ORCAS_E2E_REUSE_CURRENT_DAEMON:-false}"; then
+  if e2e_is_true "${TT_E2E_REUSE_CURRENT_DAEMON:-false}"; then
     return 0
   fi
   if [[ -n "$e2e_daemon_pid" ]]; then
@@ -341,11 +341,11 @@ e2e_require_clean_git() {
   [[ -z "$status" ]] || e2e_fail "scenario $E2E_SCENARIO_NAME requires a clean git tree"
 }
 
-e2e_require_codex() {
-  if [[ -n "${ORCAS_CODEX_BIN:-}" && -x "$ORCAS_CODEX_BIN" ]]; then
+e2e_require_tt() {
+  if [[ -n "${TT_RUNTIME_BIN:-}" && -x "$TT_RUNTIME_BIN" ]]; then
     return 0
   fi
-  command -v codex >/dev/null 2>&1 || e2e_fail "scenario $E2E_SCENARIO_NAME requires codex on PATH or ORCAS_CODEX_BIN"
+  command -v tt >/dev/null 2>&1 || e2e_fail "scenario $E2E_SCENARIO_NAME requires tt on PATH or TT_RUNTIME_BIN"
 }
 
 e2e_print_scenario_begin() {
@@ -361,15 +361,15 @@ e2e_print_scenario_end() {
   fi
 }
 
-e2e_orcas() {
-  "$e2e_bin_dir/orcas.sh" "$@"
+e2e_tt() {
+  "$e2e_bin_dir/tt.sh" "$@"
 }
 
-e2e_orcas_state_seed() {
-  local seed_bin="$e2e_repo_root/target/debug/orcas-state-seed"
+e2e_tt_state_seed() {
+  local seed_bin="$e2e_repo_root/target/debug/tt-state-seed"
 
-  if [[ ! -x "$seed_bin" || "${ORCAS_E2E_FORCE_CARGO_RUN:-0}" == "1" ]]; then
-    cargo build -q --manifest-path "$e2e_repo_root/Cargo.toml" -p orcas -p orcasd
+  if [[ ! -x "$seed_bin" || "${TT_E2E_FORCE_CARGO_RUN:-0}" == "1" ]]; then
+    cargo build -q --manifest-path "$e2e_repo_root/Cargo.toml" -p tt -p ttd
   fi
 
   "$seed_bin" "$@"
@@ -379,26 +379,26 @@ e2e_normalize_state_json() {
   local input="$1"
   local output="${2:-$1}"
 
-  e2e_orcas_state_seed --input "$input" --output "$output"
+  e2e_tt_state_seed --input "$input" --output "$output"
 }
 
-e2e_orcasd() {
-  local orcasd_bin="$e2e_repo_root/target/debug/orcasd"
-  local xdg_data_home="${ORCAS_E2E_XDG_DATA_HOME:-$e2e_output_root/xdg/default/data}"
-  local xdg_config_home="${ORCAS_E2E_XDG_CONFIG_HOME:-$e2e_output_root/xdg/default/config}"
-  local xdg_runtime_home="${ORCAS_E2E_XDG_RUNTIME_HOME:-$e2e_output_root/xdg/default/runtime}"
-  local orcas_home="${ORCAS_E2E_ORCAS_HOME:-$e2e_output_root/orcas/default}"
+e2e_ttd() {
+  local ttd_bin="$e2e_repo_root/target/debug/ttd"
+  local xdg_data_home="${TT_E2E_XDG_DATA_HOME:-$e2e_output_root/xdg/default/data}"
+  local xdg_config_home="${TT_E2E_XDG_CONFIG_HOME:-$e2e_output_root/xdg/default/config}"
+  local xdg_runtime_home="${TT_E2E_XDG_RUNTIME_HOME:-$e2e_output_root/xdg/default/runtime}"
+  local tt_home="${TT_E2E_TT_HOME:-$e2e_output_root/tt/default}"
 
   mkdir -p "$xdg_data_home" "$xdg_config_home" "$xdg_runtime_home"
-  e2e_sync_legacy_xdg_into_orcas_home "$xdg_data_home" "$xdg_config_home" "$xdg_runtime_home" "$orcas_home"
+  e2e_sync_legacy_xdg_into_tt_home "$xdg_data_home" "$xdg_config_home" "$xdg_runtime_home" "$tt_home"
   chmod 700 "$xdg_runtime_home" || true
 
-  if [[ ! -x "$orcasd_bin" || "${ORCAS_E2E_FORCE_CARGO_RUN:-0}" == "1" ]]; then
-    cargo build -q --manifest-path "$e2e_repo_root/Cargo.toml" -p orcas -p orcasd
+  if [[ ! -x "$ttd_bin" || "${TT_E2E_FORCE_CARGO_RUN:-0}" == "1" ]]; then
+    cargo build -q --manifest-path "$e2e_repo_root/Cargo.toml" -p tt -p ttd
   fi
 
-  ORCAS_HOME="$orcas_home" \
-    "$orcasd_bin" "$@"
+  TT_HOME="$tt_home" \
+    "$ttd_bin" "$@"
 }
 
 e2e_field_value() {
@@ -407,10 +407,10 @@ e2e_field_value() {
   sed -n "s/^${key}: //p" "$file" | head -n1
 }
 
-e2e_prepare_live_codex_environment() {
+e2e_prepare_live_tt_environment() {
   local suffix="$1"
   local listen_port_base="$2"
-  local supervisor_max_output_tokens="${3:-${ORCAS_SUPERVISOR_MAX_OUTPUT_TOKENS:-4096}}"
+  local supervisor_max_output_tokens="${3:-${TT_SUPERVISOR_MAX_OUTPUT_TOKENS:-4096}}"
 
   if e2e_using_shared_lab; then
     return 0
@@ -418,24 +418,24 @@ e2e_prepare_live_codex_environment() {
 
   local listen_port="$((listen_port_base + ($(printf '%s' "$E2E_RUN_ID" | cksum | awk '{print $1}') % 1000)))"
   local listen_url="ws://127.0.0.1:$listen_port"
-  local supervisor_base_url="${ORCAS_SUPERVISOR_BASE_URL:-http://127.0.0.1:8000/v1}"
-  local supervisor_model="${ORCAS_SUPERVISOR_MODEL:-gpt-oss-20b}"
-  local supervisor_api_key_env="${ORCAS_SUPERVISOR_API_KEY_ENV:-}"
-  local supervisor_reasoning_effort="${ORCAS_SUPERVISOR_REASONING_EFFORT:-}"
-  local supervisor_temperature="${ORCAS_SUPERVISOR_TEMPERATURE:-0.0}"
-  local codex_bin="${ORCAS_CODEX_BIN:-$(command -v codex)}"
+  local supervisor_base_url="${TT_SUPERVISOR_BASE_URL:-http://127.0.0.1:8000/v1}"
+  local supervisor_model="${TT_SUPERVISOR_MODEL:-gpt-oss-20b}"
+  local supervisor_api_key_env="${TT_SUPERVISOR_API_KEY_ENV:-}"
+  local supervisor_reasoning_effort="${TT_SUPERVISOR_REASONING_EFFORT:-}"
+  local supervisor_temperature="${TT_SUPERVISOR_TEMPERATURE:-0.0}"
+  local tt_bin="${TT_RUNTIME_BIN:-$(command -v tt)}"
 
   e2e_use_short_xdg_paths "$suffix"
-  mkdir -p "$E2E_SCENARIO_XDG_CONFIG_HOME/orcas"
+  mkdir -p "$E2E_SCENARIO_XDG_CONFIG_HOME/tt"
 
-  cat >"$E2E_SCENARIO_XDG_CONFIG_HOME/orcas/config.toml" <<EOF
-[codex]
-binary_path = "$codex_bin"
+  cat >"$E2E_SCENARIO_XDG_CONFIG_HOME/tt/config.toml" <<EOF
+[tt]
+binary_path = "$tt_bin"
 listen_url = "$listen_url"
 connection_mode = "spawn_if_needed"
 config_overrides = []
 
-[codex.reconnect]
+[tt.reconnect]
 initial_delay_ms = 150
 max_delay_ms = 5000
 multiplier = 2.0
@@ -452,7 +452,7 @@ max_output_tokens = $supervisor_max_output_tokens
 auto_create_on_report_recorded = false
 EOF
 
-  export ORCAS_CODEX_LISTEN_URL="$listen_url"
+  export TT_RUNTIME_LISTEN_URL="$listen_url"
 }
 
 e2e_prepare_fixture_repo_with_worktree() {
@@ -469,8 +469,8 @@ e2e_prepare_fixture_repo_with_worktree() {
   cp -R "$fixture_dir/." "$repo_root/"
 
   git -C "$repo_root" init -b "$base_ref" >"$reports_dir/${prefix}-git-init.txt" 2>&1
-  git -C "$repo_root" config user.name "Orcas E2E"
-  git -C "$repo_root" config user.email "orcas-e2e@example.com"
+  git -C "$repo_root" config user.name "TT E2E"
+  git -C "$repo_root" config user.email "tt-e2e@example.com"
   git -C "$repo_root" add .
   git -C "$repo_root" commit -m "Initial tracked-thread fixture" >"$reports_dir/${prefix}-git-initial-commit.txt" 2>&1
   git -C "$repo_root" worktree add -b "$branch_name" "$worktree_path" "$base_ref" >"$reports_dir/${prefix}-git-worktree-add.txt" 2>&1
@@ -488,11 +488,11 @@ e2e_prepare_empty_repo_with_worktree() {
   mkdir -p "$repo_root" "$(dirname "$worktree_path")"
 
   git -C "$repo_root" init -b "$base_ref" >"$reports_dir/${prefix}-git-init.txt" 2>&1
-  git -C "$repo_root" config user.name "Orcas E2E"
-  git -C "$repo_root" config user.email "orcas-e2e@example.com"
+  git -C "$repo_root" config user.name "TT E2E"
+  git -C "$repo_root" config user.email "tt-e2e@example.com"
 
   cat >"$repo_root/README.md" <<EOF
-# ${E2E_SCENARIO_NAME:-orcas-e2e}
+# ${E2E_SCENARIO_NAME:-tt-e2e}
 
 Scenario seed repository for the tracked-thread worktree lane.
 EOF
@@ -517,7 +517,7 @@ e2e_add_tracked_thread_workspace() {
   local cleanup_policy="${12}"
   local workspace_status="${13}"
 
-  e2e_orcas workunit thread add \
+  e2e_tt workunit thread add \
     --workunit "$workunit_id" \
     --title "$title" \
     --root-dir "$root_dir" \
@@ -544,7 +544,7 @@ e2e_wait_for_report_id() {
   local report_id=""
 
   for _ in $(seq 1 "$attempts"); do
-    reports_output="$("$e2e_bin_dir/orcas.sh" supervisor work reports list-for-workunit --workunit "$workunit_id" 2>/dev/null || true)"
+    reports_output="$("$e2e_bin_dir/tt.sh" supervisor work reports list-for-workunit --workunit "$workunit_id" 2>/dev/null || true)"
     report_id="$(printf '%s\n' "$reports_output" | awk -F'\t' '/^report-/ {print $1; exit}')"
     [[ -n "$report_id" ]] && break
     sleep "$delay_seconds"
@@ -563,7 +563,7 @@ e2e_wait_for_assignment_report_id() {
   local report_id=""
 
   for _ in $(seq 1 "$attempts"); do
-    assignment_output="$("$e2e_bin_dir/orcas.sh" supervisor work assignments get --assignment "$assignment_id" 2>/dev/null || true)"
+    assignment_output="$("$e2e_bin_dir/tt.sh" supervisor work assignments get --assignment "$assignment_id" 2>/dev/null || true)"
     report_id="$(printf '%s\n' "$assignment_output" | awk -F': ' '/^report_id:/ {print $2; exit}')"
     [[ -n "$report_id" ]] && break
     sleep "$delay_seconds"
@@ -576,7 +576,7 @@ e2e_wait_for_assignment_report_id() {
 e2e_capture_workstream_runtime() {
   local workstream_id="$1"
   local output_file="$2"
-  e2e_orcas workstreams runtime get --workstream "$workstream_id" >"$output_file"
+  e2e_tt workstreams runtime get --workstream "$workstream_id" >"$output_file"
 }
 
 e2e_assert_workstream_runtime() {
@@ -598,7 +598,7 @@ e2e_assert_runtime_thread_count() {
 e2e_capture_workstream_threads() {
   local workstream_id="$1"
   local output_file="$2"
-  e2e_orcas codex threads list --workstream "$workstream_id" >"$output_file"
+  e2e_tt tt threads list --workstream "$workstream_id" >"$output_file"
 }
 
 e2e_assert_managed_thread_count() {

@@ -2,30 +2,30 @@
 
 ## Goal
 
-Verify that Orcas can carry one real live worker turn all the way through to a bounded on-disk code fix and a real report inside a predeclared tracked-thread worktree lane, without the harness writing the fix or seeding the report after execution begins.
+Verify that TT can carry one real live worker turn all the way through to a bounded on-disk code fix and a real report inside a predeclared tracked-thread worktree lane, without the harness writing the fix or seeding the report after execution begins.
 
 ## Seeded Before Execution
 
 1. A tiny git repository is materialized under the scenario worktree output root.
 2. The repository contains one C source file with a small, obvious bug.
 3. A shell-based test script and Makefile are present so the repository can prove the fix locally.
-4. Orcas daemon state is started and a single workstream/work unit is created.
+4. TT daemon state is started and a single workstream/work unit is created.
 5. A tracked-thread record is created before the first live assignment, with a declared repository root, worktree path, branch name, base ref, landing target, and cleanup policy.
 6. The harness inspects the workstream runtime before execution and expects zero live lane threads at that point.
 
 ## Live Boundary
 
 - The harness may create the fixture repository, workstream, work unit, tracked-thread workspace contract, and assignment before execution starts.
-- After `assignment/start` begins, Orcas must do the actual work.
+- After `assignment/start` begins, TT must do the actual work.
 - The harness must not patch the source file, seed a report, or simulate success after execution begins.
 
 ## What This Proves
 
-- Orcas can execute one bounded worker turn in the live lane.
-- Orcas can bind the first live assignment directly into the predeclared tracked-thread workspace lane.
-- Orcas can surface the lane on the workstream runtime as one managed Codex thread instead of an unmanaged runtime thread.
-- Orcas can write a real fix to disk.
-- Orcas can emit a real report tied to the assignment and work unit.
+- TT can execute one bounded worker turn in the live lane.
+- TT can bind the first live assignment directly into the predeclared tracked-thread workspace lane.
+- TT can surface the lane on the workstream runtime as one managed TT thread instead of an unmanaged runtime thread.
+- TT can write a real fix to disk.
+- TT can emit a real report tied to the assignment and work unit.
 - The resulting repository change stays bounded to the expected file.
 
 ## Pass Conditions
@@ -51,6 +51,6 @@ Verify that Orcas can carry one real live worker turn all the way through to a b
 
 ## Known Flake Points
 
-- Live Codex latency can be variable.
+- Live TT latency can be variable.
 - The daemon bootstrap may take a few seconds before the assignment starts.
-- If network or Codex availability is interrupted, the scenario fails in the live lane by design.
+- If network or TT availability is interrupted, the scenario fails in the live lane by design.

@@ -2,7 +2,7 @@
 
 ## Goal
 
-Verify that Orcas can declare a tracked-thread worktree lane, bind it on the first live assignment, export operator-facing prompt artifacts, and carry that same lane through the tracked-thread workspace lifecycle until cleanup.
+Verify that TT can declare a tracked-thread worktree lane, bind it on the first live assignment, export operator-facing prompt artifacts, and carry that same lane through the tracked-thread workspace lifecycle until cleanup.
 
 ## What Is Seeded
 

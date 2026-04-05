@@ -1,8 +1,8 @@
-# Orcas Communication Architecture: Agent ↔ Supervisor ↔ Operator
+# TT Communication Architecture: Agent ↔ Supervisor ↔ Operator
 
 ## Purpose
 
-This document explains the **code-level flow and logic** of Orcas’s three-layer communication system:
+This document explains the **code-level flow and logic** of TT’s three-layer communication system:
 
 - **Agent / worker**
 - **Supervisor**
@@ -15,13 +15,13 @@ This is **not** a runtime-UX document. It intentionally focuses on:
 - what gets validated
 - how decisions turn into follow-on work
 
-The key architectural idea is that Orcas is **not** just “sending prompts around.” It is trying to turn language interactions into **typed, versioned, inspectable protocol/state objects**.
+The key architectural idea is that TT is **not** just “sending prompts around.” It is trying to turn language interactions into **typed, versioned, inspectable protocol/state objects**.
 
 ---
 
 ## The big picture
 
-Orcas has three distinct layers:
+TT has three distinct layers:
 
 1. **Agent / worker layer**
    - Turns an assignment seed plus state into a concrete worker prompt.
@@ -45,12 +45,12 @@ The three layers are related, but they are **not symmetric**.
 
 ## Architectural thesis
 
-The most important design choice in Orcas is:
+The most important design choice in TT is:
 
 > **Worker and supervisor interactions are not treated as ephemeral strings.**
 > They are progressively modeled as persisted, inspectable artifacts tied to domain state.
 
-That matters because it lets Orcas answer:
+That matters because it lets TT answer:
 
 - What exactly did we ask the worker to do?
 - What exact protocol/version governed that interaction?
@@ -69,14 +69,14 @@ The worker layer is the most protocolized and artifact-oriented part of the syst
 
 Conceptually:
 
-- Orcas takes structured assignment state.
+- TT takes structured assignment state.
 - It builds a **versioned packet**.
 - It renders a **concrete worker prompt**.
 - It persists both the packet and the render artifact.
 - It sends the exact rendered text to the worker.
 - It parses the returned report against the original packet and contract.
 
-This is the clearest example of Orcas’s value proposition: the “prompt” is really a **rendered protocol boundary** backed by structured data.
+This is the clearest example of TT’s value proposition: the “prompt” is really a **rendered protocol boundary** backed by structured data.
 
 ## 1.2 Supervisor layer = decision protocol
 
@@ -84,11 +84,11 @@ The supervisor layer is similar in spirit, but historically was less artifactize
 
 Conceptually:
 
-- Orcas builds a **SupervisorContextPack** from state.
-- Orcas combines that with **fixed supervisory instructions**.
-- Orcas sends the request to a reasoning backend under a strict schema.
-- Orcas parses and validates the returned proposal.
-- Orcas persists a proposal record that becomes the review object.
+- TT builds a **SupervisorContextPack** from state.
+- TT combines that with **fixed supervisory instructions**.
+- TT sends the request to a reasoning backend under a strict schema.
+- TT parses and validates the returned proposal.
+- TT persists a proposal record that becomes the review object.
 
 Later hardening made this more artifact-oriented by persisting:
 
@@ -101,7 +101,7 @@ So the supervisor path is now much closer to the worker path in auditability, ev
 
 The operator layer is not modeled as another prompt exchange.
 
-Instead, Orcas treats human review as a **proposal lifecycle** over durable state:
+Instead, TT treats human review as a **proposal lifecycle** over durable state:
 
 - Open
 - Approved
@@ -128,10 +128,10 @@ Important worker-side types include:
 
 These live primarily under:
 
-- `crates/orcas-core/src/communication.rs`
-- `crates/orcasd/src/assignment_comm/render.rs`
-- `crates/orcasd/src/assignment_comm/policy.rs`
-- `crates/orcasd/src/assignment_comm/parse.rs`
+- `crates/tt-core/src/communication.rs`
+- `crates/ttd/src/assignment_comm/render.rs`
+- `crates/ttd/src/assignment_comm/policy.rs`
+- `crates/ttd/src/assignment_comm/parse.rs`
 
 ### What they mean
 
@@ -151,7 +151,7 @@ It carries things like:
 It is the structured “why/what” of the assignment before prompt rendering.
 
 #### `AssignmentCommunicationPacket`
-The concrete packet Orcas derives from the seed plus current assignment/work-unit/workstream context.
+The concrete packet TT derives from the seed plus current assignment/work-unit/workstream context.
 
 This is the **worker-facing protocol object**.
 
@@ -216,9 +216,9 @@ Important supervisor-side types include:
 
 These live primarily under:
 
-- `crates/orcas-core/src/supervisor.rs`
-- `crates/orcasd/src/supervisor.rs`
-- `crates/orcasd/src/service.rs`
+- `crates/tt-core/src/supervisor.rs`
+- `crates/ttd/src/supervisor.rs`
+- `crates/ttd/src/service.rs`
 
 ### What they mean
 
@@ -241,9 +241,9 @@ It includes things like:
 This is the supervisor-side equivalent of “what the model is allowed to reason over.”
 
 #### `SupervisorProposal`
-The structured output object Orcas expects back from the reasoner.
+The structured output object TT expects back from the reasoner.
 
-It is schema-constrained and then validated again by Orcas policy.
+It is schema-constrained and then validated again by TT policy.
 
 #### `SupervisorProposalRecord`
 The durable review object.
@@ -261,7 +261,7 @@ This is the canonical human-review record. It persists:
 - final status
 
 #### `SupervisorPromptRenderArtifact`
-The persisted representation of what Orcas semantically sent to the supervisor reasoner.
+The persisted representation of what TT semantically sent to the supervisor reasoner.
 
 It typically includes:
 
@@ -305,7 +305,7 @@ The important conceptual point is:
 
 > The operator is reviewing a **proposal record**, not a prompt transcript.
 
-That is why Orcas’s human layer feels more like workflow/state management than prompting.
+That is why TT’s human layer feels more like workflow/state management than prompting.
 
 ---
 
@@ -317,7 +317,7 @@ The worker prompt is not a separate free-floating template file.
 
 It is rendered in Rust in:
 
-- `crates/orcasd/src/assignment_comm/render.rs`
+- `crates/ttd/src/assignment_comm/render.rs`
 
 The relevant flow is approximately:
 
@@ -339,9 +339,9 @@ The worker path has explicit version constants, including concepts like:
 
 These live around:
 
-- `crates/orcasd/src/assignment_comm/mod.rs`
+- `crates/ttd/src/assignment_comm/mod.rs`
 
-This is important because it means Orcas is not treating the prompt as “just some text.” It is treating it as part of a versioned protocol contract.
+This is important because it means TT is not treating the prompt as “just some text.” It is treating it as part of a versioned protocol contract.
 
 ## 3.3 Worker prompt section logic
 
@@ -369,7 +369,7 @@ The worker is not free to return arbitrary prose.
 
 It is expected to return a **single envelope** between fixed markers, containing the report in the required shape.
 
-Orcas then:
+TT then:
 
 - extracts the envelope
 - decodes the JSON
@@ -386,7 +386,7 @@ This is the second half of the worker protocol: not just “what we asked,” bu
 
 The supervisor request is built in code in:
 
-- `crates/orcasd/src/supervisor.rs`
+- `crates/ttd/src/supervisor.rs`
 
 Conceptually it consists of:
 
@@ -401,7 +401,7 @@ So the supervisor model is not improvising freely. It is being asked to produce 
 The supervisor request body is conceptually:
 
 - system/instruction text telling the model:
-  - Orcas state is authoritative
+  - TT state is authoritative
   - choose only allowed decisions
   - do not invent IDs or hidden context
   - output strict JSON only
@@ -422,7 +422,7 @@ Originally, the exact supervisor boundary was more reconstructable than inspecta
 
 That gap has now been closed architecturally by persisting a first-class supervisor prompt render artifact.
 
-That means Orcas now retains:
+That means TT now retains:
 
 - what instructions were used
 - what serialized context pack text was sent
@@ -432,13 +432,13 @@ This was one of the biggest observability wins in the hardening work.
 
 ## 4.4 The supervisor response is now also persisted as an artifact
 
-Likewise, Orcas now preserves a first-class response-side artifact that records what came back from the reasoner.
+Likewise, TT now preserves a first-class response-side artifact that records what came back from the reasoner.
 
 That makes the supervisor flow much easier to inspect and audit:
 
 - prompt artifact = what was sent
 - response artifact = what came back
-- parsed proposal = what Orcas accepted from it
+- parsed proposal = what TT accepted from it
 
 This separation is important.
 
@@ -466,7 +466,7 @@ That review can include:
 
 If the human layer were modeled as “just another prompt,” the system would lose a lot of workflow clarity.
 
-By modeling it as state transitions over durable proposal records, Orcas gets:
+By modeling it as state transitions over durable proposal records, TT gets:
 
 - explicit lifecycle states
 - explicit review metadata
@@ -494,7 +494,7 @@ That seed is turned into an `AssignmentCommunicationPacket`.
 
 ## 6.2 Worker packet → rendered worker prompt
 
-Orcas renders the worker prompt from the packet and stores:
+TT renders the worker prompt from the packet and stores:
 
 - packet
 - render spec
@@ -505,14 +505,14 @@ inside `AssignmentCommunicationRecord`.
 
 ## 6.3 Rendered prompt → worker execution
 
-When execution starts, Orcas sends the exact persisted prompt text to the worker.
+When execution starts, TT sends the exact persisted prompt text to the worker.
 
 This matters:
 the authoritative prompt is the persisted render artifact, not an ad hoc regenerated string.
 
 ## 6.4 Worker output → parsed report
 
-When the worker turn ends, Orcas:
+When the worker turn ends, TT:
 
 - reads the raw output
 - extracts the report envelope
@@ -525,7 +525,7 @@ When the worker turn ends, Orcas:
 
 A report can trigger supervisor reasoning.
 
-Orcas then:
+TT then:
 
 - builds `SupervisorContextPack`
 - renders supervisor prompt artifact
@@ -555,12 +555,12 @@ Freshness checks can mark proposals stale if state has moved on.
 
 When a proposal is approved:
 
-1. Orcas applies human edits if present.
-2. Orcas revalidates the resulting proposal.
-3. Orcas compiles follow-on assignment instructions/preview text.
-4. Orcas derives a structured next `AssignmentCommunicationSeed`.
-5. Orcas creates the next assignment.
-6. Orcas immediately ensures the next worker communication record exists.
+1. TT applies human edits if present.
+2. TT revalidates the resulting proposal.
+3. TT compiles follow-on assignment instructions/preview text.
+4. TT derives a structured next `AssignmentCommunicationSeed`.
+5. TT creates the next assignment.
+6. TT immediately ensures the next worker communication record exists.
 
 The key point is:
 
@@ -579,7 +579,7 @@ Instead of thinking:
 
 - “LLM prompt in, LLM output out”
 
-Orcas thinks more like:
+TT thinks more like:
 
 - structured state
 - protocol packet
@@ -605,17 +605,17 @@ So the system is not merely generating text; it is building a lineage of executi
 
 The model can propose.
 
-Orcas policy and operator review decide what is valid and what gets applied.
+TT policy and operator review decide what is valid and what gets applied.
 
 This is a strong boundary:
 
 - model = reasoning assistant
-- Orcas = protocol/state authority
+- TT = protocol/state authority
 - operator = final reviewer where required
 
 ## 7.4 It makes debugging possible
 
-Because artifacts are persisted, Orcas can answer questions like:
+Because artifacts are persisted, TT can answer questions like:
 
 - why was this report trusted or downgraded?
 - what exact worker prompt was sent?
@@ -684,7 +684,7 @@ The supervisor is governed by:
 - serialized state pack
 - decision policy
 - schema-constrained proposal output
-- Orcas-side validation
+- TT-side validation
 
 ## Operator
 “I review durable proposals and decide what actually changes state.”
@@ -703,31 +703,31 @@ The operator is governed by:
 
 ## Worker path
 
-- `crates/orcas-core/src/communication.rs`
+- `crates/tt-core/src/communication.rs`
   - worker-side communication types
-- `crates/orcasd/src/assignment_comm/mod.rs`
+- `crates/ttd/src/assignment_comm/mod.rs`
   - version constants / markers
-- `crates/orcasd/src/assignment_comm/render.rs`
+- `crates/ttd/src/assignment_comm/render.rs`
   - packet building and prompt rendering
-- `crates/orcasd/src/assignment_comm/policy.rs`
+- `crates/ttd/src/assignment_comm/policy.rs`
   - packet / envelope validation
-- `crates/orcasd/src/assignment_comm/parse.rs`
+- `crates/ttd/src/assignment_comm/parse.rs`
   - parse worker report from raw output
-- `crates/orcasd/src/service.rs`
+- `crates/ttd/src/service.rs`
   - execution start, report ingestion, persistence
 
 ## Supervisor path
 
-- `crates/orcas-core/src/supervisor.rs`
+- `crates/tt-core/src/supervisor.rs`
   - context pack, proposal record, prompt/response artifacts
-- `crates/orcasd/src/supervisor.rs`
+- `crates/ttd/src/supervisor.rs`
   - request rendering, response extraction, proposal validation
-- `crates/orcasd/src/service.rs`
+- `crates/ttd/src/service.rs`
   - proposal generation, stale/supersede handling, approval/rejection, decision application
 
 ## Operator / review path
 
-- `crates/orcasd/src/service.rs`
+- `crates/ttd/src/service.rs`
   - proposal lifecycle transitions
 - operator-client/CLI layers
   - inspection/export only; not the core logic
@@ -736,9 +736,9 @@ The operator is governed by:
 
 # 11. Bottom line
 
-The heart of Orcas’s value is not “it has prompts.”
+The heart of TT’s value is not “it has prompts.”
 
-It is that Orcas tries to make **agent execution, supervisory reasoning, and human review legible as structured protocol/state transitions**.
+It is that TT tries to make **agent execution, supervisory reasoning, and human review legible as structured protocol/state transitions**.
 
 The cleanest summary is:
 

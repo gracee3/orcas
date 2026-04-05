@@ -16,8 +16,8 @@ if e2e_is_true "$REQUIRES_CLEAN_GIT"; then
   e2e_require_clean_git
 fi
 
-if e2e_is_true "$REQUIRES_CODEX"; then
-  e2e_require_codex
+if e2e_is_true "$REQUIRES_RUNTIME"; then
+  e2e_require_tt
 fi
 
 e2e_print_scenario_begin

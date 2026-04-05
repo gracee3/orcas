@@ -10,7 +10,7 @@ This scenario uses one declared tracked-thread lane, two bounded live assignment
 
 1. A tiny git repository is materialized under the scenario worktree output root.
 2. The repository contains a tiny C program, a shell test, and a Makefile with one obvious bug.
-3. Orcas daemon state is started and one work unit is created in a workstream.
+3. TT daemon state is started and one work unit is created in a workstream.
 4. A tracked-thread record is created that points at the declared repository root, worktree path, branch name, base ref, landing target, strategy, sync policy, and cleanup policy before any live assignment begins.
 5. The harness inspects the workstream runtime before phase 1 and expects the lane to be declared but not yet running as an active runtime thread.
 
@@ -22,7 +22,7 @@ This scenario uses one declared tracked-thread lane, two bounded live assignment
 - Phase 2 is a real worker turn that reuses the same tracked-thread/worktree lane.
 - Phase 2 report ingestion is real and produces a second persisted report.
 - Final completion is a real decision applied to the second report.
-- The persisted tracked-thread, assignment, report, proposal, and decision records are all produced by Orcas.
+- The persisted tracked-thread, assignment, report, proposal, and decision records are all produced by TT.
 
 ## Live Boundary
 
@@ -32,12 +32,12 @@ This scenario uses one declared tracked-thread lane, two bounded live assignment
 
 ## What This Proves
 
-- Orcas can use one declared tracked-thread lane across multiple live assignments.
-- Orcas can keep that lane represented as exactly one managed workstream-runtime thread across both phases.
-- Orcas can preserve the same tracked-thread id, repository root, worktree path, and branch identity across phases.
-- Orcas can hand off from phase 1 to phase 2 through a real supervisor approval on the same work unit.
-- Orcas can keep the lane bounded while letting the worker make two separate, inspectable changes on the same worktree.
-- Orcas can complete the work unit cleanly after the second phase without creating a new lane.
+- TT can use one declared tracked-thread lane across multiple live assignments.
+- TT can keep that lane represented as exactly one managed workstream-runtime thread across both phases.
+- TT can preserve the same tracked-thread id, repository root, worktree path, and branch identity across phases.
+- TT can hand off from phase 1 to phase 2 through a real supervisor approval on the same work unit.
+- TT can keep the lane bounded while letting the worker make two separate, inspectable changes on the same worktree.
+- TT can complete the work unit cleanly after the second phase without creating a new lane.
 
 ## Pass Conditions
 
@@ -82,7 +82,7 @@ This scenario intentionally stops at work-unit completion rather than pruning th
 
 ## Known Flake Points
 
-- Live Codex latency can vary.
+- Live TT latency can vary.
 - The local supervisor model can take a while to generate each proposal.
 - The tracked-thread lane depends on the worker staying within the declared worktree path and not creating backup or temp files.
 - The phase 2 handoff depends on the phase 1 proposal creating the next assignment on the same work unit.

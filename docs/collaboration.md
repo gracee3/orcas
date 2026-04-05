@@ -1,8 +1,8 @@
-# Orcas Collaboration
+# TT Collaboration
 
 ## Overview
 
-Orcas keeps supervision state local, but the current implementation has more than one live state surface. The daemon owns the local IPC contract, the live bridge to the upstream Codex app-server, legacy collaboration state, and the authority store. The CLI is a daemon client. The operator client reads and mutates supervised state through the daemon, while `orcas tui` provides the dashboard wrapper that can launch the real upstream `codex resume` TUI for a selected thread.
+TT keeps supervision state local, but the current implementation has more than one live state surface. The daemon owns the local IPC contract, the live bridge to the upstream TT app-server, legacy collaboration state, and the authority store. The CLI is a daemon client. The operator client reads and mutates supervised state through the daemon, while `tt tui` provides the dashboard wrapper that can launch the real upstream `tt resume` TUI for a selected thread.
 
 This document describes the current implemented contract rather than an aspirational target. It focuses on:
 
@@ -17,25 +17,25 @@ The local-authority rationale remains documented in [Local-Authority MVP Backend
 
 ## Collaboration Model
 
-Orcas currently models work across one daemon-owned durable store plus one operator-client-local session surface.
+TT currently models work across one daemon-owned durable store plus one operator-client-local session surface.
 
 - Authority state for authority workstreams, authority work units, and tracked threads lives in SQLite `state.db`.
 - Collaboration/runtime state also persists in SQLite `state.db` as daemon-owned runtime snapshots and runtime-status rows.
 - `state/get` is a merged derived snapshot that combines daemon state with collaboration-owned summaries plus any explicit authority compatibility bridge rows needed for assignment execution.
 - `authority/hierarchy/get` is an authority-only hierarchy query over the SQLite store.
-- The operator client also can launch a local `codex resume` TUI session for a selected thread, but that child process is not daemon-owned.
+- The operator client also can launch a local `tt resume` TUI session for a selected thread, but that child process is not daemon-owned.
 
-Tracked threads are Orcas-owned local binding records, not upstream Codex thread rows. A tracked thread may reference an `upstream_thread_id`, but create, edit, and delete operations act on the local Orcas record rather than claiming ownership of upstream runtime storage.
+Tracked threads are TT-owned local binding records, not upstream TT thread rows. A tracked thread may reference an `upstream_thread_id`, but create, edit, and delete operations act on the local TT record rather than claiming ownership of upstream runtime storage.
 
-The important rule is that ORCAS does not currently present a single uniform workflow backend. Some operator-visible objects share a name while coming from different owners and read models.
+The important rule is that TT does not currently present a single uniform workflow backend. Some operator-visible objects share a name while coming from different owners and read models.
 
 ## Surface Classification
 
-ORCAS now treats public and internal surfaces as belonging to one of four buckets:
+TT now treats public and internal surfaces as belonging to one of four buckets:
 
 - Canonical:
   - authority-backed planning CRUD and planning reads
-  - operator-facing CLI namespaces `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...`
+  - operator-facing CLI namespaces `tt workstreams ...`, `tt workunits ...`, and `tt tracked-threads ...`
   - daemon authority planning RPCs such as `authority/hierarchy/get`, `authority/workstream/*`, `authority/workunit/*`, and `authority/tracked_thread/*`
 - Runtime-detail exception:
   - `workunit/get`, which remains public because the operator client uses it for collaboration execution detail such as assignments, reports, decisions, and proposals
@@ -44,13 +44,13 @@ ORCAS now treats public and internal surfaces as belonging to one of four bucket
   - collaboration planning mirrors persisted in SQLite runtime snapshots inside `state.db`
   - bridge tracking and projection logic inside the daemon that still supports execution flows
 - Test-only:
-  - `#[cfg(test)]` collaboration workstream/work-unit helpers in `orcasd/src/service.rs`
+  - `#[cfg(test)]` collaboration workstream/work-unit helpers in `ttd/src/service.rs`
 
 New planning features should land only on canonical surfaces. Runtime-detail exceptions, compatibility surfaces, and test-only helpers are not expansion targets for new operator-facing planning behavior.
 
 ## Workstream Plan
 
-Orcas now persists a canonical plan per workstream in daemon collaboration state. The plan is not a per-work-unit authority; work units and assignments can reference it, but they do not own it.
+TT now persists a canonical plan per workstream in daemon collaboration state. The plan is not a per-work-unit authority; work units and assignments can reference it, but they do not own it.
 
 The persisted plan records:
 
@@ -69,7 +69,7 @@ Supervisor execution may update plan-adjacent runtime fields without operator ap
 
 Structural plan changes require operator approval before they become canonical. That includes adding or removing goals or items, changing ordering or priority, changing success criteria or constraints, and changing the exploration policy. The supervisor may propose such changes, but the daemon only applies them as a new plan version after approval.
 
-When a supervisor proposes a revision, the daemon stores the proposal against the active plan version, validates it semantically against the current canonical plan, and preserves the prior version for historical inspection. Revision application now uses an explicit lifecycle: `pending`, `applying`, `applied`, `apply_failed`, `rejected`, or `superseded`. Orcas does not silently advance the canonical plan before downstream approval effects complete. If downstream apply fails, the revision remains inspectable with structured failure state instead of disappearing into logs.
+When a supervisor proposes a revision, the daemon stores the proposal against the active plan version, validates it semantically against the current canonical plan, and preserves the prior version for historical inspection. Revision application now uses an explicit lifecycle: `pending`, `applying`, `applied`, `apply_failed`, `rejected`, or `superseded`. TT does not silently advance the canonical plan before downstream approval effects complete. If downstream apply fails, the revision remains inspectable with structured failure state instead of disappearing into logs.
 
 `ApplyFailed` is now split into explicit recovery classes so operators can tell what kind of recovery is safe:
 
@@ -107,9 +107,9 @@ The review and collaboration operator surfaces now render plan revision recovery
 | Decision | Daemon collaboration state | SQLite runtime snapshots in `state.db` | `decision/apply` | `state/get`, `decision/apply` response | Yes | No |
 | Report | Daemon collaboration state | SQLite runtime snapshots in `state.db` | Internal daemon recording during assignment and report handling | `state/get`, `report/get`, `report/list_for_workunit` | Yes | No |
 | Worker session | Daemon collaboration state | SQLite runtime snapshots in `state.db` | Internal daemon-only selection and lifecycle updates | No dedicated public query; visible indirectly through assignment behavior and persisted collaboration state | No | No |
-| Live thread state | Daemon live state mirrored from Codex | Thread mirror data in SQLite runtime snapshots in `state.db` | `thread/start`, `thread/resume`, daemon Codex event bridge, internal mirror maintenance | `state/get`, `threads/list*`, `thread/read*`, `thread/get` | Yes | No |
-| Live turn state | Daemon live state mirrored from Codex | Turn mirror data in SQLite runtime snapshots in `state.db` | `turn/start`, `turn/steer`, `turn/interrupt`, daemon Codex event bridge, internal mirror maintenance | `state/get` active thread view, `turns/list_active`, `turns/recent`, `turn/get`, `turn/attach` | Yes, through session and active thread data | No |
-| Codex resume child session state | operator-client-local `CodexSessionManager` | None | operator client `ResumeSelectedThreadInCodex` action and local child-process lifecycle | operator-client-local state only | No | No |
+| Live thread state | Daemon live state mirrored from TT | Thread mirror data in SQLite runtime snapshots in `state.db` | `thread/start`, `thread/resume`, daemon TT event bridge, internal mirror maintenance | `state/get`, `threads/list*`, `thread/read*`, `thread/get` | Yes | No |
+| Live turn state | Daemon live state mirrored from TT | Turn mirror data in SQLite runtime snapshots in `state.db` | `turn/start`, `turn/steer`, `turn/interrupt`, daemon TT event bridge, internal mirror maintenance | `state/get` active thread view, `turns/list_active`, `turns/recent`, `turn/get`, `turn/attach` | Yes, through session and active thread data | No |
+| TT resume child session state | operator-client-local `TTSessionManager` | None | operator client `ResumeSelectedThreadInTT` action and local child-process lifecycle | operator-client-local state only | No | No |
 
 ### Projection, Visibility, And Restart Behavior
 
@@ -125,13 +125,13 @@ The review and collaboration operator surfaces now render plan revision recovery
 | Decision | Collaboration-native | `DecisionApplied` | Survives daemon restart through runtime snapshots in `state.db`; visible again through `state/get` |
 | Report | Collaboration-native | `ReportRecorded` | Survives daemon restart through runtime snapshots in `state.db`; visible again through `state/get` and report RPCs |
 | Worker session | Collaboration-native internal state | No dedicated worker-session event | Survives daemon restart through runtime snapshots in `state.db`; no dedicated client reload surface exists today |
-| Live thread state | Derived from Codex plus daemon mirrors; not authority state | `UpstreamStatusChanged`, `SessionChanged`, `ThreadUpdated`, `TurnUpdated`, `ItemUpdated`, `OutputDelta` as applicable | Stored mirrors reload from runtime snapshots in `state.db`, but clients still treat reconnect as snapshot-first and `turn/attach` as daemon-instance scoped |
-| Live turn state | Derived from Codex plus daemon mirrors | `TurnUpdated`, `ItemUpdated`, `OutputDelta`, `SessionChanged` as applicable | Stored mirrors reload from runtime snapshots in `state.db`, but attach and stream continuity are not promised across daemon restart |
-| Codex resume child session state | operator client-only derived and runtime-managed; not reflected in daemon read models | No daemon event visibility | Does not survive operator client process exit or restart; daemon reconnect does not recreate it |
+| Live thread state | Derived from TT plus daemon mirrors; not authority state | `UpstreamStatusChanged`, `SessionChanged`, `ThreadUpdated`, `TurnUpdated`, `ItemUpdated`, `OutputDelta` as applicable | Stored mirrors reload from runtime snapshots in `state.db`, but clients still treat reconnect as snapshot-first and `turn/attach` as daemon-instance scoped |
+| Live turn state | Derived from TT plus daemon mirrors | `TurnUpdated`, `ItemUpdated`, `OutputDelta`, `SessionChanged` as applicable | Stored mirrors reload from runtime snapshots in `state.db`, but attach and stream continuity are not promised across daemon restart |
+| TT resume child session state | operator client-only derived and runtime-managed; not reflected in daemon read models | No daemon event visibility | Does not survive operator client process exit or restart; daemon reconnect does not recreate it |
 
 ## IPC Contract
 
-Orcas IPC uses a local Unix domain socket and JSON-RPC 2.0 style messages. Messages are newline-delimited JSON records. Clients issue requests for commands and queries, receive responses for results, and subscribe to notifications for incremental updates.
+TT IPC uses a local Unix domain socket and JSON-RPC 2.0 style messages. Messages are newline-delimited JSON records. Clients issue requests for commands and queries, receive responses for results, and subscribe to notifications for incremental updates.
 
 The daemon exposes a snapshot-first interaction pattern. Clients typically request current state first, then subscribe to live events. That keeps reconnect behavior deterministic and avoids rebuilding UI state from raw event gaps. The important caveat is that `state/get` is not the full authority hierarchy, and authority lifecycle events are visibility signals rather than full read-model convergence.
 
@@ -150,8 +150,8 @@ Current request families include:
   - `threads/list` requires a target `workstream_id` and resolves through that workstream's runtime
   - `threads/list_loaded` requires a target `workstream_id` and resolves through that workstream's runtime
   - thread summaries surface `management_state`, `owner_workstream_id`, and `runtime_workstream_id`
-  - shared-runtime thread lists are owner-scoped: Orcas only returns threads it has explicitly bound to the requested workstream
-  - dedicated-runtime thread lists can still surface externally created Codex threads as `observed_unmanaged` until Orcas explicitly adopts them into a managed lane
+  - shared-runtime thread lists are owner-scoped: TT only returns threads it has explicitly bound to the requested workstream
+  - dedicated-runtime thread lists can still surface externally created TT threads as `observed_unmanaged` until TT explicitly adopts them into a managed lane
   - `threads/list_scoped` is deprecated
   - `thread/start`
   - `thread/read`
@@ -175,9 +175,9 @@ Current request families include:
   - `turn/steer`
   - `turn/interrupt`
 
-Worker execution now defaults to Codex `WorkspaceWrite` sandboxing. Orcas applies thread-level `WorkspaceWrite` mode on worker thread start and resume, and derives turn-level writable roots from the tracked-thread workspace when a worker lane is bound to a git worktree.
+Worker execution now defaults to TT `WorkspaceWrite` sandboxing. TT applies thread-level `WorkspaceWrite` mode on worker thread start and resume, and derives turn-level writable roots from the tracked-thread workspace when a worker lane is bound to a git worktree.
 
-Dedicated runtime stop and restart are conservative. Orcas refuses `workstream_runtime/stop` and `workstream_runtime/restart` when the runtime still reports any `observed_unmanaged` external threads, and idle-runtime retirement only stops a dedicated runtime when the runtime can be refreshed and reports zero observed threads. Shared-runtime workstream lists do not surface unowned external threads because they have no Orcas workstream owner.
+Dedicated runtime stop and restart are conservative. TT refuses `workstream_runtime/stop` and `workstream_runtime/restart` when the runtime still reports any `observed_unmanaged` external threads, and idle-runtime retirement only stops a dedicated runtime when the runtime can be refreshed and reports zero observed threads. Shared-runtime workstream lists do not surface unowned external threads because they have no TT workstream owner.
 - workflow and authority state:
   - `workunit/get`
   - `authority/hierarchy/get`
@@ -205,7 +205,7 @@ Dedicated runtime stop and restart are conservative. Orcas refuses `workstream_r
 - event subscription:
   - `events/subscribe`
 
-Notifications are delivered on `events/notification` with Orcas-owned event envelopes. The daemon keeps a recent event buffer and bounded per-client queues so one slow frontend cannot stall the broker.
+Notifications are delivered on `events/notification` with TT-owned event envelopes. The daemon keeps a recent event buffer and bounded per-client queues so one slow frontend cannot stall the broker.
 
 ## Read-Model Contract
 
@@ -216,7 +216,7 @@ Notifications are delivered on `events/notification` with Orcas-owned event enve
 - daemon status metadata
 - active session state
 - thread summaries and the active thread view
-- a collaboration-shaped snapshot of workstreams, work units, assignments, codex thread assignments, supervisor decisions, reports, and decisions
+- a collaboration-shaped snapshot of workstreams, work units, assignments, tt thread assignments, supervisor decisions, reports, and decisions
 - recent daemon event summaries
 
 `state/get` is not a single-store source-of-truth dump. It is assembled from daemon memory plus any explicitly bridged authority workstream and work unit compatibility rows that already exist in collaboration state.
@@ -227,7 +227,7 @@ Notifications are delivered on `events/notification` with Orcas-owned event enve
 - authority revisions, tombstones, or origin-node metadata
 - top-level proposal records, though work unit summaries can carry nested proposal summaries for collaboration-owned work units
 - worker-session records
-- operator-client-local Codex resume child session state
+- operator-client-local TT resume child session state
 
 Current limitations of the merged collaboration snapshot:
 
@@ -244,7 +244,7 @@ Current limitations of the merged collaboration snapshot:
 - `authority_compatibility_bridge`: collaboration-shaped bridge summary kept only because execution state still depends on it
 - `authority_projection`: authority lifecycle/event summary emitted from authority-owned planning state
 
-Those labels are public provenance hints, not a promise that every Orcas surface exposes a fully normalized provenance model.
+Those labels are public provenance hints, not a promise that every TT surface exposes a fully normalized provenance model.
 
 ### `authority/hierarchy/get`
 
@@ -270,7 +270,7 @@ This read model is the current source for:
 
 ### Which Clients Rely On Which Read Models
 
-- The CLI uses authority-backed planning CRUD for `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...`, while still using `state/get` and focused RPCs for collaboration and runtime state.
+- The CLI uses authority-backed planning CRUD for `tt workstreams ...`, `tt workunits ...`, and `tt tracked-threads ...`, while still using `state/get` and focused RPCs for collaboration and runtime state.
 - There is no longer an operator-facing legacy planning command namespace in the CLI.
 - The operator client bootstraps from both `state/get` and `authority/hierarchy/get`.
 - The operator client uses authority detail RPCs such as `authority/workstream/get`, `authority/workunit/get`, and `authority/tracked_thread/get` for focused editing surfaces.
@@ -312,7 +312,7 @@ The daemon now emits post-commit lifecycle notifications for authority CRUD muta
 - Workstream and work unit lifecycle events exist for collaboration-owned records.
 - Authority workstream and authority work unit mutations reuse those same lifecycle event families, with `created`, `updated`, and `deleted` action values.
 - Assignments emit `AssignmentLifecycle`.
-- Codex thread assignments emit `CodexAssignmentLifecycle`.
+- TT thread assignments emit `TTAssignmentLifecycle`.
 - Supervisor turn decisions emit `SupervisorDecisionLifecycle`.
 - Reports emit `ReportRecorded`.
 - Decisions emit `DecisionApplied`.
@@ -337,8 +337,8 @@ There is still no replay contract for missed daemon events. A closed or interrup
 
 ### Persistence Notes
 
-- `state.db` remains the only durable Orcas store. The authority SQLite store persists authority workstreams, authority work units, tracked threads, revisions, tombstones, command receipts, authority event history, runtime snapshots, and workstream runtime rows.
-- A legacy `state.json` may still be present only as one-time import input. Orcas does not depend on it after import completes.
+- `state.db` remains the only durable TT store. The authority SQLite store persists authority workstreams, authority work units, tracked threads, revisions, tombstones, command receipts, authority event history, runtime snapshots, and workstream runtime rows.
+- A legacy `state.json` may still be present only as one-time import input. TT does not depend on it after import completes.
 - On first authority-store initialization, SQLite can bootstrap from existing `state.json` if authority or runtime snapshot data has not already been recorded in `state.db`.
 
 ### What Survives Daemon Restart
@@ -363,32 +363,32 @@ The current operator client reconnect path also treats authority-only view state
 
 ### operator client PTY Exception
 
-The operator-client-local `codex resume` child session manager is not part of daemon state. It does not live in `state/get` or `authority/hierarchy/get`, and it is not reconstructed by daemon reconnect.
+The operator-client-local `tt resume` child session manager is not part of daemon state. It does not live in `state/get` or `authority/hierarchy/get`, and it is not reconstructed by daemon reconnect.
 
 - If the daemon restarts, the operator client must reconnect and reload daemon-owned state separately.
-- If the operator client process stays alive, an already-running local Codex resume child can continue independently while the daemon reconnects because that child session is operator client-owned rather than daemon-owned.
-- If the operator client exits, the local Codex resume child exits with it unless the operator detached it separately.
-- Local Codex child-session state should therefore be treated as operator convenience state rather than durable workflow state.
+- If the operator client process stays alive, an already-running local TT resume child can continue independently while the daemon reconnects because that child session is operator client-owned rather than daemon-owned.
+- If the operator client exits, the local TT resume child exits with it unless the operator detached it separately.
+- Local TT child-session state should therefore be treated as operator convenience state rather than durable workflow state.
 
-## Upstream Codex Integration
+## Upstream TT Integration
 
-`orcasd` owns the upstream Codex app-server connection. Clients do not use the upstream WebSocket protocol directly for supervised-state reads or writes.
+`ttd` owns the upstream TT app-server connection. Clients do not use the upstream WebSocket protocol directly for supervised-state reads or writes.
 
-The daemon connects to a configured WebSocket endpoint, with a localhost endpoint used by default in the current configuration. The upstream transport details remain an internal implementation concern. Orcas surfaces the resulting thread, turn, collaboration, and authority query state through its own IPC contract instead of mirroring the upstream wire format wholesale.
+The daemon connects to a configured WebSocket endpoint, with a localhost endpoint used by default in the current configuration. The upstream transport details remain an internal implementation concern. TT surfaces the resulting thread, turn, collaboration, and authority query state through its own IPC contract instead of mirroring the upstream wire format wholesale.
 
-The one intentional exception is the operator client's local `codex resume` child TUI. `orcas tui` may launch and manage those child processes interactively through a supervisor-backed dashboard wrapper with a border HUD, but it remains an operator-owned convenience layer rather than a daemon-owned source of supervision truth. It no longer fetches collaboration workstream/thread sidebars on startup.
+The one intentional exception is the operator client's local `tt resume` child TUI. `tt tui` may launch and manage those child processes interactively through a supervisor-backed dashboard wrapper with a border HUD, but it remains an operator-owned convenience layer rather than a daemon-owned source of supervision truth. It no longer fetches collaboration workstream/thread sidebars on startup.
 
 ## Operator And Client Surfaces
 
 - The canonical operator CRUD surface for planning hierarchy objects is now authority-backed in both clients:
-  - CLI: `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...`
+  - CLI: `tt workstreams ...`, `tt workunits ...`, and `tt tracked-threads ...`
   - operator client: authority CRUD plus `authority/hierarchy/get` and authority detail RPCs
 - There is no longer an operator-facing legacy planning command namespace. Imported collaboration planning rows can still exist in runtime snapshots, but they are no longer exposed as a peer CLI surface.
 - Both clients still depend on daemon snapshots and focused daemon RPCs for thread, turn, assignment, report, decision, and proposal views.
 - The operator client retains one collaboration work-unit detail read, `workunit/get`, because it carries execution detail that is outside the authority planning hierarchy.
 - Non-canonical surfaces are intentionally frozen: new planning behavior should not be added to `workunit/get`, bridge rows, or other collaboration compatibility paths.
 - The daemon event stream is shared and now carries post-commit create, update, and delete notifications for authority workstreams, work units, and tracked threads.
-- The operator client's `codex resume` child process is local to the operator client process and should be understood as an operator convenience layer rather than a daemon-managed session model.
+- The operator client's `tt resume` child process is local to the operator client process and should be understood as an operator convenience layer rather than a daemon-managed session model.
 
 ## Known Limitations Carried Into Later Phases
 

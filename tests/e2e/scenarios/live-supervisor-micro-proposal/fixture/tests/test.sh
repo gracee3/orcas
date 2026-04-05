@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-expected="Hello, Orcas!"
+expected="Hello, TT!"
 binary="$(mktemp "${TMPDIR:-/tmp}/live-supervisor-micro-proposal.XXXXXX")"
 trap 'rm -f "$binary"' EXIT
 cc main.c -o "$binary"

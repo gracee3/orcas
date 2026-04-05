@@ -2,15 +2,15 @@
 
 ## Goal
 
-Verify that Orcas can survive a daemon interruption during a live worker turn and still reconcile back to the correct persisted state after restart.
+Verify that TT can survive a daemon interruption during a live worker turn and still reconcile back to the correct persisted state after restart.
 
 ## What Is Seeded
 
 1. A tiny git repository is materialized under the scenario worktree output root.
 2. The repository contains one C source file with the same small greeting bug used by the other live scenarios.
 3. A shell-based test script and Makefile are present so the repository can prove the fix locally.
-4. The scenario writes a repo-local Orcas config that can target a local vLLM Responses endpoint by default, while still allowing an explicit hosted API override.
-5. Orcas daemon state is started and a single workstream/work unit is created.
+4. The scenario writes a repo-local TT config that can target a local vLLM Responses endpoint by default, while still allowing an explicit hosted API override.
+5. TT daemon state is started and a single workstream/work unit is created.
 6. A tracked-thread record is created before the first live assignment, with a declared repository root, worktree path, branch name, base ref, landing target, and cleanup policy.
 7. The harness inspects the workstream runtime before execution and expects zero live lane threads at that point.
 
@@ -19,8 +19,8 @@ Verify that Orcas can survive a daemon interruption during a live worker turn an
 - The first worker turn is real and live.
 - The daemon interruption is real and happens while the live workflow is in flight.
 - The daemon restart is real and uses the same persisted local state/XDG paths.
-- The resumed workflow is reconciled by Orcas from persisted/upstream truth, with `turns get` acting as the recovery probe after restart.
-- The final persisted assignment/report state is produced by Orcas, not seeded by the harness.
+- The resumed workflow is reconciled by TT from persisted/upstream truth, with `turns get` acting as the recovery probe after restart.
+- The final persisted assignment/report state is produced by TT, not seeded by the harness.
 
 ## What Is Intentionally Interrupted
 
@@ -35,11 +35,11 @@ Verify that Orcas can survive a daemon interruption during a live worker turn an
 
 ## What This Proves
 
-- Orcas can survive a controlled daemon interruption during a live assignment.
-- Orcas can bind the first live assignment directly into the predeclared tracked-thread workspace lane and recover that same lane after restart.
-- Orcas can restart against the same persisted local state.
-- Orcas can reconcile the in-flight workflow from durable/upstream truth instead of duplicating or losing it.
-- Orcas can converge to the correct persisted result after restart.
+- TT can survive a controlled daemon interruption during a live assignment.
+- TT can bind the first live assignment directly into the predeclared tracked-thread workspace lane and recover that same lane after restart.
+- TT can restart against the same persisted local state.
+- TT can reconcile the in-flight workflow from durable/upstream truth instead of duplicating or losing it.
+- TT can converge to the correct persisted result after restart.
 
 ## Pass Conditions
 

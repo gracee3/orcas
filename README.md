@@ -1,59 +1,59 @@
-![ORCAS Logo](assets/orcas_banner.png)
+![TT Logo](assets/orcas_banner.png)
 
-# Orcas
+# TT
 
 _Open Reasoning Context & Agent Supervisor_  
 
-Orcas is a local Rust supervisor layer built around [`codex`](https://github.com/openai/codex) [`app-server`](https://developers.openai.com/codex/app-server/).
+TT is a local Rust supervisor layer built around [`tt`](https://github.com/openai/tt) [`app-server`](https://developers.openai.com/tt/app-server/).
 
-Orcas is for the point where one agent thread is no longer enough. It keeps the control plane close: local, durable, inspectable, and calm. `orcasd` owns workflow state, lifecycle, local IPC, snapshots, and event streams. The CLI (`orcas`) is a client of that daemon.
+TT is for the point where one agent thread is no longer enough. It keeps the control plane close: local, durable, inspectable, and calm. `ttd` owns workflow state, lifecycle, local IPC, snapshots, and event streams. The CLI (`tt`) is a client of that daemon.
 
-Codex remains the execution substrate. Orcas keeps the shape of the work around that execution: workstreams, work units, assignments, threads, turns, reports, and supervisor decisions. That separation matters. It means the state that matters does not vanish into terminal scrollback, and it means review stays human. Supervisor proposals are artifacts for inspection, not hidden authority.
+TT remains the execution substrate. TT keeps the shape of the work around that execution: workstreams, work units, assignments, threads, turns, reports, and supervisor decisions. That separation matters. It means the state that matters does not vanish into terminal scrollback, and it means review stays human. Supervisor proposals are artifacts for inspection, not hidden authority.
 
-## Why Orcas
+## Why TT
 
-Orcas is useful when the work branches. Maybe one repository becomes three. Maybe one task opens into an implementation lane, a review lane, and a cleanup lane. Maybe you want several agents moving at once across separate Git worktrees or entirely separate codebases, but you still want one readable picture of what is active, what is waiting, and what needs a decision.
+TT is useful when the work branches. Maybe one repository becomes three. Maybe one task opens into an implementation lane, a review lane, and a cleanup lane. Maybe you want several agents moving at once across separate Git worktrees or entirely separate codebases, but you still want one readable picture of what is active, what is waiting, and what needs a decision.
 
-The model stays simple once it becomes familiar. A workstream holds the larger objective. Inside it, work units describe concrete pieces of work. Assignments connect that work to an execution session. Threads and turns give you the Codex-side view. The supervisor layer sits above that flow and gives you a place to review, steer, interrupt, continue, or close the loop without treating the worker transcript itself as the source of truth.
+The model stays simple once it becomes familiar. A workstream holds the larger objective. Inside it, work units describe concrete pieces of work. Assignments connect that work to an execution session. Threads and turns give you the TT-side view. The supervisor layer sits above that flow and gives you a place to review, steer, interrupt, continue, or close the loop without treating the worker transcript itself as the source of truth.
 
-What Orcas offers is not more automation for its own sake. It offers calmer automation: a way to let multiple agent threads move quickly without losing the sense of where the work is, why it exists, and what should happen next.
+What TT offers is not more automation for its own sake. It offers calmer automation: a way to let multiple agent threads move quickly without losing the sense of where the work is, why it exists, and what should happen next.
 
 ## Usage
 
-A common pattern is to open a new workstream for an objective, create one or more threads beneath it, and let those threads map cleanly to separate worktrees or separate repositories. From there, the supervisor can inspect the live state from the CLI. That is where Orcas feels especially strong: several active threads, several possible next actions, and a local view that stays coherent as the system moves.
+A common pattern is to open a new workstream for an objective, create one or more threads beneath it, and let those threads map cleanly to separate worktrees or separate repositories. From there, the supervisor can inspect the live state from the CLI. That is where TT feels especially strong: several active threads, several possible next actions, and a local view that stays coherent as the system moves.
 
-The CLI remains close at hand for scripted flows, quick checks, and direct operator actions, including authored steer creation, replacement, review, approve/send, reject, record-no-action, manual-refresh, and a cross-thread Codex decision queue/history surface for supervised threads.
+The CLI remains close at hand for scripted flows, quick checks, and direct operator actions, including authored steer creation, replacement, review, approve/send, reject, record-no-action, manual-refresh, and a cross-thread TT decision queue/history surface for supervised threads.
 
 ## Current Operator Surface
 
 The strongest checked-in operator surfaces today are the CLI and the daemon IPC contract.
 
-- `orcasd` is the durable local control plane
-- `orcas` is the primary checked-in operator client
+- `ttd` is the durable local control plane
+- `tt` is the primary checked-in operator client
 - the repo does not currently contain a primary UI surface to "resume"
 
-That matters for planning work. Orcas is currently best understood and operated through CLI flows, daemon-backed state inspection, and the checked-in integration/E2E harnesses rather than through a separate frontend.
+That matters for planning work. TT is currently best understood and operated through CLI flows, daemon-backed state inspection, and the checked-in integration/E2E harnesses rather than through a separate frontend.
 
 ## Quick start
 
 On Linux, the easiest install path is a `.deb` package. If you are working from a release archive, the tarball layout is equally simple.
 
 ```bash
-sudo dpkg -i ./orcas_0.1.0_amd64.deb
-systemctl --user enable --now orcas-daemon.service
-orcas doctor
+sudo dpkg -i ./tt_0.1.0_amd64.deb
+systemctl --user enable --now tt-daemon.service
+tt doctor
 ```
 
 Or, from a tarball release:
 
 ```bash
-tar -xzf orcas-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd orcas-v0.1.0-x86_64-unknown-linux-gnu
-./bin/orcas doctor
-./bin/orcasd
+tar -xzf tt-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+cd tt-v0.1.0-x86_64-unknown-linux-gnu
+./bin/tt doctor
+./bin/ttd
 ```
 
-Once the daemon is running, `orcas doctor` is the quickest way to confirm that Orcas can see its configuration, runtime paths, socket, and Codex endpoint. From there, you can stay in the CLI.
+Once the daemon is running, `tt doctor` is the quickest way to confirm that TT can see its configuration, runtime paths, socket, and TT endpoint. From there, you can stay in the CLI.
 
 ## Testing
 
@@ -87,9 +87,9 @@ Recent progress that is now on `main`:
 
 ## Implementation
 
-Orcas is written in Rust and designed to be fast and portable. The runtime is built on [Tokio](https://tokio.rs/), which keeps the daemon responsive under concurrent work. The daemon talks to local clients over a Unix domain socket, keeps snapshots and event streams close to the machine, and avoids turning the control plane into a heavyweight web service when it does not need to be one.
+TT is written in Rust and designed to be fast and portable. The runtime is built on [Tokio](https://tokio.rs/), which keeps the daemon responsive under concurrent work. The daemon talks to local clients over a Unix domain socket, keeps snapshots and event streams close to the machine, and avoids turning the control plane into a heavyweight web service when it does not need to be one.
 
-Inside the workspace, the responsibilities are separated cleanly. `orcas-core` holds shared types, errors, paths, and IPC structures. `orcas-codex` handles the Codex connection and typed `app-server` surface. `orcasd` builds `orcasd`, the long-lived daemon. `orcas` builds the `orcas` CLI.
+Inside the workspace, the responsibilities are separated cleanly. `tt-core` holds shared types, errors, paths, and IPC structures. `tt-runtime` handles the TT connection and typed `app-server` surface. `ttd` builds `ttd`, the long-lived daemon. `tt` builds the `tt` CLI.
 
 ## Building from source
 
@@ -102,29 +102,29 @@ cargo test
 make build
 ```
 
-Orcas expects a local Codex binary. The development default may point at a source-tree build, but in normal use you should set the installed path in configuration or with `ORCAS_CODEX_BIN`. A typical local build of Codex looks like this:
+TT expects a local TT binary. The development default may point at a source-tree build, but in normal use you should set the installed path in configuration or with `TT_RUNTIME_BIN`. A typical local build of TT looks like this:
 
 ```bash
-cd /path/to/codex/codex-rs
-cargo build -p codex-cli --bin codex
+cd /path/to/tt
+cargo build -p tt --bin tt
 ```
 
 ## Paths and configuration
 
-By default, Orcas keeps its user-scoped config, state, and logs under a single home root at `~/.orcas`. Set `ORCAS_HOME` to point Orcas at a different root when you want an isolated lab, test, or operator session.
+By default, TT keeps its user-scoped config, state, and logs under a single home root at `~/.tt`. Set `TT_HOME` to point TT at a different root when you want an isolated lab, test, or operator session.
 
 ```text
-config:  ~/.orcas/config.toml
-state:   ~/.orcas/state.json
-db:      ~/.orcas/state.db
-logs:    ~/.orcas/logs/
-socket:  ${ORCAS_HOME:-~/.orcas}/runtime/orcasd.sock
-meta:    ${ORCAS_HOME:-~/.orcas}/runtime/orcasd.json
+config:  ~/.tt/config.toml
+state:   ~/.tt/state.json
+db:      ~/.tt/state.db
+logs:    ~/.tt/logs/
+socket:  ${TT_HOME:-~/.tt}/runtime/ttd.sock
+meta:    ${TT_HOME:-~/.tt}/runtime/ttd.json
 ```
 
 `state.json` remains the live collaboration and thread/turn mirror store. `state.db` is the live authority store for authority workstreams, authority work units, and tracked threads.
 
-The packaged `orcas-daemon.service` unit is a user service, not a root-owned global daemon. It is intended to run under `systemctl --user` so the daemon and CLI resolve the same user-scoped config, data, log, and socket paths.
+The packaged `tt-daemon.service` unit is a user service, not a root-owned global daemon. It is intended to run under `systemctl --user` so the daemon and CLI resolve the same user-scoped config, data, log, and socket paths.
 
 For source installs, `make install-systemd` writes that user unit into your user manager directory and rewrites `ExecStart` to the current install prefix so it follows the binary path you actually chose.
 
@@ -141,19 +141,19 @@ Recovery is snapshot-first rather than replay-based:
 
 The current operator mutation surface is also split, but no longer ambiguous:
 
-- `orcas workstreams ...`, `orcas workunits ...`, and `orcas tracked-threads ...` are the canonical authority-backed planning hierarchy CRUD commands
+- `tt workstreams ...`, `tt workunits ...`, and `tt tracked-threads ...` are the canonical authority-backed planning hierarchy CRUD commands
 - `workunit/get` remains a daemon runtime-detail exception for collaboration execution detail; it is not a canonical planning API
 - there is no longer an operator-facing legacy planning command namespace; retained collaboration planning state is now an internal compatibility concern rather than a peer CLI surface
 - assignment, report, decision, proposal, thread, and turn flows remain collaboration- or runtime-oriented daemon surfaces rather than authority planning CRUD
 
-`RUST_LOG` controls tracing verbosity. Orcas-specific overrides use `ORCAS_*` environment variables, including the Codex binary path and upstream listen URL.
+`RUST_LOG` controls tracing verbosity. TT-specific overrides use `TT_*` environment variables, including the TT binary path and upstream listen URL.
 
 Two runtime-mode overrides are worth calling out explicitly:
 
-- `ORCAS_CONNECTION_MODE=connect_only` forces connect-only mode
-- `ORCAS_CONNECTION_MODE=spawn_always` forces spawn mode
+- `TT_CONNECTION_MODE=connect_only` forces connect-only mode
+- `TT_CONNECTION_MODE=spawn_always` forces spawn mode
 
-If `ORCAS_CONNECTION_MODE` is unset, Orcas keeps the configured or default `spawn_if_needed` behavior. The CLI and daemon flags `--connect-only` and `--force-spawn` are mutually exclusive one-shot overrides for the same setting.
+If `TT_CONNECTION_MODE` is unset, TT keeps the configured or default `spawn_if_needed` behavior. The CLI and daemon flags `--connect-only` and `--force-spawn` are mutually exclusive one-shot overrides for the same setting.
 
 ## Branch And Worktree Hygiene
 

@@ -10,7 +10,7 @@ This scenario uses two tracked-thread lanes in the same run, two separate worktr
 
 1. A tiny git repository is materialized for each lane under the scenario worktree output root.
 2. Each repository contains the same tiny C fixture and shell test, but each lane is instructed to land a different expected greeting string.
-3. Orcas daemon state is started and one workstream is created.
+3. TT daemon state is started and one workstream is created.
 4. Two work units are created in that workstream, one per lane.
 5. Two tracked-thread records are created, each with its own repository root, worktree path, branch name, base ref, landing target, and cleanup policy before any live assignment begins.
 6. The harness inspects the workstream runtime before execution and expects zero active lane threads at that point.
@@ -21,7 +21,7 @@ This scenario uses two tracked-thread lanes in the same run, two separate worktr
 - Lane B is a real live worker turn on its own tracked-thread/worktree lane.
 - Both assignments are launched in the same run before the harness waits for either one, so their active windows overlap.
 - Each lane produces a real persisted report, a real final decision, and a real tracked-thread record.
-- The workstream runtime surfaces both lanes as managed Codex threads rather than unmanaged runtime threads.
+- The workstream runtime surfaces both lanes as managed TT threads rather than unmanaged runtime threads.
 
 ## Live Boundary
 
@@ -31,12 +31,12 @@ This scenario uses two tracked-thread lanes in the same run, two separate worktr
 
 ## What This Proves
 
-- Orcas can keep two tracked-thread ids distinct in the same run.
-- Orcas can keep two worktree paths and branch identities distinct in the same run.
-- Orcas can keep report and decision lineage isolated by lane.
-- Orcas can let two live assignments overlap without cross-lane contamination.
-- Orcas can surface both lanes on the same workstream runtime as two managed threads with no unmanaged runtime thread leak.
-- Orcas can complete both lanes cleanly using persisted evidence from each lane independently.
+- TT can keep two tracked-thread ids distinct in the same run.
+- TT can keep two worktree paths and branch identities distinct in the same run.
+- TT can keep report and decision lineage isolated by lane.
+- TT can let two live assignments overlap without cross-lane contamination.
+- TT can surface both lanes on the same workstream runtime as two managed threads with no unmanaged runtime thread leak.
+- TT can complete both lanes cleanly using persisted evidence from each lane independently.
 
 ## Pass Conditions
 
@@ -75,7 +75,7 @@ This scenario stops at final completion decisions for both lanes. It does not pr
 
 ## Known Flake Points
 
-- Live Codex latency can vary.
+- Live TT latency can vary.
 - The local model can take a while to generate each worker report.
 - The strongest durability checks are the persisted report objects, the lane-specific worktree diffs, and the lane-specific final decision records.
 - The scenario relies on both lanes staying within their declared worktrees and not creating backup or temp files.

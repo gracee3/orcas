@@ -64,7 +64,7 @@
       "session-proposals": {
         "id": "session-proposals",
         "worker_id": "worker-proposals",
-        "backend_type": "codex_thread",
+        "backend_type": "tt_thread",
         "thread_id": null,
         "tracked_thread_id": null,
         "active_turn_id": null,
@@ -248,7 +248,7 @@
           "worker_session": {
             "id": "session-proposals",
             "worker_id": "worker-proposals",
-            "backend_type": "codex_thread",
+            "backend_type": "tt_thread",
             "thread_id": null,
             "active_turn_id": null,
             "runtime_status": "idle",
@@ -310,7 +310,7 @@
         "approved_assignment_id": null
       }
     },
-    "codex_thread_assignments": {},
+    "tt_thread_assignments": {},
     "supervisor_turn_decisions": {},
     "planning": {}
   }

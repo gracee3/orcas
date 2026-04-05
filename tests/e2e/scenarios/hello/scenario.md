@@ -8,7 +8,7 @@ Verify a minimal C program compiles and runs in an isolated scenario folder.
 
 1. Build `hello.c`.
 2. Run the resulting binary.
-3. Confirm the output is exactly `Hello, Orcas!`.
+3. Confirm the output is exactly `Hello, TT!`.
 
 ## Expected Result
 

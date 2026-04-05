@@ -7,11 +7,11 @@ fixture_dir="$scenario_dir/fixture"
 
 e2e_load_scenario_metadata "$scenario_dir"
 e2e_prepare_scenario_dirs "$NAME"
-e2e_prepare_live_codex_environment "cln" 6100 8192
+e2e_prepare_live_tt_environment "cln" 6100 8192
 
-base_ref="${ORCAS_E2E_GIT_BASE_REF:-main}"
+base_ref="${TT_E2E_GIT_BASE_REF:-main}"
 branch_suffix="${E2E_RUN_ID//[^a-zA-Z0-9]/-}"
-daemon_log="$E2E_SCENARIO_LOGS_DIR/orcasd.log"
+daemon_log="$E2E_SCENARIO_LOGS_DIR/ttd.log"
 reports_dir="$E2E_SCENARIO_REPORTS_DIR"
 artifacts_dir="$E2E_SCENARIO_ARTIFACTS_DIR"
 
@@ -25,13 +25,13 @@ setup_lane() {
   local lane_expected="$5"
   local repo_root="$E2E_SCENARIO_WORKTREES_DIR/${prefix}-repo"
   local worktree_path="$E2E_SCENARIO_WORKTREES_DIR/$prefix"
-  local branch_name="orcas/$NAME/$prefix/$branch_suffix"
+  local branch_name="tt/$NAME/$prefix/$branch_suffix"
   local workunit_output tracked_output workunit_id tracked_thread_id
 
   e2e_prepare_fixture_repo_with_worktree "$fixture_dir" "$repo_root" "$worktree_path" "$branch_name" "$base_ref" "$reports_dir" "$prefix"
 
   workunit_output="$(
-    e2e_orcas workunit create \
+    e2e_tt workunit create \
       --workstream "$workstream_id" \
       --title "$lane_title" \
       --task "$lane_task"
@@ -87,11 +87,11 @@ collect_lane_results() {
   local report_id="${!report_id_var}"
   local assignment_id assignment_status worker_session_id report_parse_result thread_id changed_count
 
-  e2e_orcas supervisor work reports get --report "$report_id" >"$report_get_stdout"
+  e2e_tt supervisor work reports get --report "$report_id" >"$report_get_stdout"
   assignment_id="$(e2e_field_value assignment_id "$report_get_stdout")"
   report_parse_result="$(e2e_field_value parse_result "$report_get_stdout")"
 
-  e2e_orcas supervisor work assignments get --assignment "$assignment_id" >"$assignment_get_stdout"
+  e2e_tt supervisor work assignments get --assignment "$assignment_id" >"$assignment_get_stdout"
   assignment_status="$(e2e_field_value status "$assignment_get_stdout")"
   worker_session_id="$(e2e_field_value worker_session_id "$assignment_get_stdout")"
   thread_id="$(e2e_field_value thread_id "$assignment_stdout")"
@@ -100,7 +100,7 @@ collect_lane_results() {
   make -C "$worktree_path" clean >/dev/null 2>&1 || true
   git -C "$worktree_path" status --short --untracked-files=all >"$git_status_stdout"
   diff -qr --exclude=.git "$fixture_dir" "$worktree_path" >"$tree_diff_stdout" || true
-  e2e_orcas workunit thread get --tracked-thread "$tracked_thread_id" >"$tracked_after_stdout"
+  e2e_tt workunit thread get --tracked-thread "$tracked_thread_id" >"$tracked_after_stdout"
 
   changed_count="$(sed '/^$/d' "$tree_diff_stdout" | wc -l | tr -d ' ')"
   test -n "$assignment_id"
@@ -136,7 +136,7 @@ trap cleanup EXIT
 sleep 5
 
 workstream_output="$(
-  e2e_orcas workstreams create \
+  e2e_tt workstreams create \
     --title "Live concurrent lanes" \
     --objective "Prove two tracked-thread worktree lanes can run concurrently without crossing identity or lineage" \
     --priority normal
@@ -156,8 +156,8 @@ eval "$(setup_lane lane_b "$workstream_id" \
 lane_a_tracked_before_stdout="$reports_dir/lane-a-tracked-thread-before.txt"
 lane_b_tracked_before_stdout="$reports_dir/lane-b-tracked-thread-before.txt"
 runtime_before_stdout="$reports_dir/workstream-runtime-before-live.txt"
-e2e_orcas workunit thread get --tracked-thread "$lane_a_tracked_thread_id" >"$lane_a_tracked_before_stdout"
-e2e_orcas workunit thread get --tracked-thread "$lane_b_tracked_thread_id" >"$lane_b_tracked_before_stdout"
+e2e_tt workunit thread get --tracked-thread "$lane_a_tracked_thread_id" >"$lane_a_tracked_before_stdout"
+e2e_tt workunit thread get --tracked-thread "$lane_b_tracked_thread_id" >"$lane_b_tracked_before_stdout"
 e2e_capture_workstream_runtime "$workstream_id" "$runtime_before_stdout"
 e2e_assert_workstream_runtime "$workstream_id" "$runtime_before_stdout"
 e2e_assert_runtime_thread_count "$runtime_before_stdout" 0
@@ -165,19 +165,19 @@ e2e_assert_runtime_thread_count "$runtime_before_stdout" 0
 lane_a_assignment_start_stdout="$reports_dir/lane_a-assignment-start.txt"
 lane_b_assignment_start_stdout="$reports_dir/lane_b-assignment-start.txt"
 
-timeout "${TIMEOUT_SECONDS}s" "$e2e_bin_dir/orcas.sh" supervisor work assignments start \
+timeout "${TIMEOUT_SECONDS}s" "$e2e_bin_dir/tt.sh" supervisor work assignments start \
   --workunit "$lane_a_workunit_id" \
   --worker live-concurrent-lanes-a \
-  --worker-kind codex \
+  --worker-kind tt \
   --instructions "Lane A: update the tiny C fixture so make test passes with the exact greeting 'Hello, Lane A!'. Edit only main.c and tests/test.sh. Do not touch lane B or create backup files. Return a brief summary of the exact lane A edits." \
   --cwd "$lane_a_worktree_path" \
   >"$lane_a_assignment_start_stdout" 2>&1 &
 lane_a_assignment_start_pid=$!
 
-timeout "${TIMEOUT_SECONDS}s" "$e2e_bin_dir/orcas.sh" supervisor work assignments start \
+timeout "${TIMEOUT_SECONDS}s" "$e2e_bin_dir/tt.sh" supervisor work assignments start \
   --workunit "$lane_b_workunit_id" \
   --worker live-concurrent-lanes-b \
-  --worker-kind codex \
+  --worker-kind tt \
   --instructions "Lane B: update the tiny C fixture so make test passes with the exact greeting 'Hello, Lane B!'. Edit only main.c and tests/test.sh. Do not touch lane A or create backup files. Return a brief summary of the exact lane B edits." \
   --cwd "$lane_b_worktree_path" \
   >"$lane_b_assignment_start_stdout" 2>&1 &
@@ -210,13 +210,13 @@ test "$lane_a_thread_id" != "$lane_b_thread_id"
 ! grep -q "Hello, Lane B!" "$lane_a_worktree_path/main.c"
 ! grep -q "Hello, Lane A!" "$lane_b_worktree_path/main.c"
 
-timeout "${TIMEOUT_SECONDS}s" "$e2e_bin_dir/orcas.sh" supervisor work decisions apply \
+timeout "${TIMEOUT_SECONDS}s" "$e2e_bin_dir/tt.sh" supervisor work decisions apply \
   --workunit "$lane_a_workunit_id" \
   --report "$lane_a_report_id" \
   --type mark-complete \
   --rationale "Close lane A after its bounded live worker turn landed cleanly." \
   >"$lane_a_decision_stdout" 2>&1
-timeout "${TIMEOUT_SECONDS}s" "$e2e_bin_dir/orcas.sh" supervisor work decisions apply \
+timeout "${TIMEOUT_SECONDS}s" "$e2e_bin_dir/tt.sh" supervisor work decisions apply \
   --workunit "$lane_b_workunit_id" \
   --report "$lane_b_report_id" \
   --type mark-complete \

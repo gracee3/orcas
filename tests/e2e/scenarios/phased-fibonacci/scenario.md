@@ -1,6 +1,6 @@
 # Phased Fibonacci
 
-This scenario verifies a real multi-phase tracked-thread workflow on one live Codex lane.
+This scenario verifies a real multi-phase tracked-thread workflow on one live TT lane.
 
 ## What Is Seeded
 
@@ -16,7 +16,7 @@ This scenario verifies a real multi-phase tracked-thread workflow on one live Co
 - Phase 2 is a real implementation turn that builds the Fibonacci CLI core on that same lane.
 - Phase 3 is a real completion turn that adds repeatable tests and final polish on that same lane.
 - The phase gates use real operator `Continue` and `MarkComplete` decisions rather than seeded proposal state.
-- Orcas binds the tracked-thread automatically on the first live assignment and keeps the same lane attached across all three phases.
+- TT binds the tracked-thread automatically on the first live assignment and keeps the same lane attached across all three phases.
 
 ## Pass Conditions
 

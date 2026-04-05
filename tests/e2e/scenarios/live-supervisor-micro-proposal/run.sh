@@ -7,17 +7,17 @@ fixture_dir="$scenario_dir/fixture"
 
 e2e_load_scenario_metadata "$scenario_dir"
 e2e_prepare_scenario_dirs "$NAME"
-e2e_prepare_live_codex_environment "lsmp" 5600 16384
+e2e_prepare_live_tt_environment "lsmp" 5600 16384
 e2e_require_local_supervisor_endpoint
 
 worktree_path="$E2E_SCENARIO_WORKTREES_DIR/lane"
 repo_root="$E2E_SCENARIO_WORKTREES_DIR/lane-repo"
-daemon_log="$E2E_SCENARIO_LOGS_DIR/orcasd.log"
+daemon_log="$E2E_SCENARIO_LOGS_DIR/ttd.log"
 reports_dir="$E2E_SCENARIO_REPORTS_DIR"
 artifacts_dir="$E2E_SCENARIO_ARTIFACTS_DIR"
-base_ref="${ORCAS_E2E_GIT_BASE_REF:-main}"
+base_ref="${TT_E2E_GIT_BASE_REF:-main}"
 branch_suffix="${E2E_RUN_ID//[^a-zA-Z0-9]/-}"
-branch_name="orcas/$NAME/$branch_suffix"
+branch_name="tt/$NAME/$branch_suffix"
 
 mkdir -p "$reports_dir" "$artifacts_dir"
 e2e_prepare_fixture_repo_with_worktree "$fixture_dir" "$repo_root" "$worktree_path" "$branch_name" "$base_ref" "$reports_dir" "lane"
@@ -31,7 +31,7 @@ trap cleanup EXIT
 sleep 5
 
 workstream_output="$(
-  e2e_orcas workstreams create \
+  e2e_tt workstreams create \
     --title "Live supervisor micro proposal" \
     --objective "Prove the live worker-to-supervisor loop on one bounded tracked-thread lane" \
     --priority normal
@@ -39,7 +39,7 @@ workstream_output="$(
 workstream_id="$(printf '%s\n' "$workstream_output" | awk -F': ' '/^workstream_id:/ {print $2; exit}')"
 
 workunit_output="$(
-  e2e_orcas workunit create \
+  e2e_tt workunit create \
     --workstream "$workstream_id" \
     --title "Fix the tiny greeting bug" \
     --task "Inspect the tiny C program and failing shell test in the declared tracked-thread worktree lane. Make the smallest code change needed so make test passes. Do not refactor unrelated code."
@@ -66,16 +66,16 @@ tracked_thread_id="$(printf '%s\n' "$tracked_output" | awk -F': ' '/^tracked_thr
 
 tracked_before_stdout="$reports_dir/tracked-thread-before-live.txt"
 runtime_before_stdout="$reports_dir/workstream-runtime-before-live.txt"
-e2e_orcas workunit thread get --tracked-thread "$tracked_thread_id" >"$tracked_before_stdout"
+e2e_tt workunit thread get --tracked-thread "$tracked_thread_id" >"$tracked_before_stdout"
 e2e_capture_workstream_runtime "$workstream_id" "$runtime_before_stdout"
 e2e_assert_workstream_runtime "$workstream_id" "$runtime_before_stdout"
 e2e_assert_runtime_thread_count "$runtime_before_stdout" 0
 
 assignment_stdout="$reports_dir/assignment-start.txt"
-timeout "${TIMEOUT_SECONDS}s" "$e2e_bin_dir/orcas.sh" supervisor work assignments start \
+timeout "${TIMEOUT_SECONDS}s" "$e2e_bin_dir/tt.sh" supervisor work assignments start \
   --workunit "$workunit_id" \
   --worker live-supervisor-micro-proposal-worker \
-  --worker-kind codex \
+  --worker-kind tt \
   --instructions "Inspect the tiny C program and failing shell test in the declared tracked-thread worktree lane. Make the smallest possible code change in main.c to make make test pass. Do not refactor unrelated code, do not touch the test script unless required, and keep the fix bounded to one file if possible." \
   --cwd "$worktree_path" \
   >"$assignment_stdout" 2>&1 &
@@ -97,11 +97,11 @@ tracked_after_stdout="$reports_dir/tracked-thread-after-live.txt"
 runtime_after_stdout="$reports_dir/workstream-runtime-after-live.txt"
 threads_after_stdout="$reports_dir/workstream-threads-after-live.txt"
 
-e2e_orcas supervisor work reports get --report "$report_id" >"$report_get_stdout"
+e2e_tt supervisor work reports get --report "$report_id" >"$report_get_stdout"
 assignment_id="$(e2e_field_value assignment_id "$report_get_stdout")"
 report_parse_result="$(e2e_field_value parse_result "$report_get_stdout")"
 
-e2e_orcas supervisor work assignments get --assignment "$assignment_id" >"$assignment_get_stdout"
+e2e_tt supervisor work assignments get --assignment "$assignment_id" >"$assignment_get_stdout"
 assignment_status="$(e2e_field_value status "$assignment_get_stdout")"
 worker_session_id="$(e2e_field_value worker_session_id "$assignment_get_stdout")"
 thread_id="$(e2e_field_value thread_id "$assignment_stdout")"
@@ -110,7 +110,7 @@ make -C "$worktree_path" test >"$make_test_stdout"
 make -C "$worktree_path" clean >/dev/null 2>&1 || true
 git -C "$worktree_path" status --short >"$git_status_stdout"
 diff -qr --exclude=.git "$fixture_dir" "$worktree_path" >"$tree_diff_stdout" || true
-e2e_orcas workunit thread get --tracked-thread "$tracked_thread_id" >"$tracked_after_stdout"
+e2e_tt workunit thread get --tracked-thread "$tracked_thread_id" >"$tracked_after_stdout"
 e2e_capture_workstream_runtime "$workstream_id" "$runtime_after_stdout"
 e2e_capture_workstream_threads "$workstream_id" "$threads_after_stdout"
 e2e_assert_workstream_runtime "$workstream_id" "$runtime_after_stdout"
@@ -139,7 +139,7 @@ grep -q "workspace_worktree_path: $worktree_path" "$tracked_after_stdout"
 grep -q "workspace_branch_name: $branch_name" "$tracked_after_stdout"
 
 proposal_create_output="$(
-  e2e_orcas supervisor work proposals create \
+  e2e_tt supervisor work proposals create \
     --workunit "$workunit_id" \
     --report "$report_id" \
     --requested-by live-supervisor-micro-proposal \
@@ -148,7 +148,7 @@ proposal_create_output="$(
 )"
 proposal_id="$(printf '%s\n' "$proposal_create_output" | awk -F': ' '/^proposal_id:/ {print $2; exit}')"
 
-e2e_orcas supervisor work proposals get --proposal "$proposal_id" >"$proposal_get_stdout"
+e2e_tt supervisor work proposals get --proposal "$proposal_id" >"$proposal_get_stdout"
 proposal_status="$(e2e_field_value status "$proposal_get_stdout")"
 model_summary_headline="$(e2e_field_value model_summary_headline "$proposal_get_stdout")"
 model_proposed_decision_type="$(e2e_field_value model_proposed_decision_type "$proposal_get_stdout")"
@@ -166,12 +166,12 @@ grep -q '^model_summary_situation:' "$proposal_get_stdout"
 grep -q '^model_proposed_decision_type:' "$proposal_get_stdout"
 grep -q '^model_requires_assignment:' "$proposal_get_stdout"
 
-e2e_orcas supervisor work proposals artifact-summary --proposal "$proposal_id" >"$proposal_summary_stdout"
+e2e_tt supervisor work proposals artifact-summary --proposal "$proposal_id" >"$proposal_summary_stdout"
 grep -q '^prompt_artifact_present:' "$proposal_summary_stdout"
 grep -q '^response_artifact_present:' "$proposal_summary_stdout"
 
 proposal_approve_output="$(
-  e2e_orcas supervisor work proposals approve \
+  e2e_tt supervisor work proposals approve \
     --proposal "$proposal_id" \
     --reviewed-by live-supervisor-micro-proposal \
     --review-note "Approve the bounded follow-up generated from the live report." \
@@ -188,7 +188,7 @@ grep -q "status: Approved" "$proposal_approve_stdout"
 grep -q "decision_type: Continue" "$proposal_approve_stdout"
 grep -q "next_assignment_id: $next_assignment_id" "$proposal_approve_stdout"
 
-e2e_orcas supervisor work proposals get --proposal "$proposal_id" >"$proposal_get_stdout"
+e2e_tt supervisor work proposals get --proposal "$proposal_id" >"$proposal_get_stdout"
 grep -q "status: Approved" "$proposal_get_stdout"
 grep -q "approved_decision_id: $decision_id" "$proposal_get_stdout"
 grep -q "approved_assignment_id: $next_assignment_id" "$proposal_get_stdout"
@@ -196,7 +196,7 @@ grep -q "approval_edits_present: true" "$proposal_get_stdout"
 grep -q "approval_edit_decision_type: Continue" "$proposal_get_stdout"
 grep -q "approved_proposed_decision_type: Continue" "$proposal_get_stdout"
 
-e2e_orcas supervisor work assignments get --assignment "$next_assignment_id" >"$next_assignment_get_stdout"
+e2e_tt supervisor work assignments get --assignment "$next_assignment_id" >"$next_assignment_get_stdout"
 next_assignment_work_unit_id="$(e2e_field_value work_unit_id "$next_assignment_get_stdout")"
 next_assignment_status="$(e2e_field_value status "$next_assignment_get_stdout")"
 next_assignment_attempt="$(e2e_field_value attempt "$next_assignment_get_stdout")"

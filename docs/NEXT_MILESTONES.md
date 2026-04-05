@@ -1,5 +1,5 @@
 # Next Milestones
 
-- Keep the Codex contract snapshot in `crates/orcas-codex/contracts/codex-contract-index.json` aligned with the local Codex checkout.
-- Add any future Orcas-facing typed fields to `orcas-codex::contract` before wiring them into runtime code.
-- When Codex updates land upstream, regenerate the snapshot with `cargo run -p orcas-codex --bin codex-contract-sync -- --root /home/emmy/openai/codex/codex-rs --out crates/orcas-codex/contracts/codex-contract-index.json` and run the contract drift test.
+- Keep the TT contract snapshot in `crates/tt-runtime/contracts/tt-contract-index.json` aligned with the local TT checkout.
+- Add any future TT-facing typed fields to `tt-runtime::contract` before wiring them into runtime code.
+- When TT updates land upstream, regenerate the snapshot with `cargo run -p tt-runtime --bin tt-contract-sync -- --out crates/tt-runtime/contracts/tt-contract-index.json` and run the contract drift test.

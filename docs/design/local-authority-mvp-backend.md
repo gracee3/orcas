@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-This design makes `orcasd` the explicit local authority for Orcas state in the MVP. The daemon becomes the only write path for mutable operator objects, backed by a small SQLite store with a canonical event log and a set of query projections that directly power the operator client.
+This design makes `ttd` the explicit local authority for TT state in the MVP. The daemon becomes the only write path for mutable operator objects, backed by a small SQLite store with a canonical event log and a set of query projections that directly power the operator client.
 
 The recommended MVP keeps the architecture intentionally disciplined:
 
@@ -15,7 +15,7 @@ The recommended MVP keeps the architecture intentionally disciplined:
 - tombstone-based deletes
 - future-ready seams for later replication without turning the local core into a fake cloud system now
 
-The key semantic decision is that Orcas should persist an Orcas-owned `tracked_thread` object, not treat upstream Codex runtime thread rows as directly owned mutable state. A tracked thread is a durable local record under a work unit that may reference an upstream runtime thread, but deleting it only removes Orcas tracking locally. It does not promise hard deletion of the upstream runtime thread.
+The key semantic decision is that TT should persist an TT-owned `tracked_thread` object, not treat upstream TT runtime thread rows as directly owned mutable state. A tracked thread is a durable local record under a work unit that may reference an upstream runtime thread, but deleting it only removes TT tracking locally. It does not promise hard deletion of the upstream runtime thread.
 
 This document is design rationale for the MVP rather than a current protocol reference. Later hardening phases retired most of the public legacy collaboration planning RPC family discussed below; for the current implemented contract, use [Collaboration](../collaboration.md) and [Architecture](../architecture.md).
 
@@ -27,12 +27,12 @@ Use SQLite as the local durable store. Treat the SQLite event log as the canonic
 
 ### Practical Shape
 
-- `orcas-core`
+- `tt-core`
   - domain IDs
   - command and event enums
   - projection/query DTOs
   - store traits that do not assume SQLite outside the trait boundary
-- `orcasd`
+- `ttd`
   - SQLite-backed store implementation
   - command handlers
   - projector
@@ -60,7 +60,7 @@ This keeps the store durable and portable while avoiding a heavy database layer.
 
 ### Event-Sourced, But Lightweight
 
-Yes, the event log should be the canonical write history, with projections as read models. For Orcas MVP this can stay small:
+Yes, the event log should be the canonical write history, with projections as read models. For TT MVP this can stay small:
 
 - one `event_log` table
 - one `command_receipts` table for idempotency
@@ -73,7 +73,7 @@ No distributed event bus is needed. No generic event framework is needed. SQLite
 
 ### Source Of Truth
 
-For MVP, the local daemon and its SQLite store are authoritative for Orcas-owned state.
+For MVP, the local daemon and its SQLite store are authoritative for TT-owned state.
 
 ### Entity Model
 
@@ -128,7 +128,7 @@ Suggested fields:
 
 ### Tracked Thread
 
-Purpose: Orcas-owned durable record that tracks a thread-like execution lane under a work unit.
+Purpose: TT-owned durable record that tracks a thread-like execution lane under a work unit.
 
 Suggested fields:
 
@@ -136,7 +136,7 @@ Suggested fields:
 - `work_unit_id`
 - `title`
 - `notes`
-- `backend_kind` such as `codex`
+- `backend_kind` such as `tt`
 - `upstream_thread_id` nullable
 - `binding_state` such as `unbound`, `bound`, `detached`, `missing`
 - `preferred_cwd` nullable
@@ -148,26 +148,26 @@ Suggested fields:
 
 ### Explicit Thread Semantics Decision
 
-For MVP, Orcas should persist a `tracked_thread` object locally. It should not model upstream Codex thread rows as Orcas-owned mutable entities.
+For MVP, TT should persist a `tracked_thread` object locally. It should not model upstream TT thread rows as TT-owned mutable entities.
 
 This resolves the semantic question as follows:
 
 - create:
-  - create a new Orcas tracking record under a work unit
+  - create a new TT tracking record under a work unit
   - it may start unbound
   - it may optionally bind to an existing upstream `thread_id`
 - edit:
-  - edit Orcas-owned metadata and binding fields
+  - edit TT-owned metadata and binding fields
   - examples: title, notes, preferred cwd, preferred model, local association to a different upstream thread if explicitly allowed
 - delete:
-  - tombstone the Orcas tracking record locally
+  - tombstone the TT tracking record locally
   - remove it from normal operator client hierarchy queries
   - never imply upstream hard deletion
 
-This is the right MVP contract because Orcas does control local supervision records, but it does not control the full lifecycle guarantees of upstream runtime storage. The tracked-thread model preserves a clean future seam:
+This is the right MVP contract because TT does control local supervision records, but it does not control the full lifecycle guarantees of upstream runtime storage. The tracked-thread model preserves a clean future seam:
 
-- today: Orcas owns local tracking
-- later: Orcas can replicate tracked-thread records and reconcile them with cloud-authoritative runtime objects
+- today: TT owns local tracking
+- later: TT can replicate tracked-thread records and reconcile them with cloud-authoritative runtime objects
 
 Product wording should prefer `tracked thread`. Internally and in architecture language it is a local binding record to upstream runtime state when an upstream reference exists.
 
@@ -424,7 +424,7 @@ Recommendation:
 - entity IDs: UUIDv7 strings
 - command IDs: UUIDv7 strings
 - event IDs: UUIDv7 strings
-- `origin_node_id`: stable UUID generated once per local Orcas installation and stored in `store_meta`
+- `origin_node_id`: stable UUID generated once per local TT installation and stored in `store_meta`
 
 UUIDv7 is preferred over UUIDv4 because it keeps ordering saner in SQLite and later sync logs.
 
@@ -634,8 +634,8 @@ Reasons:
 #### Deleting A Tracked Thread
 
 - tombstones only the local tracked-thread record
-- does not delete the upstream Codex thread
-- if an `upstream_thread_id` exists, the delete preview should say that Orcas tracking will be removed locally and the upstream thread may still exist
+- does not delete the upstream TT thread
+- if an `upstream_thread_id` exists, the delete preview should say that TT tracking will be removed locally and the upstream thread may still exist
 
 ### Confirmation UX
 
@@ -657,7 +657,7 @@ This gives the operator client a clean operator flow while keeping policy enforc
 
 On daemon boot:
 
-1. open SQLite database at the Orcas data path
+1. open SQLite database at the TT data path
 2. run migrations
 3. ensure `origin_node_id` exists
 4. validate projections against `projection_checkpoint`
@@ -684,14 +684,14 @@ Because writes are transactional, a crash should leave the database at the last 
 
 ### Migration From Current JSON State
 
-Earlier Orcas revisions persisted runtime state to `state.json`. The MVP implementation added a one-time import path:
+Earlier TT revisions persisted runtime state to `state.json`. The MVP implementation added a one-time import path:
 
 - if `state.db` does not exist and `state.json` does
 - import the current JSON snapshot into SQLite
 - generate creation events for imported active rows
 - preserve the JSON file as a backup during rollout
 
-That kept the design grounded in the repo’s pre-SQLite state rather than assuming a greenfield store. Current Orcas durability now lives in `state.db`; `state.json` is only a legacy import source when present.
+That kept the design grounded in the repo’s pre-SQLite state rather than assuming a greenfield store. Current TT durability now lives in `state.db`; `state.json` is only a legacy import source when present.
 
 ## 12. Explicit Future-Sync Seams Reserved For Later
 
@@ -727,11 +727,11 @@ The intended later evolution is straightforward:
 ### Pass 1: Domain And Store Skeleton
 
 - add `docs/adr` and design docs first
-- add domain IDs, command types, and event types in `orcas-core`
+- add domain IDs, command types, and event types in `tt-core`
 - add store traits for command append, event append, projection update, and query
 - add `state_db_file` path alongside the current JSON state path
 
-### Pass 2: SQLite Store In `orcasd`
+### Pass 2: SQLite Store In `ttd`
 
 - introduce a minimal SQLite dependency, preferably `rusqlite`
 - add migrations

@@ -1,6 +1,6 @@
 ## Tracked-Thread Workspace Lifecycle
 
-Orcas manages tracked-thread workspaces through an explicit, supervisor-driven lifecycle. Orcas owns intent, the worker performs git mutations, and the daemon only observes local git state read-only.
+TT manages tracked-thread workspaces through an explicit, supervisor-driven lifecycle. TT owns intent, the worker performs git mutations, and the daemon only observes local git state read-only.
 
 ### State layers
 
@@ -47,7 +47,7 @@ Worker sessions bind explicitly to a tracked thread through `WorkerSession.track
 Supervisor may trigger:
 
 ```bash
-orcas tracked-threads prepare-workspace <thread>
+tt tracked-threads prepare-workspace <thread>
 ```
 
 This creates a standardized workspace operation instructing the worker to create or normalize the declared lane.
@@ -57,7 +57,7 @@ This creates a standardized workspace operation instructing the worker to create
 Supervisor may trigger:
 
 ```bash
-orcas tracked-threads refresh-workspace <thread>
+tt tracked-threads refresh-workspace <thread>
 ```
 
 This creates a standardized workspace operation instructing the worker to sync the lane according to the declared policy without landing changes.
@@ -67,7 +67,7 @@ This creates a standardized workspace operation instructing the worker to sync t
 Supervisor may trigger:
 
 ```bash
-orcas tracked-threads merge-prep <thread>
+tt tracked-threads merge-prep <thread>
 ```
 
 This produces a bounded readiness assessment using:
@@ -91,7 +91,7 @@ with explicit reasons.
 Supervisor may trigger:
 
 ```bash
-orcas tracked-threads authorize-merge <thread>
+tt tracked-threads authorize-merge <thread>
 ```
 
 Authorization is only allowed when merge prep is ready. The authorization records:
@@ -110,7 +110,7 @@ Authorization is explicit and auditable. It does not execute the merge.
 Supervisor may trigger:
 
 ```bash
-orcas tracked-threads execute-landing <thread>
+tt tracked-threads execute-landing <thread>
 ```
 
 Execution is only allowed when there is a valid current authorization. The worker receives a dedicated landing contract tied to:
@@ -119,21 +119,21 @@ Execution is only allowed when there is a valid current authorization. The worke
 * authorized head commit
 * landing target
 
-The worker performs the landing. Orcas captures structured landing results and updates authorization/execution lifecycle state.
+The worker performs the landing. TT captures structured landing results and updates authorization/execution lifecycle state.
 
 #### 8. Prune workspace
 
 Supervisor may trigger:
 
 ```bash
-orcas tracked-threads prune-workspace <thread>
+tt tracked-threads prune-workspace <thread>
 ```
 
-Prune is conservatively gated and intended to close the lane after successful landing or explicit safe retirement. In the current implementation, Orcas only permits prune when there is a successful landing basis or the lane is already explicitly retired. The worker performs cleanup and emits structured prune results. Orcas surfaces intentional closure distinctly from accidental missing worktree state.
+Prune is conservatively gated and intended to close the lane after successful landing or explicit safe retirement. In the current implementation, TT only permits prune when there is a successful landing basis or the lane is already explicitly retired. The worker performs cleanup and emits structured prune results. TT surfaces intentional closure distinctly from accidental missing worktree state.
 
 ### Safety model
 
-Orcas does **not** perform git mutations itself in this workflow.
+TT does **not** perform git mutations itself in this workflow.
 
 Division of responsibility:
 

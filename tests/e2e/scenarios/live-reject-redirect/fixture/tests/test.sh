@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-expected="Hello, Orcas!"
+expected="Hello, TT!"
 binary="$(mktemp "${TMPDIR:-/tmp}/live-reject-redirect.XXXXXX")"
 trap 'rm -f "$binary"' EXIT
 cc main.c -o "$binary"
