@@ -646,6 +646,13 @@ struct ResolvedSpawnWorkstream {
     worktree_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedRoleDefinition {
+    name: String,
+    path: PathBuf,
+    is_override: bool,
+}
+
 impl SupervisorService {
     pub async fn load(overrides: &RuntimeOverrides) -> Result<Self> {
         let paths = AppPaths::discover()?;
@@ -746,6 +753,92 @@ impl SupervisorService {
         env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| anyhow!("unable to resolve home directory"))
+    }
+
+    fn repo_roles_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../roles")
+    }
+
+    fn local_roles_root() -> Result<PathBuf> {
+        Ok(Self::home_dir()?.join(".orcas/roles"))
+    }
+
+    fn role_file_in_root(root: &Path, role: &str) -> PathBuf {
+        root.join(role).join("role.md")
+    }
+
+    fn discover_roles_in_root(
+        root: &Path,
+        is_override: bool,
+        roles: &mut BTreeMap<String, ResolvedRoleDefinition>,
+    ) -> Result<()> {
+        if !root.exists() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let role_name = entry.file_name().to_string_lossy().into_owned();
+            let role_path = entry.path().join("role.md");
+            if !role_path.is_file() {
+                continue;
+            }
+            if is_override || !roles.contains_key(&role_name) {
+                roles.insert(
+                    role_name.clone(),
+                    ResolvedRoleDefinition {
+                        name: role_name,
+                        path: role_path,
+                        is_override,
+                    },
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn discover_roles_in_roots(
+        local_root: &Path,
+        repo_root: &Path,
+    ) -> Result<Vec<ResolvedRoleDefinition>> {
+        let mut roles = BTreeMap::new();
+        Self::discover_roles_in_root(repo_root, false, &mut roles)?;
+        Self::discover_roles_in_root(local_root, true, &mut roles)?;
+        Ok(roles.into_values().collect())
+    }
+
+    fn resolve_role_in_roots(
+        role: &str,
+        local_root: &Path,
+        repo_root: &Path,
+    ) -> Result<ResolvedRoleDefinition> {
+        let override_path = Self::role_file_in_root(local_root, role);
+        if override_path.is_file() {
+            return Ok(ResolvedRoleDefinition {
+                name: role.to_string(),
+                path: override_path,
+                is_override: true,
+            });
+        }
+
+        let repo_role = Self::role_file_in_root(repo_root, role);
+        if repo_role.is_file() {
+            return Ok(ResolvedRoleDefinition {
+                name: role.to_string(),
+                path: repo_role,
+                is_override: false,
+            });
+        }
+
+        bail!(
+            "role `{role}` was not found; expected {} or {}",
+            repo_role.display(),
+            override_path.display()
+        )
     }
 
     fn sanitize_workstream_name(name: &str) -> String {
@@ -953,26 +1046,43 @@ impl SupervisorService {
         Some(parent.to_path_buf())
     }
 
+    async fn derive_repo_root_from_worktree(worktree_path: &Path) -> Option<PathBuf> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let common_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        common_dir.parent().map(Path::to_path_buf)
+    }
+
     async fn load_role_prompt(&self, role: &str) -> Result<String> {
-        let override_path = Self::home_dir()?
-            .join(".orcas/roles")
-            .join(role)
-            .join("role.md");
-        if tokio::fs::try_exists(&override_path).await? {
-            return Ok(tokio::fs::read_to_string(&override_path).await?);
+        let resolved =
+            Self::resolve_role_in_roots(role, &Self::local_roles_root()?, &Self::repo_roles_root())?;
+        Ok(tokio::fs::read_to_string(&resolved.path).await?)
+    }
+
+    pub async fn roles_list(&self) -> Result<()> {
+        let local_root = Self::local_roles_root()?;
+        let repo_root = Self::repo_roles_root();
+        for role in Self::discover_roles_in_roots(&local_root, &repo_root)? {
+            let marker = if role.is_override { "*" } else { "" };
+            println!("{}{marker}\t{}", role.name, role.path.display());
         }
-        let repo_role = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../roles")
-            .join(role)
-            .join("role.md");
-        if tokio::fs::try_exists(&repo_role).await? {
-            return Ok(tokio::fs::read_to_string(&repo_role).await?);
-        }
-        bail!(
-            "role `{role}` was not found; expected {} or {}",
-            repo_role.display(),
-            override_path.display()
-        )
+        Ok(())
+    }
+
+    pub async fn roles_info(&self, role: &str) -> Result<()> {
+        let resolved =
+            Self::resolve_role_in_roots(role, &Self::local_roles_root()?, &Self::repo_roles_root())?;
+        println!("name: {}", resolved.name);
+        println!("path: {}", resolved.path.display());
+        Ok(())
     }
 
     pub async fn doctor(&self) -> Result<()> {
@@ -1862,6 +1972,45 @@ impl SupervisorService {
                     .map(|scope| format!("{:?}", scope.app_server_policy).to_ascii_lowercase())
                     .unwrap_or_else(|| "unset".to_string()),
                 workstream.title
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn worktrees_list(&self) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .authority_workstream_list(&ipc::AuthorityWorkstreamListRequest::default())
+            .await?;
+        for workstream in response.workstreams {
+            let worktree_path = workstream
+                .execution_scope
+                .as_ref()
+                .and_then(|scope| Self::derive_worktree_path_from_codex_home(Path::new(&scope.codex_home)))
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let branch_name = workstream
+                .execution_scope
+                .as_ref()
+                .and_then(|scope| Self::derive_worktree_path_from_codex_home(Path::new(&scope.codex_home)))
+                .and_then(|path| path.file_name().map(|value| value.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "-".to_string());
+            let repo_root = if worktree_path == "-" {
+                "-".to_string()
+            } else {
+                Self::derive_repo_root_from_worktree(Path::new(&worktree_path))
+                    .await
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            println!(
+                "{}\t{}\t{:?}\t{}\t{}\t{}",
+                workstream.id,
+                workstream.title,
+                workstream.status,
+                repo_root,
+                branch_name,
+                worktree_path
             );
         }
         Ok(())
@@ -6072,6 +6221,7 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     use chrono::Utc;
@@ -6495,6 +6645,55 @@ mod tests {
             decision.proposed_text.as_deref(),
             Some("stay within the current bounded test slice")
         );
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("orcas-{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn role_discovery_prefers_local_overrides() {
+        let repo_root = unique_test_dir("repo-roles");
+        let local_root = unique_test_dir("local-roles");
+        fs::create_dir_all(repo_root.join("plan")).expect("repo role dir");
+        fs::create_dir_all(repo_root.join("general")).expect("repo role dir");
+        fs::create_dir_all(local_root.join("plan")).expect("local role dir");
+        fs::write(repo_root.join("plan/role.md"), "# repo plan").expect("repo role file");
+        fs::write(repo_root.join("general/role.md"), "# repo general").expect("repo role file");
+        fs::write(local_root.join("plan/role.md"), "# local plan").expect("local role file");
+
+        let roles =
+            SupervisorService::discover_roles_in_roots(&local_root, &repo_root).expect("roles");
+
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles[0].name, "general");
+        assert!(!roles[0].is_override);
+        assert_eq!(roles[1].name, "plan");
+        assert!(roles[1].is_override);
+        assert_eq!(roles[1].path, local_root.join("plan/role.md"));
+
+        let _ = fs::remove_dir_all(&repo_root);
+        let _ = fs::remove_dir_all(&local_root);
+    }
+
+    #[test]
+    fn resolve_role_uses_expected_override_path() {
+        let repo_root = unique_test_dir("repo-role-resolution");
+        let local_root = unique_test_dir("local-role-resolution");
+        fs::create_dir_all(repo_root.join("plan")).expect("repo role dir");
+        fs::create_dir_all(local_root.join("plan")).expect("local role dir");
+        fs::write(repo_root.join("plan/role.md"), "# repo plan").expect("repo role file");
+        fs::write(local_root.join("plan/role.md"), "# local plan").expect("local role file");
+
+        let resolved = SupervisorService::resolve_role_in_roots("plan", &local_root, &repo_root)
+            .expect("resolved role");
+
+        assert_eq!(resolved.name, "plan");
+        assert!(resolved.is_override);
+        assert_eq!(resolved.path, local_root.join("plan/role.md"));
+
+        let _ = fs::remove_dir_all(&repo_root);
+        let _ = fs::remove_dir_all(&local_root);
     }
 
     #[tokio::test]

@@ -107,6 +107,11 @@ enum TopCommand {
         #[command(subcommand)]
         command: WorkunitCommand,
     },
+    Roles {
+        #[command(subcommand)]
+        command: RolesCommand,
+    },
+    Worktrees,
     AppServer {
         #[command(subcommand)]
         command: AppServerCommand,
@@ -142,6 +147,13 @@ enum AppServerCommand {
     Restart(AppServerNameArgs),
     Status(AppServerNameArgs),
     Info(AppServerNameArgs),
+}
+
+#[derive(Debug, Subcommand)]
+#[command(about = "Inspect Orcas role definitions")]
+enum RolesCommand {
+    List,
+    Info(RoleRefArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -443,6 +455,11 @@ struct EventsWatchArgs {
 struct AppServerNameArgs {
     #[arg(default_value = "default")]
     name: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RoleRefArgs {
+    role: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1969,6 +1986,17 @@ async fn main() -> Result<()> {
                 },
             }
         }
+        TopCommand::Roles { command } => {
+            let service = SupervisorService::load(&overrides).await?;
+            match command {
+                RolesCommand::List => service.roles_list().await?,
+                RolesCommand::Info(args) => service.roles_info(&args.role).await?,
+            }
+        }
+        TopCommand::Worktrees => {
+            let service = SupervisorService::load(&overrides).await?;
+            service.worktrees_list().await?;
+        }
         TopCommand::Codex { command } => {
             let service = SupervisorService::load(&overrides).await?;
             match command {
@@ -2077,6 +2105,8 @@ mod tests {
 
         assert!(help.contains("workstream"));
         assert!(help.contains("workunit"));
+        assert!(help.contains("roles"));
+        assert!(help.contains("worktrees"));
         assert!(help.contains("app-server"));
         assert!(help.contains("supervisor"));
         assert!(!help.contains("tracked-threads"));
@@ -2146,6 +2176,42 @@ mod tests {
             } => {
                 assert_eq!(args.name, "default");
             }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_top_level_roles_list_command() {
+        let cli = Cli::parse_from(["orcas", "roles", "list"]);
+
+        match cli.command {
+            TopCommand::Roles {
+                command: RolesCommand::List,
+            } => {}
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_top_level_roles_info_command() {
+        let cli = Cli::parse_from(["orcas", "roles", "info", "plan"]);
+
+        match cli.command {
+            TopCommand::Roles {
+                command: RolesCommand::Info(args),
+            } => {
+                assert_eq!(args.role, "plan");
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_top_level_worktrees_command() {
+        let cli = Cli::parse_from(["orcas", "worktrees"]);
+
+        match cli.command {
+            TopCommand::Worktrees => {}
             other => panic!("unexpected command parse: {other:?}"),
         }
     }
