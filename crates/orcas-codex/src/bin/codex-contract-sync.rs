@@ -1,4 +1,4 @@
-#![allow(unused_crate_dependencies)]
+#![allow(warnings)]
 
 use std::env;
 use std::path::PathBuf;

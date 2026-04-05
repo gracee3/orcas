@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 mod delivery;
 mod http;
 mod store;

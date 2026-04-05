@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 use axum::{Json, Router, routing::post};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;

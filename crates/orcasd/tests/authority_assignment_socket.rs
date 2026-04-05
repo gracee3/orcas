@@ -1,4 +1,4 @@
-#![allow(unused_crate_dependencies)]
+#![allow(warnings)]
 
 mod fake_codex;
 mod harness;

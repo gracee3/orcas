@@ -503,11 +503,11 @@ mod tests {
         SupervisorProposalFailure, SupervisorProposalFailureStage, SupervisorProposalRecord,
         SupervisorProposalStatus, SupervisorProposalTrigger, SupervisorProposalTriggerKind,
         SupervisorSourceReportContext, SupervisorStateAnchor, SupervisorSummary,
-        SupervisorWorkUnitContext, SupervisorWorkstreamPlanContext,
+        SupervisorWorkUnitContext,
     };
     use crate::{
         DecisionType, ReportConfidence, ReportDisposition, ReportParseResult,
-        planning::{PlanExecutionKind, PlanningState},
+        planning::PlanExecutionKind,
     };
 
     fn fixed_now() -> chrono::DateTime<Utc> {

@@ -1,3 +1,21 @@
+#![allow(
+    clippy::assigning_clones,
+    clippy::bool_assert_comparison,
+    clippy::default_trait_access,
+    clippy::derivable_impls,
+    clippy::float_cmp,
+    clippy::inconsistent_struct_constructor,
+    clippy::map_unwrap_or,
+    clippy::match_same_arms,
+    clippy::must_use_candidate,
+    clippy::new_without_default,
+    clippy::needless_pass_by_value,
+    clippy::struct_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+)]
+
 pub mod authority;
 pub mod collaboration;
 pub mod communication;

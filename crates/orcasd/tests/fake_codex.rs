@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Map, Value};

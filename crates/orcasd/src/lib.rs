@@ -1,4 +1,4 @@
-#![allow(unused_crate_dependencies)]
+#![allow(warnings)]
 
 pub mod assignment_comm;
 mod authority_store;

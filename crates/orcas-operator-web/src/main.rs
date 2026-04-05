@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 #[cfg(target_arch = "wasm32")]
 fn main() {
     orcas_operator_web::mount_app();

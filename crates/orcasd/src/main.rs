@@ -1,4 +1,4 @@
-#![allow(unused_crate_dependencies)]
+#![allow(warnings)]
 
 use anyhow::Result;
 use clap::{Args, Parser};

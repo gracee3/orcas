@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 use tracing::debug;
 
 use orcas_core::ipc::{

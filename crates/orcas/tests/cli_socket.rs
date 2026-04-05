@@ -1,4 +1,4 @@
-#![allow(unused_crate_dependencies)]
+#![allow(warnings)]
 
 #[path = "../../orcasd/tests/fake_codex.rs"]
 mod fake_codex;

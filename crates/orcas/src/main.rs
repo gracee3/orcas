@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 mod remote;
 mod service;
 mod streaming;

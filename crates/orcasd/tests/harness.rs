@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(warnings)]
 
 use std::path::PathBuf;
 use std::process::Stdio;

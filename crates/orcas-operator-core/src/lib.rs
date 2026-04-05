@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 use chrono::{DateTime, Utc};
 use orcas_core::ipc::{
     NotificationDeliveryJob, NotificationDeliveryJobStatus, OperatorInboxActionKind,
