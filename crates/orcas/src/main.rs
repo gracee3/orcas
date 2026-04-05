@@ -187,7 +187,7 @@ enum WorkstreamCommand {
     Add(WorkstreamAddArgs),
     Create(WorkstreamCreateArgs),
     Edit(WorkstreamEditArgs),
-    Delete(WorkstreamRefArgs),
+    Delete(WorkstreamDeleteArgs),
     List,
     Get(WorkstreamRefArgs),
 }
@@ -493,6 +493,11 @@ struct WorkstreamAddArgs {
 #[derive(Debug, Clone, Args)]
 struct WorkstreamRefArgs {
     #[arg(long)]
+    workstream: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct WorkstreamDeleteArgs {
     workstream: String,
 }
 
@@ -2357,6 +2362,28 @@ mod tests {
             }
             other => panic!("unexpected command parse: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_workstream_delete_with_positional_selector() {
+        let cli = Cli::parse_from(["orcas", "workstream", "delete", "testing"]);
+
+        match cli.command {
+            TopCommand::Workstream {
+                command: WorkstreamCommand::Delete(args),
+            } => {
+                assert_eq!(args.workstream, "testing");
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_legacy_flagged_workstream_delete_selector() {
+        let result =
+            Cli::try_parse_from(["orcas", "workstream", "delete", "--workstream", "testing"]);
+
+        assert!(result.is_err());
     }
 
     #[test]

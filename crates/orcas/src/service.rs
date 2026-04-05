@@ -857,6 +857,58 @@ impl SupervisorService {
         slug.trim_matches('-').to_string()
     }
 
+    fn default_workstream_branch_name(name: &str) -> Result<String> {
+        let slug = Self::sanitize_workstream_name(name);
+        if slug.is_empty() {
+            bail!("workstream name must contain at least one alphanumeric character");
+        }
+        Ok(format!("worktree/{slug}"))
+    }
+
+    fn default_worktree_dir_name(branch_name: &str) -> String {
+        branch_name
+            .rsplit('/')
+            .next()
+            .unwrap_or(branch_name)
+            .to_string()
+    }
+
+    fn resolve_workstream_summary_selector_from_list(
+        selector: &str,
+        workstreams: Vec<authority::WorkstreamSummary>,
+    ) -> Result<authority::WorkstreamSummary> {
+        if let Some(workstream) = workstreams
+            .iter()
+            .find(|workstream| workstream.id.as_str() == selector)
+            .cloned()
+        {
+            return Ok(workstream);
+        }
+
+        let matches = workstreams
+            .into_iter()
+            .filter(|workstream| workstream.title == selector)
+            .collect::<Vec<_>>();
+        match matches.len() {
+            0 => bail!("no workstream matched selector `{selector}`"),
+            1 => Ok(matches.into_iter().next().expect("single workstream")),
+            _ => bail!(
+                "selector `{selector}` matched multiple workstreams; use the workstream id instead"
+            ),
+        }
+    }
+
+    async fn resolve_workstream_summary_selector(
+        &self,
+        selector: &str,
+    ) -> Result<authority::WorkstreamSummary> {
+        let client = self.daemon_state_client().await?;
+        let response = client
+            .authority_workstream_list(&ipc::AuthorityWorkstreamListRequest::default())
+            .await?;
+        Self::resolve_workstream_summary_selector_from_list(selector, response.workstreams)
+    }
+
     async fn ensure_git_worktree(
         repo_root: &Path,
         worktree_path: &Path,
@@ -909,14 +961,11 @@ impl SupervisorService {
                 repo_root.display()
             )
         })?;
-        let branch_name = Self::sanitize_workstream_name(&name);
-        if branch_name.is_empty() {
-            bail!("workstream name must contain at least one alphanumeric character");
-        }
+        let branch_name = Self::default_workstream_branch_name(&name)?;
         let base_ref = Self::resolve_base_branch(&repo_root).await?;
         let worktree_root = Self::home_dir()?.join("openai/worktrees");
         tokio::fs::create_dir_all(&worktree_root).await?;
-        let worktree_path = worktree_root.join(&branch_name);
+        let worktree_path = worktree_root.join(Self::default_worktree_dir_name(&branch_name));
         if worktree_path.exists() {
             bail!(
                 "worktree path already exists for workstream `{name}`: {}",
@@ -988,51 +1037,35 @@ impl SupervisorService {
         &self,
         selector: &str,
     ) -> Result<ResolvedSpawnWorkstream> {
-        let client = self.daemon_state_client().await?;
-        let response = client
-            .authority_workstream_list(&ipc::AuthorityWorkstreamListRequest::default())
-            .await?;
-        let matches = response
-            .workstreams
-            .into_iter()
-            .filter(|workstream| {
-                workstream.id.to_string() == selector || workstream.title == selector
-            })
-            .collect::<Vec<_>>();
-        match matches.len() {
-            0 => bail!("no workstream matched selector `{selector}`"),
-            1 => {
-                let workstream = matches.into_iter().next().expect("single workstream");
-                let scope = workstream.execution_scope.as_ref().ok_or_else(|| {
-                    anyhow!(
-                        "workstream `{}` does not have an execution scope yet",
-                        workstream.title
-                    )
-                })?;
-                let worktree_path =
-                    Self::derive_worktree_path_from_codex_home(Path::new(&scope.codex_home))
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "unable to derive worktree path from codex_home {}",
-                                scope.codex_home
-                            )
-                        })?;
-                let branch_name = worktree_path
-                    .file_name()
-                    .map(|value| value.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                Ok(ResolvedSpawnWorkstream {
-                    workstream,
-                    repo_root: worktree_path.clone(),
-                    base_ref: "main".to_string(),
-                    branch_name,
-                    worktree_path,
-                })
-            }
-            _ => bail!(
-                "selector `{selector}` matched multiple workstreams; use the workstream id instead"
-            ),
-        }
+        let workstream = self.resolve_workstream_summary_selector(selector).await?;
+        let scope = workstream.execution_scope.as_ref().ok_or_else(|| {
+            anyhow!(
+                "workstream `{}` does not have an execution scope yet",
+                workstream.title
+            )
+        })?;
+        let worktree_path =
+            Self::derive_worktree_path_from_codex_home(Path::new(&scope.codex_home)).ok_or_else(
+                || anyhow!("unable to derive worktree path from codex_home {}", scope.codex_home),
+            )?;
+        let branch_name = Command::new("git")
+            .arg("-C")
+            .arg(&worktree_path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .await
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or_else(|| Self::default_workstream_branch_name(&workstream.title).unwrap_or_default());
+        Ok(ResolvedSpawnWorkstream {
+            workstream,
+            repo_root: worktree_path.clone(),
+            base_ref: "main".to_string(),
+            branch_name,
+            worktree_path,
+        })
     }
 
     fn derive_worktree_path_from_codex_home(codex_home: &Path) -> Option<PathBuf> {
@@ -1937,7 +1970,7 @@ impl SupervisorService {
 
     pub async fn workstream_delete(&self, workstream_id: &str) -> Result<()> {
         let client = self.daemon_state_client().await?;
-        let workstream_id = authority::WorkstreamId::parse(workstream_id.to_string())?;
+        let workstream_id = self.resolve_workstream_summary_selector(workstream_id).await?.id;
         let delete_plan = client
             .authority_delete_plan(&ipc::AuthorityDeletePlanRequest {
                 target: authority::DeleteTarget::Workstream {
@@ -6687,6 +6720,89 @@ mod tests {
 
         let _ = fs::remove_dir_all(&repo_root);
         let _ = fs::remove_dir_all(&local_root);
+    }
+
+    #[test]
+    fn default_workstream_branch_name_uses_worktree_prefix() {
+        let branch = SupervisorService::default_workstream_branch_name("New Workstream")
+            .expect("default branch");
+
+        assert_eq!(branch, "worktree/new-workstream");
+        assert_eq!(
+            SupervisorService::default_worktree_dir_name(&branch),
+            "new-workstream"
+        );
+    }
+
+    #[test]
+    fn resolve_workstream_selector_matches_by_exact_name() {
+        let workstreams = vec![
+            authority::WorkstreamSummary {
+                id: authority::WorkstreamId::parse("ws-1".to_string()).expect("workstream id"),
+                title: "testing".to_string(),
+                objective: "first".to_string(),
+                status: WorkstreamStatus::Active,
+                priority: "medium".to_string(),
+                execution_scope: None,
+                revision: authority::Revision::new(1),
+                updated_at: Utc::now(),
+                deleted_at: None,
+            },
+            authority::WorkstreamSummary {
+                id: authority::WorkstreamId::parse("ws-2".to_string()).expect("workstream id"),
+                title: "other".to_string(),
+                objective: "second".to_string(),
+                status: WorkstreamStatus::Active,
+                priority: "medium".to_string(),
+                execution_scope: None,
+                revision: authority::Revision::new(1),
+                updated_at: Utc::now(),
+                deleted_at: None,
+            },
+        ];
+
+        let resolved =
+            SupervisorService::resolve_workstream_summary_selector_from_list("testing", workstreams)
+                .expect("resolved workstream");
+
+        assert_eq!(resolved.title, "testing");
+        assert_eq!(resolved.id.as_str(), "ws-1");
+    }
+
+    #[test]
+    fn resolve_workstream_selector_rejects_ambiguous_name_matches() {
+        let workstreams = vec![
+            authority::WorkstreamSummary {
+                id: authority::WorkstreamId::parse("ws-a".to_string()).expect("workstream id"),
+                title: "testing".to_string(),
+                objective: "first".to_string(),
+                status: WorkstreamStatus::Active,
+                priority: "medium".to_string(),
+                execution_scope: None,
+                revision: authority::Revision::new(1),
+                updated_at: Utc::now(),
+                deleted_at: None,
+            },
+            authority::WorkstreamSummary {
+                id: authority::WorkstreamId::parse("ws-b".to_string()).expect("workstream id"),
+                title: "testing".to_string(),
+                objective: "second".to_string(),
+                status: WorkstreamStatus::Active,
+                priority: "medium".to_string(),
+                execution_scope: None,
+                revision: authority::Revision::new(1),
+                updated_at: Utc::now(),
+                deleted_at: None,
+            },
+        ];
+
+        let error = SupervisorService::resolve_workstream_summary_selector_from_list(
+            "testing",
+            workstreams,
+        )
+        .expect_err("ambiguous selector should fail");
+
+        assert!(error.to_string().contains("matched multiple workstreams"));
     }
 
     #[tokio::test]
