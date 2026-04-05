@@ -376,7 +376,7 @@ The operator-client-local `codex resume` child session manager is not part of da
 
 The daemon connects to a configured WebSocket endpoint, with a localhost endpoint used by default in the current configuration. The upstream transport details remain an internal implementation concern. Orcas surfaces the resulting thread, turn, collaboration, and authority query state through its own IPC contract instead of mirroring the upstream wire format wholesale.
 
-The one intentional exception is the operator client's local `codex resume` child TUI. `orcas tui` may launch that child process interactively, but it remains an operator-owned convenience layer rather than a daemon-owned source of supervision truth.
+The one intentional exception is the operator client's local `codex resume` child TUI. `orcas tui` may launch and manage those child processes interactively through a tabbed dashboard wrapper, but it remains an operator-owned convenience layer rather than a daemon-owned source of supervision truth.
 
 ## Operator And Client Surfaces
 

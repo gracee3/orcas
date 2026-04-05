@@ -14,6 +14,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 crossterm = "0.28.1"
+portable-pty = "0.9.0"
 serde.workspace = true
 orcas-server-client = { path = "../orcas-server-client" }
 orcasd = { path = "../orcasd" }
@@ -24,6 +25,7 @@ toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 ratatui = "0.29.0"
+vt100 = "0.15.0"
 
 [dev-dependencies]
 axum = "0.8.6"

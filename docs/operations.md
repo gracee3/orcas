@@ -42,9 +42,9 @@ The current checked-in operator surface is CLI-first:
 
 - `orcasd` is the durable local daemon and IPC boundary
 - `orcas` is the strongest checked-in operator surface
-- `orcas tui` is the checked-in dashboard wrapper for launching the upstream Codex TUI against a selected thread
+- `orcas tui` is the checked-in tabbed dashboard wrapper for launching and resuming live upstream Codex TUI sessions against selected threads
 
-The dashboard wrapper can be closed independently of the Codex child session it launches. If you resume a thread into the Codex TUI, that child process stays separate until you exit it directly.
+The dashboard wrapper can be closed independently of the Codex child sessions it launches. If you resume a thread into the Codex TUI, that child process stays separate and keeps running until you terminate it directly. The dashboard supports a toggleable HUD overlay and tab switching between live sessions.
 
 ## Logs
 

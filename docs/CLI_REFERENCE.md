@@ -174,8 +174,15 @@ These flags are accepted before any subcommand.
 - `orcas codex turns recent --thread <ID> [--limit <N>]`
 - `orcas codex turns get --thread <ID> --turn <ID>`
 
-`orcas tui` opens the Orcas dashboard wrapper. It shows daemon-visible workstreams and threads, and it can launch the real upstream `codex resume <THREAD>` TUI for the selected thread inside the current terminal.
-Closing the Orcas dashboard exits only the wrapper; the launched Codex TUI is a separate child process and ends only when that child session exits.
+`orcas tui` opens the Orcas tabbed dashboard wrapper. It can launch and resume live upstream `codex resume <THREAD>` TUI sessions inside the current terminal, switch between them, and show a toggleable HUD overlay with workstream/thread context.
+Closing the Orcas dashboard exits only the wrapper; the launched Codex TUI sessions are separate child processes and keep running until terminated directly.
+Dashboard key bindings:
+
+- `Ctrl+q` closes the Orcas wrapper only
+- `F2` toggles the HUD overlay
+- `F5` refreshes the daemon snapshot
+- `F6` / `F7` switch between live Codex session tabs
+- `F8` terminates the active Codex session
 
 `orcas codex worktree prune` accepts either a workstream selector or a tracked-thread id. It deletes the branch, prunes the worktree, and removes the corresponding authority record.
 
