@@ -38,7 +38,9 @@ use crate::streaming::{
     StreamingCommandRunner,
 };
 
-use toml::Value as TomlValue;
+use toml_edit::{
+    DocumentMut, Item as TomlEditItem, Table as TomlEditTable, value as toml_edit_value,
+};
 
 pub use orcasd::OrcasRuntimeOverrides as RuntimeOverrides;
 
@@ -855,36 +857,56 @@ impl SupervisorService {
         self.shared_app_server_codex_home().join("config.toml")
     }
 
-    fn load_shared_app_server_config(&self) -> Result<TomlValue> {
+    fn load_shared_app_server_config(&self) -> Result<DocumentMut> {
         let config_path = self.shared_app_server_config_file();
         if !config_path.is_file() {
-            return Ok(TomlValue::Table(Default::default()));
+            return Ok(DocumentMut::new());
         }
         let contents = fs::read_to_string(&config_path)
             .map_err(|error| anyhow!("failed to read {}: {error}", config_path.display()))?;
-        contents
-            .parse::<TomlValue>()
-            .map_err(|error| anyhow!("failed to parse {}: {error}", config_path.display()))
+        match contents.parse::<DocumentMut>() {
+            Ok(config) => Ok(config),
+            Err(error) => {
+                let repaired = format!("[projects]\n{contents}");
+                match repaired.parse::<DocumentMut>() {
+                    Ok(config) => {
+                        tracing::warn!(
+                            path = %config_path.display(),
+                            error = %error,
+                            "repaired malformed shared app-server config"
+                        );
+                        Ok(config)
+                    }
+                    Err(repair_error) => {
+                        tracing::warn!(
+                            path = %config_path.display(),
+                            error = %error,
+                            repair_error = %repair_error,
+                            "ignoring malformed shared app-server config"
+                        );
+                        Ok(DocumentMut::new())
+                    }
+                }
+            }
+        }
     }
 
-    fn write_shared_app_server_config(&self, config: &TomlValue) -> Result<()> {
+    fn write_shared_app_server_config(&self, config: &DocumentMut) -> Result<()> {
         let config_path = self.shared_app_server_config_file();
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let rendered = toml::to_string_pretty(config)
-            .map_err(|error| anyhow!("failed to render {}: {error}", config_path.display()))?;
-        fs::write(&config_path, rendered)
+        fs::write(&config_path, format!("{config}\n"))
             .map_err(|error| anyhow!("failed to write {}: {error}", config_path.display()))?;
         Ok(())
     }
 
     fn shared_app_server_trusted_project_count(&self) -> Result<usize> {
         let config = self.load_shared_app_server_config()?;
-        Ok(config
-            .as_table()
-            .and_then(|root| root.get("projects"))
-            .and_then(|projects| projects.as_table())
+        let root = config.as_table();
+        Ok(root
+            .get("projects")
+            .and_then(TomlEditItem::as_table)
             .map(|projects| projects.len())
             .unwrap_or(0))
     }
@@ -895,23 +917,24 @@ impl SupervisorService {
         trust_level: &str,
     ) -> Result<bool> {
         let mut config = self.load_shared_app_server_config()?;
-        let root = config
-            .as_table_mut()
-            .ok_or_else(|| anyhow!("shared app-server config is not a table"))?;
+        let root = config.as_table_mut();
         let projects = root
             .entry("projects")
-            .or_insert_with(|| TomlValue::Table(Default::default()));
+            .or_insert_with(|| TomlEditItem::Table(TomlEditTable::new()));
         let projects = projects
             .as_table_mut()
             .ok_or_else(|| anyhow!("shared app-server projects table is not a table"))?;
         let key = project_path.display().to_string();
         let existing = projects.get(&key).is_some();
-        let mut project_tbl = toml::map::Map::new();
-        project_tbl.insert(
-            "trust_level".to_string(),
-            TomlValue::String(trust_level.to_string()),
-        );
-        projects.insert(key, TomlValue::Table(project_tbl));
+        if !projects.contains_key(&key) {
+            projects.insert(key.as_str(), toml_edit::table());
+        }
+        let project = projects
+            .get_mut(&key)
+            .and_then(TomlEditItem::as_table_mut)
+            .ok_or_else(|| anyhow!("shared app-server project table is not a table"))?;
+        project.set_implicit(false);
+        project["trust_level"] = toml_edit_value(trust_level.to_string());
         self.write_shared_app_server_config(&config)?;
         Ok(!existing)
     }
@@ -922,13 +945,16 @@ impl SupervisorService {
             return Ok(false);
         }
         let mut config = self.load_shared_app_server_config()?;
-        let Some(root) = config.as_table_mut() else {
+        let root = config.as_table_mut();
+        let Some(projects) = root
+            .get_mut("projects")
+            .and_then(TomlEditItem::as_table_mut)
+        else {
             return Ok(false);
         };
-        let Some(projects) = root.get_mut("projects").and_then(|value| value.as_table_mut()) else {
-            return Ok(false);
-        };
-        let removed = projects.remove(&project_path.display().to_string()).is_some();
+        let removed = projects
+            .remove(&project_path.display().to_string())
+            .is_some();
         if removed {
             if projects.is_empty() {
                 root.remove("projects");
@@ -1378,10 +1404,7 @@ impl SupervisorService {
         let sqlite_home = lane_root.join("sqlite-home");
         tokio::fs::create_dir_all(&codex_home).await?;
         tokio::fs::create_dir_all(&sqlite_home).await?;
-        self.trust_shared_app_server_projects(&[
-            repo_root.as_path(),
-            worktree_path.as_path(),
-        ])?;
+        self.trust_shared_app_server_projects(&[repo_root.as_path(), worktree_path.as_path()])?;
 
         let execution_scope = build_execution_scope(
             Some(codex_home.display().to_string()),
