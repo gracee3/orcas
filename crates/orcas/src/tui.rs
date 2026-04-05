@@ -22,7 +22,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::service::SupervisorService;
 
-const HUD_TOP_HEIGHT: u16 = 3;
+const HUD_TOP_HEIGHT: u16 = 4;
 const HUD_BOTTOM_HEIGHT: u16 = 4;
 const HUD_FADE_STEP: f32 = 0.22;
 
@@ -542,23 +542,6 @@ fn render_border_hud(
 ) {
     let hud_border = hud_style(state.hud_opacity);
     let hud_accent = hud_accent_style(state.hud_opacity);
-    let tabs = if state.sessions.is_empty() {
-        "sessions: none".to_string()
-    } else {
-        state
-            .sessions
-            .iter()
-            .enumerate()
-            .map(|(index, session)| {
-                if Some(index) == state.active_tab {
-                    format!("[{}]", session.title())
-                } else {
-                    session.title()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" | ")
-    };
     let title = Line::from(vec![
         Span::styled(" Orcas TUI ", hud_accent),
         Span::raw(" border HUD "),
@@ -579,7 +562,7 @@ fn render_border_hud(
         Span::styled("f8", hud_accent),
         Span::raw(" terminate"),
     ]);
-    let top_lines = vec![title, shortcuts, Line::from(format!("tabs: {tabs}"))];
+    let top_lines = vec![title, shortcuts];
     let top_block = Block::default()
         .borders(Borders::ALL)
         .border_style(hud_border)
