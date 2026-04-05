@@ -179,6 +179,13 @@ enum CodexThreadsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[command(about = "Codex lane worktree lifecycle helpers")]
+enum CodexWorktreeCommand {
+    Add(CodexWorktreeAddArgs),
+    Prune(CodexWorktreePruneArgs),
+}
+
+#[derive(Debug, Subcommand)]
 enum SessionCommand {
     Active,
 }
@@ -305,6 +312,11 @@ enum CodexCommand {
         command: ModelsCommand,
     },
     Spawn(CodexSpawnArgs),
+    Resume(CodexResumeArgs),
+    Worktree {
+        #[command(subcommand)]
+        command: CodexWorktreeCommand,
+    },
     Threads {
         #[command(subcommand)]
         command: CodexThreadsCommand,
@@ -415,6 +427,15 @@ struct ThreadResumeArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+struct CodexResumeArgs {
+    thread: String,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
 struct CodexSpawnArgs {
     role: String,
     #[arg(long)]
@@ -427,6 +448,17 @@ struct CodexSpawnArgs {
     headless: bool,
     #[arg(long)]
     model: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CodexWorktreeAddArgs {
+    repo_root: PathBuf,
+    name: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CodexWorktreePruneArgs {
+    selector: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2030,6 +2062,19 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                 }
+                CodexCommand::Resume(args) => {
+                    service
+                        .thread_resume(&args.thread, args.cwd, args.model)
+                        .await?;
+                }
+                CodexCommand::Worktree { command } => match command {
+                    CodexWorktreeCommand::Add(args) => {
+                        service.workstream_add(args.repo_root, args.name).await?;
+                    }
+                    CodexWorktreeCommand::Prune(args) => {
+                        service.codex_worktree_prune(&args.selector).await?;
+                    }
+                },
                 CodexCommand::Threads { command } => match command {
                     CodexThreadsCommand::List(args) => {
                         service.threads_list(&args.workstream).await?
@@ -2297,6 +2342,56 @@ mod tests {
                 assert_eq!(args.new_workstream.as_deref(), Some("realign-v1"));
                 assert_eq!(args.repo_root, Some(PathBuf::from("/tmp/repo")));
                 assert!(args.headless);
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_codex_resume_command() {
+        let cli = Cli::parse_from(["orcas", "codex", "resume", "thread-1", "--model", "gpt-5.4"]);
+
+        match cli.command {
+            TopCommand::Codex {
+                command: CodexCommand::Resume(args),
+            } => {
+                assert_eq!(args.thread, "thread-1");
+                assert_eq!(args.model.as_deref(), Some("gpt-5.4"));
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_codex_worktree_add_command() {
+        let cli = Cli::parse_from(["orcas", "codex", "worktree", "add", "/tmp/repo", "ws-1"]);
+
+        match cli.command {
+            TopCommand::Codex {
+                command:
+                    CodexCommand::Worktree {
+                        command: CodexWorktreeCommand::Add(args),
+                    },
+            } => {
+                assert_eq!(args.repo_root, PathBuf::from("/tmp/repo"));
+                assert_eq!(args.name, "ws-1");
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_codex_worktree_prune_command() {
+        let cli = Cli::parse_from(["orcas", "codex", "worktree", "prune", "testing"]);
+
+        match cli.command {
+            TopCommand::Codex {
+                command:
+                    CodexCommand::Worktree {
+                        command: CodexWorktreeCommand::Prune(args),
+                    },
+            } => {
+                assert_eq!(args.selector, "testing");
             }
             other => panic!("unexpected command parse: {other:?}"),
         }

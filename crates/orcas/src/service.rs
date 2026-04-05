@@ -646,6 +646,22 @@ struct ResolvedSpawnWorkstream {
     worktree_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+enum ResolvedCodexWorktreeCleanupTarget {
+    Workstream {
+        workstream: authority::WorkstreamSummary,
+        repo_root: PathBuf,
+        worktree_path: PathBuf,
+        branch_name: String,
+    },
+    TrackedThread {
+        tracked_thread: authority::TrackedThreadRecord,
+        repo_root: PathBuf,
+        worktree_path: PathBuf,
+        branch_name: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedRoleDefinition {
     name: String,
@@ -964,6 +980,25 @@ impl SupervisorService {
             .to_string()
     }
 
+    async fn current_worktree_branch_name(worktree_path: &Path) -> Option<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if branch.is_empty() {
+            None
+        } else {
+            Some(branch)
+        }
+    }
+
     fn resolve_workstream_summary_selector_from_list(
         selector: &str,
         workstreams: Vec<authority::WorkstreamSummary>,
@@ -1141,16 +1176,8 @@ impl SupervisorService {
                 scope.codex_home
             )
         })?;
-        let branch_name = Command::new("git")
-            .arg("-C")
-            .arg(&worktree_path)
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
+        let branch_name = Self::current_worktree_branch_name(&worktree_path)
             .await
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-            .filter(|branch| !branch.is_empty())
             .unwrap_or_else(|| {
                 Self::default_workstream_branch_name(&workstream.title).unwrap_or_default()
             });
@@ -1187,6 +1214,186 @@ impl SupervisorService {
         }
         let common_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
         common_dir.parent().map(Path::to_path_buf)
+    }
+
+    async fn resolve_cleanup_target_from_workstream(
+        &self,
+        workstream: authority::WorkstreamSummary,
+    ) -> Result<ResolvedCodexWorktreeCleanupTarget> {
+        let scope = workstream.execution_scope.as_ref().ok_or_else(|| {
+            anyhow!(
+                "workstream `{}` does not have an execution scope yet",
+                workstream.title
+            )
+        })?;
+        let worktree_path = Self::derive_worktree_path_from_codex_home(Path::new(&scope.codex_home))
+            .ok_or_else(|| {
+                anyhow!(
+                    "unable to derive worktree path from codex_home {}",
+                    scope.codex_home
+                )
+            })?;
+        let repo_root = Self::derive_repo_root_from_worktree(&worktree_path)
+            .await
+            .ok_or_else(|| {
+                anyhow!(
+                    "unable to derive git repository root from worktree path {}",
+                    worktree_path.display()
+                )
+            })?;
+        let branch_name = Self::current_worktree_branch_name(&worktree_path)
+            .await
+            .unwrap_or_else(|| {
+                Self::default_workstream_branch_name(&workstream.title).unwrap_or_default()
+            });
+        Ok(ResolvedCodexWorktreeCleanupTarget::Workstream {
+            workstream,
+            repo_root,
+            worktree_path,
+            branch_name,
+        })
+    }
+
+    async fn resolve_cleanup_target_from_tracked_thread(
+        &self,
+        tracked_thread_id: &str,
+    ) -> Result<ResolvedCodexWorktreeCleanupTarget> {
+        let client = self.daemon_state_client().await?;
+        let tracked_thread = client
+            .authority_tracked_thread_get(&ipc::AuthorityTrackedThreadGetRequest {
+                tracked_thread_id: authority::TrackedThreadId::parse(
+                    tracked_thread_id.to_string(),
+                )?,
+            })
+            .await?
+            .tracked_thread;
+        let workspace = tracked_thread.workspace.clone().ok_or_else(|| {
+            anyhow!("tracked thread `{tracked_thread_id}` has no workspace")
+        })?;
+        Ok(ResolvedCodexWorktreeCleanupTarget::TrackedThread {
+            repo_root: PathBuf::from(&workspace.repository_root),
+            worktree_path: PathBuf::from(&workspace.worktree_path),
+            branch_name: workspace.branch_name.clone(),
+            tracked_thread,
+        })
+    }
+
+    async fn resolve_codex_worktree_cleanup_target(
+        &self,
+        selector: &str,
+    ) -> Result<ResolvedCodexWorktreeCleanupTarget> {
+        let workstream_result = self.resolve_workstream_summary_selector(selector).await;
+        let tracked_thread_result = if authority::TrackedThreadId::parse(selector.to_string())
+            .is_ok()
+        {
+            Some(self.resolve_cleanup_target_from_tracked_thread(selector).await)
+        } else {
+            None
+        };
+
+        match (workstream_result, tracked_thread_result) {
+            (Ok(_), Some(Ok(_))) => bail!(
+                "selector `{selector}` matched both a workstream and a tracked-thread; use a more specific selector"
+            ),
+            (Ok(workstream), _) => self.resolve_cleanup_target_from_workstream(workstream).await,
+            (Err(workstream_error), Some(Ok(tracked_thread))) => Ok(tracked_thread),
+            (Err(workstream_error), Some(Err(tracked_thread_error))) => {
+                Err(anyhow!("{workstream_error}; {tracked_thread_error}"))
+            }
+            (Err(workstream_error), None) => Err(workstream_error),
+        }
+    }
+
+    async fn git_prune_worktree(repo_root: &Path, worktree_path: &Path) -> Result<bool> {
+        if !worktree_path.exists() {
+            return Ok(false);
+        }
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(worktree_path)
+            .status()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to invoke `git worktree remove --force {}` from {}: {error}",
+                    worktree_path.display(),
+                    repo_root.display()
+                )
+            })?;
+        if !status.success() {
+            bail!(
+                "failed to remove worktree {} from {}: {status}",
+                worktree_path.display(),
+                repo_root.display()
+            );
+        }
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["worktree", "prune"])
+            .status()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to invoke `git worktree prune` from {}: {error}",
+                    repo_root.display()
+                )
+            })?;
+        if !status.success() {
+            bail!(
+                "`git worktree prune` failed from {} with status {}",
+                repo_root.display(),
+                status
+            );
+        }
+        Ok(true)
+    }
+
+    async fn git_delete_branch(repo_root: &Path, branch_name: &str) -> Result<bool> {
+        let exists = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch_name}"),
+            ])
+            .status()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to inspect branch `{branch_name}` from {}: {error}",
+                    repo_root.display()
+                )
+            })?;
+        if !exists.success() {
+            return Ok(false);
+        }
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["branch", "-D", branch_name])
+            .status()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to invoke `git branch -D {branch_name}` from {}: {error}",
+                    repo_root.display()
+                )
+            })?;
+        if !status.success() {
+            bail!(
+                "`git branch -D {branch_name}` failed from {} with status {}",
+                repo_root.display(),
+                status
+            );
+        }
+        Ok(true)
     }
 
     async fn load_role_prompt(&self, role: &str) -> Result<String> {
@@ -2117,6 +2324,124 @@ impl SupervisorService {
         Ok(())
     }
 
+    pub async fn codex_worktree_prune(&self, selector: &str) -> Result<()> {
+        let client = self.daemon_state_client().await?;
+        let target = self.resolve_codex_worktree_cleanup_target(selector).await?;
+        let (delete_target, target_kind, repo_root, worktree_path, branch_name) =
+            match target.clone() {
+                ResolvedCodexWorktreeCleanupTarget::Workstream {
+                    workstream,
+                    repo_root,
+                    worktree_path,
+                    branch_name,
+                } => (
+                    authority::DeleteTarget::Workstream {
+                        workstream_id: workstream.id,
+                    },
+                    "workstream",
+                    repo_root,
+                    worktree_path,
+                    branch_name,
+                ),
+                ResolvedCodexWorktreeCleanupTarget::TrackedThread {
+                    tracked_thread,
+                    repo_root,
+                    worktree_path,
+                    branch_name,
+                } => (
+                    authority::DeleteTarget::TrackedThread {
+                        tracked_thread_id: tracked_thread.id,
+                    },
+                    "tracked_thread",
+                    repo_root,
+                    worktree_path,
+                    branch_name,
+                ),
+            };
+
+        let delete_plan = client
+            .authority_delete_plan(&ipc::AuthorityDeletePlanRequest { target: delete_target })
+            .await?
+            .delete_plan;
+
+        let worktree_removed = Self::git_prune_worktree(&repo_root, &worktree_path).await?;
+        let branch_removed = Self::git_delete_branch(&repo_root, &branch_name).await?;
+
+        match target {
+            ResolvedCodexWorktreeCleanupTarget::Workstream { workstream, .. } => {
+                let response = client
+                    .authority_workstream_delete(&ipc::AuthorityWorkstreamDeleteRequest {
+                        command: authority::DeleteWorkstream {
+                            metadata: Self::authority_command_metadata(),
+                            workstream_id: workstream.id,
+                            expected_revision: delete_plan.expected_revision,
+                            delete_token: delete_plan.confirmation_token,
+                        },
+                    })
+                    .await?;
+                info!(
+                    surface = "cli",
+                    action = "codex_worktree_prune",
+                    target_kind = target_kind,
+                    workstream_id = %response.workstream.id,
+                    repo_root = %repo_root.display(),
+                    worktree_path = %worktree_path.display(),
+                    branch = %branch_name,
+                    worktree_removed,
+                    branch_removed,
+                    "pruned codex worktree lane"
+                );
+                println!("surface: codex_worktree_prune");
+                println!("target_kind: {target_kind}");
+                println!("workstream_id: {}", response.workstream.id);
+                println!("revision: {}", response.workstream.revision.get());
+                println!("repo_root: {}", repo_root.display());
+                println!("worktree_path: {}", worktree_path.display());
+                println!("branch_name: {branch_name}");
+                println!("worktree_removed: {worktree_removed}");
+                println!("branch_removed: {branch_removed}");
+                println!("deleted: {}", response.workstream.deleted_at.is_some());
+            }
+            ResolvedCodexWorktreeCleanupTarget::TrackedThread {
+                tracked_thread, ..
+            } => {
+                let response = client
+                    .authority_tracked_thread_delete(&ipc::AuthorityTrackedThreadDeleteRequest {
+                        command: authority::DeleteTrackedThread {
+                            metadata: Self::authority_command_metadata(),
+                            tracked_thread_id: tracked_thread.id.clone(),
+                            expected_revision: delete_plan.expected_revision,
+                            delete_token: delete_plan.confirmation_token,
+                        },
+                    })
+                    .await?;
+                info!(
+                    surface = "cli",
+                    action = "codex_worktree_prune",
+                    target_kind = target_kind,
+                    tracked_thread_id = %response.tracked_thread.id,
+                    repo_root = %repo_root.display(),
+                    worktree_path = %worktree_path.display(),
+                    branch = %branch_name,
+                    worktree_removed,
+                    branch_removed,
+                    "pruned codex worktree lane"
+                );
+                println!("surface: codex_worktree_prune");
+                println!("target_kind: {target_kind}");
+                println!("tracked_thread_id: {}", response.tracked_thread.id);
+                println!("revision: {}", response.tracked_thread.revision.get());
+                println!("repo_root: {}", repo_root.display());
+                println!("worktree_path: {}", worktree_path.display());
+                println!("branch_name: {branch_name}");
+                println!("worktree_removed: {worktree_removed}");
+                println!("branch_removed: {branch_removed}");
+                println!("deleted: {}", response.tracked_thread.deleted_at.is_some());
+            }
+        }
+        Ok(())
+    }
+
     pub async fn workstream_list(&self) -> Result<()> {
         let client = self.daemon_state_client().await?;
         let response = client
@@ -2154,17 +2479,13 @@ impl SupervisorService {
                 })
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let branch_name = workstream
-                .execution_scope
-                .as_ref()
-                .and_then(|scope| {
-                    Self::derive_worktree_path_from_codex_home(Path::new(&scope.codex_home))
-                })
-                .and_then(|path| {
-                    path.file_name()
-                        .map(|value| value.to_string_lossy().into_owned())
-                })
-                .unwrap_or_else(|| "-".to_string());
+            let branch_name = if worktree_path == "-" {
+                "-".to_string()
+            } else {
+                Self::current_worktree_branch_name(Path::new(&worktree_path))
+                    .await
+                    .unwrap_or_else(|| "-".to_string())
+            };
             let repo_root = if worktree_path == "-" {
                 "-".to_string()
             } else {
@@ -6893,6 +7214,96 @@ mod tests {
             SupervisorService::default_worktree_dir_name(&branch),
             "new-workstream"
         );
+    }
+
+    #[tokio::test]
+    async fn git_cleanup_prunes_worktree_and_deletes_branch() {
+        let repo_root = unique_test_dir("git-cleanup-repo");
+        let worktree_path = unique_test_dir("git-cleanup-worktree");
+        fs::create_dir_all(&repo_root).expect("repo root dir");
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {:?} failed with {status}", args);
+        };
+
+        run(&["-C", repo_root.to_str().expect("repo path"), "init"]);
+        run(&[
+            "-C",
+            repo_root.to_str().expect("repo path"),
+            "config",
+            "user.email",
+            "orcas@example.com",
+        ]);
+        run(&[
+            "-C",
+            repo_root.to_str().expect("repo path"),
+            "config",
+            "user.name",
+            "Orcas",
+        ]);
+        fs::write(repo_root.join("README.md"), "orcas\n").expect("seed file");
+        run(&["-C", repo_root.to_str().expect("repo path"), "add", "."]);
+        run(&[
+            "-C",
+            repo_root.to_str().expect("repo path"),
+            "commit",
+            "-m",
+            "initial",
+        ]);
+        run(&[
+            "-C",
+            repo_root.to_str().expect("repo path"),
+            "branch",
+            "-M",
+            "main",
+        ]);
+
+        let branch_name = "worktree/git-cleanup";
+        run(&[
+            "-C",
+            repo_root.to_str().expect("repo path"),
+            "worktree",
+            "add",
+            "-b",
+            branch_name,
+            worktree_path.to_str().expect("worktree path"),
+            "main",
+        ]);
+
+        assert!(worktree_path.exists());
+        let branch_exists = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo_root.to_str().expect("repo path"),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch_name}"),
+            ])
+            .status()
+            .expect("inspect branch");
+        assert!(branch_exists.success());
+
+        let pruned = SupervisorService::git_prune_worktree(&repo_root, &worktree_path)
+            .await
+            .expect("prune worktree");
+        assert!(pruned);
+        assert!(!worktree_path.exists());
+
+        let branch_removed = SupervisorService::git_delete_branch(&repo_root, branch_name)
+            .await
+            .expect("delete branch");
+        assert!(branch_removed);
+        let branch_removed_again = SupervisorService::git_delete_branch(&repo_root, branch_name)
+            .await
+            .expect("delete branch second time");
+        assert!(!branch_removed_again);
+
+        let _ = fs::remove_dir_all(&repo_root);
+        let _ = fs::remove_dir_all(&worktree_path);
     }
 
     #[test]
