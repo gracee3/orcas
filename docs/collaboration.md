@@ -2,7 +2,7 @@
 
 ## Overview
 
-Orcas keeps supervision state local, but the current implementation has more than one live state surface. The daemon owns the local IPC contract, the live bridge to the upstream Codex app-server, legacy collaboration state, and the authority store. The CLI is a daemon client. The operator client reads and mutates supervised state through the daemon, while also owning a local PTY-backed `codex resume` helper for interactive attachment to a selected thread.
+Orcas keeps supervision state local, but the current implementation has more than one live state surface. The daemon owns the local IPC contract, the live bridge to the upstream Codex app-server, legacy collaboration state, and the authority store. The CLI is a daemon client. The operator client reads and mutates supervised state through the daemon, while `orcas tui` provides the dashboard wrapper that can launch the real upstream `codex resume` TUI for a selected thread.
 
 This document describes the current implemented contract rather than an aspirational target. It focuses on:
 
@@ -23,7 +23,7 @@ Orcas currently models work across one daemon-owned durable store plus one opera
 - Collaboration/runtime state also persists in SQLite `state.db` as daemon-owned runtime snapshots and runtime-status rows.
 - `state/get` is a merged derived snapshot that combines daemon state with collaboration-owned summaries plus any explicit authority compatibility bridge rows needed for assignment execution.
 - `authority/hierarchy/get` is an authority-only hierarchy query over the SQLite store.
-- The operator client also keeps local PTY-backed `codex resume` session state that is not daemon-owned.
+- The operator client also can launch a local `codex resume` TUI session for a selected thread, but that child process is not daemon-owned.
 
 Tracked threads are Orcas-owned local binding records, not upstream Codex thread rows. A tracked thread may reference an `upstream_thread_id`, but create, edit, and delete operations act on the local Orcas record rather than claiming ownership of upstream runtime storage.
 
@@ -109,7 +109,7 @@ The review and collaboration operator surfaces now render plan revision recovery
 | Worker session | Daemon collaboration state | SQLite runtime snapshots in `state.db` | Internal daemon-only selection and lifecycle updates | No dedicated public query; visible indirectly through assignment behavior and persisted collaboration state | No | No |
 | Live thread state | Daemon live state mirrored from Codex | Thread mirror data in SQLite runtime snapshots in `state.db` | `thread/start`, `thread/resume`, daemon Codex event bridge, internal mirror maintenance | `state/get`, `threads/list*`, `thread/read*`, `thread/get` | Yes | No |
 | Live turn state | Daemon live state mirrored from Codex | Turn mirror data in SQLite runtime snapshots in `state.db` | `turn/start`, `turn/steer`, `turn/interrupt`, daemon Codex event bridge, internal mirror maintenance | `state/get` active thread view, `turns/list_active`, `turns/recent`, `turn/get`, `turn/attach` | Yes, through session and active thread data | No |
-| Local PTY-backed Codex resume session state | operator-client-local `CodexSessionManager` | None | operator client `ResumeSelectedThreadInCodex` action and local PTY lifecycle | operator-client-local state only | No | No |
+| Codex resume child session state | operator-client-local `CodexSessionManager` | None | operator client `ResumeSelectedThreadInCodex` action and local child-process lifecycle | operator-client-local state only | No | No |
 
 ### Projection, Visibility, And Restart Behavior
 
@@ -127,7 +127,7 @@ The review and collaboration operator surfaces now render plan revision recovery
 | Worker session | Collaboration-native internal state | No dedicated worker-session event | Survives daemon restart through runtime snapshots in `state.db`; no dedicated client reload surface exists today |
 | Live thread state | Derived from Codex plus daemon mirrors; not authority state | `UpstreamStatusChanged`, `SessionChanged`, `ThreadUpdated`, `TurnUpdated`, `ItemUpdated`, `OutputDelta` as applicable | Stored mirrors reload from runtime snapshots in `state.db`, but clients still treat reconnect as snapshot-first and `turn/attach` as daemon-instance scoped |
 | Live turn state | Derived from Codex plus daemon mirrors | `TurnUpdated`, `ItemUpdated`, `OutputDelta`, `SessionChanged` as applicable | Stored mirrors reload from runtime snapshots in `state.db`, but attach and stream continuity are not promised across daemon restart |
-| Local PTY-backed Codex resume session state | operator client-only derived and runtime-managed; not reflected in daemon read models | No daemon event visibility | Does not survive operator client process exit or restart; daemon reconnect does not recreate it |
+| Codex resume child session state | operator client-only derived and runtime-managed; not reflected in daemon read models | No daemon event visibility | Does not survive operator client process exit or restart; daemon reconnect does not recreate it |
 
 ## IPC Contract
 
@@ -227,7 +227,7 @@ Notifications are delivered on `events/notification` with Orcas-owned event enve
 - authority revisions, tombstones, or origin-node metadata
 - top-level proposal records, though work unit summaries can carry nested proposal summaries for collaboration-owned work units
 - worker-session records
-- operator-client-local PTY session state
+- operator-client-local Codex resume child session state
 
 Current limitations of the merged collaboration snapshot:
 
@@ -363,12 +363,12 @@ The current operator client reconnect path also treats authority-only view state
 
 ### operator client PTY Exception
 
-The operator-client-local PTY-backed `codex resume` session manager is not part of daemon state. It does not live in `state/get` or `authority/hierarchy/get`, and it is not reconstructed by daemon reconnect.
+The operator-client-local `codex resume` child session manager is not part of daemon state. It does not live in `state/get` or `authority/hierarchy/get`, and it is not reconstructed by daemon reconnect.
 
 - If the daemon restarts, the operator client must reconnect and reload daemon-owned state separately.
-- If the operator client process stays alive, an already-running local PTY helper can continue independently while the daemon reconnects because that PTY session is operator client-owned rather than daemon-owned.
-- If the operator client exits, the local PTY helper exits with it unless the operator detached it separately.
-- Local PTY session state should therefore be treated as operator convenience state rather than durable workflow state.
+- If the operator client process stays alive, an already-running local Codex resume child can continue independently while the daemon reconnects because that child session is operator client-owned rather than daemon-owned.
+- If the operator client exits, the local Codex resume child exits with it unless the operator detached it separately.
+- Local Codex child-session state should therefore be treated as operator convenience state rather than durable workflow state.
 
 ## Upstream Codex Integration
 
@@ -376,7 +376,7 @@ The operator-client-local PTY-backed `codex resume` session manager is not part 
 
 The daemon connects to a configured WebSocket endpoint, with a localhost endpoint used by default in the current configuration. The upstream transport details remain an internal implementation concern. Orcas surfaces the resulting thread, turn, collaboration, and authority query state through its own IPC contract instead of mirroring the upstream wire format wholesale.
 
-The one intentional exception is the operator client's local PTY-backed `codex resume` helper. That path is a local interactive attachment convenience rather than a daemon-owned source of supervision truth.
+The one intentional exception is the operator client's local `codex resume` child TUI. `orcas tui` may launch that child process interactively, but it remains an operator-owned convenience layer rather than a daemon-owned source of supervision truth.
 
 ## Operator And Client Surfaces
 
@@ -388,7 +388,7 @@ The one intentional exception is the operator client's local PTY-backed `codex r
 - The operator client retains one collaboration work-unit detail read, `workunit/get`, because it carries execution detail that is outside the authority planning hierarchy.
 - Non-canonical surfaces are intentionally frozen: new planning behavior should not be added to `workunit/get`, bridge rows, or other collaboration compatibility paths.
 - The daemon event stream is shared and now carries post-commit create, update, and delete notifications for authority workstreams, work units, and tracked threads.
-- The operator client's PTY-backed `codex resume` path is local to the operator client process and should be understood as an operator convenience layer rather than a daemon-managed session model.
+- The operator client's `codex resume` child process is local to the operator client process and should be understood as an operator convenience layer rather than a daemon-managed session model.
 
 ## Known Limitations Carried Into Later Phases
 

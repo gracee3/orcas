@@ -30,6 +30,7 @@ These flags are accepted before any subcommand.
 - `orcas roles ...`
 - `orcas worktrees`
 - `orcas app-server ...`
+- `orcas tui`
 - `orcas supervisor ...`
 - `orcas codex ...`
 - `orcas prompt ...`
@@ -172,6 +173,9 @@ These flags are accepted before any subcommand.
 - `orcas codex turns list-active`
 - `orcas codex turns recent --thread <ID> [--limit <N>]`
 - `orcas codex turns get --thread <ID> --turn <ID>`
+
+`orcas tui` opens the Orcas dashboard wrapper. It shows daemon-visible workstreams and threads, and it can launch the real upstream `codex resume <THREAD>` TUI for the selected thread inside the current terminal.
+Closing the Orcas dashboard exits only the wrapper; the launched Codex TUI is a separate child process and ends only when that child session exits.
 
 `orcas codex worktree prune` accepts either a workstream selector or a tracked-thread id. It deletes the branch, prunes the worktree, and removes the corresponding authority record.
 
