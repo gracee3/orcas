@@ -1,0 +1,14 @@
+# Project-scoped Codex config for multi-lane work.
+# This file is loaded only when the project is trusted.
+#
+# Keep lane-specific behavior in either:
+#   1) .codex/agents/*.toml for Codex custom agents / subagents, or
+#   2) Orcas thread-start settings.developer_instructions for standalone sessions.
+#
+# Do not set a top-level developer_instructions here unless you want every Codex
+# session in this repo to inherit the same lane role.
+
+[agents]
+max_threads = 6
+max_depth = 1
+job_max_runtime_seconds = 1800
