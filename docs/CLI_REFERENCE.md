@@ -1,6 +1,6 @@
 # Orcas CLI Reference
 
-This file is the command-line reference for `orcas` as implemented in [crates/orcas/src/main.rs](/home/emmy/openai/orcas/crates/orcas/src/main.rs) and [crates/orcas/src/remote.rs](/home/emmy/openai/orcas/crates/orcas/src/remote.rs).
+This file is the command-line reference for `orcas` as implemented in [crates/orcas/src/main.rs](/home/emmy/openai/tt/crates/orcas/src/main.rs) and [crates/orcas/src/remote.rs](/home/emmy/openai/tt/crates/orcas/src/remote.rs).
 
 ## Global Options
 

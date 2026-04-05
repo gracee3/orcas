@@ -3231,7 +3231,7 @@ fn WorkUnitCard(
                             <span>"Working directory"</span>
                             <input
                                 type="text"
-                                placeholder="/home/emmy/openai/orcas"
+                                placeholder="/home/emmy/openai/tt"
                                 prop:value=move || start_cwd.get()
                                 on:input=move |ev| start_cwd.set(event_target_value(&ev))
                             />
