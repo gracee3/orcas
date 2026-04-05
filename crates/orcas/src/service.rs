@@ -688,7 +688,7 @@ impl SupervisorService {
     }
 
     fn codex_role_pack_source_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../codex-role-pack/.codex")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.codex")
     }
 
     fn codex_role_pack_target_root(home_root: &Path) -> PathBuf {

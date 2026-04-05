@@ -2,7 +2,7 @@
 
 This package is the shared runtime role pack for the Orcas-managed app-server home.
 
-Orcas keeps the checked-in template under `codex-role-pack/` and refreshes the runtime `.codex` subtree into the shared app-server `CODEX_HOME`.
+Orcas keeps the checked-in template under `.codex/` and refreshes the runtime `.codex` subtree into the shared app-server `CODEX_HOME`.
 
 This package is set up for two distinct use cases:
 
@@ -11,7 +11,7 @@ This package is set up for two distinct use cases:
    - Use when a parent Codex session will explicitly spawn role-specific agents.
 
 2. **Orcas-launched standalone Codex sessions**
-   - Files: `orcas/role-instructions/*.md`
+   - Files: `.codex/orcas/role-instructions/*.md`
    - Use when Orcas starts a Codex thread directly and can set per-thread developer instructions.
 
 The same role content is used in both places so behavior stays aligned.
@@ -73,11 +73,11 @@ The older `instructions` key should be avoided.
 .codex/agents/harness.toml
 .codex/agents/feature.toml
 .codex/agents/todo.toml
-orcas/role-instructions/integration.md
-orcas/role-instructions/harness.md
-orcas/role-instructions/feature.md
-orcas/role-instructions/todo.md
-docs/roles.md
+.codex/orcas/role-instructions/integration.md
+.codex/orcas/role-instructions/harness.md
+.codex/orcas/role-instructions/feature.md
+.codex/orcas/role-instructions/todo.md
+.codex/docs/roles.md
 ```
 
 ---
@@ -91,7 +91,7 @@ Minimal pattern:
 ```json
 {
   "settings": {
-    "developer_instructions": "<contents of orcas/role-instructions/integration.md>"
+    "developer_instructions": "<contents of .codex/orcas/role-instructions/integration.md>"
   }
 }
 ```

@@ -1,9 +1,5 @@
 # Codex role pack for Orcas
 
-This directory is the checked-in template for the shared Orcas app-server home.
-
-Orcas refreshes the `.codex` subtree from this pack into the shared app-server `CODEX_HOME` on app-server setup/start.
-
 Included:
 - project-scoped Codex custom-agent files under `.codex/agents/`
 - matching plain role-instruction files for Orcas direct injection
