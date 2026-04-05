@@ -134,6 +134,7 @@ pub fn apply_runtime_overrides(config: &mut AppConfig, overrides: &OrcasRuntimeO
     }
     if let Some(listen_url) = &overrides.listen_url {
         config.codex.listen_url = listen_url.clone();
+        config.codex.app_server.default.listen_url = listen_url.clone();
     }
     if let Some(server_url) = &overrides.inbox_mirror_server_url {
         config.inbox_mirror.server_url = Some(server_url.clone());
@@ -146,9 +147,6 @@ pub fn apply_runtime_overrides(config: &mut AppConfig, overrides: &OrcasRuntimeO
     }
     if overrides.connect_only {
         config.codex.connection_mode = CodexConnectionMode::ConnectOnly;
-    }
-    if overrides.force_spawn {
-        config.codex.connection_mode = CodexConnectionMode::SpawnAlways;
     }
 }
 

@@ -396,8 +396,8 @@ impl OrcasDaemonService {
                 transport_kind: authority::WorkstreamTransportKind::LocalAppServer,
                 app_server_policy: authority::WorkstreamAppServerPolicy::SharedCurrentDaemon,
                 connection_mode: Self::workstream_connection_mode_from_config(&self.config),
-                desired_listen_url: Some(self.config.codex.listen_url.clone()),
-                effective_listen_url: Some(self.config.codex.listen_url.clone()),
+                desired_listen_url: Some(self.config.codex.effective_listen_url().to_string()),
+                effective_listen_url: Some(self.config.codex.effective_listen_url().to_string()),
                 codex_home: String::new(),
                 sqlite_home: None,
                 owner_kind: Some("orcasd_shared_runtime".to_string()),
@@ -433,7 +433,9 @@ impl OrcasDaemonService {
             config.defaults.cwd.clone(),
         ));
         let codex_client = CodexClient::new(
-            Arc::new(WebSocketTransport::new(config.codex.listen_url.clone())),
+            Arc::new(WebSocketTransport::new(
+                config.codex.effective_listen_url().to_string(),
+            )),
             config.codex.reconnect.clone(),
             Arc::new(RejectingApprovalRouter),
         );
@@ -572,7 +574,7 @@ impl OrcasDaemonService {
         {
             let mut state = self.state.write().await;
             state.upstream = ConnectionState {
-                endpoint: self.config.codex.listen_url.clone(),
+                endpoint: self.config.codex.effective_listen_url().to_string(),
                 status: "disconnected".to_string(),
                 detail: None,
             };
@@ -733,7 +735,7 @@ impl OrcasDaemonService {
             match app_server_policy {
                 authority::WorkstreamAppServerPolicy::SharedCurrentDaemon => (
                     format!("shared_{}", upstream.status),
-                    Some(self.config.codex.listen_url.clone()),
+                    Some(self.config.codex.effective_listen_url().to_string()),
                     Some("orcasd_shared_runtime".to_string()),
                     Some(self.runtime.pid),
                     Some(self.runtime.started_at),
@@ -770,21 +772,17 @@ impl OrcasDaemonService {
         config: &AppConfig,
     ) -> authority::WorkstreamExecutionConnectionMode {
         match config.codex.connection_mode {
-            CodexConnectionMode::ConnectOnly => {
+            CodexConnectionMode::ConnectOnly
+            | CodexConnectionMode::SpawnIfNeeded
+            | CodexConnectionMode::SpawnAlways => {
                 authority::WorkstreamExecutionConnectionMode::ConnectOnly
-            }
-            CodexConnectionMode::SpawnIfNeeded => {
-                authority::WorkstreamExecutionConnectionMode::SpawnIfNeeded
-            }
-            CodexConnectionMode::SpawnAlways => {
-                authority::WorkstreamExecutionConnectionMode::SpawnAlways
             }
         }
     }
 
     fn shared_runtime_route_info(&self) -> RuntimeRouteInfo {
         RuntimeRouteInfo {
-            endpoint: self.config.codex.listen_url.clone(),
+            endpoint: self.config.codex.effective_listen_url().to_string(),
             runtime_workstream_id: None,
         }
     }
@@ -896,62 +894,6 @@ impl OrcasDaemonService {
             .supervisor_turn_decisions
             .values()
             .any(|decision| decision.codex_thread_id == thread_id)
-    }
-
-    fn desired_thread_owner_workstream_id(state: &DaemonState, thread_id: &str) -> Option<String> {
-        let mut workstream_ids = BTreeSet::new();
-
-        for planning_session in state.collaboration.planning_sessions.values() {
-            if planning_session.planning_thread_id == thread_id {
-                workstream_ids.insert(planning_session.workstream_id.clone());
-            }
-        }
-
-        for codex_assignment in state.collaboration.codex_thread_assignments.values() {
-            if codex_assignment.codex_thread_id == thread_id {
-                workstream_ids.insert(codex_assignment.workstream_id.clone());
-            }
-        }
-
-        for worker_session in state.collaboration.worker_sessions.values() {
-            if worker_session.thread_id.as_deref() != Some(thread_id) {
-                continue;
-            }
-            let Some(assignment) = state
-                .collaboration
-                .assignments
-                .values()
-                .find(|assignment| assignment.worker_session_id == worker_session.id)
-            else {
-                continue;
-            };
-            let Some(work_unit) = state.collaboration.work_units.get(&assignment.work_unit_id)
-            else {
-                continue;
-            };
-            workstream_ids.insert(work_unit.workstream_id.clone());
-        }
-
-        for decision in state.collaboration.supervisor_turn_decisions.values() {
-            if decision.codex_thread_id != thread_id {
-                continue;
-            }
-            let Some(assignment) = state.collaboration.assignments.get(&decision.assignment_id)
-            else {
-                continue;
-            };
-            let Some(work_unit) = state.collaboration.work_units.get(&assignment.work_unit_id)
-            else {
-                continue;
-            };
-            workstream_ids.insert(work_unit.workstream_id.clone());
-        }
-
-        if workstream_ids.len() == 1 {
-            workstream_ids.into_iter().next()
-        } else {
-            None
-        }
     }
 
     fn desired_thread_management_state(
@@ -1482,7 +1424,7 @@ impl OrcasDaemonService {
             self.derive_workstream_runtime_summary(
                 workstream,
                 &ConnectionState {
-                    endpoint: self.config.codex.listen_url.clone(),
+                    endpoint: self.config.codex.effective_listen_url().to_string(),
                     status: "disconnected".to_string(),
                     detail: None,
                 },
@@ -2772,7 +2714,7 @@ impl OrcasDaemonService {
         Ok(ipc::DaemonStatusResponse {
             socket_path: self.paths.socket_file.display().to_string(),
             metadata_path: self.paths.daemon_metadata_file.display().to_string(),
-            codex_endpoint: self.config.codex.listen_url.clone(),
+            codex_endpoint: self.config.codex.effective_listen_url().to_string(),
             codex_binary_path: self.config.codex.binary_path.display().to_string(),
             upstream,
             client_count: self.client_count.load(Ordering::SeqCst),
@@ -15585,16 +15527,23 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
     async fn connect_upstream(&self) -> OrcasResult<()> {
         debug!(
             mode = ?self.config.codex.connection_mode,
-            listen_url = %self.config.codex.listen_url,
+            listen_url = %self.config.codex.effective_listen_url(),
             "connecting to upstream codex"
         );
         let _guard = self.connect_gate.lock().await;
         if self.codex_client.is_ready().await {
             debug!(
-                listen_url = %self.config.codex.listen_url,
+                listen_url = %self.config.codex.effective_listen_url(),
                 "upstream codex client already connected and initialized"
             );
             return Ok(());
+        }
+        if self.config.codex.connection_mode != CodexConnectionMode::ConnectOnly {
+            warn!(
+                configured_mode = ?self.config.codex.connection_mode,
+                listen_url = %self.config.codex.effective_listen_url(),
+                "legacy codex spawn mode configured, but orcasd no longer spawns app-servers; using connect-only"
+            );
         }
         let launch =
             Self::codex_launch_for_upstream_connect(self.config.codex.connection_mode.clone());
@@ -15631,15 +15580,10 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
     }
 
     fn codex_launch_for_upstream_connect(mode: CodexConnectionMode) -> CodexDaemonLaunch {
-        // `spawn_always` is appropriate when bringing the daemon up, but
-        // reconnecting on every request would churn the upstream app-server and
-        // race its listener port. Once Orcas is live, keep the upstream alive
-        // if it is reachable and only spawn when a restart is actually needed.
         match mode {
-            CodexConnectionMode::ConnectOnly => CodexDaemonLaunch::Never,
-            CodexConnectionMode::SpawnIfNeeded | CodexConnectionMode::SpawnAlways => {
-                CodexDaemonLaunch::IfNeeded
-            }
+            CodexConnectionMode::ConnectOnly
+            | CodexConnectionMode::SpawnIfNeeded
+            | CodexConnectionMode::SpawnAlways => CodexDaemonLaunch::Never,
         }
     }
 
@@ -15749,7 +15693,7 @@ Call out blockers, uncertainty, or risky/destructive changes before taking them.
                         (metadata.id.clone(), metadata)
                     })
                     .collect(),
-                last_connected_endpoint: Some(self.config.codex.listen_url.clone()),
+                last_connected_endpoint: Some(self.config.codex.effective_listen_url().to_string()),
             };
             StoredState {
                 registry,
