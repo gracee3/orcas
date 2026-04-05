@@ -73,6 +73,7 @@ These flags are accepted before any subcommand.
 `orcas workstream add` and `orcas codex spawn --new-workstream` generate `worktree/<slug>` branch names by default and create worktree directories under the configured worktree root. The default root is `~/worktrees/orcas`.
 `orcas app-server add default` and `orcas app-server start default` refresh the managed `.codex/` template into the shared app-server `CODEX_HOME`.
 `orcas workstream delete` deletes the authority record only. Use `orcas codex worktree prune <SELECTOR>` when you want to delete the branch, prune the git worktree, and delete the authority record in one lane-oriented operation.
+`orcas codex worktree prune` is the atomic lane cleanup path; `orcas workstream delete` is the authority-only path.
 
 ## Roles
 

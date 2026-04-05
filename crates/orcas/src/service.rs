@@ -2393,6 +2393,7 @@ impl SupervisorService {
                 );
                 println!("surface: codex_worktree_prune");
                 println!("target_kind: {target_kind}");
+                println!("cleanup_mode: atomic_lane_cleanup");
                 println!("workstream_id: {}", response.workstream.id);
                 println!("revision: {}", response.workstream.revision.get());
                 println!("repo_root: {}", repo_root.display());
@@ -2429,6 +2430,7 @@ impl SupervisorService {
                 );
                 println!("surface: codex_worktree_prune");
                 println!("target_kind: {target_kind}");
+                println!("cleanup_mode: atomic_lane_cleanup");
                 println!("tracked_thread_id: {}", response.tracked_thread.id);
                 println!("revision: {}", response.tracked_thread.revision.get());
                 println!("repo_root: {}", repo_root.display());
