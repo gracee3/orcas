@@ -91,6 +91,13 @@ TT is written in Rust and designed to be fast and portable. The runtime is built
 
 Inside the workspace, the responsibilities are separated cleanly. `tt-core` holds shared types, errors, paths, and IPC structures. `tt-runtime` handles the TT connection and typed `app-server` surface. `ttd` builds `ttd`, the long-lived daemon. `tt` builds the `tt` CLI.
 
+Linux sandbox support now follows the same split:
+
+- `tt-sandboxing` owns TT-specific sandbox policy shaping and Linux execution planning
+- `tt-linux-sandbox` is the standalone Linux helper that reads a sandbox request and launches the command
+
+The daemon uses the shared policy helper when it derives workspace-write sandbox roots for tracked threads, so the workspace/worktree rules live in one place instead of being duplicated across the daemon and helper binary.
+
 ## Building from source
 
 If you are building from source, install a stable Rust toolchain and build from the repository root.

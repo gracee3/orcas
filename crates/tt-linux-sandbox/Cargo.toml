@@ -9,7 +9,12 @@ rust-version.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+tt-runtime = { path = "../tt-runtime" }
 tt-sandboxing = { path = "../tt-sandboxing" }
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
+tempfile = "3.23.0"
 
 [lints]
 workspace = true
