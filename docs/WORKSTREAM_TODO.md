@@ -63,3 +63,4 @@ Tracked backlog for the active direct skill thread.
 - Implemented the lane filesystem layout scaffold and the `tt lane init|inspect|cleanup` CLI surface.
 - Added explicit lane/workspace manifest fields and surfaced discovered lane roots in `tt doctor`.
 - Added lane attachment mirroring so `tt lane attach|detach` updates tracked-thread binding state and records the attachment list in the workspace manifest.
+- Added `tt lane list` plus a cleanup guard that refuses to delete live-attached workspaces without `--force`.

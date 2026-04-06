@@ -215,6 +215,8 @@ enum TTWorktreeCommand {
 #[derive(Debug, Subcommand)]
 #[command(about = "Manage lane-local runtimes and rendered directory state")]
 enum LaneCommand {
+    /// List rendered lane roots and attachment counts.
+    List,
     Init(LaneInitArgs),
     Inspect(LaneInspectArgs),
     Attach(LaneAttachArgs),
@@ -556,6 +558,8 @@ struct LaneCleanupArgs {
     workspace: Option<String>,
     #[arg(long, value_enum, default_value_t = LaneCleanupScopeArg::Runtime)]
     scope: LaneCleanupScopeArg,
+    #[arg(long, default_value_t = false)]
+    force: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1619,6 +1623,7 @@ async fn main() -> Result<()> {
         TopCommand::Lane { command } => {
             let service = SupervisorService::load(&overrides).await?;
             match command {
+                LaneCommand::List => service.lane_list().await?,
                 LaneCommand::Init(args) => service.lane_init(&args.label, &args.repos).await?,
                 LaneCommand::Inspect(args) => service.lane_inspect(&args.label).await?,
                 LaneCommand::Attach(args) => {
@@ -1654,6 +1659,7 @@ async fn main() -> Result<()> {
                             args.repo.as_deref(),
                             args.workspace.as_deref(),
                             scope,
+                            args.force,
                         )
                         .await?;
                 }
@@ -2496,6 +2502,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_top_level_lane_list_command() {
+        let cli = Cli::parse_from(["tt", "lane", "list"]);
+
+        match cli.command {
+            TopCommand::Lane {
+                command: LaneCommand::List,
+            } => {}
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_top_level_lane_attach_command() {
         let cli = Cli::parse_from([
             "tt",
@@ -2542,6 +2560,30 @@ mod tests {
                 assert_eq!(args.repo, "openai/codex");
                 assert_eq!(args.tracked_thread, "tt-1");
                 assert!(args.workspace.is_none());
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_top_level_lane_cleanup_force_command() {
+        let cli = Cli::parse_from([
+            "tt",
+            "lane",
+            "cleanup",
+            "directory and worktree requirements",
+            "--repo",
+            "openai/codex",
+            "--force",
+        ]);
+
+        match cli.command {
+            TopCommand::Lane {
+                command: LaneCommand::Cleanup(args),
+            } => {
+                assert_eq!(args.label, "directory and worktree requirements");
+                assert_eq!(args.repo.as_deref(), Some("openai/codex"));
+                assert!(args.force);
             }
             other => panic!("unexpected command parse: {other:?}"),
         }

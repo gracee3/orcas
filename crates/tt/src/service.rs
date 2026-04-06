@@ -1503,6 +1503,14 @@ impl SupervisorService {
         Ok(entries)
     }
 
+    fn lane_manifest_attachment_count(manifest: &WorkspaceManifest) -> usize {
+        manifest.attached_tracked_thread_ids.len()
+    }
+
+    fn lane_workspace_has_live_attachments(manifest: &WorkspaceManifest) -> bool {
+        !manifest.attached_tracked_thread_ids.is_empty()
+    }
+
     fn lane_workspace_manifest_path(
         &self,
         label: &str,
@@ -1611,6 +1619,58 @@ impl SupervisorService {
                         manifest.attached_tracked_thread_ids.join(",")
                     );
                 }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn lane_list(&self) -> Result<()> {
+        let lanes_root = self.paths.data_dir.join("lanes");
+        println!("lanes_root: {}", lanes_root.display());
+        if !lanes_root.exists() {
+            return Ok(());
+        }
+        for lane_entry in fs::read_dir(&lanes_root)? {
+            let lane_entry = lane_entry?;
+            if !lane_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let lane_root = lane_entry.path();
+            let lane_manifest_path = lane_root.join("lane.toml");
+            let lane_manifest = read_toml::<LaneManifest>(&lane_manifest_path)?;
+            let lane_label = lane_manifest
+                .as_ref()
+                .map(|manifest| manifest.label.as_str())
+                .unwrap_or("(unknown)");
+            let lane_slug = lane_manifest
+                .as_ref()
+                .map(|manifest| manifest.slug.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| lane_entry.file_name().to_string_lossy().into_owned());
+            println!("lane: {lane_label}\t{lane_slug}\t{}", lane_root.display());
+            if let Some(manifest) = lane_manifest.as_ref() {
+                println!(
+                    "lane_schema_version: {}\tlane_created_at: {}",
+                    manifest.schema_version, manifest.created_at
+                );
+            }
+            for (org, repo, workspace_name, workspace_path) in
+                Self::lane_workspace_records(&lane_root.join("worktrees"))?
+            {
+                let workspace_manifest_path = lane_root
+                    .join("worktrees")
+                    .join(&org)
+                    .join(&repo)
+                    .join(&workspace_name)
+                    .join("workspace.toml");
+                let attachment_count = read_toml::<WorkspaceManifest>(&workspace_manifest_path)?
+                    .as_ref()
+                    .map(Self::lane_manifest_attachment_count)
+                    .unwrap_or(0);
+                println!(
+                    "  workspace: {org}/{repo}/{workspace_name}\tattachments={attachment_count}\t{}",
+                    workspace_path.display()
+                );
             }
         }
         Ok(())
@@ -1740,9 +1800,69 @@ impl SupervisorService {
         repo: Option<&str>,
         workspace: Option<&str>,
         scope: LaneCleanupScope,
+        force: bool,
     ) -> Result<()> {
         let (_slug, lane_paths) = self.lane_paths_for_label(label)?;
         let cleanup_repo = repo.map(Self::parse_lane_repo_spec).transpose()?;
+        if !force {
+            let candidate_workspace_paths = match scope {
+                LaneCleanupScope::Lane => Self::lane_workspace_records(&lane_paths.worktrees_dir)?
+                    .into_iter()
+                    .map(|(org, repo_name, workspace_name, _)| {
+                        lane_paths.workspace_manifest_file(&org, &repo_name, &workspace_name)
+                    })
+                    .collect::<Vec<_>>(),
+                LaneCleanupScope::Repo => {
+                    if let Some((org, repo_name, _)) = cleanup_repo.as_ref() {
+                        Self::lane_workspace_records(&lane_paths.worktrees_dir)?
+                            .into_iter()
+                            .filter(|(entry_org, entry_repo, _, _)| entry_org == org && entry_repo == repo_name)
+                            .map(|(entry_org, entry_repo, workspace_name, _)| {
+                                lane_paths.workspace_manifest_file(&entry_org, &entry_repo, &workspace_name)
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Self::lane_workspace_records(&lane_paths.worktrees_dir)?
+                            .into_iter()
+                            .map(|(org, repo_name, workspace_name, _)| {
+                                lane_paths.workspace_manifest_file(&org, &repo_name, &workspace_name)
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                }
+                _ => {
+                    if let Some((org, repo_name, _)) = cleanup_repo.as_ref() {
+                        let workspace_name = workspace.unwrap_or("default");
+                        vec![lane_paths.workspace_manifest_file(org, repo_name, workspace_name)]
+                    } else if let Some(workspace_name) = workspace {
+                        Self::lane_workspace_records(&lane_paths.worktrees_dir)?
+                            .into_iter()
+                            .filter(|(_, _, entry_workspace, _)| entry_workspace == workspace_name)
+                            .map(|(org, repo_name, entry_workspace, _)| {
+                                lane_paths.workspace_manifest_file(&org, &repo_name, &entry_workspace)
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Self::lane_workspace_records(&lane_paths.worktrees_dir)?
+                            .into_iter()
+                            .map(|(org, repo_name, workspace_name, _)| {
+                                lane_paths.workspace_manifest_file(&org, &repo_name, &workspace_name)
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                }
+            };
+            for manifest_path in candidate_workspace_paths {
+                if let Some(manifest) = read_toml::<WorkspaceManifest>(&manifest_path)?
+                    && Self::lane_workspace_has_live_attachments(&manifest)
+                {
+                    bail!(
+                        "cleanup target `{}` still has live attachments; use --force to override cleanup",
+                        manifest.workspace_root_path
+                    );
+                }
+            }
+        }
         match scope {
             LaneCleanupScope::Runtime => {
                 if let Some((org, repo, _)) = cleanup_repo {
