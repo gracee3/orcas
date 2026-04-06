@@ -14,6 +14,8 @@ use tracing::info;
 use tt_core::{
     AppPaths, DecisionType, WorkUnitStatus, WorkstreamStatus, authority, init_file_logger,
 };
+use tt_core::lane::LaneCleanupScope as LaneCleanupScopeModel;
+use tt_core::lane::LanePaths;
 
 use remote::{RemoteCommand, run_remote};
 use service::{RuntimeOverrides, SupervisorService};
@@ -129,6 +131,10 @@ enum TopCommand {
         #[command(subcommand)]
         command: AppServerCommand,
     },
+    Lane {
+        #[command(subcommand)]
+        command: LaneCommand,
+    },
     #[command(about = "Open the tt dashboard TUI")]
     Tui,
     Supervisor {
@@ -204,6 +210,14 @@ enum TTThreadsCommand {
 enum TTWorktreeCommand {
     Add(TTWorktreeAddArgs),
     Prune(TTWorktreePruneArgs),
+}
+
+#[derive(Debug, Subcommand)]
+#[command(about = "Manage lane-local runtimes and rendered directory state")]
+enum LaneCommand {
+    Init(LaneInitArgs),
+    Inspect(LaneInspectArgs),
+    Cleanup(LaneCleanupArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -495,6 +509,37 @@ struct TTWorktreeAddArgs {
 #[derive(Debug, Clone, Args)]
 struct TTWorktreePruneArgs {
     selector: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct LaneInitArgs {
+    label: String,
+    #[arg(long = "repo")]
+    repos: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct LaneInspectArgs {
+    label: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct LaneCleanupArgs {
+    label: String,
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long)]
+    workspace: Option<String>,
+    #[arg(long, value_enum, default_value_t = LaneCleanupScopeArg::Runtime)]
+    scope: LaneCleanupScopeArg,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LaneCleanupScopeArg {
+    Runtime,
+    Worktree,
+    Repo,
+    Lane,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1547,6 +1592,29 @@ async fn main() -> Result<()> {
                 AppServerCommand::Info(args) => service.app_server_info(&args.name).await?,
             }
         }
+        TopCommand::Lane { command } => {
+            let service = SupervisorService::load(&overrides).await?;
+            match command {
+                LaneCommand::Init(args) => service.lane_init(&args.label, &args.repos).await?,
+                LaneCommand::Inspect(args) => service.lane_inspect(&args.label).await?,
+                LaneCommand::Cleanup(args) => {
+                    let scope = match args.scope {
+                        LaneCleanupScopeArg::Runtime => LaneCleanupScopeModel::Runtime,
+                        LaneCleanupScopeArg::Worktree => LaneCleanupScopeModel::Worktree,
+                        LaneCleanupScopeArg::Repo => LaneCleanupScopeModel::Repo,
+                        LaneCleanupScopeArg::Lane => LaneCleanupScopeModel::Lane,
+                    };
+                    service
+                        .lane_cleanup(
+                            &args.label,
+                            args.repo.as_deref(),
+                            args.workspace.as_deref(),
+                            scope,
+                        )
+                        .await?;
+                }
+            }
+        }
         TopCommand::Doctor => {
             let service = SupervisorService::load(&overrides).await?;
             service.doctor().await?;
@@ -2287,6 +2355,7 @@ mod tests {
         assert!(help.contains("roles"));
         assert!(help.contains("worktrees"));
         assert!(help.contains("app-server"));
+        assert!(help.contains("lane"));
         assert!(help.contains("tui"));
         assert!(help.contains("supervisor"));
         assert!(!help.contains("tracked-threads"));
@@ -2355,6 +2424,28 @@ mod tests {
                 command: AppServerCommand::Info(args),
             } => {
                 assert_eq!(args.name, "default");
+            }
+            other => panic!("unexpected command parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_top_level_lane_init_command() {
+        let cli = Cli::parse_from([
+            "tt",
+            "lane",
+            "init",
+            "directory and worktree requirements",
+            "--repo",
+            "openai/codex",
+        ]);
+
+        match cli.command {
+            TopCommand::Lane {
+                command: LaneCommand::Init(args),
+            } => {
+                assert_eq!(args.label, "directory and worktree requirements");
+                assert_eq!(args.repos, vec!["openai/codex"]);
             }
             other => panic!("unexpected command parse: {other:?}"),
         }

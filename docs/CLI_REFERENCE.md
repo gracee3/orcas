@@ -30,6 +30,7 @@ These flags are accepted before any subcommand.
 - `tt roles ...`
 - `tt worktrees`
 - `tt app-server ...`
+- `tt lane ...`
 - `tt tui`
 - `tt supervisor ...`
 - `tt tt ...`
@@ -56,6 +57,14 @@ These flags are accepted before any subcommand.
 - `tt app-server restart [<NAME>]`
 - `tt app-server status [<NAME>]`
 - `tt app-server info [<NAME>]`
+
+## Lane
+
+- `tt lane init <LABEL> [--repo <ORG/REPO[=URL]>...]`
+- `tt lane inspect <LABEL>`
+- `tt lane cleanup <LABEL> [--repo <ORG/REPO[=URL]>] [--workspace <NAME>] [--scope <runtime|worktree|repo|lane>]`
+
+Lane init renders a lane root under `~/.tt/lanes/<lane-slug>/`, seeds shared read-only home overlays, clones the requested repos, and creates a default workspace per repo. Lane cleanup is explicit and does not auto-garbage-collect inactive worktrees.
 
 ## Events
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -26,6 +26,10 @@ use tt_core::{
     TT_APP_SERVER_STARTED_AT_ENV, TT_APP_SERVER_TAG_ENV, TT_APP_SERVER_TAG_VALUE,
     TTThreadAssignmentStatus, ThreadReadRequest, ThreadResumeRequest, ThreadStartRequest,
     WorkUnitStatus, WorkstreamStatus, authority, ipc,
+};
+use tt_core::lane::{
+    LaneCleanupScope, LaneManifest, LanePaths, RepoManifest, WorkspaceManifest, read_toml,
+    write_toml,
 };
 use ttd::{
     TTDaemonLaunch, TTDaemonProcessManager, TTIpcClient, TTRuntimeOverrides,
@@ -1271,6 +1275,345 @@ impl SupervisorService {
             .next()
             .unwrap_or(branch_name)
             .to_string()
+    }
+
+    fn default_lane_workspace_slug() -> String {
+        "default".to_string()
+    }
+
+    fn default_lane_branch_name(workspace_slug: &str) -> String {
+        format!("worktree/{}", LanePaths::slugify(workspace_slug))
+    }
+
+    fn lane_paths_for_label(&self, label: &str) -> Result<(String, LanePaths)> {
+        let slug = LanePaths::slugify(label);
+        if slug.is_empty() {
+            bail!("lane label must contain at least one alphanumeric character");
+        }
+        Ok((slug.clone(), LanePaths::from_app_paths(&self.paths, &slug)))
+    }
+
+    fn parse_lane_repo_spec(spec: &str) -> Result<(String, String, String)> {
+        let raw = spec.trim();
+        if raw.is_empty() {
+            bail!("repo specification cannot be empty");
+        }
+        let (repo_id, source_url) = match raw.split_once('=') {
+            Some((repo_id, source_url)) => (repo_id.trim(), source_url.trim().to_string()),
+            None => (
+                raw,
+                format!(
+                    "https://github.com/{}.git",
+                    raw.trim().trim_matches('/')
+                ),
+            ),
+        };
+        let (org, repo) = repo_id
+            .split_once('/')
+            .ok_or_else(|| anyhow!("repo specification `{spec}` must be in `org/repo` form"))?;
+        let org = org.trim();
+        let repo = repo.trim();
+        if org.is_empty() || repo.is_empty() {
+            bail!("repo specification `{spec}` must include non-empty org and repo names");
+        }
+        Ok((org.to_string(), repo.to_string(), source_url))
+    }
+
+    async fn clone_lane_repo(repo_root: &Path, source_url: &str) -> Result<()> {
+        if repo_root.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = repo_root.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let repo_path = repo_root.display().to_string();
+        let output = Command::new("git")
+            .args(["clone", source_url, &repo_path])
+            .output()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to invoke `git clone {source_url} {}`: {error}",
+                    repo_root.display()
+                )
+            })?;
+        if !output.status.success() {
+            bail!(
+                "failed to clone `{source_url}` into {}: {}",
+                repo_root.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn current_repo_template_root() -> Option<PathBuf> {
+        std::env::current_dir().ok()
+    }
+
+    fn render_lane_shared_home(lane_paths: &LanePaths) -> Result<()> {
+        fs::create_dir_all(&lane_paths.shared_home_dir)?;
+        let target_tt = &lane_paths.shared_tt_dir;
+        if let Some(template_root) = Self::current_repo_template_root() {
+            let source_tt = template_root.join(".tt");
+            if source_tt.is_dir() {
+                Self::copy_directory_tree(&source_tt, target_tt)?;
+            } else {
+                fs::create_dir_all(target_tt)?;
+            }
+            let source_codex = template_root.join(".codex");
+            if source_codex.is_dir() {
+                Self::copy_directory_tree(&source_codex, &lane_paths.shared_codex_dir)?;
+            } else {
+                fs::create_dir_all(&lane_paths.shared_codex_dir)?;
+            }
+        } else {
+            fs::create_dir_all(target_tt)?;
+            fs::create_dir_all(&lane_paths.shared_codex_dir)?;
+        }
+        Ok(())
+    }
+
+    pub async fn lane_init(&self, label: &str, repo_specs: &[String]) -> Result<()> {
+        let (slug, lane_paths) = self.lane_paths_for_label(label)?;
+        lane_paths.ensure()?;
+        Self::render_lane_shared_home(&lane_paths)?;
+        write_toml(&lane_paths.manifest_file, &LaneManifest::new(label, &slug))?;
+
+        for repo_spec in repo_specs {
+            let (org, repo, source_url) = Self::parse_lane_repo_spec(repo_spec)?;
+            let repo_root = lane_paths.repo_root(&org, &repo);
+            Self::clone_lane_repo(&repo_root, &source_url).await?;
+            write_toml(
+                &lane_paths.repo_manifest_file(&org, &repo),
+                &RepoManifest::new(&source_url, &org, &repo),
+            )?;
+
+            let workspace_slug = Self::default_lane_workspace_slug();
+            let workspace_root = lane_paths.workspace_root(&org, &repo, &workspace_slug);
+            let worktree_path = lane_paths.workspace_worktree_dir(&org, &repo, &workspace_slug);
+            let runtime_path = lane_paths.workspace_runtime_dir(&org, &repo, &workspace_slug);
+            let home_path = lane_paths.workspace_home_dir(&org, &repo, &workspace_slug);
+            tokio::fs::create_dir_all(&workspace_root).await?;
+            tokio::fs::create_dir_all(&runtime_path).await?;
+            tokio::fs::create_dir_all(&home_path).await?;
+            let base_ref = Self::resolve_base_branch(&repo_root).await?;
+            let branch_name = Self::default_lane_branch_name(&workspace_slug);
+            Self::ensure_git_worktree(&repo_root, &worktree_path, &branch_name, &base_ref).await?;
+            write_toml(
+                &lane_paths.workspace_manifest_file(&org, &repo, &workspace_slug),
+                &WorkspaceManifest::new(
+                    "default",
+                    &workspace_slug,
+                    format!("{org}/{repo}"),
+                    worktree_path.display().to_string(),
+                    runtime_path.display().to_string(),
+                    home_path.display().to_string(),
+                    branch_name,
+                ),
+            )?;
+            info!(
+                surface = "cli",
+                action = "lane_init",
+                lane_slug = %slug,
+                repo = %format!("{org}/{repo}"),
+                repo_root = %repo_root.display(),
+                worktree_path = %worktree_path.display(),
+                "initialized lane repo workspace"
+            );
+            let _ = workspace_root;
+        }
+
+        println!("lane_label: {label}");
+        println!("lane_slug: {slug}");
+        println!("lane_root: {}", lane_paths.root.display());
+        println!("lane_shared_home: {}", lane_paths.shared_home_dir.display());
+        println!("lane_shared_tt_home: {}", lane_paths.shared_tt_dir.display());
+        println!("lane_shared_codex_home: {}", lane_paths.shared_codex_dir.display());
+        println!("lane_repos_root: {}", lane_paths.repos_dir.display());
+        println!("lane_worktrees_root: {}", lane_paths.worktrees_dir.display());
+        println!("lane_runtime_root: {}", lane_paths.runtime_dir.display());
+        Ok(())
+    }
+
+    fn lane_print_manifest<T: Serialize>(prefix: &str, manifest: &T) -> Result<()> {
+        let raw = toml::to_string_pretty(manifest)
+            .map_err(|error| anyhow!("failed to render {prefix} manifest: {error}"))?;
+        for line in raw.lines() {
+            println!("{prefix}{line}");
+        }
+        Ok(())
+    }
+
+    fn lane_workspace_records(
+        worktree_root: &Path,
+    ) -> Result<Vec<(String, String, String, PathBuf)>> {
+        if !worktree_root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut entries = Vec::new();
+        for org_entry in fs::read_dir(worktree_root)? {
+            let org_entry = org_entry?;
+            if !org_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let org = org_entry.file_name().to_string_lossy().into_owned();
+            for repo_entry in fs::read_dir(org_entry.path())? {
+                let repo_entry = repo_entry?;
+                if !repo_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let repo = repo_entry.file_name().to_string_lossy().into_owned();
+                for workspace_entry in fs::read_dir(repo_entry.path())? {
+                    let workspace_entry = workspace_entry?;
+                    if workspace_entry.file_type()?.is_dir() {
+                        entries.push((
+                            org.clone(),
+                            repo.clone(),
+                            workspace_entry.file_name().to_string_lossy().into_owned(),
+                            workspace_entry.path(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    pub async fn lane_inspect(&self, label: &str) -> Result<()> {
+        let (slug, lane_paths) = self.lane_paths_for_label(label)?;
+        println!("lane_label: {label}");
+        println!("lane_slug: {slug}");
+        println!("lane_root: {}", lane_paths.root.display());
+        println!("lane_manifest: {}", lane_paths.manifest_file.display());
+        println!("lane_shared_home: {}", lane_paths.shared_home_dir.display());
+        println!("lane_shared_tt_home: {}", lane_paths.shared_tt_dir.display());
+        println!("lane_shared_codex_home: {}", lane_paths.shared_codex_dir.display());
+        println!("lane_repos_root: {}", lane_paths.repos_dir.display());
+        println!("lane_worktrees_root: {}", lane_paths.worktrees_dir.display());
+        println!("lane_runtime_root: {}", lane_paths.runtime_dir.display());
+        if let Some(manifest) = read_toml::<LaneManifest>(&lane_paths.manifest_file)? {
+            Self::lane_print_manifest("lane_manifest.", &manifest)?;
+        }
+        for (org, repo, workspace_name, workspace_path) in
+            Self::lane_workspace_records(&lane_paths.worktrees_dir)?
+        {
+            let repo_key = format!("{org}/{repo}");
+            let repo_root = lane_paths.repo_root(&org, &repo);
+            println!("repo: {repo_key}");
+            println!("repo_root: {}", repo_root.display());
+            if let Some(manifest) = read_toml::<RepoManifest>(&lane_paths.repo_manifest_file(&org, &repo))? {
+                Self::lane_print_manifest("repo_manifest.", &manifest)?;
+            }
+            let workspace_manifest_file = lane_paths.workspace_manifest_file(&org, &repo, &workspace_name);
+            println!("workspace: {workspace_name}");
+            println!("workspace_root: {}", workspace_path.display());
+            if let Some(manifest) = read_toml::<WorkspaceManifest>(&workspace_manifest_file)? {
+                Self::lane_print_manifest("workspace_manifest.", &manifest)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn lane_cleanup(
+        &self,
+        label: &str,
+        repo: Option<&str>,
+        workspace: Option<&str>,
+        scope: LaneCleanupScope,
+    ) -> Result<()> {
+        let (_slug, lane_paths) = self.lane_paths_for_label(label)?;
+        let cleanup_repo = repo.map(Self::parse_lane_repo_spec).transpose()?;
+        match scope {
+            LaneCleanupScope::Runtime => {
+                if let Some((org, repo, _)) = cleanup_repo {
+                    let workspace_name = workspace.unwrap_or("default");
+                    let runtime_path = lane_paths.workspace_runtime_dir(&org, &repo, workspace_name);
+                    if runtime_path.exists() {
+                        fs::remove_dir_all(&runtime_path)?;
+                    }
+                } else {
+                    for (_, _, _, workspace_root) in Self::lane_workspace_records(&lane_paths.worktrees_dir)? {
+                        let runtime_path = workspace_root.join("runtime");
+                        if runtime_path.exists() {
+                            fs::remove_dir_all(runtime_path)?;
+                        }
+                    }
+                }
+            }
+            LaneCleanupScope::Worktree => {
+                if let Some((org, repo, _)) = cleanup_repo {
+                    let workspace_name = workspace.unwrap_or("default");
+                    let repo_root = lane_paths.repo_root(&org, &repo);
+                    let worktree_path = lane_paths.workspace_worktree_dir(&org, &repo, workspace_name);
+                    let branch_name = read_toml::<WorkspaceManifest>(
+                        &lane_paths.workspace_manifest_file(&org, &repo, workspace_name),
+                    )?
+                    .map(|manifest| manifest.branch_name)
+                    .unwrap_or_else(|| Self::default_lane_branch_name(workspace_name));
+                    let _ = Self::git_prune_worktree(&repo_root, &worktree_path).await?;
+                    let _ = Self::git_delete_branch(&repo_root, &branch_name).await?;
+                    let workspace_root = lane_paths.workspace_root(&org, &repo, workspace_name);
+                    if workspace_root.exists() {
+                        fs::remove_dir_all(workspace_root)?;
+                    }
+                } else {
+                    let mut removed_repos = BTreeSet::new();
+                    for (org, repo, workspace_name, workspace_root) in
+                        Self::lane_workspace_records(&lane_paths.worktrees_dir)?
+                    {
+                        let repo_root = lane_paths.repo_root(&org, &repo);
+                        let worktree_path = lane_paths.workspace_worktree_dir(&org, &repo, &workspace_name);
+                        let branch_name = read_toml::<WorkspaceManifest>(
+                            &lane_paths.workspace_manifest_file(&org, &repo, &workspace_name),
+                        )?
+                        .map(|manifest| manifest.branch_name)
+                        .unwrap_or_else(|| Self::default_lane_branch_name(&workspace_name));
+                        let _ = Self::git_prune_worktree(&repo_root, &worktree_path).await?;
+                        let _ = Self::git_delete_branch(&repo_root, &branch_name).await?;
+                        if workspace_root.exists() {
+                            fs::remove_dir_all(workspace_root)?;
+                        }
+                        removed_repos.insert((org, repo));
+                    }
+                    for (org, repo) in removed_repos {
+                        let repo_root = lane_paths.repo_root(&org, &repo);
+                        if repo_root.exists() {
+                            fs::remove_dir_all(repo_root)?;
+                        }
+                    }
+                }
+            }
+            LaneCleanupScope::Repo => {
+                let repo_keys: Vec<(String, String)> = if let Some((org, repo, _)) = cleanup_repo {
+                    vec![(org, repo)]
+                } else {
+                    let mut repos = BTreeSet::new();
+                    for (org, repo, _, _) in Self::lane_workspace_records(&lane_paths.worktrees_dir)? {
+                        repos.insert((org, repo));
+                    }
+                    repos.into_iter().collect()
+                };
+                for (org, repo) in repo_keys {
+                    let repo_root = lane_paths.repo_root(&org, &repo);
+                    if repo_root.exists() {
+                        fs::remove_dir_all(&repo_root)?;
+                    }
+                    let worktree_repo_root = lane_paths.worktrees_dir.join(&org).join(&repo);
+                    if worktree_repo_root.exists() {
+                        fs::remove_dir_all(worktree_repo_root)?;
+                    }
+                }
+            }
+            LaneCleanupScope::Lane => {
+                if lane_paths.root.exists() {
+                    fs::remove_dir_all(&lane_paths.root)?;
+                }
+            }
+        }
+        println!("lane_label: {label}");
+        println!("lane_cleanup_scope: {:?}", scope);
+        Ok(())
     }
 
     async fn current_worktree_branch_name(worktree_path: &Path) -> Option<String> {

@@ -22,6 +22,7 @@ pub mod communication;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod config;
 pub mod error;
+pub mod lane;
 pub mod events;
 pub mod ipc;
 pub mod jsonrpc;
@@ -73,6 +74,10 @@ pub use config::{
     TTDaemonConfig,
 };
 pub use error::{TTError, TTResult};
+pub use lane::{
+    LaneCleanupScope, LaneManifest, LanePaths, RepoManifest, WorkspaceManifest, read_toml,
+    write_toml,
+};
 pub use events::{ConnectionState, EventEnvelope, TTEvent, TTItemEvent, TTTurnEvent};
 pub use ipc::*;
 pub use jsonrpc::{

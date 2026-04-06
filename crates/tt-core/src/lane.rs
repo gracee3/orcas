@@ -1,0 +1,243 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+
+use crate::error::{TTError, TTResult};
+use crate::paths::AppPaths;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneCleanupScope {
+    #[default]
+    Runtime,
+    Worktree,
+    Repo,
+    Lane,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaneManifest {
+    pub label: String,
+    pub slug: String,
+    pub created_at: String,
+}
+
+impl LaneManifest {
+    pub fn new(label: impl Into<String>, slug: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            slug: slug.into(),
+            created_at: Utc::now().to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoManifest {
+    pub source_url: String,
+    pub org: String,
+    pub repo: String,
+    pub cloned_at: String,
+}
+
+impl RepoManifest {
+    pub fn new(source_url: impl Into<String>, org: impl Into<String>, repo: impl Into<String>) -> Self {
+        Self {
+            source_url: source_url.into(),
+            org: org.into(),
+            repo: repo.into(),
+            cloned_at: Utc::now().to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceManifest {
+    pub label: String,
+    pub slug: String,
+    pub repo: String,
+    pub worktree_path: String,
+    pub runtime_path: String,
+    pub home_path: String,
+    pub branch_name: String,
+    pub created_at: String,
+    pub cleanup_scope: LaneCleanupScope,
+}
+
+impl WorkspaceManifest {
+    pub fn new(
+        label: impl Into<String>,
+        slug: impl Into<String>,
+        repo: impl Into<String>,
+        worktree_path: impl Into<String>,
+        runtime_path: impl Into<String>,
+        home_path: impl Into<String>,
+        branch_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            slug: slug.into(),
+            repo: repo.into(),
+            worktree_path: worktree_path.into(),
+            runtime_path: runtime_path.into(),
+            home_path: home_path.into(),
+            branch_name: branch_name.into(),
+            created_at: Utc::now().to_rfc3339(),
+            cleanup_scope: LaneCleanupScope::Runtime,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LanePaths {
+    pub root: PathBuf,
+    pub manifest_file: PathBuf,
+    pub shared_dir: PathBuf,
+    pub shared_home_dir: PathBuf,
+    pub shared_tt_dir: PathBuf,
+    pub shared_codex_dir: PathBuf,
+    pub repos_dir: PathBuf,
+    pub worktrees_dir: PathBuf,
+    pub runtime_dir: PathBuf,
+}
+
+impl LanePaths {
+    pub fn slugify(label: &str) -> String {
+        let mut slug = String::new();
+        let mut last_was_dash = false;
+        for ch in label.chars() {
+            let lowered = ch.to_ascii_lowercase();
+            if lowered.is_ascii_alphanumeric() {
+                slug.push(lowered);
+                last_was_dash = false;
+            } else if !last_was_dash {
+                slug.push('-');
+                last_was_dash = true;
+            }
+        }
+        slug.trim_matches('-').to_string()
+    }
+
+    pub fn from_base(base_root: impl AsRef<Path>, lane_slug: &str) -> Self {
+        let root = base_root.as_ref().join("lanes").join(lane_slug);
+        let shared_dir = root.join("shared");
+        let shared_home_dir = shared_dir.join("home");
+        let shared_tt_dir = shared_home_dir.join(".tt");
+        let shared_codex_dir = shared_home_dir.join(".codex");
+        let repos_dir = root.join("repos");
+        let worktrees_dir = root.join("worktrees");
+        let runtime_dir = root.join("runtime");
+        Self {
+            manifest_file: root.join("lane.toml"),
+            root,
+            shared_dir,
+            shared_home_dir,
+            shared_tt_dir,
+            shared_codex_dir,
+            repos_dir,
+            worktrees_dir,
+            runtime_dir,
+        }
+    }
+
+    pub fn from_app_paths(paths: &AppPaths, lane_slug: &str) -> Self {
+        Self::from_base(&paths.data_dir, lane_slug)
+    }
+
+    pub fn repo_root(&self, org: &str, repo: &str) -> PathBuf {
+        self.repos_dir.join(org).join(repo)
+    }
+
+    pub fn repo_manifest_file(&self, org: &str, repo: &str) -> PathBuf {
+        self.repo_root(org, repo).join("repo.toml")
+    }
+
+    pub fn workspace_root(&self, org: &str, repo: &str, workspace: &str) -> PathBuf {
+        self.worktrees_dir.join(org).join(repo).join(workspace)
+    }
+
+    pub fn workspace_manifest_file(&self, org: &str, repo: &str, workspace: &str) -> PathBuf {
+        self.workspace_root(org, repo, workspace).join("workspace.toml")
+    }
+
+    pub fn workspace_runtime_dir(&self, org: &str, repo: &str, workspace: &str) -> PathBuf {
+        self.workspace_root(org, repo, workspace).join("runtime")
+    }
+
+    pub fn workspace_worktree_dir(&self, org: &str, repo: &str, workspace: &str) -> PathBuf {
+        self.workspace_root(org, repo, workspace).join("worktree")
+    }
+
+    pub fn workspace_home_dir(&self, org: &str, repo: &str, workspace: &str) -> PathBuf {
+        self.workspace_root(org, repo, workspace).join("home")
+    }
+
+    pub fn ensure(&self) -> TTResult<()> {
+        fs::create_dir_all(&self.root)?;
+        fs::create_dir_all(&self.shared_tt_dir)?;
+        fs::create_dir_all(&self.shared_codex_dir)?;
+        fs::create_dir_all(&self.repos_dir)?;
+        fs::create_dir_all(&self.worktrees_dir)?;
+        fs::create_dir_all(&self.runtime_dir)?;
+        Ok(())
+    }
+}
+
+pub fn render_toml<T: Serialize>(value: &T) -> TTResult<String> {
+    Ok(toml::to_string_pretty(value).map_err(|error| TTError::Config(error.to_string()))?)
+}
+
+pub fn write_toml<T: Serialize>(path: &Path, value: &T) -> TTResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, render_toml(value)?)?;
+    Ok(())
+}
+
+pub fn read_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> TTResult<Option<T>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path)?;
+    Ok(Some(toml::from_str(&raw).map_err(|error| TTError::Config(error.to_string()))?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LanePaths, LaneManifest, RepoManifest, WorkspaceManifest};
+
+    #[test]
+    fn slugify_normalizes_labels() {
+        assert_eq!(LanePaths::slugify("Directory and worktree requirements"), "directory-and-worktree-requirements");
+        assert_eq!(LanePaths::slugify("my random name"), "my-random-name");
+    }
+
+    #[test]
+    fn manifests_round_trip_to_toml() {
+        let lane = LaneManifest::new("My Lane", "my-lane");
+        let encoded = toml::to_string(&lane).expect("encode lane");
+        let decoded: LaneManifest = toml::from_str(&encoded).expect("decode lane");
+        assert_eq!(decoded.slug, "my-lane");
+
+        let repo = RepoManifest::new("https://github.com/openai/codex.git", "openai", "codex");
+        let encoded = toml::to_string(&repo).expect("encode repo");
+        let decoded: RepoManifest = toml::from_str(&encoded).expect("decode repo");
+        assert_eq!(decoded.repo, "codex");
+
+        let workspace = WorkspaceManifest::new(
+            "Default",
+            "default",
+            "openai/codex",
+            "/tmp/worktree",
+            "/tmp/runtime",
+            "/tmp/home",
+            "worktree/default",
+        );
+        let encoded = toml::to_string(&workspace).expect("encode workspace");
+        let decoded: WorkspaceManifest = toml::from_str(&encoded).expect("decode workspace");
+        assert_eq!(decoded.label, "Default");
+    }
+}
