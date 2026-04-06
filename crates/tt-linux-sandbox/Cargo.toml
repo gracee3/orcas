@@ -1,0 +1,15 @@
+[package]
+name = "tt-linux-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tt-sandboxing = { path = "../tt-sandboxing" }
+
+[lints]
+workspace = true
