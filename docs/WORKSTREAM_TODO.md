@@ -61,3 +61,4 @@ Tracked backlog for the active direct skill thread.
 - Identified the need for a dedicated direct skill.
 - Established the project-level tracked backlog file for the direct workflow.
 - Implemented the lane filesystem layout scaffold and the `tt lane init|inspect|cleanup` CLI surface.
+- Added explicit lane/workspace manifest fields and surfaced discovered lane roots in `tt doctor`.

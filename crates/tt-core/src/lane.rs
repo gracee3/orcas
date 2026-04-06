@@ -19,16 +19,42 @@ pub enum LaneCleanupScope {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LaneManifest {
+    #[serde(default = "default_lane_schema_version")]
+    pub schema_version: u32,
     pub label: String,
     pub slug: String,
+    #[serde(default)]
+    pub root_path: String,
+    #[serde(default)]
+    pub shared_home_path: String,
+    #[serde(default)]
+    pub repos_root_path: String,
+    #[serde(default)]
+    pub worktrees_root_path: String,
+    #[serde(default)]
+    pub runtime_root_path: String,
     pub created_at: String,
 }
 
 impl LaneManifest {
-    pub fn new(label: impl Into<String>, slug: impl Into<String>) -> Self {
+    pub fn new(
+        label: impl Into<String>,
+        slug: impl Into<String>,
+        root_path: impl Into<String>,
+        shared_home_path: impl Into<String>,
+        repos_root_path: impl Into<String>,
+        worktrees_root_path: impl Into<String>,
+        runtime_root_path: impl Into<String>,
+    ) -> Self {
         Self {
+            schema_version: default_lane_schema_version(),
             label: label.into(),
             slug: slug.into(),
+            root_path: root_path.into(),
+            shared_home_path: shared_home_path.into(),
+            repos_root_path: repos_root_path.into(),
+            worktrees_root_path: worktrees_root_path.into(),
+            runtime_root_path: runtime_root_path.into(),
             created_at: Utc::now().to_rfc3339(),
         }
     }
@@ -36,6 +62,13 @@ impl LaneManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoManifest {
+    #[serde(default = "default_lane_schema_version")]
+    pub schema_version: u32,
+    pub lane_slug: String,
+    #[serde(default)]
+    pub lane_root_path: String,
+    #[serde(default)]
+    pub repo_root_path: String,
     pub source_url: String,
     pub org: String,
     pub repo: String,
@@ -43,8 +76,19 @@ pub struct RepoManifest {
 }
 
 impl RepoManifest {
-    pub fn new(source_url: impl Into<String>, org: impl Into<String>, repo: impl Into<String>) -> Self {
+    pub fn new(
+        lane_slug: impl Into<String>,
+        lane_root_path: impl Into<String>,
+        repo_root_path: impl Into<String>,
+        source_url: impl Into<String>,
+        org: impl Into<String>,
+        repo: impl Into<String>,
+    ) -> Self {
         Self {
+            schema_version: default_lane_schema_version(),
+            lane_slug: lane_slug.into(),
+            lane_root_path: lane_root_path.into(),
+            repo_root_path: repo_root_path.into(),
             source_url: source_url.into(),
             org: org.into(),
             repo: repo.into(),
@@ -55,10 +99,21 @@ impl RepoManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceManifest {
+    #[serde(default = "default_lane_schema_version")]
+    pub schema_version: u32,
+    pub lane_slug: String,
+    #[serde(default)]
+    pub lane_root_path: String,
+    #[serde(default)]
+    pub repo_root_path: String,
     pub label: String,
     pub slug: String,
     pub repo: String,
+    #[serde(default)]
+    pub workspace_root_path: String,
     pub worktree_path: String,
+    #[serde(default)]
+    pub worktree_root_path: String,
     pub runtime_path: String,
     pub home_path: String,
     pub branch_name: String,
@@ -68,19 +123,30 @@ pub struct WorkspaceManifest {
 
 impl WorkspaceManifest {
     pub fn new(
+        lane_slug: impl Into<String>,
+        lane_root_path: impl Into<String>,
+        repo_root_path: impl Into<String>,
         label: impl Into<String>,
         slug: impl Into<String>,
         repo: impl Into<String>,
+        workspace_root_path: impl Into<String>,
         worktree_path: impl Into<String>,
+        worktree_root_path: impl Into<String>,
         runtime_path: impl Into<String>,
         home_path: impl Into<String>,
         branch_name: impl Into<String>,
     ) -> Self {
         Self {
+            schema_version: default_lane_schema_version(),
+            lane_slug: lane_slug.into(),
+            lane_root_path: lane_root_path.into(),
+            repo_root_path: repo_root_path.into(),
             label: label.into(),
             slug: slug.into(),
             repo: repo.into(),
+            workspace_root_path: workspace_root_path.into(),
             worktree_path: worktree_path.into(),
+            worktree_root_path: worktree_root_path.into(),
             runtime_path: runtime_path.into(),
             home_path: home_path.into(),
             branch_name: branch_name.into(),
@@ -189,6 +255,10 @@ pub fn render_toml<T: Serialize>(value: &T) -> TTResult<String> {
     Ok(toml::to_string_pretty(value).map_err(|error| TTError::Config(error.to_string()))?)
 }
 
+fn default_lane_schema_version() -> u32 {
+    1
+}
+
 pub fn write_toml<T: Serialize>(path: &Path, value: &T) -> TTResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -217,21 +287,41 @@ mod tests {
 
     #[test]
     fn manifests_round_trip_to_toml() {
-        let lane = LaneManifest::new("My Lane", "my-lane");
+        let lane = LaneManifest::new(
+            "My Lane",
+            "my-lane",
+            "/tmp/lane",
+            "/tmp/lane/shared/home",
+            "/tmp/lane/repos",
+            "/tmp/lane/worktrees",
+            "/tmp/lane/runtime",
+        );
         let encoded = toml::to_string(&lane).expect("encode lane");
         let decoded: LaneManifest = toml::from_str(&encoded).expect("decode lane");
         assert_eq!(decoded.slug, "my-lane");
 
-        let repo = RepoManifest::new("https://github.com/openai/codex.git", "openai", "codex");
+        let repo = RepoManifest::new(
+            "my-lane",
+            "/tmp/lane",
+            "/tmp/lane/repos/openai/codex",
+            "https://github.com/openai/codex.git",
+            "openai",
+            "codex",
+        );
         let encoded = toml::to_string(&repo).expect("encode repo");
         let decoded: RepoManifest = toml::from_str(&encoded).expect("decode repo");
         assert_eq!(decoded.repo, "codex");
 
         let workspace = WorkspaceManifest::new(
+            "my-lane",
+            "/tmp/lane",
+            "/tmp/lane/repos/openai/codex",
             "Default",
             "default",
             "openai/codex",
+            "/tmp/lane/worktrees/openai/codex/default",
             "/tmp/worktree",
+            "/tmp/lane/worktrees/openai/codex/default",
             "/tmp/runtime",
             "/tmp/home",
             "worktree/default",

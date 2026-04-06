@@ -48,6 +48,8 @@ These flags are accepted before any subcommand.
 
 - `tt doctor`
 
+`tt doctor` now also reports the discovered lane roots under `~/.tt/lanes/` and prints the rendered lane manifest fields for each lane it finds.
+
 ## App Server
 
 - `tt app-server add [<NAME>]`

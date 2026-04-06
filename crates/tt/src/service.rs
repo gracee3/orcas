@@ -1378,7 +1378,18 @@ impl SupervisorService {
         let (slug, lane_paths) = self.lane_paths_for_label(label)?;
         lane_paths.ensure()?;
         Self::render_lane_shared_home(&lane_paths)?;
-        write_toml(&lane_paths.manifest_file, &LaneManifest::new(label, &slug))?;
+        write_toml(
+            &lane_paths.manifest_file,
+            &LaneManifest::new(
+                label,
+                &slug,
+                lane_paths.root.display().to_string(),
+                lane_paths.shared_home_dir.display().to_string(),
+                lane_paths.repos_dir.display().to_string(),
+                lane_paths.worktrees_dir.display().to_string(),
+                lane_paths.runtime_dir.display().to_string(),
+            ),
+        )?;
 
         for repo_spec in repo_specs {
             let (org, repo, source_url) = Self::parse_lane_repo_spec(repo_spec)?;
@@ -1386,7 +1397,14 @@ impl SupervisorService {
             Self::clone_lane_repo(&repo_root, &source_url).await?;
             write_toml(
                 &lane_paths.repo_manifest_file(&org, &repo),
-                &RepoManifest::new(&source_url, &org, &repo),
+                &RepoManifest::new(
+                    &slug,
+                    lane_paths.root.display().to_string(),
+                    repo_root.display().to_string(),
+                    &source_url,
+                    &org,
+                    &repo,
+                ),
             )?;
 
             let workspace_slug = Self::default_lane_workspace_slug();
@@ -1403,10 +1421,15 @@ impl SupervisorService {
             write_toml(
                 &lane_paths.workspace_manifest_file(&org, &repo, &workspace_slug),
                 &WorkspaceManifest::new(
+                    &slug,
+                    lane_paths.root.display().to_string(),
+                    repo_root.display().to_string(),
                     "default",
                     &workspace_slug,
                     format!("{org}/{repo}"),
+                    workspace_root.display().to_string(),
                     worktree_path.display().to_string(),
+                    lane_paths.worktrees_dir.join(&org).join(&repo).display().to_string(),
                     runtime_path.display().to_string(),
                     home_path.display().to_string(),
                     branch_name,
@@ -2083,6 +2106,27 @@ impl SupervisorService {
             "app_server_owner: {:?}",
             self.config.tt.effective_app_server().owner
         );
+        let lanes_root = self.paths.data_dir.join("lanes");
+        println!("lanes_root: {}", lanes_root.display());
+        if lanes_root.exists() {
+            for lane_entry in fs::read_dir(&lanes_root)? {
+                let lane_entry = lane_entry?;
+                if !lane_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let lane_root = lane_entry.path();
+                let lane_manifest_file = lane_root.join("lane.toml");
+                if let Some(manifest) = read_toml::<LaneManifest>(&lane_manifest_file)? {
+                    println!("lane: {}\t{}", manifest.slug, lane_root.display());
+                    println!("lane_manifest.label: {}", manifest.label);
+                    println!("lane_manifest.root_path: {}", manifest.root_path);
+                    println!("lane_manifest.shared_home_path: {}", manifest.shared_home_path);
+                    println!("lane_manifest.repos_root_path: {}", manifest.repos_root_path);
+                    println!("lane_manifest.worktrees_root_path: {}", manifest.worktrees_root_path);
+                    println!("lane_manifest.runtime_root_path: {}", manifest.runtime_root_path);
+                }
+            }
+        }
         Ok(())
     }
 
