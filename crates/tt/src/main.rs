@@ -102,69 +102,93 @@ struct GlobalOptions {
 
 #[derive(Debug, Subcommand)]
 enum TopCommand {
+    #[command(about = "Launch and manage the tt daemon")]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    #[command(about = "Inspect the current TT state and surfaces")]
     Doctor,
+    #[command(about = "Export rendered CLI documentation")]
     Docs {
         #[command(subcommand)]
         command: DocsCommand,
     },
+    #[command(about = "Run TT commands against a remote runtime")]
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    #[command(about = "Inspect the recent TT event stream")]
     Events {
         #[command(subcommand)]
         command: EventsCommand,
     },
     #[command(name = "project")]
+    #[command(about = "Manage durable TT project records")]
     Workstream {
         #[command(subcommand)]
         command: WorkstreamCommand,
     },
     #[command(name = "worktree")]
+    #[command(about = "Canonical authority-backed CRUD for planning work units")]
     Workunit {
         #[command(subcommand)]
         command: WorkunitCommand,
     },
+    #[command(about = "Capture notes, review gaps, and turn TODOs into plans")]
     Todo {
         #[command(subcommand)]
         command: TodoCommand,
     },
+    #[command(about = "Start an implementation thread for the current branch")]
     Develop(ModeSpawnArgs),
+    #[command(about = "Start a validation thread for the current branch")]
     Test(ModeSpawnArgs),
+    #[command(about = "Start a repo-branch coordination thread")]
     Integrate(ModeSpawnArgs),
+    #[command(about = "Start a discuss-only thread")]
     Chat(ModeSpawnArgs),
+    #[command(about = "Start a recon and gap-finding thread")]
     Learn(ModeSpawnArgs),
+    #[command(about = "Start a handoff thread")]
     Handoff(ModeSpawnArgs),
+    #[command(about = "Inspect tracked and untracked changes before cleanup")]
     Diff(DiffArgs),
+    #[command(about = "Fork a new child thread and worktree from the current context")]
     Split(SplitArgs),
+    #[command(about = "Tear down the current worktree according to policy")]
     Close(CloseArgs),
+    #[command(about = "Suspend the current worktree without cleanup")]
     Park(ParkArgs),
     #[command(hide = true)]
     Roles {
         #[command(subcommand)]
         command: RolesCommand,
     },
+    #[command(about = "Inspect and manage TT-derived git worktrees")]
     Worktrees,
+    #[command(about = "Manage the shared tt app-server lifecycle")]
     AppServer {
         #[command(subcommand)]
         command: AppServerCommand,
     },
+    #[command(about = "Manage lane-local runtimes and rendered directory state")]
     Lane {
         #[command(subcommand)]
         command: LaneCommand,
     },
+    #[command(about = "Create, fork, diff, and prune TT snapshots")]
     Snapshot {
         #[command(subcommand)]
         command: SnapshotRuntimeCommand,
     },
+    #[command(about = "Edit snapshot context selection and pinning")]
     Context {
         #[command(subcommand)]
         command: SnapshotContextCommand,
     },
+    #[command(about = "Bind snapshots to workspace and git state")]
     Workspace {
         #[command(subcommand)]
         command: SnapshotWorkspaceCommand,
@@ -176,10 +200,12 @@ enum TopCommand {
         #[command(subcommand)]
         command: SupervisorCommand,
     },
+    #[command(about = "Invoke the TT app-embedded command surface")]
     App {
         #[command(subcommand)]
         command: AppCommand,
     },
+    #[command(about = "Coordinate the desktop window manager")]
     I3 {
         #[command(subcommand)]
         command: I3Command,
@@ -194,7 +220,9 @@ enum TopCommand {
         #[command(subcommand)]
         command: TTCommand,
     },
+    #[command(about = "Send a single prompt to a thread")]
     Prompt(PromptArgs),
+    #[command(about = "Launch a quick TT session from freeform input")]
     Quickstart(QuickstartArgs),
 }
 
@@ -258,10 +286,15 @@ enum TTWorktreeCommand {
 enum LaneCommand {
     /// List rendered lane roots and attachment counts.
     List,
+    /// Bootstrap a new lane with rendered directory state and repo checkouts.
     Init(LaneInitArgs),
+    /// Print the current lane manifest, worktrees, and attachment summary.
     Inspect(LaneInspectArgs),
+    /// Bind a tracked thread to a lane workspace.
     Attach(LaneAttachArgs),
+    /// Unbind a tracked thread from a lane workspace.
     Detach(LaneDetachArgs),
+    /// Clean up lane runtime state according to the requested scope.
     Cleanup(LaneCleanupArgs),
 }
 
@@ -614,48 +647,67 @@ struct TTWorktreePruneArgs {
 
 #[derive(Debug, Clone, Args)]
 struct LaneInitArgs {
+    /// Human-readable lane label to normalize into the lane slug.
     label: String,
-    #[arg(long = "repo")]
+    #[arg(
+        long = "repo",
+        help = "Repo to include in the lane in org/repo form; repeat for multiple repos"
+    )]
     repos: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]
 struct LaneInspectArgs {
+    /// Human-readable lane label to inspect.
     label: String,
 }
 
 #[derive(Debug, Clone, Args)]
 struct LaneAttachArgs {
+    /// Human-readable lane label that owns the workspace.
     label: String,
-    #[arg(long)]
+    #[arg(long, help = "Repo to bind in org/repo form")]
     repo: String,
-    #[arg(long)]
+    #[arg(long, help = "Workspace name within the lane repo; defaults to `default`")]
     workspace: Option<String>,
-    #[arg(long = "tracked-thread")]
+    #[arg(
+        long = "tracked-thread",
+        help = "Authority tracked-thread id to attach to the lane workspace"
+    )]
     tracked_thread: String,
 }
 
 #[derive(Debug, Clone, Args)]
 struct LaneDetachArgs {
+    /// Human-readable lane label that owns the workspace.
     label: String,
-    #[arg(long)]
+    #[arg(long, help = "Repo to unbind in org/repo form")]
     repo: String,
-    #[arg(long)]
+    #[arg(long, help = "Workspace name within the lane repo; defaults to `default`")]
     workspace: Option<String>,
-    #[arg(long = "tracked-thread")]
+    #[arg(
+        long = "tracked-thread",
+        help = "Authority tracked-thread id to detach from the lane workspace"
+    )]
     tracked_thread: String,
 }
 
 #[derive(Debug, Clone, Args)]
 struct LaneCleanupArgs {
+    /// Human-readable lane label to clean up.
     label: String,
-    #[arg(long)]
+    #[arg(long, help = "Optional repo scope in org/repo form")]
     repo: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Optional workspace name within the lane repo")]
     workspace: Option<String>,
-    #[arg(long, value_enum, default_value_t = LaneCleanupScopeArg::Runtime)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = LaneCleanupScopeArg::Runtime,
+        help = "Cleanup scope to apply: runtime, worktree, repo, or lane"
+    )]
     scope: LaneCleanupScopeArg,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, help = "Bypass safety checks for dirty or attached state")]
     force: bool,
 }
 
@@ -671,9 +723,13 @@ struct DocsExportCliArgs {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LaneCleanupScopeArg {
+    /// Remove only runtime state.
     Runtime,
+    /// Remove runtime state and the active worktree.
     Worktree,
+    /// Remove runtime state, the worktree, and the repo checkout.
     Repo,
+    /// Remove the full lane subtree.
     Lane,
 }
 
@@ -1664,19 +1720,19 @@ struct DecisionApplyArgs {
 
 #[derive(Debug, Clone, Args)]
 struct PromptArgs {
-    #[arg(long)]
+    #[arg(long, help = "Target thread id to receive the prompt")]
     thread: String,
-    #[arg(long)]
+    #[arg(long, help = "Prompt text to send to the thread")]
     text: String,
 }
 
 #[derive(Debug, Clone, Args)]
 struct QuickstartArgs {
-    #[arg(long)]
+    #[arg(long, help = "Optional working directory for the quickstart session")]
     cwd: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, help = "Optional model override for the quickstart session")]
     model: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Freeform text used to seed the session")]
     text: String,
 }
 
@@ -2711,14 +2767,14 @@ mod tests {
 
     #[test]
     fn project_help_marks_surface_as_durable() {
-        let mut command = Cli::command();
-        let help = command
-            .find_subcommand_mut("project")
+        let about = Cli::command()
+            .find_subcommand("project")
             .expect("project subcommand")
-            .render_help()
+            .get_about()
+            .expect("project about")
             .to_string();
 
-        assert!(help.contains("Manage durable tt project records"));
+        assert!(about.contains("Manage durable TT project records"));
     }
 
     #[test]

@@ -11,35 +11,35 @@ Usage: tt [OPTIONS] <COMMAND>
 
 Commands:
   daemon      Launch and manage the tt daemon
-  doctor      
+  doctor      Inspect the current TT state and surfaces
   docs        Export rendered CLI documentation
-  remote      
-  events      
-  project     Manage durable tt project records
+  remote      Run TT commands against a remote runtime
+  events      Inspect the recent TT event stream
+  project     Manage durable TT project records
   worktree    Canonical authority-backed CRUD for planning work units
-  todo        
-  develop     
-  test        
-  integrate   
-  chat        
-  learn       
-  handoff     
-  diff        
-  split       
-  close       
-  park        
-  worktrees   
+  todo        Capture notes, review gaps, and turn TODOs into plans
+  develop     Start an implementation thread for the current branch
+  test        Start a validation thread for the current branch
+  integrate   Start a repo-branch coordination thread
+  chat        Start a discuss-only thread
+  learn       Start a recon and gap-finding thread
+  handoff     Start a handoff thread
+  diff        Inspect tracked and untracked changes before cleanup
+  split       Fork a new child thread and worktree from the current context
+  close       Tear down the current worktree according to policy
+  park        Suspend the current worktree without cleanup
+  worktrees   Inspect and manage TT-derived git worktrees
   app-server  Manage the shared tt app-server lifecycle
   lane        Manage lane-local runtimes and rendered directory state
-  snapshot    
-  context     
-  workspace   
+  snapshot    Create, fork, diff, and prune TT snapshots
+  context     Edit snapshot context selection and pinning
+  workspace   Bind snapshots to workspace and git state
   tui         Open the tt dashboard TUI
-  app         
-  i3          
+  app         Invoke the TT app-embedded command surface
+  i3          Coordinate the desktop window manager
   skill       Run a typed skill runtime command
-  prompt      
-  quickstart  
+  prompt      Send a single prompt to a thread
+  quickstart  Launch a quick TT session from freeform input
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -146,6 +146,8 @@ Options:
 ### `tt doctor`
 
 ```text
+Inspect the current TT state and surfaces
+
 Usage: doctor
 
 Options:
@@ -187,6 +189,8 @@ Options:
 ### `tt remote`
 
 ```text
+Run TT commands against a remote runtime
+
 Usage: remote <COMMAND>
 
 Commands:
@@ -517,6 +521,8 @@ Options:
 ### `tt events`
 
 ```text
+Inspect the recent TT event stream
+
 Usage: events <COMMAND>
 
 Commands:
@@ -561,7 +567,7 @@ Options:
 ### `tt project`
 
 ```text
-Manage durable tt project records
+Manage durable TT project records
 
 Usage: project <COMMAND>
 
@@ -1137,6 +1143,8 @@ Options:
 ### `tt todo`
 
 ```text
+Capture notes, review gaps, and turn TODOs into plans
+
 Usage: todo <COMMAND>
 
 Commands:
@@ -1228,6 +1236,8 @@ Options:
 ### `tt develop`
 
 ```text
+Start an implementation thread for the current branch
+
 Usage: develop [OPTIONS]
 
 Options:
@@ -1253,6 +1263,8 @@ Options:
 ### `tt test`
 
 ```text
+Start a validation thread for the current branch
+
 Usage: test [OPTIONS]
 
 Options:
@@ -1278,6 +1290,8 @@ Options:
 ### `tt integrate`
 
 ```text
+Start a repo-branch coordination thread
+
 Usage: integrate [OPTIONS]
 
 Options:
@@ -1303,6 +1317,8 @@ Options:
 ### `tt chat`
 
 ```text
+Start a discuss-only thread
+
 Usage: chat [OPTIONS]
 
 Options:
@@ -1328,6 +1344,8 @@ Options:
 ### `tt learn`
 
 ```text
+Start a recon and gap-finding thread
+
 Usage: learn [OPTIONS]
 
 Options:
@@ -1353,6 +1371,8 @@ Options:
 ### `tt handoff`
 
 ```text
+Start a handoff thread
+
 Usage: handoff [OPTIONS]
 
 Options:
@@ -1378,6 +1398,8 @@ Options:
 ### `tt diff`
 
 ```text
+Inspect tracked and untracked changes before cleanup
+
 Usage: diff [OPTIONS]
 
 Options:
@@ -1397,6 +1419,8 @@ Options:
 ### `tt split`
 
 ```text
+Fork a new child thread and worktree from the current context
+
 Usage: split [OPTIONS]
 
 Options:
@@ -1428,6 +1452,8 @@ Options:
 ### `tt close`
 
 ```text
+Tear down the current worktree according to policy
+
 Usage: close [OPTIONS] <SELECTOR>
 
 Arguments:
@@ -1445,6 +1471,8 @@ Options:
 ### `tt park`
 
 ```text
+Suspend the current worktree without cleanup
+
 Usage: park [OPTIONS] <SELECTOR>
 
 Arguments:
@@ -1462,6 +1490,8 @@ Options:
 ### `tt worktrees`
 
 ```text
+Inspect and manage TT-derived git worktrees
+
 Usage: worktrees
 
 Options:
@@ -1598,11 +1628,11 @@ Usage: lane <COMMAND>
 
 Commands:
   list     List rendered lane roots and attachment counts
-  init     
-  inspect  
-  attach   
-  detach   
-  cleanup  
+  init     Bootstrap a new lane with rendered directory state and repo checkouts
+  inspect  Print the current lane manifest, worktrees, and attachment summary
+  attach   Bind a tracked thread to a lane workspace
+  detach   Unbind a tracked thread from a lane workspace
+  cleanup  Clean up lane runtime state according to the requested scope
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1625,15 +1655,17 @@ Options:
 #### `tt lane init`
 
 ```text
+Bootstrap a new lane with rendered directory state and repo checkouts
+
 Usage: init [OPTIONS] <LABEL>
 
 Arguments:
   <LABEL>
-          
+          Human-readable lane label to normalize into the lane slug
 
 Options:
       --repo <REPOS>
-          
+          Repo to include in the lane in org/repo form; repeat for multiple repos
 
   -h, --help
           Print help
@@ -1642,11 +1674,13 @@ Options:
 #### `tt lane inspect`
 
 ```text
+Print the current lane manifest, worktrees, and attachment summary
+
 Usage: inspect <LABEL>
 
 Arguments:
   <LABEL>
-          
+          Human-readable lane label to inspect
 
 Options:
   -h, --help
@@ -1656,21 +1690,23 @@ Options:
 #### `tt lane attach`
 
 ```text
+Bind a tracked thread to a lane workspace
+
 Usage: attach [OPTIONS] --repo <REPO> --tracked-thread <TRACKED_THREAD> <LABEL>
 
 Arguments:
   <LABEL>
-          
+          Human-readable lane label that owns the workspace
 
 Options:
       --repo <REPO>
-          
+          Repo to bind in org/repo form
 
       --workspace <WORKSPACE>
-          
+          Workspace name within the lane repo; defaults to `default`
 
       --tracked-thread <TRACKED_THREAD>
-          
+          Authority tracked-thread id to attach to the lane workspace
 
   -h, --help
           Print help
@@ -1679,21 +1715,23 @@ Options:
 #### `tt lane detach`
 
 ```text
+Unbind a tracked thread from a lane workspace
+
 Usage: detach [OPTIONS] --repo <REPO> --tracked-thread <TRACKED_THREAD> <LABEL>
 
 Arguments:
   <LABEL>
-          
+          Human-readable lane label that owns the workspace
 
 Options:
       --repo <REPO>
-          
+          Repo to unbind in org/repo form
 
       --workspace <WORKSPACE>
-          
+          Workspace name within the lane repo; defaults to `default`
 
       --tracked-thread <TRACKED_THREAD>
-          
+          Authority tracked-thread id to detach from the lane workspace
 
   -h, --help
           Print help
@@ -1702,33 +1740,44 @@ Options:
 #### `tt lane cleanup`
 
 ```text
+Clean up lane runtime state according to the requested scope
+
 Usage: cleanup [OPTIONS] <LABEL>
 
 Arguments:
   <LABEL>
-          
+          Human-readable lane label to clean up
 
 Options:
       --repo <REPO>
-          
+          Optional repo scope in org/repo form
 
       --workspace <WORKSPACE>
-          
+          Optional workspace name within the lane repo
 
       --scope <SCOPE>
+          Cleanup scope to apply: runtime, worktree, repo, or lane
+
+          Possible values:
+          - runtime:  Remove only runtime state
+          - worktree: Remove runtime state and the active worktree
+          - repo:     Remove runtime state, the worktree, and the repo checkout
+          - lane:     Remove the full lane subtree
+          
           [default: runtime]
-          [possible values: runtime, worktree, repo, lane]
 
       --force
-          
+          Bypass safety checks for dirty or attached state
 
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 ### `tt snapshot`
 
 ```text
+Create, fork, diff, and prune TT snapshots
+
 Usage: snapshot <COMMAND>
 
 Commands:
@@ -1950,6 +1999,8 @@ Options:
 ### `tt context`
 
 ```text
+Edit snapshot context selection and pinning
+
 Usage: context <COMMAND>
 
 Commands:
@@ -2097,6 +2148,8 @@ Options:
 ### `tt workspace`
 
 ```text
+Bind snapshots to workspace and git state
+
 Usage: workspace <COMMAND>
 
 Commands:
@@ -2189,6 +2242,8 @@ Options:
 ### `tt app`
 
 ```text
+Invoke the TT app-embedded command surface
+
 Usage: app <COMMAND>
 
 Commands:
@@ -2499,6 +2554,8 @@ Options:
 ### `tt i3`
 
 ```text
+Coordinate the desktop window manager
+
 Usage: i3 <COMMAND>
 
 Commands:
@@ -3402,14 +3459,16 @@ Options:
 ### `tt prompt`
 
 ```text
+Send a single prompt to a thread
+
 Usage: prompt --thread <THREAD> --text <TEXT>
 
 Options:
       --thread <THREAD>
-          
+          Target thread id to receive the prompt
 
       --text <TEXT>
-          
+          Prompt text to send to the thread
 
   -h, --help
           Print help
@@ -3418,17 +3477,19 @@ Options:
 ### `tt quickstart`
 
 ```text
+Launch a quick TT session from freeform input
+
 Usage: quickstart [OPTIONS] --text <TEXT>
 
 Options:
       --cwd <CWD>
-          
+          Optional working directory for the quickstart session
 
       --model <MODEL>
-          
+          Optional model override for the quickstart session
 
       --text <TEXT>
-          
+          Freeform text used to seed the session
 
   -h, --help
           Print help
