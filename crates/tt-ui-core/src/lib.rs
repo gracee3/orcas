@@ -27,3 +27,12 @@ pub struct GitRepositorySummary {
     pub merge_ready: bool,
     pub worktree_count: usize,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexThreadSummary {
+    pub thread_id: String,
+    pub thread_name: Option<String>,
+    pub updated_at: Option<String>,
+    pub bound_work_unit_id: Option<String>,
+    pub workspace_binding_count: usize,
+}

@@ -153,6 +153,8 @@ pub enum DaemonResponse {
     WorkspaceBinding(Option<WorkspaceBinding>),
     MergeRuns(Vec<MergeRun>),
     MergeRun(Option<MergeRun>),
+    CodexThreads(Vec<CodexThreadSummary>),
+    CodexThread(Option<CodexThreadSummary>),
 }
 
 #[derive(Debug, Clone)]
@@ -182,7 +184,7 @@ impl DaemonRuntime {
     pub fn open(cwd: impl AsRef<Path>) -> Result<Self> {
         let cwd = cwd.as_ref().to_path_buf();
         let store = OverlayStore::open_in_dir(&cwd)?;
-        let codex_home = CodexHome::discover().ok();
+        let codex_home = CodexHome::discover_in(&cwd).ok();
         let service = match codex_home.clone() {
             Some(home) => DaemonService::with_codex_home(store, home),
             None => DaemonService::new(store),
@@ -417,6 +419,57 @@ impl DaemonService {
             .as_ref()
             .map(|home| home.session_catalog())
             .transpose()
+    }
+
+    pub fn codex_threads(&self, limit: Option<usize>) -> Result<Vec<CodexThreadSummary>> {
+        let Some(catalog) = self.codex_catalog()? else {
+            return Ok(Vec::new());
+        };
+        let limit = limit.unwrap_or(catalog.all_threads().len());
+        Ok(catalog
+            .recent_threads(limit)
+            .into_iter()
+            .map(|thread| {
+                let bound_work_unit_id = self
+                    .get_thread_binding(&thread.thread_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|binding| binding.work_unit_id);
+                let workspace_binding_count = self
+                    .list_workspace_bindings_for_thread(&thread.thread_id)
+                    .map(|bindings| bindings.len())
+                    .unwrap_or(0);
+                CodexThreadSummary {
+                    thread_id: thread.thread_id,
+                    thread_name: thread.thread_name,
+                    updated_at: thread.updated_at.map(|value| value.to_rfc3339()),
+                    bound_work_unit_id,
+                    workspace_binding_count,
+                }
+            })
+            .collect())
+    }
+
+    pub fn codex_thread(&self, selector: &str) -> Result<Option<CodexThreadSummary>> {
+        let Some(catalog) = self.codex_catalog()? else {
+            return Ok(None);
+        };
+        let Some(thread) = catalog.resolve_thread(selector) else {
+            return Ok(None);
+        };
+        let bound_work_unit_id = self
+            .get_thread_binding(&thread.thread_id)?
+            .and_then(|binding| binding.work_unit_id);
+        let workspace_binding_count = self
+            .list_workspace_bindings_for_thread(&thread.thread_id)?
+            .len();
+        Ok(Some(CodexThreadSummary {
+            thread_id: thread.thread_id.clone(),
+            thread_name: thread.thread_name.clone(),
+            updated_at: thread.updated_at.map(|value| value.to_rfc3339()),
+            bound_work_unit_id,
+            workspace_binding_count,
+        }))
     }
 
     pub fn status(&self) -> Result<DaemonStatus> {

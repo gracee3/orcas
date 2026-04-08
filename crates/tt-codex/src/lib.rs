@@ -30,6 +30,14 @@ impl CodexHome {
         Self::discover_from(env::var_os(CODEX_HOME_ENV), dirs::home_dir())
     }
 
+    pub fn discover_in(cwd: impl AsRef<Path>) -> Result<Self> {
+        let codex_dir = cwd.as_ref().join(".codex");
+        if codex_dir.is_dir() {
+            return Ok(Self::from_path(codex_dir));
+        }
+        Self::discover()
+    }
+
     pub fn from_path(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -79,7 +87,7 @@ pub struct SessionIndexEntry {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexThreadRecord {
     pub thread_id: String,
     pub thread_name: Option<String>,
@@ -128,17 +136,43 @@ impl CodexSessionCatalog {
                 .then_with(|| right.thread_id.cmp(&left.thread_id))
         });
 
-        Ok(Self { codex_home, threads })
+        Ok(Self {
+            codex_home,
+            threads,
+        })
     }
 
     pub fn find_thread_by_id(&self, thread_id: &str) -> Option<&CodexThreadRecord> {
-        self.threads.iter().find(|record| record.thread_id == thread_id)
+        self.threads
+            .iter()
+            .find(|record| record.thread_id == thread_id)
     }
 
     pub fn find_thread_by_name(&self, thread_name: &str) -> Option<&CodexThreadRecord> {
         self.threads
             .iter()
             .find(|record| record.thread_name.as_deref() == Some(thread_name))
+    }
+
+    pub fn resolve_thread(&self, selector: &str) -> Option<&CodexThreadRecord> {
+        self.find_thread_by_id(selector)
+            .or_else(|| self.find_thread_by_name(selector))
+            .or_else(|| {
+                self.threads.iter().find(|record| {
+                    record
+                        .thread_id
+                        .split_once(':')
+                        .is_some_and(|(_, suffix)| suffix == selector)
+                })
+            })
+    }
+
+    pub fn recent_threads(&self, limit: usize) -> Vec<CodexThreadRecord> {
+        self.threads.iter().take(limit).cloned().collect()
+    }
+
+    pub fn all_threads(&self) -> &[CodexThreadRecord] {
+        &self.threads
     }
 }
 
@@ -192,7 +226,9 @@ mod tests {
 
         assert_eq!(catalog.threads.len(), 2);
         assert_eq!(
-            catalog.find_thread_by_id("a").and_then(|record| record.thread_name.as_deref()),
+            catalog
+                .find_thread_by_id("a")
+                .and_then(|record| record.thread_name.as_deref()),
             Some("alpha")
         );
         assert!(catalog.find_thread_by_name("alpha").is_some());
