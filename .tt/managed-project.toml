@@ -1,0 +1,32 @@
+schema = "tt-managed-project-v1"
+project_id = "019d6f7d-5079-7ec2-affa-4c1650b893f9"
+slug = "tt"
+title = "tt"
+objective = "Coordinate dev, test, and integration work for tt"
+repo_root = "/home/emmy/openai/tt"
+base_branch = "main"
+worktree_root = "/home/emmy/openai/.tt-worktrees/tt"
+contract_path = "/home/emmy/openai/tt/.tt/contracts/worker-contract.md"
+codex_config_path = "/home/emmy/openai/tt/.codex/config.toml"
+
+[roles.dev]
+work_unit_id = "019d6f7d-50b2-7d81-9f9d-d6ce5f07af39"
+agent_path = "/home/emmy/openai/tt/.codex/agents/dev.toml"
+branch_name = "tt/tt/dev"
+worktree_path = "/home/emmy/openai/.tt-worktrees/tt/dev"
+
+[roles.director]
+work_unit_id = "019d6f7d-5096-7550-917f-5bed67376468"
+agent_path = "/home/emmy/openai/tt/.codex/agents/director.toml"
+
+[roles.integration]
+work_unit_id = "019d6f7d-511d-7030-93b9-8686cc85fbee"
+agent_path = "/home/emmy/openai/tt/.codex/agents/integration.toml"
+branch_name = "tt/tt/integration"
+worktree_path = "/home/emmy/openai/.tt-worktrees/tt/integration"
+
+[roles.test]
+work_unit_id = "019d6f7d-50e8-7fd3-90be-10630e7a563f"
+agent_path = "/home/emmy/openai/tt/.codex/agents/test.toml"
+branch_name = "tt/tt/test"
+worktree_path = "/home/emmy/openai/.tt-worktrees/tt/test"
