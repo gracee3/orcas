@@ -131,6 +131,101 @@ pub fn render_dashboard(snapshot: &TuiSnapshot) -> String {
     output
 }
 
+fn render_status(status: &DaemonStatus) -> String {
+    let mut output = String::new();
+    output.push_str("TT status\n");
+    output.push_str("=========\n");
+    if let Some(codex_home) = status.codex_home.as_ref() {
+        output.push_str(&format!("Codex home: {}\n", codex_home.display()));
+    }
+    if let Some(codex_state_db) = status.codex_state_db.as_ref() {
+        output.push_str(&format!("Codex state db: {}\n", codex_state_db.display()));
+    }
+    if let Some(codex_session_index) = status.codex_session_index.as_ref() {
+        output.push_str(&format!(
+            "Codex session index: {}\n",
+            codex_session_index.display()
+        ));
+    }
+    output.push_str(&format!("Projects: {}\n", status.project_count));
+    output.push_str(&format!("Work units: {}\n", status.work_unit_count));
+    output.push_str(&format!("Bound threads: {}\n", status.bound_thread_count));
+    output.push_str(&format!("Ready workspaces: {}\n", status.ready_workspace_count));
+    output
+}
+
+fn render_repository_summary(summary: &GitRepositorySummary) -> String {
+    let mut output = String::new();
+    output.push_str("Repository\n");
+    output.push_str("==========\n");
+    output.push_str(&format!("Root: {}\n", summary.repository_root));
+    output.push_str(&format!(
+        "Worktree: {}\n",
+        summary.current_worktree.as_deref().unwrap_or("<unset>")
+    ));
+    output.push_str(&format!(
+        "Branch: {}\n",
+        summary.current_branch.as_deref().unwrap_or("<detached>")
+    ));
+    output.push_str(&format!(
+        "Head: {}\n",
+        summary.current_head_commit.as_deref().unwrap_or("<unknown>")
+    ));
+    output.push_str(&format!("Dirty: {}\n", summary.dirty));
+    output.push_str(&format!("Merge ready: {}\n", summary.merge_ready));
+    output.push_str(&format!("Worktrees: {}\n", summary.worktree_count));
+    if let Some(upstream) = summary.upstream.as_ref() {
+        output.push_str(&format!("Upstream: {}\n", upstream));
+    }
+    if let Some(ahead_by) = summary.ahead_by {
+        output.push_str(&format!("Ahead by: {}\n", ahead_by));
+    }
+    if let Some(behind_by) = summary.behind_by {
+        output.push_str(&format!("Behind by: {}\n", behind_by));
+    }
+    output
+}
+
+fn render_project(project: &Project) -> String {
+    format!(
+        "Project\n=======\nID: {}\nSlug: {}\nTitle: {}\nObjective: {}\nStatus: {:?}\nCreated: {}\nUpdated: {}\n",
+        project.id,
+        project.slug,
+        project.title,
+        project.objective,
+        project.status,
+        project.created_at,
+        project.updated_at
+    )
+}
+
+fn render_work_unit(work_unit: &WorkUnit) -> String {
+    format!(
+        "Work unit\n=========\nID: {}\nProject: {}\nSlug: {}\nTitle: {}\nTask: {}\nStatus: {:?}\nCreated: {}\nUpdated: {}\n",
+        work_unit.id,
+        work_unit.project_id,
+        work_unit.slug.as_deref().unwrap_or("<unset>"),
+        work_unit.title,
+        work_unit.task,
+        work_unit.status,
+        work_unit.created_at,
+        work_unit.updated_at
+    )
+}
+
+fn render_thread_binding(binding: &ThreadBinding) -> String {
+    format!(
+        "Thread binding\n==============\nThread: {}\nWork unit: {}\nRole: {:?}\nStatus: {:?}\nNotes: {}\nCreated: {}\nUpdated: {}\n",
+        binding.codex_thread_id,
+        binding.work_unit_id.as_deref().unwrap_or("<unbound>"),
+        binding.role,
+        binding.status,
+        binding.notes.as_deref().unwrap_or("<unset>"),
+        binding.created_at,
+        binding.updated_at
+    )
+}
+
 pub fn run_interactive(cwd: impl AsRef<Path>) -> Result<()> {
     let cwd = cwd.as_ref().to_path_buf();
     let stdin = io::stdin();
@@ -166,7 +261,7 @@ fn command_help() -> String {
         "  Codex: codex-threads [limit], codex-thread <selector>, codex-thread-read <selector> [include_turns], codex-thread-start [model] [ephemeral], codex-thread-resume <selector> [model]",
         "  Workspace actions: workspace-prepare <id>, workspace-refresh <id>, workspace-merge-prep <id>, workspace-authorize-merge <id>, workspace-execute-landing <id>, workspace-prune <id> [force]",
         "  Workspace lifecycle: workspace-close [selector] [force], workspace-park [selector] [note...], workspace-split <role> [model] [ephemeral]",
-        "  Records: projects, project <id>, project-status <id> <status>, work-units [project], work-unit <id>, work-unit-status <id> <status>, thread-bindings [work-unit], thread-binding-status <thread> <status>, workspace-bindings [thread], workspace-binding-status <id> <status>, workspace-binding-refresh <id>, merge-runs, merge-run-status <id> <readiness> <authorization> <execution> [head_commit], merge-run-refresh <workspace-binding-id>",
+        "  Records / legacy: projects, project <id>, project-status <id> <status>, work-units [project], work-unit <id>, work-unit-status <id> <status>, thread-bindings [work-unit], thread-binding <thread>, thread-binding-status <thread> <status>, workspace-bindings [thread], workspace-binding <id>, workspace-binding-status <id> <status>, workspace-binding-refresh <id>, merge-runs, merge-run-status <id> <readiness> <authorization> <execution> [head_commit], merge-run-refresh <workspace-binding-id>",
     ]
     .join("\n")
 }
@@ -181,6 +276,30 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
         "help" => Ok(Some(command_help())),
         "quit" | "exit" => Ok(None),
         "refresh" => Ok(Some(render_dashboard(&load_snapshot_from_cwd(cwd)?))),
+        "status" => {
+            let response = request_for_cwd(cwd, DaemonRequest::Status)?;
+            match response {
+                DaemonResponse::Status(status) => Ok(Some(render_status(&status))),
+                other => bail!("unexpected daemon response for status: {other:?}"),
+            }
+        }
+        "repo" => {
+            let response = request_for_cwd(
+                cwd,
+                DaemonRequest::RepositorySummary {
+                    cwd: cwd.to_path_buf(),
+                },
+            )?;
+            match response {
+                DaemonResponse::RepositorySummary(Some(summary)) => {
+                    Ok(Some(render_repository_summary(&summary)))
+                }
+                DaemonResponse::RepositorySummary(None) => {
+                    Ok(Some("not inside a git checkout".to_string()))
+                }
+                other => bail!("unexpected daemon response for repo: {other:?}"),
+            }
+        }
         "projects" => {
             let projects = match request_for_cwd(cwd, DaemonRequest::ListProjects)? {
                 DaemonResponse::Projects(projects) => projects,
@@ -196,10 +315,7 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 id_or_slug: id_or_slug.to_string(),
             })?;
             match response {
-                DaemonResponse::Project(Some(project)) => Ok(Some(format!(
-                    "{}\n{}\n{}\n{}\n",
-                    project.id, project.slug, project.title, project.objective
-                ))),
+                DaemonResponse::Project(Some(project)) => Ok(Some(render_project(&project))),
                 DaemonResponse::Project(None) => Ok(Some(format!("project not found: {id_or_slug}"))),
                 other => bail!("unexpected daemon response for project: {other:?}"),
             }
@@ -240,10 +356,7 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 id_or_slug: id_or_slug.to_string(),
             })?;
             match response {
-                DaemonResponse::WorkUnit(Some(work_unit)) => Ok(Some(format!(
-                    "{}\n{}\n{}\n{}\n",
-                    work_unit.id, work_unit.title, work_unit.task, work_unit.project_id
-                ))),
+                DaemonResponse::WorkUnit(Some(work_unit)) => Ok(Some(render_work_unit(&work_unit))),
                 DaemonResponse::WorkUnit(None) => {
                     Ok(Some(format!("work unit not found: {id_or_slug}")))
                 }
@@ -290,6 +403,26 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 other => bail!("unexpected daemon response for thread bindings: {other:?}"),
             }
         }
+        "thread-binding" => {
+            let Some(thread_id) = parts.next() else {
+                bail!("thread-binding requires a thread id");
+            };
+            let response = request_for_cwd(
+                cwd,
+                DaemonRequest::GetThreadBinding {
+                    codex_thread_id: thread_id.to_string(),
+                },
+            )?;
+            match response {
+                DaemonResponse::ThreadBinding(Some(binding)) => {
+                    Ok(Some(render_thread_binding(&binding)))
+                }
+                DaemonResponse::ThreadBinding(None) => {
+                    Ok(Some(format!("thread binding not found: {thread_id}")))
+                }
+                other => bail!("unexpected daemon response for thread-binding: {other:?}"),
+            }
+        }
         "thread-binding-status" => {
             let Some(thread_id) = parts.next() else {
                 bail!("thread-binding-status requires a thread id");
@@ -330,6 +463,24 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                     Ok(Some(render_workspace_bindings(&bindings)))
                 }
                 other => bail!("unexpected daemon response for workspace bindings: {other:?}"),
+            }
+        }
+        "workspace-binding" => {
+            let Some(id) = parts.next() else {
+                bail!("workspace-binding requires an id");
+            };
+            let response = request_for_cwd(
+                cwd,
+                DaemonRequest::GetWorkspaceBinding {
+                    id: id.to_string(),
+                },
+            )?;
+            match response {
+                DaemonResponse::WorkspaceBinding(Some(binding)) => Ok(Some(render_workspace_binding(&binding))),
+                DaemonResponse::WorkspaceBinding(None) => {
+                    Ok(Some(format!("workspace binding not found: {id}")))
+                }
+                other => bail!("unexpected daemon response for workspace-binding: {other:?}"),
             }
         }
         "workspace-binding-status" => {
@@ -385,9 +536,7 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 },
             )?;
             match response {
-                DaemonResponse::WorkspaceBinding(Some(binding)) => {
-                    Ok(Some(render_workspace_binding(&binding)))
-                }
+                DaemonResponse::WorkspaceBinding(Some(binding)) => Ok(Some(render_workspace_binding(&binding))),
                 DaemonResponse::WorkspaceBinding(None) => {
                     Ok(Some(format!("workspace binding not found: {id}")))
                 }
@@ -405,9 +554,7 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 },
             )?;
             match response {
-                DaemonResponse::WorkspaceBinding(Some(binding)) => {
-                    Ok(Some(render_workspace_binding(&binding)))
-                }
+                DaemonResponse::WorkspaceBinding(Some(binding)) => Ok(Some(render_workspace_binding(&binding))),
                 DaemonResponse::WorkspaceBinding(None) => {
                     Ok(Some(format!("workspace binding not found: {id}")))
                 }
@@ -425,7 +572,7 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 },
             )?;
             match response {
-                DaemonResponse::MergeRun(Some(run)) => Ok(Some(render_merge_runs(&[run]))),
+                DaemonResponse::MergeRun(Some(run)) => Ok(Some(render_merge_run_detail(&run))),
                 DaemonResponse::MergeRun(None) => {
                     Ok(Some(format!("merge run not found for workspace binding: {id}")))
                 }
@@ -443,7 +590,7 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 },
             )?;
             match response {
-                DaemonResponse::MergeRun(Some(run)) => Ok(Some(render_merge_runs(&[run]))),
+                DaemonResponse::MergeRun(Some(run)) => Ok(Some(render_merge_run_detail(&run))),
                 DaemonResponse::MergeRun(None) => {
                     Ok(Some(format!("merge run not found for workspace binding: {id}")))
                 }
@@ -463,7 +610,7 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 },
             )?;
             match response {
-                DaemonResponse::MergeRun(Some(run)) => Ok(Some(render_merge_runs(&[run]))),
+                DaemonResponse::MergeRun(Some(run)) => Ok(Some(render_merge_run_detail(&run))),
                 DaemonResponse::MergeRun(None) => {
                     Ok(Some(format!("merge run not found for workspace binding: {id}")))
                 }
@@ -488,9 +635,9 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 },
             )?;
             match response {
-                DaemonResponse::WorkspaceBinding(Some(binding)) => {
-                    Ok(Some(render_workspace_binding(&binding)))
-                }
+                DaemonResponse::WorkspaceBinding(Some(binding)) => Ok(Some(
+                    render_workspace_lifecycle_result("workspace-prune", &binding, force, Some(id)),
+                )),
                 DaemonResponse::WorkspaceBinding(None) => {
                     Ok(Some(format!("workspace binding not found: {id}")))
                 }
@@ -507,14 +654,19 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 cwd,
                 DaemonRequest::CloseWorkspace {
                     cwd: cwd.to_path_buf(),
-                    selector,
+                    selector: selector.clone(),
                     force,
                 },
             )?;
             match response {
-                DaemonResponse::WorkspaceBinding(Some(binding)) => {
-                    Ok(Some(render_workspace_binding(&binding)))
-                }
+                DaemonResponse::WorkspaceBinding(Some(binding)) => Ok(Some(
+                    render_workspace_lifecycle_result(
+                        "workspace-close",
+                        &binding,
+                        force,
+                        selector.as_deref(),
+                    ),
+                )),
                 DaemonResponse::WorkspaceBinding(None) => {
                     Ok(Some("workspace binding not found".to_string()))
                 }
@@ -533,14 +685,19 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 cwd,
                 DaemonRequest::ParkWorkspace {
                     cwd: cwd.to_path_buf(),
-                    selector,
+                    selector: selector.clone(),
                     note,
                 },
             )?;
             match response {
-                DaemonResponse::WorkspaceBinding(Some(binding)) => {
-                    Ok(Some(render_workspace_binding(&binding)))
-                }
+                DaemonResponse::WorkspaceBinding(Some(binding)) => Ok(Some(
+                    render_workspace_lifecycle_result(
+                        "workspace-park",
+                        &binding,
+                        false,
+                        selector.as_deref(),
+                    ),
+                )),
                 DaemonResponse::WorkspaceBinding(None) => {
                     Ok(Some("workspace binding not found".to_string()))
                 }
@@ -564,9 +721,14 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 },
             )?;
             match response {
-                DaemonResponse::WorkspaceBinding(Some(binding)) => {
-                    Ok(Some(render_workspace_binding(&binding)))
-                }
+                DaemonResponse::WorkspaceBinding(Some(binding)) => Ok(Some(
+                    render_workspace_lifecycle_result(
+                        "workspace-split",
+                        &binding,
+                        ephemeral,
+                        Some(role_raw),
+                    ),
+                )),
                 DaemonResponse::WorkspaceBinding(None) => {
                     Ok(Some("could not split workspace from current cwd".to_string()))
                 }
@@ -591,7 +753,7 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 },
             )?;
             match response {
-                DaemonResponse::MergeRun(Some(run)) => Ok(Some(render_merge_runs(&[run]))),
+                DaemonResponse::MergeRun(Some(run)) => Ok(Some(render_merge_run_detail(&run))),
                 DaemonResponse::MergeRun(None) => Ok(Some(format!(
                     "merge run not found for workspace binding: {workspace_binding_id}"
                 ))),
@@ -810,13 +972,21 @@ fn render_workspace_bindings(bindings: &[WorkspaceBinding]) -> String {
 
 fn render_workspace_binding(binding: &WorkspaceBinding) -> String {
     format!(
-        "{} | {} | {:?} | thread={} | worktree={} | branch={}\n",
+        "Workspace binding\n=================\nID: {}\nRepo root: {}\nThread: {}\nWorktree: {}\nBranch: {}\nBase ref: {}\nBase commit: {}\nLanding target: {}\nStrategy: {:?}\nSync policy: {:?}\nCleanup policy: {:?}\nStatus: {:?}\nCreated: {}\nUpdated: {}\n",
         binding.id,
         binding.repo_root,
-        binding.status,
         binding.codex_thread_id,
         binding.worktree_path.as_deref().unwrap_or("<unset>"),
-        binding.branch_name.as_deref().unwrap_or("<unset>")
+        binding.branch_name.as_deref().unwrap_or("<unset>"),
+        binding.base_ref.as_deref().unwrap_or("<unset>"),
+        binding.base_commit.as_deref().unwrap_or("<unset>"),
+        binding.landing_target.as_deref().unwrap_or("<unset>"),
+        binding.strategy,
+        binding.sync_policy,
+        binding.cleanup_policy,
+        binding.status,
+        binding.created_at,
+        binding.updated_at
     )
 }
 
@@ -832,6 +1002,20 @@ fn render_merge_runs(runs: &[MergeRun]) -> String {
         ));
     }
     output
+}
+
+fn render_merge_run_detail(run: &MergeRun) -> String {
+    format!(
+        "Merge run\n=========\nID: {}\nWorkspace binding: {}\nReadiness: {:?}\nAuthorization: {:?}\nExecution: {:?}\nHead commit: {}\nCreated: {}\nUpdated: {}\n",
+        run.id,
+        run.workspace_binding_id,
+        run.readiness,
+        run.authorization,
+        run.execution,
+        run.head_commit.as_deref().unwrap_or("<unset>"),
+        run.created_at,
+        run.updated_at
+    )
 }
 
 fn render_codex_threads(threads: &[CodexThreadSummary]) -> String {
@@ -881,13 +1065,43 @@ fn render_codex_thread_detail(thread: &CodexThreadDetail) -> String {
     )
 }
 
+fn render_workspace_lifecycle_result(
+    action: &str,
+    binding: &WorkspaceBinding,
+    flag: bool,
+    selector: Option<&str>,
+) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("{}\n", action.replace('-', " ")));
+    output.push_str(&format!("Binding: {}\n", binding.id));
+    if let Some(selector) = selector {
+        output.push_str(&format!("Selector: {}\n", selector));
+    }
+    output.push_str(&format!("Thread: {}\n", binding.codex_thread_id));
+    output.push_str(&format!(
+        "Worktree: {}\n",
+        binding.worktree_path.as_deref().unwrap_or("<unset>")
+    ));
+    output.push_str(&format!(
+        "Branch: {}\n",
+        binding.branch_name.as_deref().unwrap_or("<unset>")
+    ));
+    output.push_str(&format!("Status: {:?}\n", binding.status));
+    output.push_str(&format!("Flag: {}\n", flag));
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use std::process::Command;
     use tempfile::tempdir;
-    use tt_domain::{Project, ProjectStatus};
+    use tt_domain::{
+        Project, ProjectStatus, ThreadBinding, ThreadBindingStatus, ThreadRole, WorkUnit,
+        WorkUnitStatus, WorkspaceBinding, WorkspaceCleanupPolicy, WorkspaceStatus,
+        WorkspaceStrategy, WorkspaceSyncPolicy,
+    };
 
     fn ts() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 4, 8, 12, 0, 0).unwrap()
@@ -983,6 +1197,163 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn handle_command_reports_status_and_repo() {
+        let dir = tempdir().expect("tempdir");
+        let status = handle_command(dir.path(), "status")
+            .expect("command")
+            .expect("output");
+        assert!(status.contains("TT status"));
+
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("create repo");
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["init", "-b", "main"])
+            .status()
+            .expect("git init");
+        assert!(init.success());
+        let repo = handle_command(&repo_root, "repo")
+            .expect("command")
+            .expect("output");
+        assert!(repo.contains("Repository"));
+    }
+
+    #[test]
+    fn handle_command_shows_binding_details() {
+        let dir = tempdir().expect("tempdir");
+        request_for_cwd(
+            dir.path(),
+            DaemonRequest::UpsertProject {
+                project: Project {
+                    id: "p1".into(),
+                    slug: "alpha".into(),
+                    title: "Alpha".into(),
+                    objective: "Ship".into(),
+                    status: ProjectStatus::Active,
+                    created_at: ts(),
+                    updated_at: ts(),
+                },
+            },
+        )
+        .expect("upsert project");
+        request_for_cwd(
+            dir.path(),
+            DaemonRequest::UpsertWorkUnit {
+                work_unit: WorkUnit {
+                    id: "wu1".into(),
+                    project_id: "p1".into(),
+                    slug: Some("wu-alpha".into()),
+                    title: "Work unit".into(),
+                    task: "Do the thing".into(),
+                    status: WorkUnitStatus::Ready,
+                    created_at: ts(),
+                    updated_at: ts(),
+                },
+            },
+        )
+        .expect("upsert work unit");
+        request_for_cwd(
+            dir.path(),
+            DaemonRequest::UpsertThreadBinding {
+                binding: ThreadBinding {
+                    codex_thread_id: "thread-1".into(),
+                    work_unit_id: Some("wu1".into()),
+                    role: ThreadRole::Develop,
+                    status: ThreadBindingStatus::Bound,
+                    notes: Some("note".into()),
+                    created_at: ts(),
+                    updated_at: ts(),
+                },
+            },
+        )
+        .expect("upsert thread binding");
+        request_for_cwd(
+            dir.path(),
+            DaemonRequest::UpsertWorkspaceBinding {
+                binding: WorkspaceBinding {
+                    id: "ws1".into(),
+                    codex_thread_id: "thread-1".into(),
+                    repo_root: "/repo".into(),
+                    worktree_path: Some("/repo/worktree".into()),
+                    branch_name: Some("tt/main".into()),
+                    base_ref: Some("main".into()),
+                    base_commit: Some("abc123".into()),
+                    landing_target: Some("main".into()),
+                    strategy: WorkspaceStrategy::DedicatedWorktree,
+                    sync_policy: WorkspaceSyncPolicy::RebaseBeforeLanding,
+                    cleanup_policy: WorkspaceCleanupPolicy::PruneAfterLanding,
+                    status: WorkspaceStatus::Ready,
+                    created_at: ts(),
+                    updated_at: ts(),
+                },
+            },
+        )
+        .expect("upsert workspace binding");
+
+        let thread_binding = handle_command(dir.path(), "thread-binding thread-1")
+            .expect("command")
+            .expect("output");
+        assert!(thread_binding.contains("Thread binding"));
+        assert!(thread_binding.contains("thread-1"));
+
+        let workspace_binding = handle_command(dir.path(), "workspace-binding ws1")
+            .expect("command")
+            .expect("output");
+        assert!(workspace_binding.contains("Workspace binding"));
+        assert!(workspace_binding.contains("ws1"));
+    }
+
+    #[test]
+    fn handle_command_reports_workspace_close_details() {
+        let dir = tempdir().expect("tempdir");
+        request_for_cwd(
+            dir.path(),
+            DaemonRequest::UpsertThreadBinding {
+                binding: ThreadBinding {
+                    codex_thread_id: "thread-1".into(),
+                    work_unit_id: None,
+                    role: ThreadRole::Develop,
+                    status: ThreadBindingStatus::Bound,
+                    notes: Some("note".into()),
+                    created_at: ts(),
+                    updated_at: ts(),
+                },
+            },
+        )
+        .expect("upsert thread binding");
+        request_for_cwd(
+            dir.path(),
+            DaemonRequest::UpsertWorkspaceBinding {
+                binding: WorkspaceBinding {
+                    id: "ws1".into(),
+                    codex_thread_id: "thread-1".into(),
+                    repo_root: "/repo".into(),
+                    worktree_path: Some("/repo/worktree".into()),
+                    branch_name: Some("tt/main".into()),
+                    base_ref: Some("main".into()),
+                    base_commit: Some("abc123".into()),
+                    landing_target: Some("main".into()),
+                    strategy: WorkspaceStrategy::DedicatedWorktree,
+                    sync_policy: WorkspaceSyncPolicy::RebaseBeforeLanding,
+                    cleanup_policy: WorkspaceCleanupPolicy::PruneAfterLanding,
+                    status: WorkspaceStatus::Ready,
+                    created_at: ts(),
+                    updated_at: ts(),
+                },
+            },
+        )
+        .expect("upsert workspace binding");
+
+        let output = handle_command(dir.path(), "workspace-close ws1 force")
+            .expect("command")
+            .expect("output");
+        assert!(output.contains("workspace close"));
+        assert!(output.contains("Status: Pruned"));
+        assert!(output.contains("Flag: true"));
     }
 
     #[test]

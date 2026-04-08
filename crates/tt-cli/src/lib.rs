@@ -224,7 +224,7 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
     let response = request_for_cwd(&cwd, command_to_request(cli.command, &cwd)?)?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    println!("{}", render_response(&response));
     Ok(())
 }
 
@@ -428,6 +428,183 @@ where
     T::from_str(raw).map_err(|error| anyhow::anyhow!(error))
 }
 
+fn render_response(response: &DaemonResponse) -> String {
+    match response {
+        DaemonResponse::Unit => "ok".to_string(),
+        DaemonResponse::Count(count) => format!("updated {count}"),
+        DaemonResponse::Status(status) => format!(
+            "status\nprojects: {}\nwork-units: {}\nbound-threads: {}\nready-workspaces: {}\n",
+            status.project_count, status.work_unit_count, status.bound_thread_count, status.ready_workspace_count
+        ),
+        DaemonResponse::DashboardSummary(summary) => format!(
+            "dashboard\nprojects: {}\nwork-units: {}\nbound-threads: {}\nready-workspaces: {}\n",
+            summary.active_projects, summary.active_work_units, summary.bound_threads, summary.ready_workspaces
+        ),
+        DaemonResponse::RepositorySummary(Some(summary)) => format!(
+            "repository\nroot: {}\nworktree: {}\nbranch: {}\nhead: {}\ndirty: {}\nmerge-ready: {}\nworktrees: {}\n",
+            summary.repository_root,
+            summary.current_worktree.as_deref().unwrap_or("<unset>"),
+            summary.current_branch.as_deref().unwrap_or("<detached>"),
+            summary.current_head_commit.as_deref().unwrap_or("<unknown>"),
+            summary.dirty,
+            summary.merge_ready,
+            summary.worktree_count
+        ),
+        DaemonResponse::RepositorySummary(None) => "not inside a git checkout".to_string(),
+        DaemonResponse::Project(Some(project)) => format!(
+            "project\nid: {}\nslug: {}\ntitle: {}\nobjective: {}\nstatus: {:?}\n",
+            project.id, project.slug, project.title, project.objective, project.status
+        ),
+        DaemonResponse::Project(None) => "project not found".to_string(),
+        DaemonResponse::WorkUnit(Some(work_unit)) => format!(
+            "work-unit\nid: {}\nproject: {}\nslug: {}\ntitle: {}\ntask: {}\nstatus: {:?}\n",
+            work_unit.id,
+            work_unit.project_id,
+            work_unit.slug.as_deref().unwrap_or("<unset>"),
+            work_unit.title,
+            work_unit.task,
+            work_unit.status
+        ),
+        DaemonResponse::WorkUnit(None) => "work unit not found".to_string(),
+        DaemonResponse::ThreadBinding(Some(binding)) => format!(
+            "thread-binding\nthread: {}\nwork-unit: {}\nrole: {:?}\nstatus: {:?}\nnotes: {}\n",
+            binding.codex_thread_id,
+            binding.work_unit_id.as_deref().unwrap_or("<unbound>"),
+            binding.role,
+            binding.status,
+            binding.notes.as_deref().unwrap_or("<unset>")
+        ),
+        DaemonResponse::ThreadBinding(None) => "thread binding not found".to_string(),
+        DaemonResponse::WorkspaceBinding(Some(binding)) => format!(
+            "workspace-binding\nid: {}\nrepo-root: {}\nthread: {}\nworktree: {}\nbranch: {}\nstatus: {:?}\n",
+            binding.id,
+            binding.repo_root,
+            binding.codex_thread_id,
+            binding.worktree_path.as_deref().unwrap_or("<unset>"),
+            binding.branch_name.as_deref().unwrap_or("<unset>"),
+            binding.status
+        ),
+        DaemonResponse::WorkspaceBinding(None) => "workspace binding not found".to_string(),
+        DaemonResponse::MergeRun(Some(run)) => format!(
+            "merge-run\nid: {}\nworkspace-binding: {}\nreadiness: {:?}\nauthorization: {:?}\nexecution: {:?}\nhead-commit: {}\n",
+            run.id,
+            run.workspace_binding_id,
+            run.readiness,
+            run.authorization,
+            run.execution,
+            run.head_commit.as_deref().unwrap_or("<unset>")
+        ),
+        DaemonResponse::MergeRun(None) => "merge run not found".to_string(),
+        DaemonResponse::Projects(projects) => format!(
+            "{}",
+            projects
+                .iter()
+                .map(|project| format!(
+                    "{} | {} | {:?}",
+                    project.slug, project.title, project.status
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        DaemonResponse::WorkUnits(work_units) => format!(
+            "{}",
+            work_units
+                .iter()
+                .map(|work_unit| format!(
+                    "{} | {} | {:?}",
+                    work_unit.id, work_unit.title, work_unit.status
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        DaemonResponse::ThreadBindings(bindings) => format!(
+            "{}",
+            bindings
+                .iter()
+                .map(|binding| format!(
+                    "{} | {:?} | {:?}",
+                    binding.codex_thread_id, binding.role, binding.status
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        DaemonResponse::WorkspaceBindings(bindings) => format!(
+            "{}",
+            bindings
+                .iter()
+                .map(|binding| format!(
+                    "{} | {} | {:?}",
+                    binding.id, binding.repo_root, binding.status
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        DaemonResponse::MergeRuns(runs) => format!(
+            "{}",
+            runs.iter()
+                .map(|run| format!(
+                    "{} | {} | {:?} | {:?}",
+                    run.id, run.workspace_binding_id, run.readiness, run.execution
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        DaemonResponse::CodexThreads(threads) => format!(
+            "{}",
+            threads
+                .iter()
+                .map(|thread| format!(
+                    "{} | {} | {:?} | work-unit={} | workspaces={}",
+                    thread.thread_id,
+                    thread.thread_name.as_deref().unwrap_or("<unnamed>"),
+                    thread.updated_at,
+                    thread.bound_work_unit_id.as_deref().unwrap_or("<unbound>"),
+                    thread.workspace_binding_count
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        DaemonResponse::CodexThread(Some(thread)) => format!(
+            "{}\n{}\n{:?}\nwork-unit={}\nworkspaces={}\n",
+            thread.thread_id,
+            thread.thread_name.as_deref().unwrap_or("<unnamed>"),
+            thread.updated_at,
+            thread.bound_work_unit_id.as_deref().unwrap_or("<unbound>"),
+            thread.workspace_binding_count
+        ),
+        DaemonResponse::CodexThread(None) => "codex thread not found".to_string(),
+        DaemonResponse::CodexThreadDetails(details) => format!(
+            "{}",
+            details
+                .iter()
+                .map(|detail| format!(
+                    "{} | {} | {}\n",
+                    detail.thread_id,
+                    detail.thread_name.as_deref().unwrap_or("<unnamed>"),
+                    detail.status
+                ))
+                .collect::<Vec<_>>()
+                .join("")
+        ),
+        DaemonResponse::CodexThreadDetail(Some(thread)) => format!(
+            "{}\n{}\nstatus={}\ncwd={}\npreview={}\nmodel_provider={}\nephemeral={}\nupdated_at={}\nturn_count={}\nlatest_turn_id={}\nbound_work_unit_id={}\nworkspace_binding_count={}\n",
+            thread.thread_id,
+            thread.thread_name.as_deref().unwrap_or("<unnamed>"),
+            thread.status,
+            thread.cwd,
+            thread.preview,
+            thread.model_provider,
+            thread.ephemeral,
+            thread.updated_at,
+            thread.turn_count,
+            thread.latest_turn_id.as_deref().unwrap_or("-"),
+            thread.bound_work_unit_id.as_deref().unwrap_or("<unbound>"),
+            thread.workspace_binding_count
+        ),
+        DaemonResponse::CodexThreadDetail(None) => "codex thread not found".to_string(),
+    }
+}
+
 fn read_json<T>(path: PathBuf) -> Result<T>
 where
     T: DeserializeOwned,
@@ -451,7 +628,16 @@ pub fn response_is_empty(response: &DaemonResponse) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tt_domain::{Project, ProjectStatus};
+    use chrono::{TimeZone, Utc};
+    use tt_domain::{
+        MergeAuthorizationStatus, MergeExecutionStatus, MergeReadiness, MergeRun, Project,
+        ProjectStatus, WorkspaceBinding, WorkspaceCleanupPolicy, WorkspaceStatus,
+        WorkspaceStrategy, WorkspaceSyncPolicy,
+    };
+
+    fn ts() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 8, 12, 0, 0).unwrap()
+    }
 
     #[test]
     fn parses_project_list_command() {
@@ -499,5 +685,44 @@ mod tests {
         };
         let json = serde_json::to_string(&project).expect("serialize");
         let _: Project = serde_json::from_str(&json).expect("deserialize");
+    }
+
+    #[test]
+    fn renders_workspace_binding_and_merge_run_details() {
+        let binding = WorkspaceBinding {
+            id: "ws1".into(),
+            codex_thread_id: "thread-1".into(),
+            repo_root: "/repo".into(),
+            worktree_path: Some("/repo/worktree".into()),
+            branch_name: Some("tt/main".into()),
+            base_ref: Some("main".into()),
+            base_commit: Some("abc123".into()),
+            landing_target: Some("main".into()),
+            strategy: WorkspaceStrategy::DedicatedWorktree,
+            sync_policy: WorkspaceSyncPolicy::RebaseBeforeLanding,
+            cleanup_policy: WorkspaceCleanupPolicy::PruneAfterLanding,
+            status: WorkspaceStatus::Ready,
+            created_at: ts(),
+            updated_at: ts(),
+        };
+        let binding_text = render_response(&DaemonResponse::WorkspaceBinding(Some(binding)));
+        assert!(binding_text.contains("workspace-binding"));
+        assert!(binding_text.contains("thread-1"));
+        assert!(binding_text.contains("tt/main"));
+
+        let run = MergeRun {
+            id: "ws1".into(),
+            workspace_binding_id: "ws1".into(),
+            readiness: MergeReadiness::Ready,
+            authorization: MergeAuthorizationStatus::NotRequested,
+            execution: MergeExecutionStatus::NotStarted,
+            head_commit: Some("abc123".into()),
+            created_at: ts(),
+            updated_at: ts(),
+        };
+        let run_text = render_response(&DaemonResponse::MergeRun(Some(run)));
+        assert!(run_text.contains("merge-run"));
+        assert!(run_text.contains("abc123"));
+        assert!(run_text.contains("readiness"));
     }
 }
