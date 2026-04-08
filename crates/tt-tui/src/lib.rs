@@ -7,11 +7,16 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::str::FromStr;
 
-use anyhow::{bail, Result};
-use tt_daemon::{request_for_cwd, DaemonRequest, DaemonResponse, DaemonStatus};
-use tt_domain::{MergeRun, Project, ThreadBinding, WorkUnit, WorkspaceBinding};
-use tt_ui_core::{DashboardSummary, GitRepositorySummary};
+use anyhow::{Result, bail};
+use tt_daemon::{DaemonRequest, DaemonResponse, DaemonStatus, request_for_cwd};
+use tt_domain::{
+    MergeAuthorizationStatus, MergeExecutionStatus, MergeReadiness, MergeRun, Project,
+    ProjectStatus, ThreadBinding, ThreadBindingStatus, WorkUnit, WorkUnitStatus, WorkspaceBinding,
+    WorkspaceStatus,
+};
+use tt_ui_core::{CodexThreadSummary, DashboardSummary, GitRepositorySummary};
 
 pub const TT_TUI_PRODUCT: &str = "tt-tui";
 
@@ -36,9 +41,12 @@ pub fn load_snapshot_from_cwd(cwd: impl AsRef<Path>) -> Result<TuiSnapshot> {
         DaemonResponse::DashboardSummary(summary) => summary,
         other => bail!("unexpected daemon response for dashboard summary: {other:?}"),
     };
-    let repository = match request_for_cwd(cwd, DaemonRequest::RepositorySummary {
-        cwd: cwd.to_path_buf(),
-    })? {
+    let repository = match request_for_cwd(
+        cwd,
+        DaemonRequest::RepositorySummary {
+            cwd: cwd.to_path_buf(),
+        },
+    )? {
         DaemonResponse::RepositorySummary(summary) => summary,
         other => bail!("unexpected daemon response for repository summary: {other:?}"),
     };
@@ -64,7 +72,10 @@ pub fn render_dashboard(snapshot: &TuiSnapshot) -> String {
         output.push_str(&format!("Codex state db: {}\n", state_db.display()));
     }
     if let Some(session_index) = snapshot.status.codex_session_index.as_ref() {
-        output.push_str(&format!("Codex session index: {}\n", session_index.display()));
+        output.push_str(&format!(
+            "Codex session index: {}\n",
+            session_index.display()
+        ));
     }
 
     if let Some(repo) = snapshot.repository.as_ref() {
@@ -77,7 +88,10 @@ pub fn render_dashboard(snapshot: &TuiSnapshot) -> String {
             "Head: {}\n",
             repo.current_head_commit.as_deref().unwrap_or("<unknown>")
         ));
-        output.push_str(&format!("Dirty: {}\n", if repo.dirty { "yes" } else { "no" }));
+        output.push_str(&format!(
+            "Dirty: {}\n",
+            if repo.dirty { "yes" } else { "no" }
+        ));
         output.push_str(&format!(
             "Merge ready: {}\n",
             if repo.merge_ready { "yes" } else { "no" }
@@ -98,12 +112,18 @@ pub fn render_dashboard(snapshot: &TuiSnapshot) -> String {
 
     output.push_str("\nOverlay counts\n");
     output.push_str("--------------\n");
-    output.push_str(&format!("Projects: {}\n", snapshot.dashboard.active_projects));
+    output.push_str(&format!(
+        "Projects: {}\n",
+        snapshot.dashboard.active_projects
+    ));
     output.push_str(&format!(
         "Work units: {}\n",
         snapshot.dashboard.active_work_units
     ));
-    output.push_str(&format!("Bound threads: {}\n", snapshot.dashboard.bound_threads));
+    output.push_str(&format!(
+        "Bound threads: {}\n",
+        snapshot.dashboard.bound_threads
+    ));
     output.push_str(&format!(
         "Ready workspaces: {}\n",
         snapshot.dashboard.ready_workspaces
@@ -116,10 +136,14 @@ pub fn run_interactive(cwd: impl AsRef<Path>) -> Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
-    writeln!(stdout, "{}", render_dashboard(&load_snapshot_from_cwd(&cwd)?))?;
     writeln!(
         stdout,
-        "\nCommands: help, refresh, projects, project <id>, work-units [project], work-unit <id>, thread-bindings [work-unit], workspace-bindings [thread], merge-runs, quit"
+        "{}",
+        render_dashboard(&load_snapshot_from_cwd(&cwd)?)
+    )?;
+    writeln!(
+        stdout,
+        "\nCommands: help, refresh, projects, project <id>, project-status <id> <status>, work-units [project], work-unit <id>, work-unit-status <id> <status>, thread-bindings [work-unit], thread-binding-status <thread> <status>, workspace-bindings [thread], workspace-binding-status <id> <status>, merge-runs, merge-run-status <id> <readiness> <authorization> <execution> [head_commit], codex-threads [limit], codex-thread <selector>, quit"
     )?;
     stdout.flush()?;
 
@@ -146,7 +170,7 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
 
     match command {
         "help" => Ok(Some(
-            "Commands: help, refresh, projects, project <id>, work-units [project], work-unit <id>, thread-bindings [work-unit], workspace-bindings [thread], merge-runs, quit".to_string(),
+            "Commands: help, refresh, projects, project <id>, project-status <id> <status>, work-units [project], work-unit <id>, work-unit-status <id> <status>, thread-bindings [work-unit], thread-binding-status <thread> <status>, workspace-bindings [thread], workspace-binding-status <id> <status>, merge-runs, merge-run-status <id> <readiness> <authorization> <execution> [head_commit], codex-threads [limit], codex-thread <selector>, quit".to_string(),
         )),
         "quit" | "exit" => Ok(None),
         "refresh" => Ok(Some(render_dashboard(&load_snapshot_from_cwd(cwd)?))),
@@ -171,6 +195,26 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 ))),
                 DaemonResponse::Project(None) => Ok(Some(format!("project not found: {id_or_slug}"))),
                 other => bail!("unexpected daemon response for project: {other:?}"),
+            }
+        }
+        "project-status" => {
+            let Some(id_or_slug) = parts.next() else {
+                bail!("project-status requires an id or slug");
+            };
+            let Some(raw_status) = parts.next() else {
+                bail!("project-status requires a status");
+            };
+            let status = parse_status::<ProjectStatus>(raw_status)?;
+            let response = request_for_cwd(
+                cwd,
+                DaemonRequest::SetProjectStatus {
+                    id_or_slug: id_or_slug.to_string(),
+                    status,
+                },
+            )?;
+            match response {
+                DaemonResponse::Count(count) => Ok(Some(format!("updated {} project(s)", count))),
+                other => bail!("unexpected daemon response for project-status: {other:?}"),
             }
         }
         "work-units" => {
@@ -199,6 +243,26 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 other => bail!("unexpected daemon response for work unit: {other:?}"),
             }
         }
+        "work-unit-status" => {
+            let Some(id_or_slug) = parts.next() else {
+                bail!("work-unit-status requires an id or slug");
+            };
+            let Some(raw_status) = parts.next() else {
+                bail!("work-unit-status requires a status");
+            };
+            let status = parse_status::<WorkUnitStatus>(raw_status)?;
+            let response = request_for_cwd(
+                cwd,
+                DaemonRequest::SetWorkUnitStatus {
+                    id_or_slug: id_or_slug.to_string(),
+                    status,
+                },
+            )?;
+            match response {
+                DaemonResponse::Count(count) => Ok(Some(format!("updated {} work unit(s)", count))),
+                other => bail!("unexpected daemon response for work-unit-status: {other:?}"),
+            }
+        }
         "thread-bindings" => {
             let Some(work_unit_id) = parts.next() else {
                 let response = request_for_cwd(cwd, DaemonRequest::ListThreadBindings)?;
@@ -217,6 +281,28 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                     Ok(Some(render_thread_bindings(&bindings)))
                 }
                 other => bail!("unexpected daemon response for thread bindings: {other:?}"),
+            }
+        }
+        "thread-binding-status" => {
+            let Some(thread_id) = parts.next() else {
+                bail!("thread-binding-status requires a thread id");
+            };
+            let Some(raw_status) = parts.next() else {
+                bail!("thread-binding-status requires a status");
+            };
+            let status = parse_status::<ThreadBindingStatus>(raw_status)?;
+            let response = request_for_cwd(
+                cwd,
+                DaemonRequest::SetThreadBindingStatus {
+                    codex_thread_id: thread_id.to_string(),
+                    status,
+                },
+            )?;
+            match response {
+                DaemonResponse::Count(count) => {
+                    Ok(Some(format!("updated {} thread binding(s)", count)))
+                }
+                other => bail!("unexpected daemon response for thread-binding-status: {other:?}"),
             }
         }
         "workspace-bindings" => {
@@ -239,6 +325,28 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 other => bail!("unexpected daemon response for workspace bindings: {other:?}"),
             }
         }
+        "workspace-binding-status" => {
+            let Some(id) = parts.next() else {
+                bail!("workspace-binding-status requires an id");
+            };
+            let Some(raw_status) = parts.next() else {
+                bail!("workspace-binding-status requires a status");
+            };
+            let status = parse_status::<WorkspaceStatus>(raw_status)?;
+            let response = request_for_cwd(
+                cwd,
+                DaemonRequest::SetWorkspaceBindingStatus {
+                    id: id.to_string(),
+                    status,
+                },
+            )?;
+            match response {
+                DaemonResponse::Count(count) => {
+                    Ok(Some(format!("updated {} workspace binding(s)", count)))
+                }
+                other => bail!("unexpected daemon response for workspace-binding-status: {other:?}"),
+            }
+        }
         "merge-runs" => {
             let response = request_for_cwd(cwd, DaemonRequest::ListMergeRuns)?;
             match response {
@@ -246,8 +354,77 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 other => bail!("unexpected daemon response for merge runs: {other:?}"),
             }
         }
+        "codex-threads" => {
+            let limit = parts.next().and_then(|value| value.parse::<usize>().ok());
+            let response = request_for_cwd(cwd, DaemonRequest::ListCodexThreads { limit })?;
+            match response {
+                DaemonResponse::CodexThreads(threads) => Ok(Some(render_codex_threads(&threads))),
+                other => bail!("unexpected daemon response for codex threads: {other:?}"),
+            }
+        }
+        "codex-thread" => {
+            let Some(selector) = parts.next() else {
+                bail!("codex-thread requires a selector");
+            };
+            let response = request_for_cwd(
+                cwd,
+                DaemonRequest::GetCodexThread {
+                    selector: selector.to_string(),
+                },
+            )?;
+            match response {
+                DaemonResponse::CodexThread(Some(thread)) => {
+                    Ok(Some(render_codex_thread(&thread)))
+                }
+                DaemonResponse::CodexThread(None) => {
+                    Ok(Some(format!("codex thread not found: {selector}")))
+                }
+                other => bail!("unexpected daemon response for codex thread: {other:?}"),
+            }
+        }
+        "merge-run-status" => {
+            let Some(id) = parts.next() else {
+                bail!("merge-run-status requires an id");
+            };
+            let Some(raw_readiness) = parts.next() else {
+                bail!("merge-run-status requires a readiness");
+            };
+            let Some(raw_authorization) = parts.next() else {
+                bail!("merge-run-status requires an authorization");
+            };
+            let Some(raw_execution) = parts.next() else {
+                bail!("merge-run-status requires an execution status");
+            };
+            let readiness = parse_status::<MergeReadiness>(raw_readiness)?;
+            let authorization = parse_status::<MergeAuthorizationStatus>(raw_authorization)?;
+            let execution = parse_status::<MergeExecutionStatus>(raw_execution)?;
+            let head_commit = parts.next().map(ToString::to_string);
+            let response = request_for_cwd(
+                cwd,
+                DaemonRequest::SetMergeRunStatus {
+                    id: id.to_string(),
+                    readiness,
+                    authorization,
+                    execution,
+                    head_commit,
+                },
+            )?;
+            match response {
+                DaemonResponse::Count(count) => {
+                    Ok(Some(format!("updated {} merge run(s)", count)))
+                }
+                other => bail!("unexpected daemon response for merge-run-status: {other:?}"),
+            }
+        }
         other => Ok(Some(format!("unknown command: {other}"))),
     }
+}
+
+fn parse_status<T>(raw: &str) -> Result<T>
+where
+    T: FromStr<Err = String>,
+{
+    T::from_str(raw).map_err(|error| anyhow::anyhow!(error))
 }
 
 fn render_projects(projects: &[Project]) -> String {
@@ -258,7 +435,9 @@ fn render_projects(projects: &[Project]) -> String {
     for project in projects {
         output.push_str(&format!(
             "{} | {} | {}\n",
-            project.slug, project.title, format!("{:?}", project.status)
+            project.slug,
+            project.title,
+            format!("{:?}", project.status)
         ));
     }
     output
@@ -272,7 +451,9 @@ fn render_work_units(work_units: &[WorkUnit]) -> String {
     for work_unit in work_units {
         output.push_str(&format!(
             "{} | {} | {}\n",
-            work_unit.id, work_unit.title, format!("{:?}", work_unit.status)
+            work_unit.id,
+            work_unit.title,
+            format!("{:?}", work_unit.status)
         ));
     }
     output
@@ -320,6 +501,35 @@ fn render_merge_runs(runs: &[MergeRun]) -> String {
     output
 }
 
+fn render_codex_threads(threads: &[CodexThreadSummary]) -> String {
+    if threads.is_empty() {
+        return "no codex threads".to_string();
+    }
+    let mut output = String::new();
+    for thread in threads {
+        output.push_str(&format!(
+            "{} | {} | {:?} | work-unit={} | workspaces={}\n",
+            thread.thread_id,
+            thread.thread_name.as_deref().unwrap_or("<unnamed>"),
+            thread.updated_at,
+            thread.bound_work_unit_id.as_deref().unwrap_or("<unbound>"),
+            thread.workspace_binding_count
+        ));
+    }
+    output
+}
+
+fn render_codex_thread(thread: &CodexThreadSummary) -> String {
+    format!(
+        "{}\n{}\n{:?}\nwork-unit={}\nworkspaces={}\n",
+        thread.thread_id,
+        thread.thread_name.as_deref().unwrap_or("<unnamed>"),
+        thread.updated_at,
+        thread.bound_work_unit_id.as_deref().unwrap_or("<unbound>"),
+        thread.workspace_binding_count
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,7 +573,9 @@ mod tests {
     #[test]
     fn handle_command_lists_projects() {
         let dir = tempdir().expect("tempdir");
-        request_for_cwd(dir.path(), DaemonRequest::UpsertProject {
+        request_for_cwd(
+            dir.path(),
+            DaemonRequest::UpsertProject {
                 project: Project {
                     id: "p1".into(),
                     slug: "alpha".into(),
@@ -373,12 +585,73 @@ mod tests {
                     created_at: ts(),
                     updated_at: ts(),
                 },
-            }).expect("upsert project");
+            },
+        )
+        .expect("upsert project");
 
         let output = handle_command(dir.path(), "projects")
             .expect("command")
             .expect("output");
         assert!(output.contains("alpha"));
+    }
+
+    #[test]
+    fn handle_command_updates_project_status() {
+        let dir = tempdir().expect("tempdir");
+        request_for_cwd(
+            dir.path(),
+            DaemonRequest::UpsertProject {
+                project: Project {
+                    id: "p1".into(),
+                    slug: "alpha".into(),
+                    title: "Alpha".into(),
+                    objective: "Ship".into(),
+                    status: ProjectStatus::Active,
+                    created_at: ts(),
+                    updated_at: ts(),
+                },
+            },
+        )
+        .expect("upsert project");
+
+        let output = handle_command(dir.path(), "project-status alpha blocked")
+            .expect("command")
+            .expect("output");
+        assert!(output.contains("updated 1 project(s)"));
+
+        let response = request_for_cwd(
+            dir.path(),
+            DaemonRequest::GetProject {
+                id_or_slug: "alpha".into(),
+            },
+        )
+        .expect("get project");
+        match response {
+            DaemonResponse::Project(Some(project)) => {
+                assert_eq!(project.status, ProjectStatus::Blocked)
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_command_lists_codex_threads() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".codex")).expect("create codex dir");
+        std::fs::write(
+            dir.path().join(".codex").join("session_index.jsonl"),
+            concat!(
+                "{\"id\":\"thread-1\",\"thread_name\":\"alpha\",\"updated_at\":\"2026-04-08T12:00:00Z\"}\n",
+                "{\"id\":\"thread-2\",\"thread_name\":\"beta\",\"updated_at\":\"2026-04-08T12:01:00Z\"}\n"
+            ),
+        )
+        .expect("write codex index");
+
+        let output = handle_command(dir.path(), "codex-threads")
+            .expect("command")
+            .expect("output");
+        assert!(output.contains("thread-1"));
+        assert!(output.contains("thread-2"));
     }
 
     #[test]
