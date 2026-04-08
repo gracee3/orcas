@@ -207,6 +207,19 @@ pub enum DaemonRequest {
         test_model: Option<String>,
         integration_model: Option<String>,
     },
+    DirectManagedProject {
+        cwd: PathBuf,
+        title: Option<String>,
+        objective: Option<String>,
+        base_branch: Option<String>,
+        worktree_root: Option<PathBuf>,
+        director_model: Option<String>,
+        dev_model: Option<String>,
+        test_model: Option<String>,
+        integration_model: Option<String>,
+        roles: Option<Vec<ThreadRole>>,
+        bindings: Vec<ManagedProjectThreadAttachment>,
+    },
     SpawnManagedProject {
         cwd: PathBuf,
         roles: Option<Vec<ThreadRole>>,
@@ -1445,6 +1458,31 @@ impl DaemonService {
                 test_model,
                 integration_model,
             )?),
+            DirectManagedProject {
+                cwd,
+                title,
+                objective,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+                roles,
+                bindings,
+            } => DaemonResponse::ManagedProject(self.direct_managed_project(
+                cwd,
+                title,
+                objective,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+                roles,
+                bindings,
+            )?),
             SpawnManagedProject { cwd, roles } => {
                 DaemonResponse::ManagedProject(self.spawn_managed_project(cwd, roles)?)
             }
@@ -1868,6 +1906,106 @@ impl DaemonService {
 
         for role in selected_roles {
             self.spawn_managed_project_role(&repository, &mut bootstrap, role)?;
+        }
+
+        let role_refs: Vec<_> = bootstrap.roles.iter().collect();
+        let manifest = build_managed_project_manifest(
+            &bootstrap.project,
+            &bootstrap.repo_root,
+            &bootstrap.base_branch,
+            &bootstrap.worktree_root,
+            &bootstrap.contract_path,
+            &bootstrap.codex_config_path,
+            &role_refs,
+        );
+        save_managed_project_manifest(&bootstrap.manifest_path, &manifest)?;
+        Ok(bootstrap)
+    }
+
+    fn direct_managed_project(
+        &self,
+        cwd: impl AsRef<Path>,
+        title: Option<String>,
+        objective: Option<String>,
+        base_branch: Option<String>,
+        worktree_root: Option<PathBuf>,
+        director_model: Option<String>,
+        dev_model: Option<String>,
+        test_model: Option<String>,
+        integration_model: Option<String>,
+        roles: Option<Vec<ThreadRole>>,
+        bindings: Vec<ManagedProjectThreadAttachment>,
+    ) -> Result<ManagedProjectBootstrap> {
+        let cwd = cwd.as_ref();
+        let Some(repository) = GitRepository::discover(cwd)? else {
+            anyhow::bail!("managed project director requires a git repository");
+        };
+        let repo_root = repository.repository_root.clone();
+        let manifest_path = repo_root.join(".tt").join("managed-project.toml");
+        let mut bootstrap = if manifest_path.exists() {
+            let manifest = load_managed_project_manifest(&manifest_path)?;
+            self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?
+        } else {
+            self.open_managed_project(
+                cwd,
+                title,
+                objective,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+            )?
+        };
+
+        let selected_roles = roles.unwrap_or_else(default_managed_project_roles);
+        let mut binding_map = BTreeMap::new();
+        for binding in bindings {
+            let role_key = role_slug(binding.role).to_string();
+            if binding_map
+                .insert(role_key.clone(), binding.thread_id.clone())
+                .is_some()
+            {
+                anyhow::bail!(
+                    "managed project role `{}` was specified more than once",
+                    role_key
+                );
+            }
+        }
+
+        for role in selected_roles {
+            let role_index = bootstrap
+                .roles
+                .iter()
+                .position(|candidate| candidate.role == role)
+                .ok_or_else(|| anyhow::anyhow!("managed project role `{}` not found", role_slug(role)))?;
+            let existing_thread_id = bootstrap.roles[role_index].thread_id.clone();
+            if let Some(existing_thread_id) = existing_thread_id.as_ref() {
+                if let Some(requested_thread_id) = binding_map.get(role_slug(role))
+                    && requested_thread_id != existing_thread_id
+                {
+                    anyhow::bail!(
+                        "managed project role `{}` is already bound to thread `{}`",
+                        role_slug(role),
+                        existing_thread_id
+                    );
+                }
+                continue;
+            }
+
+            if let Some(thread_id) = binding_map.get(role_slug(role)).cloned() {
+                self.attach_managed_project_role(
+                    &repository,
+                    &mut bootstrap,
+                    ManagedProjectThreadAttachment {
+                        role,
+                        thread_id: thread_id.clone(),
+                    },
+                )?;
+            } else {
+                self.spawn_managed_project_role(&repository, &mut bootstrap, role)?;
+            }
         }
 
         let role_refs: Vec<_> = bootstrap.roles.iter().collect();
@@ -2434,6 +2572,29 @@ mod tests {
     fn request_and_response_round_trip() {
         let request = DaemonRequest::DeleteProject {
             id_or_slug: "alpha".to_string(),
+        };
+        let encoded = serde_json::to_string(&request).expect("serialize request");
+        let decoded: DaemonRequest = serde_json::from_str(&encoded).expect("deserialize request");
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn director_request_round_trips() {
+        let request = DaemonRequest::DirectManagedProject {
+            cwd: PathBuf::from("/repo"),
+            title: Some("Alpha".into()),
+            objective: Some("Ship".into()),
+            base_branch: Some("main".into()),
+            worktree_root: None,
+            director_model: Some("director-model".into()),
+            dev_model: Some("dev-model".into()),
+            test_model: Some("test-model".into()),
+            integration_model: Some("integration-model".into()),
+            roles: Some(vec![ThreadRole::Director, ThreadRole::Develop]),
+            bindings: vec![ManagedProjectThreadAttachment {
+                role: ThreadRole::Director,
+                thread_id: "thread-1".into(),
+            }],
         };
         let encoded = serde_json::to_string(&request).expect("serialize request");
         let decoded: DaemonRequest = serde_json::from_str(&encoded).expect("deserialize request");

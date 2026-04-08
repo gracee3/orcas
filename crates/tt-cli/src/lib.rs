@@ -109,6 +109,28 @@ pub enum ProjectFlowCommand {
         #[arg(long)]
         integration_model: Option<String>,
     },
+    Director {
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        objective: Option<String>,
+        #[arg(long)]
+        base_branch: Option<String>,
+        #[arg(long)]
+        worktree_root: Option<PathBuf>,
+        #[arg(long)]
+        director_model: Option<String>,
+        #[arg(long)]
+        dev_model: Option<String>,
+        #[arg(long)]
+        test_model: Option<String>,
+        #[arg(long)]
+        integration_model: Option<String>,
+        #[arg(long)]
+        role: Vec<String>,
+        #[arg(long)]
+        binding: Vec<String>,
+    },
     Spawn {
         #[arg(long)]
         role: Vec<String>,
@@ -305,6 +327,34 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
                 dev_model,
                 test_model,
                 integration_model,
+            },
+            ProjectFlowCommand::Director {
+                title,
+                objective,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+                role,
+                binding,
+            } => DaemonRequest::DirectManagedProject {
+                cwd: cwd.to_path_buf(),
+                title,
+                objective,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+                roles: if role.is_empty() {
+                    None
+                } else {
+                    Some(parse_thread_roles(&role)?)
+                },
+                bindings: parse_thread_bindings(&binding)?,
             },
             ProjectFlowCommand::Spawn { role } => DaemonRequest::SpawnManagedProject {
                 cwd: cwd.to_path_buf(),
@@ -868,6 +918,25 @@ mod tests {
                     command: ProjectCommand::List
                 }
             }
+        ));
+    }
+
+    #[test]
+    fn parses_project_director_command() {
+        let cli = Cli::parse_from([
+            "tt",
+            "project",
+            "director",
+            "--role",
+            "dev",
+            "--binding",
+            "director=thread-1",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Project {
+                command: ProjectFlowCommand::Director { ref role, ref binding, .. }
+            } if role == &vec!["dev".to_string()] && binding == &vec!["director=thread-1".to_string()]
         ));
     }
 

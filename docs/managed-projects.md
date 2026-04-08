@@ -28,6 +28,8 @@ bound later with `tt project attach`.
 ## Lifecycle
 
 - `tt project open` writes the manifest, contract, and agent files.
+- `tt project director` creates or reuses the scaffold, chooses the role
+  topology, and activates the selected roles in one shot.
 - `tt project spawn` starts live Codex threads for the selected roles and
   records the resulting thread ids in `.tt/managed-project.toml`.
 - `tt project attach` binds existing Codex thread ids to the corresponding
@@ -37,6 +39,7 @@ Example:
 
 ```bash
 tt project open --cwd /path/to/repo
+tt project director --cwd /path/to/repo
 tt project spawn --cwd /path/to/repo
 tt project spawn --cwd /path/to/repo --role dev --role test
 tt project attach --cwd /path/to/repo \
