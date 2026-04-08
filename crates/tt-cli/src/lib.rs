@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::de::DeserializeOwned;
-use tt_daemon::{DaemonRequest, DaemonResponse, DaemonRuntime};
+use tt_daemon::{request_for_cwd, DaemonRequest, DaemonResponse};
 use tt_domain as _;
 
 pub const TT_CLI_GENERATION: &str = "v2";
@@ -94,8 +94,7 @@ pub enum MergeRunCommand {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
-    let runtime = DaemonRuntime::open(cwd)?;
-    let response = runtime.request(command_to_request(cli.command, runtime.cwd())?)?;
+    let response = request_for_cwd(&cwd, command_to_request(cli.command, &cwd)?)?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
@@ -164,8 +163,7 @@ where
 pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
     let cli = Cli::parse_from(args);
     let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
-    let runtime = DaemonRuntime::open(cwd)?;
-    let response = runtime.request(command_to_request(cli.command, runtime.cwd())?)?;
+    let response = request_for_cwd(&cwd, command_to_request(cli.command, &cwd)?)?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }

@@ -177,6 +177,7 @@ Tracked backlog for the active direct skill thread.
 - Implemented a git/worktree inspection layer that discovers current checkouts, lists worktrees, and derives merge-readiness summaries for the daemon.
 - Added a runnable `tt-tui` dashboard entrypoint that renders Codex, repo, and overlay state from the new v2 services.
 - Added a local daemon request/response API and thin `tt-cli` client commands for status, repo, and entity CRUD.
+- Added a Unix-socket daemon transport under `.tt/runtime/ttd.sock` and switched the CLI/TUI to route through it when available.
 - Implemented the lane filesystem layout scaffold and the `tt lane init|inspect|cleanup` CLI surface.
 - Added explicit lane/workspace manifest fields and surfaced discovered lane roots in `tt doctor`.
 - Added lane attachment mirroring so `tt lane attach|detach` updates tracked-thread binding state and records the attachment list in the workspace manifest.

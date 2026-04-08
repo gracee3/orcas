@@ -9,7 +9,7 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use anyhow::{bail, Result};
-use tt_daemon::{DaemonRequest, DaemonResponse, DaemonRuntime, DaemonStatus};
+use tt_daemon::{request_for_cwd, DaemonRequest, DaemonResponse, DaemonStatus};
 use tt_domain::{MergeRun, Project, ThreadBinding, WorkUnit, WorkspaceBinding};
 use tt_ui_core::{DashboardSummary, GitRepositorySummary};
 
@@ -23,21 +23,21 @@ pub struct TuiSnapshot {
 }
 
 pub fn load_snapshot(cwd: impl AsRef<Path>) -> Result<TuiSnapshot> {
-    let runtime = DaemonRuntime::open(cwd)?;
-    load_snapshot_from_runtime(&runtime)
+    load_snapshot_from_cwd(cwd)
 }
 
-pub fn load_snapshot_from_runtime(runtime: &DaemonRuntime) -> Result<TuiSnapshot> {
-    let status = match runtime.request(DaemonRequest::Status)? {
+pub fn load_snapshot_from_cwd(cwd: impl AsRef<Path>) -> Result<TuiSnapshot> {
+    let cwd = cwd.as_ref();
+    let status = match request_for_cwd(cwd, DaemonRequest::Status)? {
         DaemonResponse::Status(status) => status,
         other => bail!("unexpected daemon response for status: {other:?}"),
     };
-    let dashboard = match runtime.request(DaemonRequest::DashboardSummary)? {
+    let dashboard = match request_for_cwd(cwd, DaemonRequest::DashboardSummary)? {
         DaemonResponse::DashboardSummary(summary) => summary,
         other => bail!("unexpected daemon response for dashboard summary: {other:?}"),
     };
-    let repository = match runtime.request(DaemonRequest::RepositorySummary {
-        cwd: runtime.cwd().to_path_buf(),
+    let repository = match request_for_cwd(cwd, DaemonRequest::RepositorySummary {
+        cwd: cwd.to_path_buf(),
     })? {
         DaemonResponse::RepositorySummary(summary) => summary,
         other => bail!("unexpected daemon response for repository summary: {other:?}"),
@@ -112,11 +112,11 @@ pub fn render_dashboard(snapshot: &TuiSnapshot) -> String {
 }
 
 pub fn run_interactive(cwd: impl AsRef<Path>) -> Result<()> {
-    let runtime = DaemonRuntime::open(cwd)?;
+    let cwd = cwd.as_ref().to_path_buf();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
-    writeln!(stdout, "{}", render_dashboard(&load_snapshot_from_runtime(&runtime)?))?;
+    writeln!(stdout, "{}", render_dashboard(&load_snapshot_from_cwd(&cwd)?))?;
     writeln!(
         stdout,
         "\nCommands: help, refresh, projects, project <id>, work-units [project], work-unit <id>, thread-bindings [work-unit], workspace-bindings [thread], merge-runs, quit"
@@ -125,7 +125,7 @@ pub fn run_interactive(cwd: impl AsRef<Path>) -> Result<()> {
 
     for line in stdin.lock().lines() {
         let line = line?;
-        match handle_command(&runtime, &line)? {
+        match handle_command(&cwd, &line)? {
             Some(output) => {
                 writeln!(stdout, "{output}")?;
             }
@@ -138,7 +138,7 @@ pub fn run_interactive(cwd: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
-fn handle_command(runtime: &DaemonRuntime, input: &str) -> Result<Option<String>> {
+fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
     let mut parts = input.split_whitespace();
     let Some(command) = parts.next() else {
         return Ok(Some(String::new()));
@@ -149,9 +149,9 @@ fn handle_command(runtime: &DaemonRuntime, input: &str) -> Result<Option<String>
             "Commands: help, refresh, projects, project <id>, work-units [project], work-unit <id>, thread-bindings [work-unit], workspace-bindings [thread], merge-runs, quit".to_string(),
         )),
         "quit" | "exit" => Ok(None),
-        "refresh" => Ok(Some(render_dashboard(&load_snapshot_from_runtime(runtime)?))),
+        "refresh" => Ok(Some(render_dashboard(&load_snapshot_from_cwd(cwd)?))),
         "projects" => {
-            let projects = match runtime.request(DaemonRequest::ListProjects)? {
+            let projects = match request_for_cwd(cwd, DaemonRequest::ListProjects)? {
                 DaemonResponse::Projects(projects) => projects,
                 other => bail!("unexpected daemon response for projects: {other:?}"),
             };
@@ -161,7 +161,7 @@ fn handle_command(runtime: &DaemonRuntime, input: &str) -> Result<Option<String>
             let Some(id_or_slug) = parts.next() else {
                 bail!("project requires an id or slug");
             };
-            let response = runtime.request(DaemonRequest::GetProject {
+            let response = request_for_cwd(cwd, DaemonRequest::GetProject {
                 id_or_slug: id_or_slug.to_string(),
             })?;
             match response {
@@ -175,7 +175,7 @@ fn handle_command(runtime: &DaemonRuntime, input: &str) -> Result<Option<String>
         }
         "work-units" => {
             let project_id = parts.next().map(ToString::to_string);
-            let response = runtime.request(DaemonRequest::ListWorkUnits { project_id })?;
+            let response = request_for_cwd(cwd, DaemonRequest::ListWorkUnits { project_id })?;
             match response {
                 DaemonResponse::WorkUnits(work_units) => Ok(Some(render_work_units(&work_units))),
                 other => bail!("unexpected daemon response for work units: {other:?}"),
@@ -185,7 +185,7 @@ fn handle_command(runtime: &DaemonRuntime, input: &str) -> Result<Option<String>
             let Some(id_or_slug) = parts.next() else {
                 bail!("work-unit requires an id or slug");
             };
-            let response = runtime.request(DaemonRequest::GetWorkUnit {
+            let response = request_for_cwd(cwd, DaemonRequest::GetWorkUnit {
                 id_or_slug: id_or_slug.to_string(),
             })?;
             match response {
@@ -201,7 +201,7 @@ fn handle_command(runtime: &DaemonRuntime, input: &str) -> Result<Option<String>
         }
         "thread-bindings" => {
             let Some(work_unit_id) = parts.next() else {
-                let response = runtime.request(DaemonRequest::ListThreadBindings)?;
+                let response = request_for_cwd(cwd, DaemonRequest::ListThreadBindings)?;
                 return match response {
                     DaemonResponse::ThreadBindings(bindings) => {
                         Ok(Some(render_thread_bindings(&bindings)))
@@ -209,7 +209,7 @@ fn handle_command(runtime: &DaemonRuntime, input: &str) -> Result<Option<String>
                     other => bail!("unexpected daemon response for thread bindings: {other:?}"),
                 };
             };
-            let response = runtime.request(DaemonRequest::ListThreadBindingsForWorkUnit {
+            let response = request_for_cwd(cwd, DaemonRequest::ListThreadBindingsForWorkUnit {
                 work_unit_id: work_unit_id.to_string(),
             })?;
             match response {
@@ -221,7 +221,7 @@ fn handle_command(runtime: &DaemonRuntime, input: &str) -> Result<Option<String>
         }
         "workspace-bindings" => {
             let Some(thread_id) = parts.next() else {
-                let response = runtime.request(DaemonRequest::ListWorkspaceBindings)?;
+                let response = request_for_cwd(cwd, DaemonRequest::ListWorkspaceBindings)?;
                 return match response {
                     DaemonResponse::WorkspaceBindings(bindings) => {
                         Ok(Some(render_workspace_bindings(&bindings)))
@@ -229,7 +229,7 @@ fn handle_command(runtime: &DaemonRuntime, input: &str) -> Result<Option<String>
                     other => bail!("unexpected daemon response for workspace bindings: {other:?}"),
                 };
             };
-            let response = runtime.request(DaemonRequest::ListWorkspaceBindingsForThread {
+            let response = request_for_cwd(cwd, DaemonRequest::ListWorkspaceBindingsForThread {
                 codex_thread_id: thread_id.to_string(),
             })?;
             match response {
@@ -240,7 +240,7 @@ fn handle_command(runtime: &DaemonRuntime, input: &str) -> Result<Option<String>
             }
         }
         "merge-runs" => {
-            let response = runtime.request(DaemonRequest::ListMergeRuns)?;
+            let response = request_for_cwd(cwd, DaemonRequest::ListMergeRuns)?;
             match response {
                 DaemonResponse::MergeRuns(runs) => Ok(Some(render_merge_runs(&runs))),
                 other => bail!("unexpected daemon response for merge runs: {other:?}"),
@@ -363,9 +363,7 @@ mod tests {
     #[test]
     fn handle_command_lists_projects() {
         let dir = tempdir().expect("tempdir");
-        let runtime = DaemonRuntime::open(dir.path()).expect("open runtime");
-        runtime
-            .request(DaemonRequest::UpsertProject {
+        request_for_cwd(dir.path(), DaemonRequest::UpsertProject {
                 project: Project {
                     id: "p1".into(),
                     slug: "alpha".into(),
@@ -375,10 +373,9 @@ mod tests {
                     created_at: ts(),
                     updated_at: ts(),
                 },
-            })
-            .expect("upsert project");
+            }).expect("upsert project");
 
-        let output = handle_command(&runtime, "projects")
+        let output = handle_command(dir.path(), "projects")
             .expect("command")
             .expect("output");
         assert!(output.contains("alpha"));

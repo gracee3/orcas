@@ -5,8 +5,15 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{
+    fs,
+    io::{BufRead, BufReader, Write},
+    os::unix::net::{UnixListener, UnixStream},
+    thread,
+};
 
 use anyhow::Result;
+use clap as _;
 use serde::{Deserialize, Serialize};
 use tt_codex::CodexHome;
 use tt_domain::{
@@ -16,6 +23,7 @@ use tt_store::OverlayStore;
 use tt_ui_core::{DashboardSummary, GitRepositorySummary};
 
 pub const TT_DAEMON_API_VERSION: &str = "v2";
+pub const TT_DAEMON_SOCKET_NAME: &str = "ttd.sock";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
@@ -90,6 +98,17 @@ pub struct DaemonRuntime {
     service: DaemonService,
 }
 
+#[derive(Debug, Clone)]
+pub struct DaemonClient {
+    socket_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct DaemonServer {
+    runtime: DaemonRuntime,
+    socket_path: PathBuf,
+}
+
 impl DaemonRuntime {
     pub fn open(cwd: impl AsRef<Path>) -> Result<Self> {
         let cwd = cwd.as_ref().to_path_buf();
@@ -112,6 +131,64 @@ impl DaemonRuntime {
 
     pub fn request(&self, request: DaemonRequest) -> Result<DaemonResponse> {
         self.service.handle_request(request)
+    }
+}
+
+impl DaemonClient {
+    pub fn connect(socket_path: impl AsRef<Path>) -> Result<Self> {
+        let socket_path = socket_path.as_ref().to_path_buf();
+        if !socket_path.exists() {
+            anyhow::bail!("daemon socket {} does not exist", socket_path.display());
+        }
+        Ok(Self { socket_path })
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    pub fn request(&self, request: DaemonRequest) -> Result<DaemonResponse> {
+        let mut stream = UnixStream::connect(&self.socket_path)?;
+        send_request(&mut stream, &request)?;
+        recv_response(&mut stream)
+    }
+}
+
+impl DaemonServer {
+    pub fn new(runtime: DaemonRuntime) -> Self {
+        let socket_path = socket_path_for(runtime.cwd());
+        Self {
+            runtime,
+            socket_path,
+        }
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    pub fn serve(&self) -> Result<()> {
+        if let Some(parent) = self.socket_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if self.socket_path.exists() {
+            let _ = fs::remove_file(&self.socket_path);
+        }
+        let listener = UnixListener::bind(&self.socket_path)?;
+        for incoming in listener.incoming() {
+            let runtime = self.runtime.clone();
+            match incoming {
+                Ok(stream) => {
+                    thread::spawn(move || {
+                        if let Err(error) = handle_connection(&runtime, stream) {
+                            eprintln!("tt daemon connection error: {error:?}");
+                        }
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -353,11 +430,68 @@ impl DaemonService {
     }
 }
 
+pub fn socket_path_for(cwd: impl AsRef<Path>) -> PathBuf {
+    cwd.as_ref().join(".tt").join("runtime").join(TT_DAEMON_SOCKET_NAME)
+}
+
+pub fn request_for_cwd(cwd: impl AsRef<Path>, request: DaemonRequest) -> Result<DaemonResponse> {
+    let cwd = cwd.as_ref();
+    let socket_path = socket_path_for(cwd);
+    if let Ok(client) = DaemonClient::connect(&socket_path) {
+        if let Ok(response) = client.request(request.clone()) {
+            return Ok(response);
+        }
+    }
+    DaemonRuntime::open(cwd)?.request(request)
+}
+
+fn send_request(stream: &mut UnixStream, request: &DaemonRequest) -> Result<()> {
+    let mut line = serde_json::to_vec(request)?;
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn recv_response(stream: &mut UnixStream) -> Result<DaemonResponse> {
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    let bytes = reader.read_line(&mut response_line)?;
+    if bytes == 0 {
+        anyhow::bail!("daemon closed the socket before sending a response");
+    }
+    let response: Result<DaemonResponse, String> = serde_json::from_str(&response_line)?;
+    match response {
+        Ok(value) => Ok(value),
+        Err(message) => anyhow::bail!(message),
+    }
+}
+
+fn handle_connection(runtime: &DaemonRuntime, mut stream: UnixStream) -> Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    let bytes = reader.read_line(&mut request_line)?;
+    if bytes == 0 {
+        anyhow::bail!("client closed the socket before sending a request");
+    }
+    let request: DaemonRequest = serde_json::from_str(&request_line)?;
+    let response = match runtime.request(request) {
+        Ok(response) => Ok(response),
+        Err(error) => Err(error.to_string()),
+    };
+    let mut line = serde_json::to_vec(&response)?;
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    stream.flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use std::process::Command;
+    use std::time::Duration;
     use tempfile::tempdir;
     use tt_domain::{
         ProjectStatus, ThreadBindingStatus, ThreadRole, WorkUnitStatus, WorkspaceCleanupPolicy,
@@ -541,5 +675,26 @@ mod tests {
         assert!(matches!(deleted, DaemonResponse::Count(1)));
 
         let _ = repo;
+    }
+
+    #[test]
+    fn socket_client_round_trips_requests() {
+        let dir = tempdir().expect("tempdir");
+        let runtime = DaemonRuntime::open(dir.path()).expect("open runtime");
+        let server = DaemonServer::new(runtime.clone());
+        let socket_path = server.socket_path().to_path_buf();
+        let handle = thread::spawn(move || server.serve().expect("serve"));
+        for _ in 0..20 {
+            if socket_path.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let client = DaemonClient::connect(&socket_path).expect("client connect");
+        let response = client.request(DaemonRequest::Status).expect("status");
+        assert!(matches!(response, DaemonResponse::Status(_)));
+
+        drop(handle);
     }
 }
