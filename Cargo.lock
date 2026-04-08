@@ -4183,6 +4183,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tt-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tt-daemon",
+]
+
+[[package]]
+name = "tt-codex"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tt-domain",
+]
+
+[[package]]
 name = "tt-core"
 version = "0.1.0"
 dependencies = [
@@ -4197,6 +4218,39 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "tt-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "tempfile",
+ "tt-codex",
+ "tt-domain",
+ "tt-git",
+ "tt-store",
+ "tt-ui-core",
+]
+
+[[package]]
+name = "tt-domain"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "tt-git"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "tt-domain",
 ]
 
 [[package]]
@@ -4321,6 +4375,33 @@ dependencies = [
  "async-trait",
  "clap",
  "tokio",
+]
+
+[[package]]
+name = "tt-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rusqlite",
+ "tempfile",
+ "tt-domain",
+]
+
+[[package]]
+name = "tt-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tt-ui-core",
+]
+
+[[package]]
+name = "tt-ui-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tt-domain",
 ]
 
 [[package]]

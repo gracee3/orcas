@@ -1,0 +1,25 @@
+[package]
+name = "tt-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "tt_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+tt-git = { path = "../tt-git" }
+tt-ui-core = { path = "../tt-ui-core" }
+tt-codex = { path = "../tt-codex" }
+tt-domain = { path = "../tt-domain" }
+tt-store = { path = "../tt-store" }
+
+[dev-dependencies]
+chrono.workspace = true
+tempfile = "3.23.0"
+
+[lints]
+workspace = true

@@ -170,6 +170,11 @@ Tracked backlog for the active direct skill thread.
 
 - Identified the need for a dedicated direct skill.
 - Established the project-level tracked backlog file for the direct workflow.
+- Wrote the TT v2 architecture doc and added the parallel v2 crate scaffold for `tt-domain`, `tt-store`, `tt-codex`, `tt-git`, `tt-daemon`, `tt-ui-core`, `tt-tui`, and `tt-cli`.
+- Implemented a sqlite-backed `.tt` overlay store with project, work unit, binding, and merge-run persistence plus round-trip tests.
+- Implemented a Codex home/session-index adapter that discovers `~/.codex`, derives Codex state paths, and loads a lightweight thread catalog.
+- Implemented a TT daemon status/dashboard service that summarizes overlay counts and optional Codex catalog state.
+- Implemented a git/worktree inspection layer that discovers current checkouts, lists worktrees, and derives merge-readiness summaries for the daemon.
 - Implemented the lane filesystem layout scaffold and the `tt lane init|inspect|cleanup` CLI surface.
 - Added explicit lane/workspace manifest fields and surfaced discovered lane roots in `tt doctor`.
 - Added lane attachment mirroring so `tt lane attach|detach` updates tracked-thread binding state and records the attachment list in the workspace manifest.

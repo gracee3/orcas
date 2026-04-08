@@ -34,6 +34,19 @@ The strongest checked-in operator surfaces today are the CLI and the daemon IPC 
 
 That matters for planning work. TT is currently best understood and operated through CLI flows, daemon-backed state inspection, and the checked-in integration/E2E harnesses rather than through a separate frontend.
 
+## TT v2 direction
+
+The repo now also carries an explicit TT v2 direction in [TT v2 Architecture](docs/tt_v2_architecture.md).
+
+That direction changes the intended shape of the system:
+
+- Codex becomes the canonical runtime for threads, turns, rollout/state, sandboxing, and app-server bindings
+- `.tt` becomes an overlay for TT-owned orchestration metadata
+- the initial v2 operator surface is TUI-first
+- `operator-web` and full remote/operator-server parity are not part of the initial v2 scope
+
+The current stack remains the active implementation until the parallel v2 crates reach usable parity.
+
 ## Quick start
 
 On Linux, the easiest install path is a `.deb` package. If you are working from a release archive, the tarball layout is equally simple.

@@ -1,0 +1,19 @@
+[package]
+name = "tt-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "tt_git"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+tt-domain = { path = "../tt-domain" }
+
+[lints]
+workspace = true

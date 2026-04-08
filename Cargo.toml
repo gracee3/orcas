@@ -11,6 +11,14 @@ members = [
     "crates/tt-skills",
     "crates/tt",
     "crates/tt-server",
+    "crates/tt-domain",
+    "crates/tt-store",
+    "crates/tt-codex",
+    "crates/tt-git",
+    "crates/tt-daemon",
+    "crates/tt-ui-core",
+    "crates/tt-tui",
+    "crates/tt-cli",
 ]
 default-members = [
     "crates/tt-core",
@@ -20,6 +28,14 @@ default-members = [
     "crates/ttd",
     "crates/tt-skills",
     "crates/tt",
+    "crates/tt-domain",
+    "crates/tt-store",
+    "crates/tt-codex",
+    "crates/tt-git",
+    "crates/tt-daemon",
+    "crates/tt-ui-core",
+    "crates/tt-tui",
+    "crates/tt-cli",
 ]
 resolver = "2"
 

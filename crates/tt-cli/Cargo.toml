@@ -1,0 +1,17 @@
+[package]
+name = "tt-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "tt_cli"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+tt-daemon = { path = "../tt-daemon" }
+
+[lints]
+workspace = true

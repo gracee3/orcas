@@ -1,0 +1,22 @@
+[package]
+name = "tt-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "tt_store"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+tt-domain = { path = "../tt-domain" }
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[lints]
+workspace = true

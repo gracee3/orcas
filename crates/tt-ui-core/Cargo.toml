@@ -1,0 +1,17 @@
+[package]
+name = "tt-ui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "tt_ui_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+tt-domain = { path = "../tt-domain" }
+
+[lints]
+workspace = true
