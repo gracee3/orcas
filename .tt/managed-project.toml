@@ -14,19 +14,27 @@ work_unit_id = "019d6f7d-50b2-7d81-9f9d-d6ce5f07af39"
 agent_path = "/home/emmy/openai/tt/.codex/agents/dev.toml"
 branch_name = "tt/tt/dev"
 worktree_path = "/home/emmy/openai/.tt-worktrees/tt/dev"
+thread_id = "019d6f7e-da44-74a2-ab5f-eb3a9b73ce0c"
+workspace_binding_id = "tt:dev"
 
 [roles.director]
 work_unit_id = "019d6f7d-5096-7550-917f-5bed67376468"
 agent_path = "/home/emmy/openai/tt/.codex/agents/director.toml"
+thread_id = "019d6f7e-d986-7f02-ba25-ab2a74d8329e"
+workspace_binding_id = "tt:director"
 
 [roles.integration]
 work_unit_id = "019d6f7d-511d-7030-93b9-8686cc85fbee"
 agent_path = "/home/emmy/openai/tt/.codex/agents/integration.toml"
 branch_name = "tt/tt/integration"
 worktree_path = "/home/emmy/openai/.tt-worktrees/tt/integration"
+thread_id = "019d6f7e-db76-7b71-bd71-18b3e7e6c52c"
+workspace_binding_id = "tt:integration"
 
 [roles.test]
 work_unit_id = "019d6f7d-50e8-7fd3-90be-10630e7a563f"
 agent_path = "/home/emmy/openai/tt/.codex/agents/test.toml"
 branch_name = "tt/tt/test"
 worktree_path = "/home/emmy/openai/.tt-worktrees/tt/test"
+thread_id = "019d6f7e-dadf-7cb2-81f6-10972c4a2402"
+workspace_binding_id = "tt:test"
