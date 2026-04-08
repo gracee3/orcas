@@ -10,9 +10,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::de::DeserializeOwned;
-use tt_daemon::{
-    request_for_cwd, DaemonRequest, DaemonResponse, ManagedProjectThreadAttachment,
-};
+use tt_daemon::{DaemonRequest, DaemonResponse, ManagedProjectThreadAttachment, request_for_cwd};
 use tt_domain as _;
 use tt_domain::{
     MergeAuthorizationStatus, MergeExecutionStatus, MergeReadiness, ProjectStatus,
@@ -91,6 +89,8 @@ pub enum CodexThreadsCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ProjectFlowCommand {
+    #[command(alias = "status")]
+    Inspect,
     Open {
         #[arg(long)]
         title: Option<String>,
@@ -308,6 +308,9 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
             cwd: cwd.to_path_buf(),
         },
         Command::Project { command } => match command {
+            ProjectFlowCommand::Inspect => DaemonRequest::InspectManagedProject {
+                cwd: cwd.to_path_buf(),
+            },
             ProjectFlowCommand::Open {
                 title,
                 objective,
@@ -743,7 +746,38 @@ fn render_response(response: &DaemonResponse) -> String {
         ),
         DaemonResponse::CodexThreadDetail(None) => "codex thread not found".to_string(),
         DaemonResponse::ManagedProject(bootstrap) => render_managed_project_bootstrap(bootstrap),
+        DaemonResponse::ManagedProjectInspection(inspection) => {
+            render_managed_project_inspection(inspection)
+        }
     }
+}
+
+fn render_managed_project_inspection(inspection: &tt_daemon::ManagedProjectInspection) -> String {
+    let mut output = render_managed_project_bootstrap(&inspection.bootstrap);
+    if let Some(repository) = inspection.repository_summary.as_ref() {
+        output.push_str("\nRepository\n");
+        output.push_str("----------\n");
+        output.push_str(&format!("root: {}\n", repository.repository_root));
+        output.push_str(&format!(
+            "worktree: {}\n",
+            repository.current_worktree.as_deref().unwrap_or("<unset>")
+        ));
+        output.push_str(&format!(
+            "branch: {}\n",
+            repository.current_branch.as_deref().unwrap_or("<detached>")
+        ));
+        output.push_str(&format!(
+            "head: {}\n",
+            repository
+                .current_head_commit
+                .as_deref()
+                .unwrap_or("<unknown>")
+        ));
+        output.push_str(&format!("dirty: {}\n", repository.dirty));
+        output.push_str(&format!("merge-ready: {}\n", repository.merge_ready));
+        output.push_str(&format!("worktrees: {}\n", repository.worktree_count));
+    }
+    output
 }
 
 fn render_managed_project_bootstrap(bootstrap: &tt_daemon::ManagedProjectBootstrap) -> String {
@@ -847,8 +881,7 @@ fn parse_thread_bindings(values: &[String]) -> Result<Vec<ManagedProjectThreadAt
                 anyhow::bail!("binding `{value}` must be formatted as role=thread_id");
             };
             Ok(ManagedProjectThreadAttachment {
-                role: ThreadRole::from_str(role_name)
-                    .map_err(|error| anyhow::anyhow!(error))?,
+                role: ThreadRole::from_str(role_name).map_err(|error| anyhow::anyhow!(error))?,
                 thread_id: thread_id.to_string(),
             })
         })
@@ -905,6 +938,17 @@ mod tests {
                     ..
                 }
             } if title == "Alpha"
+        ));
+    }
+
+    #[test]
+    fn parses_project_status_alias_for_inspect_command() {
+        let cli = Cli::parse_from(["tt", "project", "status"]);
+        assert!(matches!(
+            cli.command,
+            Command::Project {
+                command: ProjectFlowCommand::Inspect
+            }
         ));
     }
 
@@ -1045,5 +1089,92 @@ mod tests {
         assert!(run_text.contains("merge-run"));
         assert!(run_text.contains("abc123"));
         assert!(run_text.contains("readiness"));
+    }
+
+    #[test]
+    fn renders_managed_project_inspection_details() {
+        let project = Project {
+            id: "p-inspect".into(),
+            slug: "alpha".into(),
+            title: "Alpha".into(),
+            objective: "Ship".into(),
+            status: ProjectStatus::Active,
+            created_at: ts(),
+            updated_at: ts(),
+        };
+        let roles = vec![
+            tt_daemon::ManagedProjectRoleBootstrap {
+                role: tt_domain::ThreadRole::Director,
+                work_unit: tt_domain::WorkUnit {
+                    id: "wu-director".into(),
+                    project_id: project.id.clone(),
+                    slug: Some("director".into()),
+                    title: "Director".into(),
+                    task: "Coordinate".into(),
+                    status: tt_domain::WorkUnitStatus::Ready,
+                    created_at: ts(),
+                    updated_at: ts(),
+                },
+                agent_path: "/repo/.codex/agents/director.toml".into(),
+                model: Some("director-model".into()),
+                branch_name: None,
+                worktree_path: None,
+                thread_id: None,
+                thread_name: None,
+                workspace_binding_id: None,
+            },
+            tt_daemon::ManagedProjectRoleBootstrap {
+                role: tt_domain::ThreadRole::Develop,
+                work_unit: tt_domain::WorkUnit {
+                    id: "wu-dev".into(),
+                    project_id: project.id.clone(),
+                    slug: Some("dev".into()),
+                    title: "Dev".into(),
+                    task: "Implement".into(),
+                    status: tt_domain::WorkUnitStatus::Ready,
+                    created_at: ts(),
+                    updated_at: ts(),
+                },
+                agent_path: "/repo/.codex/agents/dev.toml".into(),
+                model: Some("dev-model".into()),
+                branch_name: Some("tt/alpha/dev".into()),
+                worktree_path: Some("/repo/.tt-worktrees/alpha/dev".into()),
+                thread_id: Some("thread-1".into()),
+                thread_name: Some("alpha-dev".into()),
+                workspace_binding_id: Some("alpha:dev".into()),
+            },
+        ];
+        let bootstrap = tt_daemon::ManagedProjectBootstrap {
+            project,
+            repo_root: "/repo".into(),
+            base_branch: "main".into(),
+            worktree_root: "/repo/.tt-worktrees/alpha".into(),
+            manifest_path: "/repo/.tt/managed-project.toml".into(),
+            contract_path: "/repo/.tt/contracts/worker-contract.md".into(),
+            codex_config_path: "/repo/.codex/config.toml".into(),
+            roles,
+        };
+        let inspection = tt_daemon::ManagedProjectInspection {
+            bootstrap,
+            repository_summary: Some(tt_ui_core::GitRepositorySummary {
+                repository_root: "/repo".into(),
+                current_worktree: Some("/repo".into()),
+                current_branch: Some("main".into()),
+                current_head_commit: Some("abc123".into()),
+                dirty: false,
+                upstream: Some("origin/main".into()),
+                ahead_by: Some(0),
+                behind_by: Some(0),
+                merge_ready: true,
+                worktree_count: 3,
+            }),
+        };
+        let text = render_response(&DaemonResponse::ManagedProjectInspection(inspection));
+        assert!(text.contains("managed project"));
+        assert!(text.contains("state: partial"));
+        assert!(text.contains("Repository"));
+        assert!(text.contains("merge-ready: true"));
+        assert!(text.contains("dev"));
+        assert!(text.contains("thread-1"));
     }
 }

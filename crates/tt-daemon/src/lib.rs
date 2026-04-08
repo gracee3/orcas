@@ -3,16 +3,16 @@
 //! The daemon coordinates TT overlay state, Codex runtime state, and git state.
 //! It owns the local request/response API used by the TUI and CLI.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
     thread,
 };
-use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -52,6 +52,9 @@ pub enum DaemonRequest {
     Status,
     DashboardSummary,
     RepositorySummary {
+        cwd: PathBuf,
+    },
+    InspectManagedProject {
         cwd: PathBuf,
     },
     ListProjects,
@@ -238,6 +241,7 @@ pub enum DaemonResponse {
     Status(DaemonStatus),
     DashboardSummary(DashboardSummary),
     RepositorySummary(Option<GitRepositorySummary>),
+    ManagedProjectInspection(ManagedProjectInspection),
     Projects(Vec<Project>),
     Project(Option<Project>),
     WorkUnits(Vec<WorkUnit>),
@@ -278,6 +282,12 @@ pub struct ManagedProjectBootstrap {
     pub contract_path: PathBuf,
     pub codex_config_path: PathBuf,
     pub roles: Vec<ManagedProjectRoleBootstrap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedProjectInspection {
+    pub bootstrap: ManagedProjectBootstrap,
+    pub repository_summary: Option<GitRepositorySummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1086,6 +1096,30 @@ impl DaemonService {
         }))
     }
 
+    pub fn inspect_managed_project(
+        &self,
+        cwd: impl AsRef<Path>,
+    ) -> Result<ManagedProjectInspection> {
+        let cwd = cwd.as_ref();
+        let Some(repository) = GitRepository::discover(cwd)? else {
+            anyhow::bail!("managed project inspect requires a git repository");
+        };
+        let repo_root = repository.repository_root.clone();
+        let manifest_path = repo_root.join(".tt").join("managed-project.toml");
+        if !manifest_path.exists() {
+            anyhow::bail!(
+                "managed project manifest not found at {}",
+                manifest_path.display()
+            );
+        }
+        let manifest = load_managed_project_manifest(&manifest_path)?;
+        let bootstrap = self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
+        Ok(ManagedProjectInspection {
+            bootstrap,
+            repository_summary: self.repository_summary(&repo_root)?,
+        })
+    }
+
     pub fn open_managed_project(
         &self,
         cwd: impl AsRef<Path>,
@@ -1273,6 +1307,9 @@ impl DaemonService {
             DashboardSummary => DaemonResponse::DashboardSummary(self.dashboard_summary()?),
             RepositorySummary { cwd } => {
                 DaemonResponse::RepositorySummary(self.repository_summary(cwd)?)
+            }
+            InspectManagedProject { cwd } => {
+                DaemonResponse::ManagedProjectInspection(self.inspect_managed_project(cwd)?)
             }
             ListProjects => DaemonResponse::Projects(self.list_projects()?),
             GetProject { id_or_slug } => DaemonResponse::Project(self.get_project(&id_or_slug)?),
@@ -1753,8 +1790,7 @@ fn save_managed_project_manifest(path: &Path, manifest: &ManagedProjectManifest)
 }
 
 fn load_managed_project_manifest(path: &Path) -> Result<ManagedProjectManifest> {
-    let contents =
-        fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))
 }
 
@@ -1795,7 +1831,13 @@ fn managed_project_thread_binding_id(project_slug: &str, role: ThreadRole) -> St
 
 fn managed_project_workspace_strategy(role: ThreadRole) -> WorkspaceStrategy {
     match role {
-        ThreadRole::Director | ThreadRole::Review | ThreadRole::Todo | ThreadRole::Chat | ThreadRole::Learn | ThreadRole::Handoff | ThreadRole::Custom => WorkspaceStrategy::Shared,
+        ThreadRole::Director
+        | ThreadRole::Review
+        | ThreadRole::Todo
+        | ThreadRole::Chat
+        | ThreadRole::Learn
+        | ThreadRole::Handoff
+        | ThreadRole::Custom => WorkspaceStrategy::Shared,
         ThreadRole::Develop | ThreadRole::Test | ThreadRole::Integrate => {
             WorkspaceStrategy::DedicatedWorktree
         }
@@ -1804,7 +1846,13 @@ fn managed_project_workspace_strategy(role: ThreadRole) -> WorkspaceStrategy {
 
 fn managed_project_workspace_sync_policy(role: ThreadRole) -> WorkspaceSyncPolicy {
     match role {
-        ThreadRole::Director | ThreadRole::Review | ThreadRole::Todo | ThreadRole::Chat | ThreadRole::Learn | ThreadRole::Handoff | ThreadRole::Custom => WorkspaceSyncPolicy::Manual,
+        ThreadRole::Director
+        | ThreadRole::Review
+        | ThreadRole::Todo
+        | ThreadRole::Chat
+        | ThreadRole::Learn
+        | ThreadRole::Handoff
+        | ThreadRole::Custom => WorkspaceSyncPolicy::Manual,
         ThreadRole::Develop => WorkspaceSyncPolicy::RebaseBeforeReview,
         ThreadRole::Test | ThreadRole::Integrate => WorkspaceSyncPolicy::RebaseBeforeLanding,
     }
@@ -1812,7 +1860,13 @@ fn managed_project_workspace_sync_policy(role: ThreadRole) -> WorkspaceSyncPolic
 
 fn managed_project_workspace_cleanup_policy(role: ThreadRole) -> WorkspaceCleanupPolicy {
     match role {
-        ThreadRole::Director | ThreadRole::Review | ThreadRole::Todo | ThreadRole::Chat | ThreadRole::Learn | ThreadRole::Handoff | ThreadRole::Custom => WorkspaceCleanupPolicy::KeepForAudit,
+        ThreadRole::Director
+        | ThreadRole::Review
+        | ThreadRole::Todo
+        | ThreadRole::Chat
+        | ThreadRole::Learn
+        | ThreadRole::Handoff
+        | ThreadRole::Custom => WorkspaceCleanupPolicy::KeepForAudit,
         ThreadRole::Develop | ThreadRole::Test | ThreadRole::Integrate => {
             WorkspaceCleanupPolicy::PruneAfterLanding
         }
@@ -1901,7 +1955,8 @@ impl DaemonService {
         let repo_root = repository.repository_root.clone();
         let manifest_path = repo_root.join(".tt").join("managed-project.toml");
         let manifest = load_managed_project_manifest(&manifest_path)?;
-        let mut bootstrap = self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
+        let mut bootstrap =
+            self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
         let selected_roles = roles.unwrap_or_else(default_managed_project_roles);
 
         for role in selected_roles {
@@ -1979,7 +2034,9 @@ impl DaemonService {
                 .roles
                 .iter()
                 .position(|candidate| candidate.role == role)
-                .ok_or_else(|| anyhow::anyhow!("managed project role `{}` not found", role_slug(role)))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("managed project role `{}` not found", role_slug(role))
+                })?;
             let existing_thread_id = bootstrap.roles[role_index].thread_id.clone();
             if let Some(existing_thread_id) = existing_thread_id.as_ref() {
                 if let Some(requested_thread_id) = binding_map.get(role_slug(role))
@@ -2034,7 +2091,8 @@ impl DaemonService {
         let repo_root = repository.repository_root.clone();
         let manifest_path = repo_root.join(".tt").join("managed-project.toml");
         let manifest = load_managed_project_manifest(&manifest_path)?;
-        let mut bootstrap = self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
+        let mut bootstrap =
+            self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
 
         for attachment in bindings {
             self.attach_managed_project_role(&repository, &mut bootstrap, attachment)?;
@@ -2064,7 +2122,9 @@ impl DaemonService {
             .roles
             .iter()
             .position(|candidate| candidate.role == role)
-            .ok_or_else(|| anyhow::anyhow!("managed project role `{}` not found", role_slug(role)))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("managed project role `{}` not found", role_slug(role))
+            })?;
         if bootstrap.roles[role_index].thread_id.is_some() {
             anyhow::bail!(
                 "managed project role `{}` is already attached",
@@ -2078,19 +2138,11 @@ impl DaemonService {
             .worktree_path
             .as_deref()
             .unwrap_or(bootstrap.repo_root.as_path());
-        let thread = self.start_managed_project_thread(
-            cwd,
-            &bootstrap.project,
-            role,
-            &agent_file,
-        )?;
+        let thread =
+            self.start_managed_project_thread(cwd, &bootstrap.project, role, &agent_file)?;
         self.verify_thread_workspace(&role_bootstrap, &bootstrap.repo_root, &thread)?;
-        let updated = self.bind_managed_project_role(
-            repository,
-            bootstrap,
-            &role_bootstrap,
-            &thread,
-        )?;
+        let updated =
+            self.bind_managed_project_role(repository, bootstrap, &role_bootstrap, &thread)?;
         bootstrap.roles[role_index] = updated;
         Ok(())
     }
@@ -2106,7 +2158,9 @@ impl DaemonService {
             .roles
             .iter()
             .position(|candidate| candidate.role == role)
-            .ok_or_else(|| anyhow::anyhow!("managed project role `{}` not found", role_slug(role)))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("managed project role `{}` not found", role_slug(role))
+            })?;
         let role_bootstrap = bootstrap.roles[role_index].clone();
         if let Some(existing_thread_id) = role_bootstrap.thread_id.as_ref()
             && existing_thread_id != &attachment.thread_id
@@ -2128,12 +2182,8 @@ impl DaemonService {
                 )
             })?;
         self.verify_thread_workspace(&role_bootstrap, &bootstrap.repo_root, &snapshot)?;
-        let updated = self.bind_managed_project_role(
-            repository,
-            bootstrap,
-            &role_bootstrap,
-            &snapshot,
-        )?;
+        let updated =
+            self.bind_managed_project_role(repository, bootstrap, &role_bootstrap, &snapshot)?;
         bootstrap.roles[role_index] = updated;
         Ok(())
     }
@@ -2170,10 +2220,7 @@ impl DaemonService {
         snapshot: &CodexThreadRuntimeSnapshot,
     ) -> Result<()> {
         let observed = Path::new(&snapshot.cwd);
-        let expected = role_bootstrap
-            .worktree_path
-            .as_deref()
-            .unwrap_or(repo_root);
+        let expected = role_bootstrap.worktree_path.as_deref().unwrap_or(repo_root);
         if observed != expected {
             anyhow::bail!(
                 "thread `{}` is running in `{}` but role `{}` expects `{}`",
@@ -2232,9 +2279,15 @@ impl DaemonService {
         snapshot: &CodexThreadRuntimeSnapshot,
         id: &str,
     ) -> Result<WorkspaceBinding> {
-        let inspect_repository = if let Some(worktree_path) = role_bootstrap.worktree_path.as_ref() {
+        let inspect_repository = if let Some(worktree_path) = role_bootstrap.worktree_path.as_ref()
+        {
             GitRepository::discover(worktree_path)?
-                .ok_or_else(|| anyhow::anyhow!("managed project role worktree {} is not a git repository", worktree_path.display()))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "managed project role worktree {} is not a git repository",
+                        worktree_path.display()
+                    )
+                })?
                 .inspect_repository()?
         } else {
             repository.inspect_repository()?
@@ -2602,6 +2655,16 @@ mod tests {
     }
 
     #[test]
+    fn inspection_request_round_trips() {
+        let request = DaemonRequest::InspectManagedProject {
+            cwd: PathBuf::from("/repo"),
+        };
+        let encoded = serde_json::to_string(&request).expect("serialize request");
+        let decoded: DaemonRequest = serde_json::from_str(&encoded).expect("deserialize request");
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
     fn runtime_supports_request_api_and_repo_summary() {
         let (repo, worktree) = setup_repo();
         let dir = tempdir().expect("tempdir");
@@ -2775,7 +2838,10 @@ mod tests {
         let loaded_role = loaded.roles.get("dev").expect("dev role");
         assert_eq!(loaded_role.thread_id.as_deref(), Some("thread-1"));
         assert_eq!(loaded_role.thread_name.as_deref(), Some("alpha-dev"));
-        assert_eq!(loaded_role.workspace_binding_id.as_deref(), Some("alpha:dev"));
+        assert_eq!(
+            loaded_role.workspace_binding_id.as_deref(),
+            Some("alpha:dev")
+        );
     }
 
     #[test]
@@ -2812,6 +2878,39 @@ mod tests {
         {
             DaemonResponse::Project(Some(project)) => {
                 assert_eq!(project.status, ProjectStatus::Blocked)
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_supports_managed_project_inspection() {
+        let (repo, _worktree) = setup_repo();
+        let dir = tempdir().expect("tempdir");
+        let runtime = DaemonRuntime::open(dir.path()).expect("open runtime");
+
+        runtime
+            .request(DaemonRequest::OpenManagedProject {
+                cwd: repo.clone(),
+                title: Some("Alpha".into()),
+                objective: Some("Ship the alpha slice".into()),
+                base_branch: None,
+                worktree_root: None,
+                director_model: Some("director-model".into()),
+                dev_model: Some("dev-model".into()),
+                test_model: Some("test-model".into()),
+                integration_model: Some("integration-model".into()),
+            })
+            .expect("open managed project");
+
+        let response = runtime
+            .request(DaemonRequest::InspectManagedProject { cwd: repo.clone() })
+            .expect("inspect managed project");
+        match response {
+            DaemonResponse::ManagedProjectInspection(inspection) => {
+                assert_eq!(inspection.bootstrap.project.slug, "alpha");
+                assert_eq!(inspection.bootstrap.roles.len(), 4);
+                assert!(inspection.repository_summary.is_some());
             }
             other => panic!("unexpected response: {other:?}"),
         }

@@ -2966,6 +2966,7 @@ dependencies = [
  "serde_json",
  "tt-daemon",
  "tt-domain",
+ "tt-ui-core",
 ]
 
 [[package]]

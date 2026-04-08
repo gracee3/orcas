@@ -19,6 +19,7 @@ tt-daemon = { path = "../tt-daemon" }
 
 [dev-dependencies]
 chrono.workspace = true
+tt-ui-core = { path = "../tt-ui-core" }
 
 [lints]
 workspace = true
