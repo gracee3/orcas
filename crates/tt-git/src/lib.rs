@@ -64,8 +64,9 @@ impl GitRepository {
 
     pub fn inspect_repository(&self) -> Result<GitRepositoryInspection> {
         let inspected_at = Utc::now();
-        let current_worktree = git_stdout(&self.repository_root, &["rev-parse", "--show-toplevel"])?
-            .map(|value| PathBuf::from(value.trim()));
+        let current_worktree =
+            git_stdout(&self.repository_root, &["rev-parse", "--show-toplevel"])?
+                .map(|value| PathBuf::from(value.trim()));
         let current_branch = git_stdout(&self.repository_root, &["branch", "--show-current"])?;
         let current_branch = current_branch.and_then(normalize_non_empty);
         let current_head_commit = git_stdout(&self.repository_root, &["rev-parse", "HEAD"])?;
@@ -80,27 +81,28 @@ impl GitRepository {
             Some(_) => {
                 let upstream = git_stdout(
                     &self.repository_root,
-                    &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+                    &[
+                        "rev-parse",
+                        "--abbrev-ref",
+                        "--symbolic-full-name",
+                        "@{upstream}",
+                    ],
                 )?
                 .and_then(normalize_non_empty);
                 let divergence = if upstream.is_some() {
-                    compare_revision_distance(
-                        &self.repository_root,
-                        "@{upstream}",
-                        "HEAD",
-                    )?
+                    compare_revision_distance(&self.repository_root, "@{upstream}", "HEAD")?
                 } else {
                     None
                 };
-                let (ahead_by, behind_by) = divergence.map_or((None, None), |(ahead, behind)| {
-                    (Some(ahead), Some(behind))
-                });
+                let (ahead_by, behind_by) =
+                    divergence.map_or((None, None), |(ahead, behind)| (Some(ahead), Some(behind)));
                 (upstream, ahead_by, behind_by)
             }
             None => (None, None, None),
         };
 
-        let merge_readiness = if dirty || current_branch.is_none() || current_head_commit.is_none() {
+        let merge_readiness = if dirty || current_branch.is_none() || current_head_commit.is_none()
+        {
             MergeReadiness::Blocked
         } else if behind_by.is_some_and(|value| value > 0) {
             MergeReadiness::Blocked
@@ -124,7 +126,8 @@ impl GitRepository {
     }
 
     pub fn list_worktrees(&self) -> Result<Vec<GitWorktreeInspection>> {
-        let Some(stdout) = git_stdout(&self.repository_root, &["worktree", "list", "--porcelain"])? else {
+        let Some(stdout) = git_stdout(&self.repository_root, &["worktree", "list", "--porcelain"])?
+        else {
             return Ok(Vec::new());
         };
 
@@ -323,10 +326,12 @@ mod tests {
         assert!(!inspection.dirty);
         assert_eq!(inspection.merge_readiness, MergeReadiness::Ready);
         assert_eq!(inspection.worktrees.len(), 2);
-        assert!(inspection
-            .worktrees
-            .iter()
-            .any(|entry| entry.worktree_path == worktree));
+        assert!(
+            inspection
+                .worktrees
+                .iter()
+                .any(|entry| entry.worktree_path == worktree)
+        );
     }
 
     #[test]
@@ -353,6 +358,10 @@ mod tests {
         let worktrees = repository.list_worktrees().expect("worktrees");
 
         assert_eq!(worktrees.len(), 2);
-        assert!(worktrees.iter().any(|entry| entry.worktree_path == worktree));
+        assert!(
+            worktrees
+                .iter()
+                .any(|entry| entry.worktree_path == worktree)
+        );
     }
 }

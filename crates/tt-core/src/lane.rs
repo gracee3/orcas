@@ -258,7 +258,8 @@ impl LanePaths {
     }
 
     pub fn workspace_manifest_file(&self, org: &str, repo: &str, workspace: &str) -> PathBuf {
-        self.workspace_root(org, repo, workspace).join("workspace.toml")
+        self.workspace_root(org, repo, workspace)
+            .join("workspace.toml")
     }
 
     pub fn workspace_runtime_dir(&self, org: &str, repo: &str, workspace: &str) -> PathBuf {
@@ -274,15 +275,18 @@ impl LanePaths {
     }
 
     pub fn workspace_snapshot_log_file(&self, org: &str, repo: &str, workspace: &str) -> PathBuf {
-        self.workspace_root(org, repo, workspace).join("snapshots.jsonl")
+        self.workspace_root(org, repo, workspace)
+            .join("snapshots.jsonl")
     }
 
     pub fn workspace_snapshot_db_file(&self, org: &str, repo: &str, workspace: &str) -> PathBuf {
-        self.workspace_root(org, repo, workspace).join("snapshots.sqlite")
+        self.workspace_root(org, repo, workspace)
+            .join("snapshots.sqlite")
     }
 
     pub fn workspace_turn_log_file(&self, org: &str, repo: &str, workspace: &str) -> PathBuf {
-        self.workspace_root(org, repo, workspace).join("turns.jsonl")
+        self.workspace_root(org, repo, workspace)
+            .join("turns.jsonl")
     }
 
     pub fn ensure(&self) -> TTResult<()> {
@@ -317,16 +321,21 @@ pub fn read_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> TTResult<Option<T
         return Ok(None);
     }
     let raw = fs::read_to_string(path)?;
-    Ok(Some(toml::from_str(&raw).map_err(|error| TTError::Config(error.to_string()))?))
+    Ok(Some(
+        toml::from_str(&raw).map_err(|error| TTError::Config(error.to_string()))?,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LanePaths, LaneManifest, RepoManifest, WorkspaceManifest};
+    use super::{LaneManifest, LanePaths, RepoManifest, WorkspaceManifest};
 
     #[test]
     fn slugify_normalizes_labels() {
-        assert_eq!(LanePaths::slugify("Directory and worktree requirements"), "directory-and-worktree-requirements");
+        assert_eq!(
+            LanePaths::slugify("Directory and worktree requirements"),
+            "directory-and-worktree-requirements"
+        );
         assert_eq!(LanePaths::slugify("my random name"), "my-random-name");
     }
 

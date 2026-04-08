@@ -1,10 +1,10 @@
 #![allow(warnings)]
 
-mod remote;
 mod docs;
+mod remote;
 mod service;
-mod snapshot;
 mod skill_runtime;
+mod snapshot;
 mod streaming;
 mod tui;
 
@@ -13,16 +13,19 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::info;
+use tt_core::lane::LaneCleanupScope as LaneCleanupScopeModel;
+use tt_core::lane::LanePaths;
 use tt_core::{
     AppPaths, DecisionType, WorkUnitStatus, WorkstreamStatus, authority, init_file_logger,
 };
-use tt_core::lane::LaneCleanupScope as LaneCleanupScopeModel;
-use tt_core::lane::LanePaths;
 
-use snapshot::{ContextCommand as SnapshotContextCommand, SnapshotCommand as SnapshotRuntimeCommand, WorkspaceCommand as SnapshotWorkspaceCommand};
 use remote::{RemoteCommand, run_remote};
 use service::{RuntimeOverrides, SupervisorService};
 use skill_runtime::TTSkillBackend;
+use snapshot::{
+    ContextCommand as SnapshotContextCommand, SnapshotCommand as SnapshotRuntimeCommand,
+    WorkspaceCommand as SnapshotWorkspaceCommand,
+};
 use tt_skills::{SkillCommand as RuntimeSkillCommand, SkillContext as RuntimeSkillContext};
 
 #[derive(Debug, Parser)]
@@ -623,7 +626,11 @@ struct ThreadStartArgs {
     cwd: Option<PathBuf>,
     #[arg(long, help = "Model to use for the spawned thread")]
     model: Option<String>,
-    #[arg(long, default_value_t = false, help = "Start the thread without a visible UI")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Start the thread without a visible UI"
+    )]
     ephemeral: bool,
 }
 
@@ -660,7 +667,11 @@ struct TTSpawnArgs {
     new_workstream: Option<String>,
     #[arg(long, help = "Repository root to bind the spawned thread to")]
     repo_root: Option<PathBuf>,
-    #[arg(long, default_value_t = false, help = "Spawn the thread without a visible UI")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Spawn the thread without a visible UI"
+    )]
     headless: bool,
     #[arg(long, help = "Model to use for the spawned thread")]
     model: Option<String>,
@@ -677,7 +688,11 @@ struct ModeSpawnArgs {
     new_workstream: Option<String>,
     #[arg(long, help = "Repository root to bind the mode thread to")]
     repo_root: Option<PathBuf>,
-    #[arg(long, default_value_t = false, help = "Spawn the thread without a visible UI")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Spawn the thread without a visible UI"
+    )]
     headless: bool,
     #[arg(long, help = "Model to use for the spawned thread")]
     model: Option<String>,
@@ -689,7 +704,11 @@ struct SplitArgs {
     role: Option<String>,
     #[command(flatten)]
     spawn: ModeSpawnArgs,
-    #[arg(long, default_value_t = false, help = "Mark the split thread as ephemeral")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Mark the split thread as ephemeral"
+    )]
     ephemeral: bool,
 }
 
@@ -697,7 +716,11 @@ struct SplitArgs {
 struct CloseArgs {
     /// Selector describing the thread, branch, or workspace to close.
     selector: String,
-    #[arg(long, default_value_t = false, help = "Force close even when safety checks fail")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Force close even when safety checks fail"
+    )]
     force: bool,
 }
 
@@ -767,7 +790,10 @@ struct LaneAttachArgs {
     label: String,
     #[arg(long, help = "Repo to bind in org/repo form")]
     repo: String,
-    #[arg(long, help = "Workspace name within the lane repo; defaults to `default`")]
+    #[arg(
+        long,
+        help = "Workspace name within the lane repo; defaults to `default`"
+    )]
     workspace: Option<String>,
     #[arg(
         long = "tracked-thread",
@@ -782,7 +808,10 @@ struct LaneDetachArgs {
     label: String,
     #[arg(long, help = "Repo to unbind in org/repo form")]
     repo: String,
-    #[arg(long, help = "Workspace name within the lane repo; defaults to `default`")]
+    #[arg(
+        long,
+        help = "Workspace name within the lane repo; defaults to `default`"
+    )]
     workspace: Option<String>,
     #[arg(
         long = "tracked-thread",
@@ -806,7 +835,11 @@ struct LaneCleanupArgs {
         help = "Cleanup scope to apply: runtime, worktree, repo, or lane"
     )]
     scope: LaneCleanupScopeArg,
-    #[arg(long, default_value_t = false, help = "Bypass safety checks for dirty or attached state")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Bypass safety checks for dirty or attached state"
+    )]
     force: bool,
 }
 
@@ -850,7 +883,11 @@ struct TurnsRecentArgs {
 
 #[derive(Debug, Clone, Args)]
 struct EventsRecentArgs {
-    #[arg(long, default_value_t = 20, help = "Maximum number of events to return")]
+    #[arg(
+        long,
+        default_value_t = 20,
+        help = "Maximum number of events to return"
+    )]
     limit: usize,
 }
 
@@ -868,7 +905,10 @@ struct EventsWatchArgs {
 
 #[derive(Debug, Clone, Args)]
 struct AppServerNameArgs {
-    #[arg(default_value = "default", help = "Named app-server instance to target")]
+    #[arg(
+        default_value = "default",
+        help = "Named app-server instance to target"
+    )]
     name: String,
 }
 
@@ -1052,11 +1092,23 @@ struct TrackedThreadWorkspaceArgs {
     landing_target: Option<String>,
     #[arg(long = "workspace-strategy", value_enum, help = "Workspace strategy")]
     strategy: Option<TrackedThreadWorkspaceStrategyArg>,
-    #[arg(long = "workspace-landing-policy", value_enum, help = "Workspace landing policy")]
+    #[arg(
+        long = "workspace-landing-policy",
+        value_enum,
+        help = "Workspace landing policy"
+    )]
     landing_policy: Option<TrackedThreadWorkspaceLandingPolicyArg>,
-    #[arg(long = "workspace-sync-policy", value_enum, help = "Workspace sync policy")]
+    #[arg(
+        long = "workspace-sync-policy",
+        value_enum,
+        help = "Workspace sync policy"
+    )]
     sync_policy: Option<TrackedThreadWorkspaceSyncPolicyArg>,
-    #[arg(long = "workspace-cleanup-policy", value_enum, help = "Workspace cleanup policy")]
+    #[arg(
+        long = "workspace-cleanup-policy",
+        value_enum,
+        help = "Workspace cleanup policy"
+    )]
     cleanup_policy: Option<TrackedThreadWorkspaceCleanupPolicyArg>,
     #[arg(long = "workspace-status", value_enum, help = "Workspace status")]
     status: Option<TrackedThreadWorkspaceStatusArg>,
@@ -1077,7 +1129,11 @@ struct PlanningSessionRefArgs {
 struct PlanningSessionListArgs {
     #[arg(long, help = "Optional workstream filter")]
     workstream: Option<String>,
-    #[arg(long, default_value_t = false, help = "Include closed planning sessions")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Include closed planning sessions"
+    )]
     include_closed: bool,
 }
 
@@ -1091,7 +1147,10 @@ struct PlanningSessionSummaryArgs {
     constraints: Vec<String>,
     #[arg(long = "non-goal", help = "Planning session non-goals")]
     non_goals: Vec<String>,
-    #[arg(long = "open-question", help = "Open questions that still need answers")]
+    #[arg(
+        long = "open-question",
+        help = "Open questions that still need answers"
+    )]
     open_questions: Vec<String>,
     #[arg(
         long,
@@ -1282,7 +1341,11 @@ struct ProposalCreateArgs {
     note: Option<String>,
     #[arg(long, help = "Who requested the proposal")]
     requested_by: Option<String>,
-    #[arg(long, default_value_t = false, help = "Supersede open proposals for the same work unit")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Supersede open proposals for the same work unit"
+    )]
     supersede_open: bool,
 }
 

@@ -4,8 +4,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Subcommand};
 use chrono::Utc;
+use clap::{Args, Subcommand};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -90,7 +90,11 @@ pub struct SnapshotForkArgs {
 pub struct SnapshotRestoreArgs {
     #[arg(long = "snapshot", help = "Snapshot id to restore")]
     pub snapshot_id: String,
-    #[arg(long, default_value_t = false, help = "Bind the restored snapshot to the workspace")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Bind the restored snapshot to the workspace"
+    )]
     pub bind: bool,
     #[arg(long, help = "Optional output path for the restored artifact")]
     pub out: Option<PathBuf>,
@@ -108,7 +112,11 @@ pub struct SnapshotDiffArgs {
 pub struct SnapshotPruneArgs {
     #[arg(long = "snapshot", help = "Snapshot ids to prune")]
     pub snapshots: Vec<String>,
-    #[arg(long, default_value_t = false, help = "Force prune even when references remain")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Force prune even when references remain"
+    )]
     pub force: bool,
 }
 
@@ -284,23 +292,35 @@ impl SnapshotStore {
     }
 
     fn workspace_manifest_path(&self) -> PathBuf {
-        self.lane_paths
-            .workspace_manifest_file(&self.repo_org, &self.repo_name, &self.workspace_slug)
+        self.lane_paths.workspace_manifest_file(
+            &self.repo_org,
+            &self.repo_name,
+            &self.workspace_slug,
+        )
     }
 
     fn snapshot_log_path(&self) -> PathBuf {
-        self.lane_paths
-            .workspace_snapshot_log_file(&self.repo_org, &self.repo_name, &self.workspace_slug)
+        self.lane_paths.workspace_snapshot_log_file(
+            &self.repo_org,
+            &self.repo_name,
+            &self.workspace_slug,
+        )
     }
 
     fn snapshot_db_path(&self) -> PathBuf {
-        self.lane_paths
-            .workspace_snapshot_db_file(&self.repo_org, &self.repo_name, &self.workspace_slug)
+        self.lane_paths.workspace_snapshot_db_file(
+            &self.repo_org,
+            &self.repo_name,
+            &self.workspace_slug,
+        )
     }
 
     fn turn_log_path(&self) -> PathBuf {
-        self.lane_paths
-            .workspace_turn_log_file(&self.repo_org, &self.repo_name, &self.workspace_slug)
+        self.lane_paths.workspace_turn_log_file(
+            &self.repo_org,
+            &self.repo_name,
+            &self.workspace_slug,
+        )
     }
 
     fn ensure_dirs(&self) -> Result<()> {
@@ -309,7 +329,9 @@ impl SnapshotStore {
             .with_context(|| {
                 format!(
                     "create {}",
-                    self.lane_paths.repo_root(&self.repo_org, &self.repo_name).display()
+                    self.lane_paths
+                        .repo_root(&self.repo_org, &self.repo_name)
+                        .display()
                 )
             })?;
         fs::create_dir_all(self.workspace_root())
@@ -352,8 +374,8 @@ impl SnapshotStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: SnapshotTurnRecord =
-                serde_json::from_str(&line).with_context(|| format!("decode {}", path.display()))?;
+            let entry: SnapshotTurnRecord = serde_json::from_str(&line)
+                .with_context(|| format!("decode {}", path.display()))?;
             turns.push(entry.turn);
         }
         Ok(turns)
@@ -438,8 +460,8 @@ impl SnapshotStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: SnapshotLogEntry =
-                serde_json::from_str(&line).with_context(|| format!("decode {}", log_path.display()))?;
+            let entry: SnapshotLogEntry = serde_json::from_str(&line)
+                .with_context(|| format!("decode {}", log_path.display()))?;
             if entry.snapshot.snapshot_id == snapshot_id {
                 return Ok(Some(entry.snapshot));
             }
@@ -532,9 +554,11 @@ impl SnapshotStore {
     fn next_sequence(&self) -> Result<u64> {
         let connection = self.ensure_sqlite()?;
         let seq = connection
-            .query_row("select coalesce(max(rowid), 0) + 1 from snapshots", [], |row| {
-                row.get::<_, u64>(0)
-            })
+            .query_row(
+                "select coalesce(max(rowid), 0) + 1 from snapshots",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
             .context("calculate next snapshot sequence")?;
         Ok(seq)
     }
@@ -590,12 +614,15 @@ impl SnapshotStore {
             .filter_map(|snapshot| snapshot.parent_snapshot_id.as_ref())
             .any(|parent| prune_set.contains(parent));
         if has_children && !force {
-            bail!("refusing to prune snapshots that still have children; pass --force to rewrite the log");
+            bail!(
+                "refusing to prune snapshots that still have children; pass --force to rewrite the log"
+            );
         }
         let before = snapshots.len();
         snapshots.retain(|snapshot| !prune_set.contains(&snapshot.snapshot_id));
         let log_path = self.snapshot_log_path();
-        let mut log = File::create(&log_path).with_context(|| format!("rewrite {}", log_path.display()))?;
+        let mut log =
+            File::create(&log_path).with_context(|| format!("rewrite {}", log_path.display()))?;
         for (seq, snapshot) in snapshots.iter().enumerate() {
             let entry = SnapshotLogEntry {
                 seq: (seq + 1) as u64,
@@ -660,11 +687,21 @@ impl SnapshotService {
                 LanePaths::slugify(&args.scope.workspace),
                 format!("{}/{}", store.repo_org, store.repo_name),
                 store.workspace_root().display().to_string(),
-                store.workspace_root().join("worktree").display().to_string(),
-                store.workspace_root().join("worktree").display().to_string(),
+                store
+                    .workspace_root()
+                    .join("worktree")
+                    .display()
+                    .to_string(),
+                store
+                    .workspace_root()
+                    .join("worktree")
+                    .display()
+                    .to_string(),
                 store.workspace_root().join("runtime").display().to_string(),
                 store.workspace_root().join("home").display().to_string(),
-                args.branch.clone().unwrap_or_else(|| "detached".to_string()),
+                args.branch
+                    .clone()
+                    .unwrap_or_else(|| "detached".to_string()),
             )
         });
         let workspace = workspace_binding_from_store(
@@ -682,10 +719,7 @@ impl SnapshotService {
         };
         let config = SnapshotConfigRef {
             model: args.model.clone(),
-            cwd: args
-                .cwd
-                .as_ref()
-                .map(|path| path.display().to_string()),
+            cwd: args.cwd.as_ref().map(|path| path.display().to_string()),
             ..SnapshotConfigRef::default()
         };
         let summary = args.summary.as_ref().map(|summary| SnapshotContextSummary {
@@ -754,8 +788,8 @@ impl SnapshotService {
         if !lanes_root.exists() {
             return Ok(stores);
         }
-        for lane_entry in fs::read_dir(&lanes_root)
-            .with_context(|| format!("read {}", lanes_root.display()))?
+        for lane_entry in
+            fs::read_dir(&lanes_root).with_context(|| format!("read {}", lanes_root.display()))?
         {
             let lane_entry = lane_entry?;
             if !lane_entry.file_type()?.is_dir() {
@@ -810,7 +844,10 @@ impl SnapshotService {
                             },
                             repo_org: org_entry.file_name().to_string_lossy().to_string(),
                             repo_name: repo_name.clone(),
-                            workspace_slug: workspace_entry.file_name().to_string_lossy().to_string(),
+                            workspace_slug: workspace_entry
+                                .file_name()
+                                .to_string_lossy()
+                                .to_string(),
                         });
                     }
                 }
@@ -823,7 +860,10 @@ impl SnapshotService {
         SnapshotStore::new(
             &SnapshotScopeArgs {
                 lane: record.workspace.lane_label.clone(),
-                repo: format!("{}/{}", record.workspace.repo_org, record.workspace.repo_name),
+                repo: format!(
+                    "{}/{}",
+                    record.workspace.repo_org, record.workspace.repo_name
+                ),
                 workspace: record.workspace.workspace_slug.clone(),
             },
             &self.paths,
@@ -841,7 +881,8 @@ impl SnapshotService {
         );
         if let Some(out) = args.out.as_ref() {
             if let Some(parent) = out.parent() {
-                fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
             }
             fs::write(out, &prompt.rendered_prompt)
                 .with_context(|| format!("write {}", out.display()))?;
@@ -857,7 +898,10 @@ impl SnapshotService {
                     snapshot.workspace.repo_root_path.clone(),
                     snapshot.workspace.workspace_slug.clone(),
                     snapshot.workspace.workspace_slug.clone(),
-                    format!("{}/{}", snapshot.workspace.repo_org, snapshot.workspace.repo_name),
+                    format!(
+                        "{}/{}",
+                        snapshot.workspace.repo_org, snapshot.workspace.repo_name
+                    ),
                     store.workspace_root().display().to_string(),
                     snapshot.workspace.worktree_path.clone(),
                     snapshot.workspace.worktree_path.clone(),
@@ -866,7 +910,12 @@ impl SnapshotService {
                     snapshot.workspace.branch_name.clone().unwrap_or_default(),
                 )
             });
-            update_workspace_manifest_for_binding(&store, &manifest, &snapshot, snapshot.workspace.canonical)?;
+            update_workspace_manifest_for_binding(
+                &store,
+                &manifest,
+                &snapshot,
+                snapshot.workspace.canonical,
+            )?;
         }
         Ok(prompt)
     }
@@ -893,16 +942,27 @@ impl SnapshotService {
         next.created_at = Utc::now().to_rfc3339();
         next.created_by = created_by.unwrap_or_else(|| "tt".to_string());
         next.tags.extend(tags);
-        next.conversation = mutate_selection(turns, &base.conversation, selection, summary.clone(), mode)?;
+        next.conversation =
+            mutate_selection(turns, &base.conversation, selection, summary.clone(), mode)?;
         if let Some(summary_text) = summary {
             next.summary = Some(SnapshotContextSummary {
                 summary_text,
                 source_turn_ids: next.conversation.summary_source_turn_ids.clone(),
-                summary_version: base.summary.as_ref().map(|value| value.summary_version + 1).unwrap_or(1),
+                summary_version: base
+                    .summary
+                    .as_ref()
+                    .map(|value| value.summary_version + 1)
+                    .unwrap_or(1),
                 generated_at: Utc::now().to_rfc3339(),
             });
         }
-        next.prompt_hash = compute_prompt_hash(&next.workspace, &next.conversation, &next.skills, &next.config, &next.summary);
+        next.prompt_hash = compute_prompt_hash(
+            &next.workspace,
+            &next.conversation,
+            &next.skills,
+            &next.config,
+            &next.summary,
+        );
         next.lineage_hash = hash_lineage(Some(&base.lineage_hash), &next.prompt_hash);
         next.tags.sort();
         next.tags.dedup();
@@ -916,7 +976,11 @@ impl SnapshotService {
             let store_snapshots = store.list_snapshots()?;
             let relevant: Vec<String> = snapshot_ids
                 .iter()
-                .filter(|id| store_snapshots.iter().any(|snapshot| &snapshot.snapshot_id == *id))
+                .filter(|id| {
+                    store_snapshots
+                        .iter()
+                        .any(|snapshot| &snapshot.snapshot_id == *id)
+                })
                 .cloned()
                 .collect();
             if relevant.is_empty() {
@@ -1000,7 +1064,10 @@ fn build_prompt_bundle(
     let mut rendered = String::new();
     rendered.push_str(&format!("# snapshot {}\n", workspace.workspace_slug));
     rendered.push_str(&format!("lane: {}\n", workspace.lane_slug));
-    rendered.push_str(&format!("repo: {}/{}\n", workspace.repo_org, workspace.repo_name));
+    rendered.push_str(&format!(
+        "repo: {}/{}\n",
+        workspace.repo_org, workspace.repo_name
+    ));
     rendered.push_str(&format!("workspace: {}\n", workspace.workspace_slug));
     rendered.push_str(&format!("commit: {}\n", workspace.commit_sha));
     rendered.push_str(&format!("thread: {}\n", conversation.thread_id));
@@ -1096,7 +1163,12 @@ fn build_selection(
         included_turn_ids.extend(turns.iter().map(|turn| turn.id.clone()));
     }
     included_turn_ids.retain(|turn_id| !excluded_turn_ids.contains(turn_id));
-    let history_hash = hash_json(&(included_turn_ids.clone(), excluded_turn_ids.clone(), pinned_turn_ids.clone(), pinned_facts.clone()));
+    let history_hash = hash_json(&(
+        included_turn_ids.clone(),
+        excluded_turn_ids.clone(),
+        pinned_turn_ids.clone(),
+        pinned_facts.clone(),
+    ));
     let selected_turns = materialize_selected_turns_from_ids(turns, &included_turn_ids);
 
     SnapshotConversationSelection {
@@ -1209,9 +1281,9 @@ fn parse_turn_range(thread_id: &str, spec: &str) -> Result<SnapshotTurnRange> {
     } else {
         (thread_id, spec)
     };
-    let (start_turn_id, end_turn_id) = turn_spec
-        .split_once("..")
-        .ok_or_else(|| anyhow!("turn range must be formatted as start..end or thread:start..end"))?;
+    let (start_turn_id, end_turn_id) = turn_spec.split_once("..").ok_or_else(|| {
+        anyhow!("turn range must be formatted as start..end or thread:start..end")
+    })?;
     Ok(SnapshotTurnRange {
         thread_id: turn_spec_thread.to_string(),
         start_turn_id: start_turn_id.to_string(),
@@ -1231,13 +1303,15 @@ fn mutate_selection(
         ContextMutationMode::Include => {
             next.included_turn_ids.extend(selection.include_turn);
             for spec in selection.include_turn_range {
-                next.included_turn_ranges.push(parse_turn_range(&base.thread_id, &spec)?);
+                next.included_turn_ranges
+                    .push(parse_turn_range(&base.thread_id, &spec)?);
             }
         }
         ContextMutationMode::Exclude => {
             next.excluded_turn_ids.extend(selection.exclude_turn);
             for spec in selection.exclude_turn_range {
-                next.excluded_turn_ranges.push(parse_turn_range(&base.thread_id, &spec)?);
+                next.excluded_turn_ranges
+                    .push(parse_turn_range(&base.thread_id, &spec)?);
             }
         }
         ContextMutationMode::Pin => {
@@ -1255,18 +1329,16 @@ fn mutate_selection(
             summarized_turn_ids.dedup();
             next.summary_source_turn_ids = summarized_turn_ids.clone();
             next.excluded_turn_ids.extend(summarized_turn_ids.clone());
-            next.excluded_turn_ranges.extend(
-                summarized_turn_ids
-                    .iter()
-                    .map(|turn_id| SnapshotTurnRange {
-                        thread_id: base.thread_id.clone(),
-                        start_turn_id: turn_id.clone(),
-                        end_turn_id: turn_id.clone(),
-                    }),
-            );
+            next.excluded_turn_ranges
+                .extend(summarized_turn_ids.iter().map(|turn_id| SnapshotTurnRange {
+                    thread_id: base.thread_id.clone(),
+                    start_turn_id: turn_id.clone(),
+                    end_turn_id: turn_id.clone(),
+                }));
         }
     }
-    next.included_turn_ids.retain(|turn_id| !next.excluded_turn_ids.contains(turn_id));
+    next.included_turn_ids
+        .retain(|turn_id| !next.excluded_turn_ids.contains(turn_id));
     next.pinned_turn_ids.sort();
     next.pinned_turn_ids.dedup();
     next.pinned_facts.sort();
@@ -1282,11 +1354,20 @@ fn mutate_selection(
                 ContextMutationMode::Compact => next.summary_source_turn_ids.clone(),
                 _ => next.included_turn_ids.clone(),
             },
-            summary_version: base.summary.as_ref().map(|value| value.summary_version + 1).unwrap_or(1),
+            summary_version: base
+                .summary
+                .as_ref()
+                .map(|value| value.summary_version + 1)
+                .unwrap_or(1),
             generated_at: Utc::now().to_rfc3339(),
         });
     }
-    next.history_hash = hash_json(&(next.included_turn_ids.clone(), next.excluded_turn_ids.clone(), next.pinned_turn_ids.clone(), next.pinned_facts.clone()));
+    next.history_hash = hash_json(&(
+        next.included_turn_ids.clone(),
+        next.excluded_turn_ids.clone(),
+        next.pinned_turn_ids.clone(),
+        next.pinned_facts.clone(),
+    ));
     Ok(next)
 }
 
@@ -1368,11 +1449,19 @@ fn workspace_binding_from_store(
     let worktree_path = worktree
         .map(|path| path.display().to_string())
         .or_else(|| manifest.bound_worktree_path.clone())
-        .unwrap_or_else(|| store.workspace_root().join("worktree").display().to_string());
+        .unwrap_or_else(|| {
+            store
+                .workspace_root()
+                .join("worktree")
+                .display()
+                .to_string()
+        });
     let commit_sha = commit
         .map(str::to_string)
         .or_else(|| manifest.bound_commit_sha.clone())
-        .unwrap_or_else(|| git_head_commit(Path::new(&worktree_path)).unwrap_or_else(|_| "unknown".to_string()));
+        .unwrap_or_else(|| {
+            git_head_commit(Path::new(&worktree_path)).unwrap_or_else(|_| "unknown".to_string())
+        });
     Ok(SnapshotWorkspaceBinding {
         lane_label: manifest.label.clone(),
         lane_slug: manifest.lane_slug.clone(),
@@ -1383,7 +1472,12 @@ fn workspace_binding_from_store(
         worktree_path,
         branch_name: branch
             .map(str::to_string)
-            .or_else(|| manifest.bound_commit_sha.clone().map(|_| manifest.branch_name.clone()))
+            .or_else(|| {
+                manifest
+                    .bound_commit_sha
+                    .clone()
+                    .map(|_| manifest.branch_name.clone())
+            })
             .or_else(|| Some(manifest.branch_name.clone())),
         commit_sha,
         dirty_state_hash: Some(git_dirty_hash(Path::new(&manifest.repo_root_path))?),
@@ -1406,13 +1500,20 @@ fn git_head_commit(worktree: &Path) -> Result<String> {
 
 fn git_dirty_hash(repo_root: &Path) -> Result<String> {
     let output = std::process::Command::new("git")
-        .args(["-C", repo_root.to_str().unwrap_or("."), "status", "--porcelain"])
+        .args([
+            "-C",
+            repo_root.to_str().unwrap_or("."),
+            "status",
+            "--porcelain",
+        ])
         .output()
         .context("run git status --porcelain")?;
     if !output.status.success() {
         bail!("git status --porcelain failed");
     }
-    Ok(hash_json(&String::from_utf8_lossy(&output.stdout).to_string()))
+    Ok(hash_json(
+        &String::from_utf8_lossy(&output.stdout).to_string(),
+    ))
 }
 
 pub async fn snapshot_command(paths: tt_core::AppPaths, command: SnapshotCommand) -> Result<()> {
@@ -1494,10 +1595,7 @@ pub async fn snapshot_command(paths: tt_core::AppPaths, command: SnapshotCommand
     Ok(())
 }
 
-pub async fn context_command(
-    paths: tt_core::AppPaths,
-    command: ContextCommand,
-) -> Result<()> {
+pub async fn context_command(paths: tt_core::AppPaths, command: ContextCommand) -> Result<()> {
     let service = SnapshotService::new(paths);
     match command {
         ContextCommand::Include(args) => {
@@ -1587,10 +1685,7 @@ pub async fn context_command(
     Ok(())
 }
 
-pub async fn workspace_command(
-    paths: tt_core::AppPaths,
-    command: WorkspaceCommand,
-) -> Result<()> {
+pub async fn workspace_command(paths: tt_core::AppPaths, command: WorkspaceCommand) -> Result<()> {
     let service = SnapshotService::new(paths);
     match command {
         WorkspaceCommand::Bind(args) => {
@@ -1688,7 +1783,10 @@ pub async fn skill_apply_command(paths: tt_core::AppPaths, args: &SkillApplyArgs
     Ok(())
 }
 
-fn create_workspace_manifest(store: &SnapshotStore, scope: &SnapshotScopeArgs) -> WorkspaceManifest {
+fn create_workspace_manifest(
+    store: &SnapshotStore,
+    scope: &SnapshotScopeArgs,
+) -> WorkspaceManifest {
     WorkspaceManifest::new(
         scope.lane.clone(),
         store.lane_paths.root.display().to_string(),
@@ -1701,8 +1799,16 @@ fn create_workspace_manifest(store: &SnapshotStore, scope: &SnapshotScopeArgs) -
         LanePaths::slugify(&scope.workspace),
         format!("{}/{}", store.repo_org, store.repo_name),
         store.workspace_root().display().to_string(),
-        store.workspace_root().join("worktree").display().to_string(),
-        store.workspace_root().join("worktree").display().to_string(),
+        store
+            .workspace_root()
+            .join("worktree")
+            .display()
+            .to_string(),
+        store
+            .workspace_root()
+            .join("worktree")
+            .display()
+            .to_string(),
         store.workspace_root().join("runtime").display().to_string(),
         store.workspace_root().join("home").display().to_string(),
         "detached".to_string(),
@@ -1727,7 +1833,10 @@ fn print_snapshot_record(snapshot: &SnapshotRecord) {
         snapshot.parent_snapshot_id.as_deref().unwrap_or("-")
     );
     println!("lane: {}", snapshot.workspace.lane_slug);
-    println!("repo: {}/{}", snapshot.workspace.repo_org, snapshot.workspace.repo_name);
+    println!(
+        "repo: {}/{}",
+        snapshot.workspace.repo_org, snapshot.workspace.repo_name
+    );
     println!("workspace: {}", snapshot.workspace.workspace_slug);
     println!("thread: {}", snapshot.conversation.thread_id);
     println!("status: {:?}", snapshot.status);
@@ -1769,11 +1878,11 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use std::collections::BTreeMap;
+    use tt_core::AppPaths;
     use tt_core::ipc::{
         ItemView, ThreadLoadedStatus, ThreadManagementState, ThreadMonitorState, ThreadSummary,
         ThreadView, TurnView,
     };
-    use tt_core::AppPaths;
 
     fn sample_thread_view() -> ThreadView {
         ThreadView {
@@ -1913,7 +2022,8 @@ mod tests {
     #[test]
     fn prompt_hash_is_stable_for_identical_input() {
         let thread = sample_thread_view();
-        let selection = build_selection(&thread.turns, &SnapshotSelectionArgs::default(), "thread-1");
+        let selection =
+            build_selection(&thread.turns, &SnapshotSelectionArgs::default(), "thread-1");
         let workspace = SnapshotWorkspaceBinding {
             lane_label: "lane".to_string(),
             lane_slug: "lane".to_string(),
@@ -1952,7 +2062,8 @@ mod tests {
     #[test]
     fn diff_detects_workspace_and_prompt_changes() {
         let thread = sample_thread_view();
-        let selection = build_selection(&thread.turns, &SnapshotSelectionArgs::default(), "thread-1");
+        let selection =
+            build_selection(&thread.turns, &SnapshotSelectionArgs::default(), "thread-1");
         let workspace = SnapshotWorkspaceBinding {
             lane_label: "lane".to_string(),
             lane_slug: "lane".to_string(),
@@ -2085,7 +2196,10 @@ mod tests {
         let service = SnapshotService::new(paths);
         let scope = SnapshotScopeArgs {
             lane: snapshot.workspace.lane_label.clone(),
-            repo: format!("{}/{}", snapshot.workspace.repo_org, snapshot.workspace.repo_name),
+            repo: format!(
+                "{}/{}",
+                snapshot.workspace.repo_org, snapshot.workspace.repo_name
+            ),
             workspace: snapshot.workspace.workspace_slug.clone(),
         };
         let store = service.store(&scope).expect("store");
@@ -2171,10 +2285,13 @@ mod tests {
         let thread = sample_thread_view();
         let snapshot = sample_snapshot_record();
 
-        store.append_turn_history(&thread).expect("append raw turns");
+        store
+            .append_turn_history(&thread)
+            .expect("append raw turns");
         let turn_log_before = fs::read_to_string(store.turn_log_path()).expect("read turn log");
         store.append_snapshot(&snapshot).expect("append snapshot");
-        let turn_log_after = fs::read_to_string(store.turn_log_path()).expect("read turn log again");
+        let turn_log_after =
+            fs::read_to_string(store.turn_log_path()).expect("read turn log again");
         let snapshots = store.list_snapshots().expect("list snapshots");
 
         assert_eq!(turn_log_before, turn_log_after);

@@ -255,7 +255,11 @@ pub struct AgentSpawnArgs {
     pub new_workstream: Option<String>,
     #[arg(long, help = "Repository root to bind the agent to")]
     pub repo_root: Option<PathBuf>,
-    #[arg(long, default_value_t = false, help = "Spawn the agent without a visible UI")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Spawn the agent without a visible UI"
+    )]
     pub headless: bool,
     #[arg(long, help = "Model to use for the agent")]
     pub model: Option<String>,
@@ -274,7 +278,11 @@ pub struct TTSpawnArgs {
     pub new_workstream: Option<String>,
     #[arg(long, help = "Repository root to bind the TT thread to")]
     pub repo_root: Option<PathBuf>,
-    #[arg(long, default_value_t = false, help = "Spawn the TT thread without a visible UI")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Spawn the TT thread without a visible UI"
+    )]
     pub headless: bool,
     #[arg(long, help = "Model to use for the TT thread")]
     pub model: Option<String>,
@@ -350,7 +358,11 @@ pub struct I3WindowMoveArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct I3MessageArgs {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, help = "Message payload to send to i3/sway")]
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = "Message payload to send to i3/sway"
+    )]
     pub message: Vec<String>,
 }
 
@@ -1007,11 +1019,7 @@ mod tests2 {
             Ok(SkillOutcome::new("i3.workspace.list"))
         }
 
-        async fn skill_apply(
-            &self,
-            _: &SkillContext,
-            _: &SkillApplyArgs,
-        ) -> Result<SkillOutcome> {
+        async fn skill_apply(&self, _: &SkillContext, _: &SkillApplyArgs) -> Result<SkillOutcome> {
             self.push("skill.apply");
             Ok(SkillOutcome::new("skill.apply"))
         }
@@ -1446,11 +1454,7 @@ mod tests {
             Ok(SkillOutcome::new("i3.message"))
         }
 
-        async fn skill_apply(
-            &self,
-            _: &SkillContext,
-            _: &SkillApplyArgs,
-        ) -> Result<SkillOutcome> {
+        async fn skill_apply(&self, _: &SkillContext, _: &SkillApplyArgs) -> Result<SkillOutcome> {
             self.push("skill.apply");
             Ok(SkillOutcome::new("skill.apply"))
         }

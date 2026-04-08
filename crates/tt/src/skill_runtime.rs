@@ -858,11 +858,7 @@ impl SkillBackend for TTSkillBackend {
         Ok(Self::outcome("i3.workspace.list"))
     }
 
-    async fn skill_apply(
-        &self,
-        _: &SkillContext,
-        args: &SkillApplyArgs,
-    ) -> Result<SkillOutcome> {
+    async fn skill_apply(&self, _: &SkillContext, args: &SkillApplyArgs) -> Result<SkillOutcome> {
         let paths = tt_core::AppPaths::discover()?;
         snapshot::skill_apply_command(paths, args).await?;
         Ok(Self::outcome("skill.apply"))

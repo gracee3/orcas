@@ -22,17 +22,17 @@ pub mod communication;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod config;
 pub mod error;
-pub mod lane;
 pub mod events;
 pub mod ipc;
 pub mod jsonrpc;
-pub mod snapshot;
+pub mod lane;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod logging;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod paths;
 pub mod planning;
 pub mod session;
+pub mod snapshot;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod store;
 pub mod supervisor;
@@ -75,16 +75,15 @@ pub use config::{
     TTDaemonConfig,
 };
 pub use error::{TTError, TTResult};
-pub use lane::{
-    LaneCleanupScope, LaneManifest, LanePaths, RepoManifest, WorkspaceManifest, read_toml,
-    write_toml,
-};
-pub use snapshot::*;
 pub use events::{ConnectionState, EventEnvelope, TTEvent, TTItemEvent, TTTurnEvent};
 pub use ipc::*;
 pub use jsonrpc::{
     JsonRpcError, JsonRpcErrorObject, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
     JsonRpcResponse, RequestId,
+};
+pub use lane::{
+    LaneCleanupScope, LaneManifest, LanePaths, RepoManifest, WorkspaceManifest, read_toml,
+    write_toml,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use logging::init_file_logger;
@@ -92,6 +91,7 @@ pub use logging::init_file_logger;
 pub use paths::AppPaths;
 pub use planning::*;
 pub use session::{ThreadDescriptor, ThreadMetadata, ThreadRegistry, TurnDescriptor};
+pub use snapshot::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub use store::{JsonSessionStore, StoredState, TTSessionStore};
 pub use supervisor::*;

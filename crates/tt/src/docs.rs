@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use clap::{Command, CommandFactory, ColorChoice};
+use clap::{ColorChoice, Command, CommandFactory};
 
 use crate::Cli;
 
