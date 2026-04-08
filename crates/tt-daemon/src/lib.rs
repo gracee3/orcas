@@ -23,6 +23,7 @@ use tt_domain::{
 };
 use tt_store::OverlayStore;
 use tt_ui_core::{CodexThreadDetail, CodexThreadSummary, DashboardSummary, GitRepositorySummary};
+use chrono::Utc;
 
 pub const TT_DAEMON_API_VERSION: &str = "v2";
 pub const TT_DAEMON_SOCKET_NAME: &str = "ttd.sock";
@@ -110,12 +111,18 @@ pub enum DaemonRequest {
     ListWorkspaceBindingsForThread {
         codex_thread_id: String,
     },
+    RefreshWorkspaceBinding {
+        id: String,
+    },
     ListMergeRuns,
     GetMergeRun {
         id: String,
     },
     UpsertMergeRun {
         run: MergeRun,
+    },
+    RefreshMergeRun {
+        workspace_binding_id: String,
     },
     SetMergeRunStatus {
         id: String,
@@ -405,6 +412,30 @@ impl DaemonService {
             .list_workspace_bindings_for_thread(codex_thread_id)
     }
 
+    pub fn refresh_workspace_binding(&self, id: &str) -> Result<Option<WorkspaceBinding>> {
+        let Some(mut binding) = self.get_workspace_binding(id)? else {
+            return Ok(None);
+        };
+        let inspection_cwd = binding
+            .worktree_path
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or_else(|| Path::new(&binding.repo_root));
+        let Some(inspection) = tt_git::GitRepository::inspect(inspection_cwd)? else {
+            binding.status = WorkspaceStatus::Requested;
+            binding.updated_at = Utc::now();
+            self.upsert_workspace_binding(&binding)?;
+            return Ok(Some(binding));
+        };
+
+        binding.branch_name = inspection.current_branch.clone();
+        binding.base_commit = inspection.current_head_commit.clone();
+        binding.status = workspace_status_from_git(&inspection);
+        binding.updated_at = Utc::now();
+        self.upsert_workspace_binding(&binding)?;
+        Ok(Some(binding))
+    }
+
     pub fn list_merge_runs(&self) -> Result<Vec<MergeRun>> {
         self.store.list_merge_runs()
     }
@@ -431,6 +462,63 @@ impl DaemonService {
 
     pub fn delete_merge_run(&self, id: &str) -> Result<usize> {
         self.store.delete_merge_run(id)
+    }
+
+    pub fn refresh_merge_run(&self, workspace_binding_id: &str) -> Result<Option<MergeRun>> {
+        let Some(binding) = self.get_workspace_binding(workspace_binding_id)? else {
+            return Ok(None);
+        };
+        let inspection_cwd = binding
+            .worktree_path
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or_else(|| Path::new(&binding.repo_root));
+        let Some(inspection) = tt_git::GitRepository::inspect(inspection_cwd)? else {
+            let now = Utc::now();
+            let run = MergeRun {
+                id: workspace_binding_id.to_string(),
+                workspace_binding_id: workspace_binding_id.to_string(),
+                readiness: MergeReadiness::Unknown,
+                authorization: MergeAuthorizationStatus::NotRequested,
+                execution: MergeExecutionStatus::NotStarted,
+                head_commit: None,
+                created_at: now,
+                updated_at: now,
+            };
+            self.upsert_merge_run(&run)?;
+            return Ok(Some(run));
+        };
+        let now = Utc::now();
+        let existing = self
+            .store
+            .get_merge_run_for_workspace_binding(workspace_binding_id)?;
+        let mut run = existing.unwrap_or_else(|| MergeRun {
+            id: workspace_binding_id.to_string(),
+            workspace_binding_id: workspace_binding_id.to_string(),
+            readiness: MergeReadiness::Unknown,
+            authorization: MergeAuthorizationStatus::NotRequested,
+            execution: MergeExecutionStatus::NotStarted,
+            head_commit: None,
+            created_at: now,
+            updated_at: now,
+        });
+        run.readiness = inspection.merge_readiness;
+        run.authorization = match binding.status {
+            WorkspaceStatus::Merged => MergeAuthorizationStatus::Authorized,
+            WorkspaceStatus::Abandoned | WorkspaceStatus::Pruned => {
+                MergeAuthorizationStatus::Rejected
+            }
+            _ => run.authorization,
+        };
+        run.execution = match binding.status {
+            WorkspaceStatus::Merged => MergeExecutionStatus::Succeeded,
+            WorkspaceStatus::Abandoned | WorkspaceStatus::Pruned => MergeExecutionStatus::Failed,
+            _ => run.execution,
+        };
+        run.head_commit = inspection.current_head_commit.clone();
+        run.updated_at = now;
+        self.upsert_merge_run(&run)?;
+        Ok(Some(run))
     }
 
     pub fn codex_catalog(&self) -> Result<Option<tt_codex::CodexSessionCatalog>> {
@@ -659,12 +747,18 @@ impl DaemonService {
                     self.list_workspace_bindings_for_thread(&codex_thread_id)?,
                 )
             }
+            RefreshWorkspaceBinding { id } => {
+                DaemonResponse::WorkspaceBinding(self.refresh_workspace_binding(&id)?)
+            }
             ListMergeRuns => DaemonResponse::MergeRuns(self.list_merge_runs()?),
             GetMergeRun { id } => DaemonResponse::MergeRun(self.get_merge_run(&id)?),
             UpsertMergeRun { run } => {
                 self.upsert_merge_run(&run)?;
                 DaemonResponse::Unit
             }
+            RefreshMergeRun {
+                workspace_binding_id,
+            } => DaemonResponse::MergeRun(self.refresh_merge_run(&workspace_binding_id)?),
             SetMergeRunStatus {
                 id,
                 readiness,
@@ -747,6 +841,20 @@ impl DaemonService {
             bound_work_unit_id,
             workspace_binding_count,
         })
+    }
+}
+
+fn workspace_status_from_git(inspection: &tt_git::GitRepositoryInspection) -> WorkspaceStatus {
+    if inspection.dirty {
+        WorkspaceStatus::Dirty
+    } else if inspection.ahead_by.unwrap_or(0) > 0 && inspection.behind_by.unwrap_or(0) > 0 {
+        WorkspaceStatus::Conflicted
+    } else if inspection.behind_by.unwrap_or(0) > 0 {
+        WorkspaceStatus::Behind
+    } else if inspection.ahead_by.unwrap_or(0) > 0 {
+        WorkspaceStatus::Ahead
+    } else {
+        WorkspaceStatus::Ready
     }
 }
 

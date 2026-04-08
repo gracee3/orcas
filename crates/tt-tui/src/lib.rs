@@ -143,7 +143,7 @@ pub fn run_interactive(cwd: impl AsRef<Path>) -> Result<()> {
     )?;
     writeln!(
         stdout,
-        "\nCommands: help, refresh, projects, project <id>, project-status <id> <status>, work-units [project], work-unit <id>, work-unit-status <id> <status>, thread-bindings [work-unit], thread-binding-status <thread> <status>, workspace-bindings [thread], workspace-binding-status <id> <status>, merge-runs, merge-run-status <id> <readiness> <authorization> <execution> [head_commit], codex-threads [limit], codex-thread <selector>, codex-thread-read <selector> [include_turns], codex-thread-start [model] [ephemeral], codex-thread-resume <selector> [model], quit"
+        "\nCommands: help, refresh, projects, project <id>, project-status <id> <status>, work-units [project], work-unit <id>, work-unit-status <id> <status>, thread-bindings [work-unit], thread-binding-status <thread> <status>, workspace-bindings [thread], workspace-binding-status <id> <status>, workspace-binding-refresh <id>, merge-runs, merge-run-status <id> <readiness> <authorization> <execution> [head_commit], merge-run-refresh <workspace-binding-id>, codex-threads [limit], codex-thread <selector>, codex-thread-read <selector> [include_turns], codex-thread-start [model] [ephemeral], codex-thread-resume <selector> [model], quit"
     )?;
     stdout.flush()?;
 
@@ -170,7 +170,7 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
 
     match command {
         "help" => Ok(Some(
-            "Commands: help, refresh, projects, project <id>, project-status <id> <status>, work-units [project], work-unit <id>, work-unit-status <id> <status>, thread-bindings [work-unit], thread-binding-status <thread> <status>, workspace-bindings [thread], workspace-binding-status <id> <status>, merge-runs, merge-run-status <id> <readiness> <authorization> <execution> [head_commit], codex-threads [limit], codex-thread <selector>, codex-thread-read <selector> [include_turns], codex-thread-start [model] [ephemeral], codex-thread-resume <selector> [model], quit".to_string(),
+            "Commands: help, refresh, projects, project <id>, project-status <id> <status>, work-units [project], work-unit <id>, work-unit-status <id> <status>, thread-bindings [work-unit], thread-binding-status <thread> <status>, workspace-bindings [thread], workspace-binding-status <id> <status>, workspace-binding-refresh <id>, merge-runs, merge-run-status <id> <readiness> <authorization> <execution> [head_commit], merge-run-refresh <workspace-binding-id>, codex-threads [limit], codex-thread <selector>, codex-thread-read <selector> [include_turns], codex-thread-start [model] [ephemeral], codex-thread-resume <selector> [model], quit".to_string(),
         )),
         "quit" | "exit" => Ok(None),
         "refresh" => Ok(Some(render_dashboard(&load_snapshot_from_cwd(cwd)?))),
@@ -347,11 +347,49 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
                 other => bail!("unexpected daemon response for workspace-binding-status: {other:?}"),
             }
         }
+        "workspace-binding-refresh" => {
+            let Some(id) = parts.next() else {
+                bail!("workspace-binding-refresh requires an id");
+            };
+            let response = request_for_cwd(
+                cwd,
+                DaemonRequest::RefreshWorkspaceBinding {
+                    id: id.to_string(),
+                },
+            )?;
+            match response {
+                DaemonResponse::WorkspaceBinding(Some(binding)) => {
+                    Ok(Some(render_workspace_bindings(&[binding])))
+                }
+                DaemonResponse::WorkspaceBinding(None) => {
+                    Ok(Some(format!("workspace binding not found: {id}")))
+                }
+                other => bail!("unexpected daemon response for workspace-binding-refresh: {other:?}"),
+            }
+        }
         "merge-runs" => {
             let response = request_for_cwd(cwd, DaemonRequest::ListMergeRuns)?;
             match response {
                 DaemonResponse::MergeRuns(runs) => Ok(Some(render_merge_runs(&runs))),
                 other => bail!("unexpected daemon response for merge runs: {other:?}"),
+            }
+        }
+        "merge-run-refresh" => {
+            let Some(workspace_binding_id) = parts.next() else {
+                bail!("merge-run-refresh requires a workspace binding id");
+            };
+            let response = request_for_cwd(
+                cwd,
+                DaemonRequest::RefreshMergeRun {
+                    workspace_binding_id: workspace_binding_id.to_string(),
+                },
+            )?;
+            match response {
+                DaemonResponse::MergeRun(Some(run)) => Ok(Some(render_merge_runs(&[run]))),
+                DaemonResponse::MergeRun(None) => Ok(Some(format!(
+                    "merge run not found for workspace binding: {workspace_binding_id}"
+                ))),
+                other => bail!("unexpected daemon response for merge-run-refresh: {other:?}"),
             }
         }
         "codex-threads" => {

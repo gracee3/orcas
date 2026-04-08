@@ -769,6 +769,26 @@ impl OverlayStore {
         })
     }
 
+    pub fn get_merge_run_for_workspace_binding(
+        &self,
+        workspace_binding_id: &str,
+    ) -> Result<Option<MergeRun>> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "select id, workspace_binding_id, readiness, authorization, execution, head_commit,
+                            created_at, updated_at
+                     from merge_runs where workspace_binding_id = ?1
+                     order by updated_at desc, id desc limit 1",
+                )
+                .context("prepare get merge run for workspace binding")?;
+            statement
+                .query_row(params![workspace_binding_id], read_merge_run_row)
+                .optional()
+                .context("get merge run for workspace binding")
+        })
+    }
+
     pub fn delete_merge_run(&self, id: &str) -> Result<usize> {
         self.with_transaction(|tx| {
             let affected = tx

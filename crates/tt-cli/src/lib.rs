@@ -132,6 +132,7 @@ pub enum WorkspaceBindingCommand {
     Get { id: String },
     Upsert { file: PathBuf },
     SetStatus { id: String, status: String },
+    Refresh { id: String },
     Delete { id: String },
 }
 
@@ -150,6 +151,9 @@ pub enum MergeRunCommand {
         authorization: String,
         execution: String,
         head_commit: Option<String>,
+    },
+    Refresh {
+        workspace_binding_id: String,
     },
     Delete {
         id: String,
@@ -259,6 +263,9 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
                     status: parse_status::<WorkspaceStatus>(&status)?,
                 }
             }
+            WorkspaceBindingCommand::Refresh { id } => {
+                DaemonRequest::RefreshWorkspaceBinding { id }
+            }
             WorkspaceBindingCommand::Delete { id } => DaemonRequest::DeleteWorkspaceBinding { id },
         },
         Command::MergeRun { command } => match command {
@@ -279,6 +286,11 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
                 authorization: parse_status::<MergeAuthorizationStatus>(&authorization)?,
                 execution: parse_status::<MergeExecutionStatus>(&execution)?,
                 head_commit,
+            },
+            MergeRunCommand::Refresh {
+                workspace_binding_id,
+            } => DaemonRequest::RefreshMergeRun {
+                workspace_binding_id,
             },
             MergeRunCommand::Delete { id } => DaemonRequest::DeleteMergeRun { id },
         },
