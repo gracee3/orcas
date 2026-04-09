@@ -49,6 +49,9 @@ pub struct CodexThreadDetail {
     pub updated_at: i64,
     pub turn_count: usize,
     pub latest_turn_id: Option<String>,
+    pub latest_turn_status: Option<String>,
+    pub latest_turn_error: Option<String>,
+    pub latest_turn_summary: Option<String>,
     pub bound_work_unit_id: Option<String>,
     pub workspace_binding_count: usize,
 }

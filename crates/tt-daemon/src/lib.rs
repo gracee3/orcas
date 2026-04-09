@@ -1100,7 +1100,13 @@ impl DaemonService {
         include_turns: bool,
     ) -> Result<Option<CodexThreadDetail>> {
         let client = self.codex_runtime_client(cwd.as_ref())?;
-        let Some(snapshot) = client.read_thread(selector, include_turns)? else {
+        if include_turns {
+            let Some(thread) = client.read_thread_full(selector, true)? else {
+                return Ok(None);
+            };
+            return self.enrich_codex_thread(thread).map(Some);
+        }
+        let Some(snapshot) = client.read_thread(selector, false)? else {
             return Ok(None);
         };
         Ok(Some(self.enrich_codex_snapshot(snapshot)?))
@@ -1667,6 +1673,47 @@ impl DaemonService {
             updated_at: snapshot.updated_at,
             turn_count: snapshot.turn_count,
             latest_turn_id: snapshot.latest_turn_id,
+            latest_turn_status: None,
+            latest_turn_error: None,
+            latest_turn_summary: None,
+            bound_work_unit_id,
+            workspace_binding_count,
+        })
+    }
+
+    fn enrich_codex_thread(&self, thread: protocol::Thread) -> Result<CodexThreadDetail> {
+        let bound_work_unit_id = self
+            .get_thread_binding(&thread.id)?
+            .and_then(|binding| binding.work_unit_id);
+        let workspace_binding_count = self.list_workspace_bindings_for_thread(&thread.id)?.len();
+        let latest_turn = thread.turns.last();
+        let latest_turn_id = latest_turn.map(|turn| turn.id.clone());
+        let latest_turn_status = latest_turn.map(|turn| format!("{:?}", turn.status));
+        let latest_turn_error = latest_turn.and_then(|turn| {
+            turn.error.as_ref().map(|error| {
+                let details = error.additional_details.as_deref().unwrap_or("").trim();
+                if details.is_empty() {
+                    error.message.clone()
+                } else {
+                    format!("{}\n{}", error.message, details)
+                }
+            })
+        });
+        let latest_turn_summary = latest_turn.map(|turn| summarize_turn_items(&turn.items));
+        Ok(CodexThreadDetail {
+            thread_id: thread.id,
+            thread_name: thread.name.or(thread.agent_nickname),
+            preview: thread.preview,
+            status: format!("{:?}", thread.status),
+            cwd: thread.cwd.display().to_string(),
+            model_provider: thread.model_provider.to_string(),
+            ephemeral: thread.ephemeral,
+            updated_at: thread.updated_at,
+            turn_count: thread.turns.len(),
+            latest_turn_id,
+            latest_turn_status,
+            latest_turn_error,
+            latest_turn_summary,
             bound_work_unit_id,
             workspace_binding_count,
         })
@@ -2415,6 +2462,13 @@ impl DaemonService {
                 &worker_context,
                 state.pending_approval.as_ref(),
             );
+            write_scenario_artifact(
+                bootstrap,
+                &state.scenario_id,
+                spec.round_number,
+                "director-prompt.txt",
+                &director_prompt,
+            )?;
             let director_turn = self.run_role_prompt(
                 &bootstrap.repo_root,
                 &director,
@@ -2456,8 +2510,22 @@ impl DaemonService {
                     &director_turn.summary,
                     state.pending_approval.as_ref(),
                 );
+                write_scenario_artifact(
+                    bootstrap,
+                    &state.scenario_id,
+                    spec.round_number,
+                    &format!("{}-prompt.txt", role_slug(role.role)),
+                    &worker_prompt,
+                )?;
                 let handoff =
                     self.run_role_prompt(&bootstrap.repo_root, role, thread_id, &worker_prompt)?;
+                write_scenario_artifact(
+                    bootstrap,
+                    &state.scenario_id,
+                    spec.round_number,
+                    &format!("{}-handoff.txt", role_slug(role.role)),
+                    &handoff.summary,
+                )?;
                 eprintln!(
                     "tt director scenario {} round {} {} completed turn {}",
                     scenario_kind,
@@ -2479,6 +2547,13 @@ impl DaemonService {
             }
 
             worker_context = render_round_handoffs(&round);
+            write_scenario_artifact(
+                bootstrap,
+                &state.scenario_id,
+                spec.round_number,
+                "round-summary.md",
+                &worker_context,
+            )?;
             state.rounds.push(round);
             bootstrap.scenario = Some(state.clone());
             self.save_managed_project_bootstrap(bootstrap)?;
@@ -3084,6 +3159,27 @@ fn render_round_handoffs(round: &ManagedProjectRoundState) -> String {
     output
 }
 
+fn write_scenario_artifact(
+    bootstrap: &ManagedProjectBootstrap,
+    scenario_id: &str,
+    round_number: usize,
+    filename: &str,
+    contents: &str,
+) -> Result<()> {
+    let path = bootstrap
+        .repo_root
+        .join(".tt")
+        .join("scenarios")
+        .join(scenario_id)
+        .join(format!("round-{:02}", round_number))
+        .join(filename);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, contents)?;
+    Ok(())
+}
+
 fn workspace_status_from_git(inspection: &tt_git::GitRepositoryInspection) -> WorkspaceStatus {
     if inspection.dirty {
         WorkspaceStatus::Dirty
@@ -3656,5 +3752,30 @@ mod tests {
         assert!(matches!(response, DaemonResponse::Status(_)));
 
         drop(handle);
+    }
+
+    #[test]
+    fn init_managed_project_scaffold_is_workspace_isolated() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("taskflow");
+        let service = DaemonService::new(OverlayStore::open_in_dir(dir.path()).expect("store"));
+        let bootstrap = service
+            .init_managed_project(
+                &root,
+                Some("Taskflow".into()),
+                Some("Ship".into()),
+                Some("rust-taskflow".into()),
+                Some("main".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("init managed project");
+        let cargo_toml =
+            fs::read_to_string(bootstrap.repo_root.join("Cargo.toml")).expect("read Cargo.toml");
+        assert!(cargo_toml.contains("[workspace]"));
+        assert!(cargo_toml.contains("name = \"taskflow\""));
     }
 }

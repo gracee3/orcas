@@ -793,7 +793,7 @@ fn render_response(response: &DaemonResponse) -> String {
                 .join("")
         ),
         DaemonResponse::CodexThreadDetail(Some(thread)) => format!(
-            "{}\n{}\nstatus={}\ncwd={}\npreview={}\nmodel_provider={}\nephemeral={}\nupdated_at={}\nturn_count={}\nlatest_turn_id={}\nbound_work_unit_id={}\nworkspace_binding_count={}\n",
+            "{}\n{}\nstatus={}\ncwd={}\npreview={}\nmodel_provider={}\nephemeral={}\nupdated_at={}\nturn_count={}\nlatest_turn_id={}\nlatest_turn_status={}\nlatest_turn_error={}\nlatest_turn_summary={}\nbound_work_unit_id={}\nworkspace_binding_count={}\n",
             thread.thread_id,
             thread.thread_name.as_deref().unwrap_or("<unnamed>"),
             thread.status,
@@ -804,6 +804,9 @@ fn render_response(response: &DaemonResponse) -> String {
             thread.updated_at,
             thread.turn_count,
             thread.latest_turn_id.as_deref().unwrap_or("-"),
+            thread.latest_turn_status.as_deref().unwrap_or("-"),
+            thread.latest_turn_error.as_deref().unwrap_or("-"),
+            thread.latest_turn_summary.as_deref().unwrap_or("-"),
             thread.bound_work_unit_id.as_deref().unwrap_or("<unbound>"),
             thread.workspace_binding_count
         ),
@@ -1263,5 +1266,30 @@ mod tests {
         assert!(text.contains("merge-ready: true"));
         assert!(text.contains("dev"));
         assert!(text.contains("thread-1"));
+    }
+
+    #[test]
+    fn renders_codex_thread_detail_diagnostics() {
+        let detail = tt_ui_core::CodexThreadDetail {
+            thread_id: "thread-1".into(),
+            thread_name: Some("director".into()),
+            preview: "preview".into(),
+            status: "systemError".into(),
+            cwd: "/repo".into(),
+            model_provider: "openai".into(),
+            ephemeral: false,
+            updated_at: 123,
+            turn_count: 2,
+            latest_turn_id: Some("turn-2".into()),
+            latest_turn_status: Some("Failed".into()),
+            latest_turn_error: Some("model backend failed".into()),
+            latest_turn_summary: Some("plan\nnext_step".into()),
+            bound_work_unit_id: Some("wu-1".into()),
+            workspace_binding_count: 1,
+        };
+        let text = render_response(&DaemonResponse::CodexThreadDetail(Some(detail)));
+        assert!(text.contains("latest_turn_status=Failed"));
+        assert!(text.contains("latest_turn_error=model backend failed"));
+        assert!(text.contains("latest_turn_summary=plan"));
     }
 }
