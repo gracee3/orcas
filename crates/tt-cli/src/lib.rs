@@ -10,7 +10,10 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::de::DeserializeOwned;
-use tt_daemon::{DaemonRequest, DaemonResponse, ManagedProjectThreadAttachment, request_for_cwd};
+use tt_daemon::{
+    DaemonRequest, DaemonResponse, ManagedProjectThreadAttachment,
+    ManagedProjectThreadControlMode, request_for_cwd,
+};
 use tt_domain as _;
 use tt_domain::{
     MergeAuthorizationStatus, MergeExecutionStatus, MergeReadiness, ProjectStatus,
@@ -166,6 +169,12 @@ pub enum ProjectFlowCommand {
         scenario: Option<String>,
         #[arg(long)]
         seed_file: Option<PathBuf>,
+    },
+    Control {
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        mode: String,
     },
     Spawn {
         #[arg(long)]
@@ -462,6 +471,13 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
                 scenario,
                 seed_file: seed_file.map(|path| resolve_cli_path(cwd, path)),
             },
+            ProjectFlowCommand::Control { role, mode } => {
+                DaemonRequest::SetManagedProjectThreadControl {
+                    cwd: cwd.to_path_buf(),
+                    role: ThreadRole::from_str(&role).map_err(|error| anyhow::anyhow!(error))?,
+                    mode: parse_thread_control_mode(&mode)?,
+                }
+            }
             ProjectFlowCommand::Spawn { role } => DaemonRequest::SpawnManagedProject {
                 cwd: cwd.to_path_buf(),
                 roles: if role.is_empty() {
@@ -919,6 +935,9 @@ fn render_response(response: &DaemonResponse) -> String {
             render_managed_project_inspection(inspection)
         }
         DaemonResponse::ManagedProjectPlan(inspection) => render_managed_project_plan(inspection),
+        DaemonResponse::ManagedProjectThreadControl(inspection) => {
+            render_managed_project_inspection(inspection)
+        }
     }
 }
 
@@ -1260,7 +1279,7 @@ fn render_managed_project_bootstrap(bootstrap: &tt_daemon::ManagedProjectBootstr
     ));
     for role in &bootstrap.roles {
         output.push_str(&format!(
-            "{} | work-unit={} | branch={} | worktree={} | agent={} | thread={} | workspace={}\n",
+            "{} | work-unit={} | branch={} | worktree={} | agent={} | thread={} | control={} | workspace={}\n",
             role_name(role.role),
             role.work_unit.id,
             role.branch_name.as_deref().unwrap_or("<none>"),
@@ -1270,6 +1289,7 @@ fn render_managed_project_bootstrap(bootstrap: &tt_daemon::ManagedProjectBootstr
                 .unwrap_or_else(|| "<none>".to_string()),
             role.agent_path.display(),
             role.thread_id.as_deref().unwrap_or("<none>"),
+            role.control_mode,
             role.workspace_binding_id.as_deref().unwrap_or("<none>"),
         ));
     }
@@ -1312,6 +1332,23 @@ fn parse_thread_roles(values: &[String]) -> Result<Vec<ThreadRole>> {
         .iter()
         .map(|value| ThreadRole::from_str(value).map_err(|error| anyhow::anyhow!(error)))
         .collect()
+}
+
+fn parse_thread_control_mode(value: &str) -> Result<ManagedProjectThreadControlMode> {
+    match value {
+        "director" => Ok(ManagedProjectThreadControlMode::Director),
+        "manual_next_turn" | "manual-next-turn" => {
+            Ok(ManagedProjectThreadControlMode::ManualNextTurn)
+        }
+        "manual" => Ok(ManagedProjectThreadControlMode::Manual),
+        "director_paused" | "director-paused" | "paused" => {
+            Ok(ManagedProjectThreadControlMode::DirectorPaused)
+        }
+        other => anyhow::bail!(
+            "unknown managed project thread control mode `{}`; expected director, manual_next_turn, manual, or director_paused",
+            other
+        ),
+    }
 }
 
 fn parse_thread_bindings(values: &[String]) -> Result<Vec<ManagedProjectThreadAttachment>> {
@@ -1596,6 +1633,7 @@ mod tests {
                 agent_path: "/repo/.codex/agents/director.toml".into(),
                 model: Some("director-model".into()),
                 reasoning_effort: Some("medium".into()),
+                control_mode: tt_daemon::ManagedProjectThreadControlMode::Director,
                 branch_name: None,
                 worktree_path: None,
                 thread_id: None,
@@ -1617,6 +1655,7 @@ mod tests {
                 agent_path: "/repo/.codex/agents/dev.toml".into(),
                 model: Some("dev-model".into()),
                 reasoning_effort: Some("medium".into()),
+                control_mode: tt_daemon::ManagedProjectThreadControlMode::Manual,
                 branch_name: Some("tt/alpha/dev".into()),
                 worktree_path: Some("/repo/.tt-worktrees/alpha/dev".into()),
                 thread_id: Some("thread-1".into()),
@@ -1801,6 +1840,44 @@ mod tests {
         assert!(text.contains("latest_round_summary: round 4 merge"));
         assert!(text.contains("dev: source=extracted status=complete"));
         assert!(text.contains("test: source=seeded_fallback status=complete"));
+        assert!(text.contains("control=director"));
+        assert!(text.contains("control=manual"));
+    }
+
+    #[test]
+    fn parses_thread_control_mode_commands() {
+        let mode = parse_thread_control_mode("manual_next_turn").expect("mode");
+        assert_eq!(
+            mode,
+            tt_daemon::ManagedProjectThreadControlMode::ManualNextTurn
+        );
+        let mode = parse_thread_control_mode("paused").expect("mode");
+        assert_eq!(
+            mode,
+            tt_daemon::ManagedProjectThreadControlMode::DirectorPaused
+        );
+    }
+
+    #[test]
+    fn project_control_command_maps_to_daemon_request() {
+        let request = command_to_request(
+            Command::Project {
+                command: ProjectFlowCommand::Control {
+                    role: "dev".into(),
+                    mode: "manual_next_turn".into(),
+                },
+            },
+            Path::new("/repo"),
+        )
+        .expect("request");
+        assert_eq!(
+            request,
+            DaemonRequest::SetManagedProjectThreadControl {
+                cwd: PathBuf::from("/repo"),
+                role: ThreadRole::Develop,
+                mode: tt_daemon::ManagedProjectThreadControlMode::ManualNextTurn,
+            }
+        );
     }
 
     #[test]

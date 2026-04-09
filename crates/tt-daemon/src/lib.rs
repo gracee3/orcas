@@ -111,6 +111,11 @@ pub enum DaemonRequest {
     RefreshManagedProjectPlan {
         cwd: PathBuf,
     },
+    SetManagedProjectThreadControl {
+        cwd: PathBuf,
+        role: ThreadRole,
+        mode: ManagedProjectThreadControlMode,
+    },
     ListProjects,
     GetProject {
         id_or_slug: String,
@@ -313,6 +318,7 @@ pub enum DaemonResponse {
     RepositorySummary(Option<GitRepositorySummary>),
     ManagedProjectInspection(ManagedProjectInspection),
     ManagedProjectPlan(ManagedProjectInspection),
+    ManagedProjectThreadControl(ManagedProjectInspection),
     Projects(Vec<Project>),
     Project(Option<Project>),
     WorkUnits(Vec<WorkUnit>),
@@ -337,6 +343,7 @@ pub struct ManagedProjectRoleBootstrap {
     pub agent_path: PathBuf,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub control_mode: ManagedProjectThreadControlMode,
     pub branch_name: Option<String>,
     pub worktree_path: Option<PathBuf>,
     pub thread_id: Option<String>,
@@ -371,6 +378,32 @@ pub struct ManagedProjectInspection {
 pub struct ManagedProjectThreadAttachment {
     pub role: ThreadRole,
     pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedProjectThreadControlMode {
+    Director,
+    ManualNextTurn,
+    Manual,
+    DirectorPaused,
+}
+
+impl Default for ManagedProjectThreadControlMode {
+    fn default() -> Self {
+        Self::Director
+    }
+}
+
+impl std::fmt::Display for ManagedProjectThreadControlMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Director => "director",
+            Self::ManualNextTurn => "manual_next_turn",
+            Self::Manual => "manual",
+            Self::DirectorPaused => "director_paused",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -606,6 +639,8 @@ struct ManagedProjectManifestRole {
     agent_path: String,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    #[serde(default)]
+    control_mode: ManagedProjectThreadControlMode,
     branch_name: Option<String>,
     worktree_path: Option<String>,
     thread_id: Option<String>,
@@ -652,6 +687,15 @@ struct ManagedProjectTurnAttempt {
     turn_id: Option<String>,
     status: Option<String>,
     failure_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedProjectThreadControlState {
+    pub role: String,
+    pub thread_id: Option<String>,
+    pub thread_name: Option<String>,
+    pub workspace_binding_id: Option<String>,
+    pub mode: ManagedProjectThreadControlMode,
 }
 
 #[derive(Debug, Clone)]
@@ -1486,6 +1530,38 @@ impl DaemonService {
         })
     }
 
+    pub fn set_managed_project_thread_control(
+        &self,
+        cwd: impl AsRef<Path>,
+        role: ThreadRole,
+        mode: ManagedProjectThreadControlMode,
+    ) -> Result<ManagedProjectInspection> {
+        let cwd = cwd.as_ref();
+        let Some(repo_root) = managed_project_repo_root(cwd)? else {
+            anyhow::bail!("managed project control requires a git repository");
+        };
+        let manifest_path = repo_root.join(".tt").join("managed-project.toml");
+        if !manifest_path.exists() {
+            anyhow::bail!(
+                "managed project manifest not found at {}",
+                manifest_path.display()
+            );
+        }
+        let manifest = load_managed_project_manifest(&manifest_path)?;
+        let mut bootstrap =
+            self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
+        let role_index = bootstrap
+            .roles
+            .iter()
+            .position(|candidate| candidate.role == role)
+            .ok_or_else(|| {
+                anyhow::anyhow!("managed project role `{}` not found", role_slug(role))
+            })?;
+        bootstrap.roles[role_index].control_mode = mode;
+        self.save_managed_project_bootstrap(&bootstrap)?;
+        self.inspect_managed_project(cwd)
+    }
+
     pub fn open_managed_project(
         &self,
         cwd: impl AsRef<Path>,
@@ -1705,6 +1781,7 @@ impl DaemonService {
             agent_path,
             model,
             reasoning_effort,
+            control_mode: ManagedProjectThreadControlMode::Director,
             branch_name,
             worktree_path,
             thread_id: None,
@@ -1735,6 +1812,11 @@ impl DaemonService {
             }
             RefreshManagedProjectPlan { cwd } => {
                 DaemonResponse::ManagedProjectPlan(self.refresh_managed_project_plan(cwd)?)
+            }
+            SetManagedProjectThreadControl { cwd, role, mode } => {
+                DaemonResponse::ManagedProjectInspection(
+                    self.set_managed_project_thread_control(cwd, role, mode)?,
+                )
             }
             ListProjects => DaemonResponse::Projects(self.list_projects()?),
             GetProject { id_or_slug } => DaemonResponse::Project(self.get_project(&id_or_slug)?),
@@ -2214,6 +2296,12 @@ fn render_agent_file(
 - If progress is quiet but plausible, the director should classify it as quiet or suspect rather than failing immediately.\n",
     );
     output.push_str(
+        "Thread control:\n\
+- The operator may temporarily take over the next turn for this thread in Codex TUI.\n\
+- If control is marked manual_next_turn or manual, pause automatic dispatch and preserve the live thread for manual continuation.\n\
+- When control returns to director, resume the project from the saved round state instead of restarting it.\n",
+    );
+    output.push_str(
         "Planning expectations:\n\
 - Start with the plan before dispatching workers.\n\
 - Keep checkpoint commits aligned with the plan's checkpoint triggers.\n\
@@ -2228,6 +2316,9 @@ fn render_agent_file(
             );
             output.push_str("Keep the operator informed, request approval for merges or destructive cleanup, summarize outcomes after each phase, and watch for quiet or suspect progress periods.\n");
             output.push_str(
+                "If a role is marked manual_next_turn or manual, pause auto-dispatch for that role and let the operator continue the live thread in Codex TUI before resuming director control later.\n",
+            );
+            output.push_str(
                 "Review `.tt/project.toml` and `.tt/plan.toml` before dispatching any worker.\n",
             );
             output.push_str("Do not implement product code unless explicitly instructed.\n");
@@ -2237,6 +2328,7 @@ fn render_agent_file(
             output.push_str("You report to the director, not to other workers or the operator.\n");
             output.push_str("Treat test as the validator and integration as the landing worker.\n");
             output.push_str("Report changed files, tests run, blockers, next step, and whether you are actively building, testing, or waiting on I/O.\n");
+            output.push_str("If the operator takes over the thread for the next turn, keep the live thread open and wait for director control to be restored before the next autonomous turn.\n");
             output.push_str("Honor checkpoint commits required by the project plan.\n");
         }
         ThreadRole::Test => {
@@ -2245,6 +2337,7 @@ fn render_agent_file(
             output.push_str("Assume dev produced the change and integration will handle landing if tests pass.\n");
             output.push_str("Do not widen scope or rewrite implementation code.\n");
             output.push_str("Include progress checkpoints if tests are long-running or flaky so the director can distinguish quiet from stalled.\n");
+            output.push_str("If the operator pauses the thread for manual takeover, stop automatic dispatch and resume only when the director regains control.\n");
             output.push_str("Honor checkpoint commits required by the project plan.\n");
         }
         ThreadRole::Integrate => {
@@ -2255,6 +2348,7 @@ fn render_agent_file(
                 "Assume dev implemented the slice and test validated it before landing.\n",
             );
             output.push_str("Keep the landing path narrow, evidence-driven, and punctuated with short status updates if merge prep takes a while.\n");
+            output.push_str("If a manual takeover is requested for the next turn, pause automatic landing steps until the director is restored.\n");
             output.push_str("Honor checkpoint commits required by the project plan.\n");
         }
         ThreadRole::Review => {
@@ -2324,6 +2418,11 @@ Base branch: `{base_branch}`\n\n\
 - Workers escalate questions and blockers to the director.\n\
 - The director escalates merge/landing approval to the operator when needed.\n\
 - Workers do not change branch strategy or project topology on their own.\n\n\
+## Thread Control\n\
+- The operator may temporarily take over a thread for the next turn in Codex TUI.\n\
+- `manual_next_turn` pauses automatic dispatch before the next role turn.\n\
+- `manual` keeps the thread live but under operator control until the director is restored.\n\
+- `director_paused` means the director is not dispatching that thread yet.\n\n\
 ## Liveness Policy\n\
 - Expected long builds: `{expected_long_build}`\n\
 - Progress updates required: `{require_progress_updates}`\n\
@@ -2363,16 +2462,17 @@ fn build_managed_project_manifest(
 ) -> ManagedProjectManifest {
     let mut role_map = BTreeMap::new();
     for role in roles {
-        role_map.insert(
-            role_slug(role.role).to_string(),
-            ManagedProjectManifestRole {
-                work_unit_id: role.work_unit.id.clone(),
-                agent_path: role.agent_path.display().to_string(),
-                model: role.model.clone(),
-                reasoning_effort: role.reasoning_effort.clone(),
-                branch_name: role.branch_name.clone(),
-                worktree_path: role
-                    .worktree_path
+            role_map.insert(
+                role_slug(role.role).to_string(),
+                ManagedProjectManifestRole {
+                    work_unit_id: role.work_unit.id.clone(),
+                    agent_path: role.agent_path.display().to_string(),
+                    model: role.model.clone(),
+                    reasoning_effort: role.reasoning_effort.clone(),
+                    control_mode: role.control_mode,
+                    branch_name: role.branch_name.clone(),
+                    worktree_path: role
+                        .worktree_path
                     .as_ref()
                     .map(|path| path.display().to_string()),
                 thread_id: role.thread_id.clone(),
@@ -2860,6 +2960,7 @@ impl DaemonService {
                 thread_id: role_manifest.thread_id.clone(),
                 thread_name: role_manifest.thread_name.clone(),
                 workspace_binding_id: role_manifest.workspace_binding_id.clone(),
+                control_mode: role_manifest.control_mode,
             });
         }
 
@@ -3154,7 +3255,12 @@ impl DaemonService {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("managed project integration role missing"))?;
 
-        let mut state = ManagedProjectScenarioState {
+        let resumed_scenario = bootstrap
+            .scenario
+            .clone()
+            .filter(|scenario| scenario.scenario_kind == scenario_kind && !scenario.completed);
+        let resumed = resumed_scenario.is_some();
+        let mut state = resumed_scenario.unwrap_or_else(|| ManagedProjectScenarioState {
             scenario_id: uuid::Uuid::now_v7().to_string(),
             scenario_kind: scenario_kind.to_string(),
             operator_seed: seed.operator_seed.clone(),
@@ -3180,12 +3286,17 @@ impl DaemonService {
             pending_approval: None,
             rounds: Vec::new(),
             completed: false,
+        });
+        let scenario_event = if resumed {
+            "scenario-resume"
+        } else {
+            "scenario-start"
         };
         write_scenario_progress_event(
             bootstrap,
             &state.scenario_id,
             &ManagedProjectProgressEvent {
-                event: "scenario-start".to_string(),
+                event: scenario_event.to_string(),
                 scenario_id: state.scenario_id.clone(),
                 scenario_kind: scenario_kind.to_string(),
                 phase: state.current_phase.clone(),
@@ -3202,7 +3313,12 @@ impl DaemonService {
                     .as_ref()
                     .and_then(|watchdog| watchdog.last_signal.clone()),
                 message: format!(
-                    "director thread {director_thread_id} starting managed project with roles director/dev/test/integration"
+                    "director thread {director_thread_id} {} managed project with roles director/dev/test/integration",
+                    if resumed {
+                        "resuming"
+                    } else {
+                        "starting"
+                    }
                 ),
                 timestamp: Utc::now(),
             },
@@ -3246,71 +3362,93 @@ impl DaemonService {
                 },
             )?;
 
-            let mut round = ManagedProjectRoundState {
-                round_number: spec.round_number,
-                phase: spec.phase.to_string(),
-                director_turn_id: None,
-                director_summary: None,
-                role_handoffs: BTreeMap::new(),
-            };
-
-            let director_prompt = build_director_round_prompt(
-                bootstrap,
-                spec,
-                &seed.operator_seed,
-                &worker_context,
-                state.pending_approval.as_ref(),
-            );
-            write_scenario_artifact(
-                bootstrap,
-                &state.scenario_id,
-                spec.round_number,
-                "director-prompt.txt",
-                &director_prompt,
-            )?;
-            let director_turn = self.run_role_prompt(
-                bootstrap,
-                &state.scenario_id,
-                spec.round_number,
-                &director,
-                director_thread_id,
-                &director_prompt,
-            )?;
-            eprintln!(
-                "tt director scenario {} round {} director completed turn {}",
-                scenario_kind, spec.round_number, director_turn.turn_id
-            );
-            write_scenario_progress_event(
-                bootstrap,
-                &state.scenario_id,
-                &ManagedProjectProgressEvent {
-                    event: "director-turn-complete".to_string(),
-                    scenario_id: state.scenario_id.clone(),
-                    scenario_kind: scenario_kind.to_string(),
+            let round_position = state
+                .rounds
+                .iter()
+                .position(|round| round.round_number == spec.round_number);
+            let mut round = round_position
+                .and_then(|index| state.rounds.get(index).cloned())
+                .unwrap_or_else(|| ManagedProjectRoundState {
+                    round_number: spec.round_number,
                     phase: spec.phase.to_string(),
-                    round: spec.round_number,
-                    role: Some("director".to_string()),
-                    thread_id: Some(director_thread_id.to_string()),
-                    turn_id: Some(director_turn.turn_id.clone()),
-                    state: state
-                        .watchdog
-                        .as_ref()
-                        .map(|watchdog| watchdog.state.clone()),
-                    signal: state
-                        .watchdog
-                        .as_ref()
-                        .and_then(|watchdog| watchdog.last_signal.clone()),
-                    message: format!(
-                        "director completed turn {} with summary {}",
-                        director_turn.turn_id,
-                        director_turn.summary.lines().next().unwrap_or("<empty>")
-                    ),
-                    timestamp: Utc::now(),
-                },
-            )?;
-            round.director_turn_id = Some(director_turn.turn_id.clone());
-            round.director_summary = Some(director_turn.summary.clone());
-            state.watchdog = director_turn.watchdog.clone();
+                    director_turn_id: None,
+                    director_summary: None,
+                    role_handoffs: BTreeMap::new(),
+                });
+
+            let director_turn = if round.director_turn_id.is_some() {
+                ManagedProjectTurnOutcome {
+                    turn_id: round.director_turn_id.clone().unwrap(),
+                    summary: round.director_summary.clone().unwrap_or_default(),
+                    extraction: WorkerHandoffExtraction {
+                        handoff: None,
+                        raw_text: None,
+                        parse_error: None,
+                        source: WorkerHandoffSource::SeededFallback,
+                    },
+                    attempts: Vec::new(),
+                    watchdog: state.watchdog.clone(),
+                }
+            } else {
+                let director_prompt = build_director_round_prompt(
+                    bootstrap,
+                    spec,
+                    &state.operator_seed,
+                    &worker_context,
+                    state.pending_approval.as_ref(),
+                );
+                write_scenario_artifact(
+                    bootstrap,
+                    &state.scenario_id,
+                    spec.round_number,
+                    "director-prompt.txt",
+                    &director_prompt,
+                )?;
+                let director_turn = self.run_role_prompt(
+                    bootstrap,
+                    &state.scenario_id,
+                    spec.round_number,
+                    &director,
+                    director_thread_id,
+                    &director_prompt,
+                )?;
+                eprintln!(
+                    "tt director scenario {} round {} director completed turn {}",
+                    scenario_kind, spec.round_number, director_turn.turn_id
+                );
+                write_scenario_progress_event(
+                    bootstrap,
+                    &state.scenario_id,
+                    &ManagedProjectProgressEvent {
+                        event: "director-turn-complete".to_string(),
+                        scenario_id: state.scenario_id.clone(),
+                        scenario_kind: scenario_kind.to_string(),
+                        phase: spec.phase.to_string(),
+                        round: spec.round_number,
+                        role: Some("director".to_string()),
+                        thread_id: Some(director_thread_id.to_string()),
+                        turn_id: Some(director_turn.turn_id.clone()),
+                        state: state
+                            .watchdog
+                            .as_ref()
+                            .map(|watchdog| watchdog.state.clone()),
+                        signal: state
+                            .watchdog
+                            .as_ref()
+                            .and_then(|watchdog| watchdog.last_signal.clone()),
+                        message: format!(
+                            "director completed turn {} with summary {}",
+                            director_turn.turn_id,
+                            director_turn.summary.lines().next().unwrap_or("<empty>")
+                        ),
+                        timestamp: Utc::now(),
+                    },
+                )?;
+                round.director_turn_id = Some(director_turn.turn_id.clone());
+                round.director_summary = Some(director_turn.summary.clone());
+                state.watchdog = director_turn.watchdog.clone();
+                director_turn
+            };
 
             if spec.requires_landing_approval {
                 state.pending_approval = Some(ManagedProjectApprovalState {
@@ -3323,6 +3461,170 @@ impl DaemonService {
             }
 
             for role in [&dev, &test, &integration] {
+                let role_name = role_slug(role.role).to_string();
+                if round.role_handoffs.contains_key(&role_name) {
+                    continue;
+                }
+                let role_index = bootstrap
+                    .roles
+                    .iter()
+                    .position(|candidate| candidate.role == role.role)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "managed project role `{}` missing during scenario run",
+                            role_slug(role.role)
+                        )
+                    })?;
+                let control_mode = bootstrap.roles[role_index].control_mode;
+                match control_mode {
+                    ManagedProjectThreadControlMode::Director => {}
+                    ManagedProjectThreadControlMode::ManualNextTurn => {
+                        bootstrap.roles[role_index].control_mode = ManagedProjectThreadControlMode::Manual;
+                        state.current_phase = format!("manual-override-{}", role_name);
+                        state.watchdog = Some(ManagedProjectWatchdogState {
+                            state: "quiet".to_string(),
+                            last_signal: Some(format!(
+                                "manual takeover requested before {} turn",
+                                role_name
+                            )),
+                            last_observed_at: Some(Utc::now()),
+                            last_progress_at: Some(Utc::now()),
+                            role: Some(role_name.clone()),
+                            round: Some(spec.round_number),
+                            turn_id: None,
+                            elapsed_seconds: 0,
+                            silence_seconds: 0,
+                            turn_status: None,
+                            turn_items: 0,
+                            app_server_log_modified_at: None,
+                            app_server_log_size: None,
+                            note: Some(format!(
+                                "manual takeover requested before {} turn; resume director control later",
+                                role_name
+                            )),
+                        });
+                        round.director_summary = Some(format!(
+                            "paused before {} turn for manual takeover",
+                            role_name
+                        ));
+                        write_scenario_artifact(
+                            bootstrap,
+                            &state.scenario_id,
+                            spec.round_number,
+                            &format!("{}-control.txt", role_name),
+                            &format!(
+                                "mode: {}\nthread: {}\nstatus: paused before next turn for manual takeover\n",
+                                control_mode,
+                                role.thread_id.as_deref().unwrap_or("<none>")
+                            ),
+                        )?;
+                        write_scenario_progress_event(
+                            bootstrap,
+                            &state.scenario_id,
+                            &ManagedProjectProgressEvent {
+                                event: "manual-takeover-pending".to_string(),
+                                scenario_id: state.scenario_id.clone(),
+                                scenario_kind: scenario_kind.to_string(),
+                                phase: spec.phase.to_string(),
+                                round: spec.round_number,
+                                role: Some(role_name.clone()),
+                                thread_id: role.thread_id.clone(),
+                                turn_id: None,
+                                state: state
+                                    .watchdog
+                                    .as_ref()
+                                    .map(|watchdog| watchdog.state.clone()),
+                                signal: state
+                                    .watchdog
+                                    .as_ref()
+                                    .and_then(|watchdog| watchdog.last_signal.clone()),
+                                message: format!(
+                                    "{} control mode set to manual_next_turn; pause before turn",
+                                    role_name
+                                ),
+                                timestamp: Utc::now(),
+                            },
+                        )?;
+                        state.rounds.retain(|existing| existing.round_number != round.round_number);
+                        state.rounds.push(round.clone());
+                        bootstrap.scenario = Some(state.clone());
+                        self.save_managed_project_bootstrap(bootstrap)?;
+                        return Ok(state);
+                    }
+                    ManagedProjectThreadControlMode::Manual
+                    | ManagedProjectThreadControlMode::DirectorPaused => {
+                        state.current_phase = format!("paused-{}", role_name);
+                        state.watchdog = Some(ManagedProjectWatchdogState {
+                            state: "quiet".to_string(),
+                            last_signal: Some(format!(
+                                "director paused before {} turn",
+                                role_name
+                            )),
+                            last_observed_at: Some(Utc::now()),
+                            last_progress_at: Some(Utc::now()),
+                            role: Some(role_name.clone()),
+                            round: Some(spec.round_number),
+                            turn_id: None,
+                            elapsed_seconds: 0,
+                            silence_seconds: 0,
+                            turn_status: None,
+                            turn_items: 0,
+                            app_server_log_modified_at: None,
+                            app_server_log_size: None,
+                            note: Some(format!(
+                                "manual control remains active for {}",
+                                role_name
+                            )),
+                        });
+                        round.director_summary = Some(format!(
+                            "paused before {} turn because control mode is {}",
+                            role_name, control_mode
+                        ));
+                        write_scenario_artifact(
+                            bootstrap,
+                            &state.scenario_id,
+                            spec.round_number,
+                            &format!("{}-control.txt", role_name),
+                            &format!(
+                                "mode: {}\nthread: {}\nstatus: paused before next turn\n",
+                                control_mode,
+                                role.thread_id.as_deref().unwrap_or("<none>")
+                            ),
+                        )?;
+                        write_scenario_progress_event(
+                            bootstrap,
+                            &state.scenario_id,
+                            &ManagedProjectProgressEvent {
+                                event: "director-paused".to_string(),
+                                scenario_id: state.scenario_id.clone(),
+                                scenario_kind: scenario_kind.to_string(),
+                                phase: spec.phase.to_string(),
+                                round: spec.round_number,
+                                role: Some(role_name.clone()),
+                                thread_id: role.thread_id.clone(),
+                                turn_id: None,
+                                state: state
+                                    .watchdog
+                                    .as_ref()
+                                    .map(|watchdog| watchdog.state.clone()),
+                                signal: state
+                                    .watchdog
+                                    .as_ref()
+                                    .and_then(|watchdog| watchdog.last_signal.clone()),
+                                message: format!(
+                                    "{} control mode {} paused director dispatch",
+                                    role_name, control_mode
+                                ),
+                                timestamp: Utc::now(),
+                            },
+                        )?;
+                        state.rounds.retain(|existing| existing.round_number != round.round_number);
+                        state.rounds.push(round.clone());
+                        bootstrap.scenario = Some(state.clone());
+                        self.save_managed_project_bootstrap(bootstrap)?;
+                        return Ok(state);
+                    }
+                }
                 let thread_id = role.thread_id.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "managed project role `{}` is not attached",
@@ -3541,7 +3843,11 @@ impl DaemonService {
                     timestamp: Utc::now(),
                 },
             )?;
-            state.rounds.push(round);
+            if let Some(index) = round_position {
+                state.rounds[index] = round;
+            } else {
+                state.rounds.push(round);
+            }
             bootstrap.scenario = Some(state.clone());
             self.save_managed_project_bootstrap(bootstrap)?;
             eprintln!(
@@ -5450,6 +5756,63 @@ mod tests {
     }
 
     #[test]
+    fn control_request_round_trips() {
+        let request = DaemonRequest::SetManagedProjectThreadControl {
+            cwd: PathBuf::from("/repo"),
+            role: ThreadRole::Develop,
+            mode: ManagedProjectThreadControlMode::ManualNextTurn,
+        };
+        let encoded = serde_json::to_string(&request).expect("serialize request");
+        let decoded: DaemonRequest = serde_json::from_str(&encoded).expect("deserialize request");
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn managed_project_thread_control_updates_manifest_and_inspection() {
+        let (repo, _worktree) = setup_repo();
+        let dir = tempdir().expect("tempdir");
+        let service = DaemonService::new(OverlayStore::open_in_dir(dir.path()).expect("store"));
+        let bootstrap = service
+            .open_managed_project(
+                &repo,
+                Some("Alpha".to_string()),
+                Some("Ship".to_string()),
+                None,
+                None,
+                Some("director-model".to_string()),
+                Some("dev-model".to_string()),
+                Some("test-model".to_string()),
+                Some("integration-model".to_string()),
+            )
+            .expect("open managed project");
+
+        let inspection = service
+            .set_managed_project_thread_control(
+                &repo,
+                ThreadRole::Develop,
+                ManagedProjectThreadControlMode::ManualNextTurn,
+            )
+            .expect("set thread control");
+        let updated_role = inspection
+            .bootstrap
+            .roles
+            .iter()
+            .find(|role| role.role == ThreadRole::Develop)
+            .expect("dev role");
+        assert_eq!(
+            updated_role.control_mode,
+            ManagedProjectThreadControlMode::ManualNextTurn
+        );
+
+        let manifest = load_managed_project_manifest(&bootstrap.manifest_path).expect("manifest");
+        let manifest_role = manifest.roles.get("dev").expect("dev role");
+        assert_eq!(
+            manifest_role.control_mode,
+            ManagedProjectThreadControlMode::ManualNextTurn
+        );
+    }
+
+    #[test]
     fn plan_request_round_trips() {
         let request = DaemonRequest::InspectManagedProjectPlan {
             cwd: PathBuf::from("/repo"),
@@ -5705,6 +6068,7 @@ mod tests {
             agent_path: dir.path().join(".codex/agents/dev.toml"),
             model: Some("gpt-5.4".into()),
             reasoning_effort: Some("medium".into()),
+            control_mode: ManagedProjectThreadControlMode::Director,
             branch_name: Some("tt/alpha/dev".into()),
             worktree_path: Some(dir.path().join("worktree")),
             thread_id: Some("thread-1".into()),

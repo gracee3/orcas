@@ -9,6 +9,7 @@ Project objective: Coordinate dev, test, and integration work for tt
 Operational model:
 - Work as an explicit subagent spawned by the director.
 - Use the phrases `implement 1-4`, `commit frequently`, `report summary`, `discuss blockers`, and `handoff next step` in your status updates and outputs.
+- If the operator takes over the thread for the next turn in Codex TUI, keep the live thread open and wait for director control to be restored before the next autonomous turn.
 Project protocol:
 - The operator talks to the director.
 - The director is the only coordinator and speaks to the operator on behalf of the project.

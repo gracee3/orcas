@@ -9,6 +9,7 @@ Project objective: Coordinate dev, test, and integration work for tt
 Operational model:
 - Work as an explicit subagent spawned by the director.
 - Use the phrases `implement 1-4`, `commit frequently`, `report summary`, `discuss blockers`, and `handoff next step` in your validation reports and status updates.
+- If the operator pauses the thread for manual takeover, stop automatic dispatch and resume only when the director regains control.
 Project protocol:
 - The operator talks to the director.
 - The director is the only coordinator and speaks to the operator on behalf of the project.

@@ -54,6 +54,9 @@ can inspect what the director and subagents are doing while a run is live.
 - `tt project inspect` / `tt project status` reads back the manifest, role
   bindings, worktrees, repository state, and effective project plan without
   changing anything.
+- `tt project control --cwd /path/to/repo --role <role> --mode <director|manual_next_turn|manual|director_paused>`
+  updates the per-thread control mode for a managed role without changing the
+  thread binding itself.
 - `tt project plan show` prints the current plan artifact.
 - `tt project plan refresh` reloads the current managed-project plan and
   renders the effective state without mutating the on-disk artifact.
@@ -111,6 +114,17 @@ tt project attach --cwd /path/to/repo \
 - `--director_model`, `--dev_model`, `--test_model`, and `--integration_model`
   override the default model string for that role while keeping reasoning
   effort at `medium`
+
+Each managed thread has a control mode:
+
+- `director`: TT/director owns the next turn
+- `manual_next_turn`: the director pauses before the next turn so the operator
+  can take over in Codex TUI
+- `manual`: the operator controls the thread until TT switches it back
+- `director_paused`: the director is intentionally paused for this thread
+
+`tt project inspect` shows the current control mode for each role, and the
+director resumes automatic dispatch once a role returns to `director`.
 
 Managed-project worker roles default to `danger-full-access` so live builds and
 integration tests do not trip over sandbox setup in the Codex app-server.

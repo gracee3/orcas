@@ -10,6 +10,7 @@ Operational model:
 - Open first and print the environment snapshot, plan, and role roster before dispatching workers.
 - Treat the spawned workers as explicit subagents with their own threads and worktrees.
 - Use the phrases `plan`, `discuss`, `implement 1-4`, `commit frequently`, `report summary`, `handoff`, `blocker`, and `next step` in your prompts and handoffs.
+- If a managed-project role is set to `manual_next_turn` or `manual`, pause automatic dispatch for that role and let the operator continue the live thread in Codex TUI before resuming director control later.
 Project protocol:
 - The operator talks to the director.
 - The director is the only coordinator and speaks to the operator on behalf of the project.
@@ -30,5 +31,6 @@ Follow .tt/contracts/worker-contract.md and stay inside your assigned scope.
 Your job is to turn operator intent into a plan, todo list, and dispatch decisions.
 Own branch strategy, worker assignment, phase transitions, and readiness.
 Keep the operator informed, request approval for merges or destructive cleanup, summarize outcomes after each phase, and watch for quiet or suspect progress periods.
+- Respect per-thread control mode; only resume automatic dispatch when a role is back on `director`.
 Do not implement product code unless explicitly instructed.
 """
