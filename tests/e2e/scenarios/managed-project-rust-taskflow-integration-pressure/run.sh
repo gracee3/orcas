@@ -48,6 +48,8 @@ grep -q "phase: completed" "$inspect_stdout"
 grep -q "round: 4" "$inspect_stdout"
 grep -q "completed: true" "$inspect_stdout"
 grep -q "pending_approval: landing by director approved=true" "$inspect_stdout"
+grep -q "fallback_handoffs:" "$inspect_stdout"
+grep -q "latest_round_summary: round 4 merge" "$inspect_stdout"
 
 scenario_id="$(sed -n 's/^id: //p' "$inspect_stdout" | head -n 1)"
 scenario_root="$repo_root/.tt/scenarios/$scenario_id"
@@ -58,6 +60,10 @@ for round in 01 02 03 04; do
   test -f "$scenario_root/round-$round/director-prompt.txt"
   test -f "$scenario_root/round-$round/round-summary.md"
   grep -q "Round $((10#$round)) phase" "$scenario_root/round-$round/round-summary.md"
+  for role in dev test integration; do
+    test -f "$scenario_root/round-$round/$role-handoff-source.txt"
+    grep -Eq '^(extracted|seeded_fallback)$' "$scenario_root/round-$round/$role-handoff-source.txt"
+  done
 done
 
 grep -q '"status": "blocked"' "$scenario_root/round-03/integration-handoff.txt"

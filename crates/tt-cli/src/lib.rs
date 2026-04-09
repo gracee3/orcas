@@ -886,6 +886,35 @@ fn render_managed_project_bootstrap(bootstrap: &tt_daemon::ManagedProjectBootstr
                 approval.approval_kind, approval.requested_by_role, approval.approved
             ));
         }
+        let fallback_rounds = scenario
+            .rounds
+            .iter()
+            .flat_map(|round| round.role_handoffs.values())
+            .filter(|handoff| handoff.handoff_source == "seeded_fallback")
+            .count();
+        output.push_str(&format!("fallback_handoffs: {}\n", fallback_rounds));
+        if let Some(round) = scenario.rounds.last() {
+            output.push_str(&format!(
+                "latest_round_summary: round {} {}\n",
+                round.round_number, round.phase
+            ));
+            for role in ["dev", "test", "integration"] {
+                if let Some(handoff) = round.role_handoffs.get(role) {
+                    let blockers = if handoff.blockers.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        handoff.blockers.join(" | ")
+                    };
+                    output.push_str(&format!(
+                        "  {}: source={} status={} blockers={}\n",
+                        role,
+                        handoff.handoff_source,
+                        handoff.status.as_deref().unwrap_or("<unknown>"),
+                        blockers
+                    ));
+                }
+            }
+        }
     }
     output.push_str("\nRoles\n");
     output.push_str("-----\n");
@@ -1241,7 +1270,67 @@ mod tests {
             manifest_path: "/repo/.tt/managed-project.toml".into(),
             contract_path: "/repo/.tt/contracts/worker-contract.md".into(),
             codex_config_path: "/repo/.codex/config.toml".into(),
-            scenario: None,
+            scenario: Some(tt_daemon::ManagedProjectScenarioState {
+                scenario_id: "scn-1".into(),
+                scenario_kind: "rust-taskflow-four-round".into(),
+                current_round: 4,
+                current_phase: "completed".into(),
+                operator_seed: "build taskflow".into(),
+                pending_approval: Some(tt_daemon::ManagedProjectApprovalState {
+                    approval_kind: "landing".into(),
+                    requested_by_role: "director".into(),
+                    prompt: "ready to land".into(),
+                    approved: true,
+                    response: Some("approved".into()),
+                }),
+                rounds: vec![tt_daemon::ManagedProjectRoundState {
+                    round_number: 4,
+                    phase: "merge".into(),
+                    director_turn_id: Some("turn-4".into()),
+                    director_summary: Some("finalize landing".into()),
+                    role_handoffs: std::collections::BTreeMap::from([
+                        (
+                            "dev".into(),
+                            tt_daemon::ManagedProjectRoleHandoff {
+                                role: "dev".into(),
+                                thread_id: "thread-1".into(),
+                                turn_id: Some("turn-dev".into()),
+                                prompt_summary: "dev prompt".into(),
+                                handoff_summary: Some("{}".into()),
+                                status: Some("complete".into()),
+                                changed_files: vec!["src/lib.rs".into()],
+                                tests_run: vec!["cargo test".into()],
+                                blockers: vec![],
+                                next_step: Some("wait".into()),
+                                handoff_source: "extracted".into(),
+                                handoff_parse_error: None,
+                                raw_handoff_text: Some("{\"status\":\"complete\"}".into()),
+                                completed: true,
+                            },
+                        ),
+                        (
+                            "test".into(),
+                            tt_daemon::ManagedProjectRoleHandoff {
+                                role: "test".into(),
+                                thread_id: "thread-2".into(),
+                                turn_id: Some("turn-test".into()),
+                                prompt_summary: "test prompt".into(),
+                                handoff_summary: Some("{}".into()),
+                                status: Some("complete".into()),
+                                changed_files: vec!["tests/taskflow.rs".into()],
+                                tests_run: vec!["cargo test".into()],
+                                blockers: vec![],
+                                next_step: Some("report".into()),
+                                handoff_source: "seeded_fallback".into(),
+                                handoff_parse_error: Some("no agent message found".into()),
+                                raw_handoff_text: None,
+                                completed: true,
+                            },
+                        ),
+                    ]),
+                }],
+                completed: true,
+            }),
             roles,
         };
         let inspection = tt_daemon::ManagedProjectInspection {
@@ -1266,6 +1355,10 @@ mod tests {
         assert!(text.contains("merge-ready: true"));
         assert!(text.contains("dev"));
         assert!(text.contains("thread-1"));
+        assert!(text.contains("fallback_handoffs: 1"));
+        assert!(text.contains("latest_round_summary: round 4 merge"));
+        assert!(text.contains("dev: source=extracted status=complete"));
+        assert!(text.contains("test: source=seeded_fallback status=complete"));
     }
 
     #[test]

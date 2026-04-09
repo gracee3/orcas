@@ -354,6 +354,9 @@ pub struct ManagedProjectRoleHandoff {
     pub tests_run: Vec<String>,
     pub blockers: Vec<String>,
     pub next_step: Option<String>,
+    pub handoff_source: String,
+    pub handoff_parse_error: Option<String>,
+    pub raw_handoff_text: Option<String>,
     pub completed: bool,
 }
 
@@ -364,6 +367,21 @@ struct StructuredWorkerHandoff {
     tests_run: Vec<String>,
     blockers: Vec<String>,
     next_step: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkerHandoffExtraction {
+    handoff: Option<StructuredWorkerHandoff>,
+    raw_text: Option<String>,
+    source: WorkerHandoffSource,
+    parse_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkerHandoffSource {
+    Extracted,
+    SeededFallback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,6 +442,7 @@ struct ManagedProjectRoundSpec {
 struct ManagedProjectTurnOutcome {
     turn_id: String,
     summary: String,
+    extraction: WorkerHandoffExtraction,
 }
 
 #[derive(Debug, Clone)]
@@ -2536,8 +2555,22 @@ impl DaemonService {
                 )?;
                 let handoff =
                     self.run_role_prompt(&bootstrap.repo_root, role, thread_id, &worker_prompt)?;
-                let structured_handoff =
-                    seeded_worker_handoff(scenario_kind, spec, role.role);
+                let extraction = handoff.extraction;
+                let (structured_handoff, handoff_source, handoff_parse_error, raw_handoff_text) =
+                    match extraction.handoff {
+                        Some(parsed) => (
+                            parsed,
+                            extraction.source,
+                            extraction.parse_error,
+                            extraction.raw_text,
+                        ),
+                        None => (
+                            seeded_worker_handoff(scenario_kind, spec, role.role),
+                            WorkerHandoffSource::SeededFallback,
+                            extraction.parse_error,
+                            extraction.raw_text,
+                        ),
+                    };
                 let handoff_summary = serde_json::to_string_pretty(&structured_handoff)?;
                 write_scenario_artifact(
                     bootstrap,
@@ -2546,6 +2579,34 @@ impl DaemonService {
                     &format!("{}-handoff.txt", role_slug(role.role)),
                     &handoff_summary,
                 )?;
+                write_scenario_artifact(
+                    bootstrap,
+                    &state.scenario_id,
+                    spec.round_number,
+                    &format!("{}-handoff-source.txt", role_slug(role.role)),
+                    match handoff_source {
+                        WorkerHandoffSource::Extracted => "extracted\n",
+                        WorkerHandoffSource::SeededFallback => "seeded_fallback\n",
+                    },
+                )?;
+                if let Some(raw_handoff_text) = raw_handoff_text.as_ref() {
+                    write_scenario_artifact(
+                        bootstrap,
+                        &state.scenario_id,
+                        spec.round_number,
+                        &format!("{}-handoff-raw.txt", role_slug(role.role)),
+                        raw_handoff_text,
+                    )?;
+                }
+                if let Some(handoff_parse_error) = handoff_parse_error.as_ref() {
+                    write_scenario_artifact(
+                        bootstrap,
+                        &state.scenario_id,
+                        spec.round_number,
+                        &format!("{}-handoff-parse-error.txt", role_slug(role.role)),
+                        handoff_parse_error,
+                    )?;
+                }
                 eprintln!(
                     "tt director scenario {} round {} {} completed turn {}",
                     scenario_kind,
@@ -2566,6 +2627,12 @@ impl DaemonService {
                         tests_run: structured_handoff.tests_run.clone(),
                         blockers: structured_handoff.blockers.clone(),
                         next_step: Some(structured_handoff.next_step.clone()),
+                        handoff_source: match handoff_source {
+                            WorkerHandoffSource::Extracted => "extracted".to_string(),
+                            WorkerHandoffSource::SeededFallback => "seeded_fallback".to_string(),
+                        },
+                        handoff_parse_error,
+                        raw_handoff_text,
                         completed: true,
                     },
                 );
@@ -2638,20 +2705,21 @@ impl DaemonService {
             completed.id,
             completed.status
         );
-        let thread = client
-            .resume_thread_full(thread_id, Some(cwd), role_bootstrap.model.clone())?
-            .ok_or_else(|| anyhow::anyhow!("thread `{thread_id}` not found after turn"))?;
-        let finished_turn = thread
-            .turns
-            .into_iter()
-            .find(|candidate| candidate.id == completed.id)
+        let finished_turn = client
+            .load_completed_turn_with_history(
+                thread_id,
+                &completed.id,
+                Some(cwd),
+                role_bootstrap.model.clone(),
+            )?
             .ok_or_else(|| anyhow::anyhow!("turn `{}` not found after completion", completed.id))?;
         match finished_turn.status {
             protocol::TurnStatus::Completed => {
-                let _ = parse_structured_worker_handoff(&finished_turn.items)?;
+                let extraction = extract_worker_handoff(&finished_turn.items);
                 Ok(ManagedProjectTurnOutcome {
                     turn_id: finished_turn.id,
                     summary: summarize_turn_items(&finished_turn.items),
+                    extraction,
                 })
             }
             protocol::TurnStatus::Failed => anyhow::bail!(
@@ -3182,23 +3250,48 @@ fn summarize_turn_items(items: &[protocol::ThreadItem]) -> String {
     }
 }
 
-fn parse_structured_worker_handoff(
-    items: &[protocol::ThreadItem],
-) -> Result<Option<StructuredWorkerHandoff>> {
-    let text = items.iter().find_map(|item| match item {
-        protocol::ThreadItem::AgentMessage { text, .. } => Some(text.trim()),
+fn worker_handoff_text(items: &[protocol::ThreadItem]) -> Option<String> {
+    items.iter().find_map(|item| match item {
+        protocol::ThreadItem::AgentMessage { text, .. } => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
         _ => None,
-    });
-    let Some(text) = text else {
-        return Ok(None);
+    })
+}
+
+fn extract_worker_handoff(items: &[protocol::ThreadItem]) -> WorkerHandoffExtraction {
+    let raw_text = worker_handoff_text(items);
+    let Some(raw_text_value) = raw_text.clone() else {
+        return WorkerHandoffExtraction {
+            handoff: None,
+            raw_text: None,
+            source: WorkerHandoffSource::SeededFallback,
+            parse_error: Some("no agent message found in completed turn".to_string()),
+        };
     };
-    if text.is_empty() {
-        return Ok(None);
+    match serde_json::from_str::<StructuredWorkerHandoff>(&raw_text_value) {
+        Ok(handoff) => match validate_structured_worker_handoff(&handoff) {
+            Ok(()) => WorkerHandoffExtraction {
+                handoff: Some(handoff),
+                raw_text: Some(raw_text_value),
+                source: WorkerHandoffSource::Extracted,
+                parse_error: None,
+            },
+            Err(error) => WorkerHandoffExtraction {
+                handoff: None,
+                raw_text: Some(raw_text_value),
+                source: WorkerHandoffSource::SeededFallback,
+                parse_error: Some(error.to_string()),
+            },
+        },
+        Err(error) => WorkerHandoffExtraction {
+            handoff: None,
+            raw_text: Some(raw_text_value),
+            source: WorkerHandoffSource::SeededFallback,
+            parse_error: Some(format!("parse structured worker handoff JSON: {error}")),
+        },
     }
-    let handoff: StructuredWorkerHandoff = serde_json::from_str(text)
-        .with_context(|| "parse structured worker handoff JSON".to_string())?;
-    validate_structured_worker_handoff(&handoff)?;
-    Ok(Some(handoff))
 }
 
 fn validate_structured_worker_handoff(handoff: &StructuredWorkerHandoff) -> Result<()> {

@@ -532,6 +532,19 @@ impl CodexRuntimeClient {
         }
     }
 
+    pub fn load_completed_turn_with_history(
+        &self,
+        selector: &str,
+        turn_id: &str,
+        cwd: Option<&Path>,
+        model: Option<String>,
+    ) -> Result<Option<protocol::Turn>> {
+        let Some(thread) = self.resume_thread_full(selector, cwd, model)? else {
+            return Ok(None);
+        };
+        Ok(thread.turns.into_iter().find(|turn| turn.id == turn_id))
+    }
+
     fn resolve_selector(&self, selector: &str) -> Result<Option<String>> {
         if uuid::Uuid::parse_str(selector).is_ok() {
             return Ok(Some(selector.to_string()));

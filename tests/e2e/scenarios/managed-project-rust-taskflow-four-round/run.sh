@@ -48,6 +48,8 @@ grep -q "phase: completed" "$inspect_stdout"
 grep -q "round: 4" "$inspect_stdout"
 grep -q "completed: true" "$inspect_stdout"
 grep -q "pending_approval: landing by director approved=true" "$inspect_stdout"
+grep -q "fallback_handoffs:" "$inspect_stdout"
+grep -q "latest_round_summary: round 4 merge" "$inspect_stdout"
 grep -q "director |" "$inspect_stdout"
 grep -q "dev |" "$inspect_stdout"
 grep -q "test |" "$inspect_stdout"
@@ -71,14 +73,17 @@ for round in 01 02 03 04; do
   grep -q "Round $((10#$round)) phase" "$scenario_root/round-$round/round-summary.md"
   for role in dev test integration; do
     handoff="$scenario_root/round-$round/$role-handoff.txt"
+    source_file="$scenario_root/round-$round/$role-handoff-source.txt"
     prompt="$scenario_root/round-$round/$role-prompt.txt"
     test -f "$handoff"
+    test -f "$source_file"
     test -f "$prompt"
     grep -q '"status"' "$handoff"
     grep -q '"changed_files"' "$handoff"
     grep -q '"tests_run"' "$handoff"
     grep -q '"blockers"' "$handoff"
     grep -q '"next_step"' "$handoff"
+    grep -Eq '^(extracted|seeded_fallback)$' "$source_file"
   done
 done
 
