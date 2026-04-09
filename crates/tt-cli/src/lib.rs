@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Arg, ArgAction, CommandFactory, Parser, Subcommand};
 use serde::de::DeserializeOwned;
 use tt_daemon::{
     DaemonRequest, DaemonResponse, ManagedProjectThreadAttachment, ManagedProjectThreadControlMode,
@@ -59,6 +59,18 @@ pub enum Command {
     Records {
         #[command(subcommand)]
         command: RecordsCommand,
+    },
+    Docs {
+        #[command(subcommand)]
+        command: DocsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DocsCommand {
+    ExportCliRef {
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -347,11 +359,43 @@ pub enum MergeRunCommand {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(output) = local_command_output(&cli.command, &cli.cwd)? {
+        print!("{output}");
+        return Ok(());
+    }
     let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
     let request_cwd = request_cwd_for_command(&cwd, &cli.command);
     let response = request_for_cwd(&request_cwd, command_to_request(cli.command, &cwd)?)?;
     println!("{}", render_response(&response));
     Ok(())
+}
+
+fn local_command_output(command: &Command, cli_cwd: &Option<PathBuf>) -> Result<Option<String>> {
+    match command {
+        Command::Docs {
+            command: DocsCommand::ExportCliRef { output },
+        } => {
+            let markdown = render_cli_reference_markdown();
+            if let Some(path) = output {
+                let base = cli_cwd
+                    .clone()
+                    .unwrap_or(std::env::current_dir().context("resolve current working directory")?);
+                let resolved = resolve_cli_path(&base, path.clone());
+                if let Some(parent) = resolved.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("create docs parent {}", parent.display()))?;
+                }
+                fs::write(&resolved, markdown.as_bytes())
+                    .with_context(|| format!("write CLI reference to {}", resolved.display()))?;
+                return Ok(Some(format!(
+                    "exported CLI reference to {}\n",
+                    resolved.display()
+                )));
+            }
+            Ok(Some(markdown))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn request_cwd_for_command(cwd: &Path, command: &Command) -> PathBuf {
@@ -680,6 +724,7 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
                 }
             },
         },
+        Command::Docs { .. } => anyhow::bail!("docs commands are handled locally"),
     })
 }
 
@@ -688,6 +733,100 @@ where
     T: FromStr<Err = String>,
 {
     T::from_str(raw).map_err(|error| anyhow::anyhow!(error))
+}
+
+fn render_cli_reference_markdown() -> String {
+    let command = Cli::command().name("tt");
+    let mut output = String::new();
+    output.push_str("# TT CLI Reference\n\n");
+    output.push_str("_Generated from the current `tt` Clap command tree._\n\n");
+    render_command_markdown(&command, &["tt".to_string()], &mut output);
+    output
+}
+
+fn render_command_markdown(command: &clap::Command, path: &[String], output: &mut String) {
+    let depth = path.len().saturating_sub(1).min(5);
+    let heading = "#".repeat(depth + 2);
+    output.push_str(&format!("{heading} `{}`\n\n", path.join(" ")));
+
+    if let Some(about) = command.get_about() {
+        output.push_str(&format!("{about}\n\n"));
+    }
+
+    output.push_str("**Usage**\n\n```text\n");
+    let mut usage_command = command.clone();
+    output.push_str(&usage_command.render_usage().to_string());
+    output.push_str("\n```\n\n");
+
+    let subcommands: Vec<_> = command
+        .get_subcommands()
+        .filter(|subcommand| !subcommand.is_hide_set() && subcommand.get_name() != "help")
+        .collect();
+    if !subcommands.is_empty() {
+        output.push_str("**Subcommands**\n\n");
+        for subcommand in &subcommands {
+            let mut names = vec![format!("`{}`", subcommand.get_name())];
+            let mut aliases = subcommand.get_visible_aliases();
+            if let Some(alias) = aliases.next() {
+                names.push(format!("alias: `{alias}`"));
+            }
+            output.push_str(&format!("- {}\n", names.join(" ")));
+        }
+        output.push('\n');
+    }
+
+    let arguments: Vec<_> = command
+        .get_arguments()
+        .filter(|arg| !arg.is_hide_set())
+        .collect();
+    if !arguments.is_empty() {
+        output.push_str("**Arguments**\n\n");
+        for arg in arguments {
+            output.push_str(&format_argument_markdown(arg));
+        }
+        output.push('\n');
+    }
+
+    for subcommand in subcommands {
+        let mut child_path = path.to_vec();
+        child_path.push(subcommand.get_name().to_string());
+        render_command_markdown(subcommand, &child_path, output);
+    }
+}
+
+fn format_argument_markdown(arg: &Arg) -> String {
+    let mut line = String::from("- ");
+    if let Some(short) = arg.get_short() {
+        line.push_str(&format!("`-{short}`"));
+        if arg.get_long().is_some() {
+            line.push_str(", ");
+        }
+    }
+    if let Some(long) = arg.get_long() {
+        line.push_str(&format!("`--{long}`"));
+    }
+    if arg.get_short().is_none() && arg.get_long().is_none() {
+        line.push_str(&format!("`{}`", arg.get_id()));
+    }
+    let takes_value = !matches!(
+        arg.get_action(),
+        ArgAction::SetTrue | ArgAction::SetFalse | ArgAction::Count | ArgAction::Help | ArgAction::Version
+    );
+    if takes_value {
+        if let Some(value_names) = arg.get_value_names() {
+            for value_name in value_names {
+                line.push_str(&format!(" `<{}>`", value_name));
+            }
+        }
+    }
+    if !arg.is_required_set() {
+        line.push_str(" (optional)");
+    }
+    if let Some(help) = arg.get_help() {
+        line.push_str(&format!(": {help}"));
+    }
+    line.push('\n');
+    line
 }
 
 fn render_response(response: &DaemonResponse) -> String {
@@ -2168,5 +2307,16 @@ mod tests {
         assert!(text.contains("listen_source=TT_APP_SERVER_LISTEN_URL"));
         assert!(text.contains("listen_error=connection refused"));
         assert!(text.contains("note=repo scoped metadata only"));
+    }
+
+    #[test]
+    fn renders_cli_reference_markdown() {
+        let markdown = render_cli_reference_markdown();
+        assert!(markdown.contains("# TT CLI Reference"));
+        assert!(markdown.contains("## `tt`"));
+        assert!(markdown.contains("### `tt project`"));
+        assert!(markdown.contains("#### `tt codex threads`"));
+        assert!(markdown.contains("`docs`"));
+        assert!(markdown.contains("`export-cli-ref`"));
     }
 }
