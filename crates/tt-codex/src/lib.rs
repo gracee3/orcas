@@ -5,10 +5,11 @@
 
 use std::env;
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -46,7 +47,10 @@ const APP_SERVER_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TURN_WAIT_TIMEOUT_SECS_ENV: &str = "TT_CODEX_TURN_WAIT_TIMEOUT_SECS";
-const DEFAULT_TURN_WAIT_TIMEOUT_SECS: u64 = 300;
+const TURN_SOFT_SILENCE_SECS_ENV: &str = "TT_CODEX_TURN_SOFT_SILENCE_SECS";
+const TURN_HARD_CEILING_SECS_ENV: &str = "TT_CODEX_TURN_HARD_CEILING_SECS";
+const DEFAULT_TURN_SOFT_SILENCE_SECS: u64 = 900;
+const DEFAULT_TURN_HARD_CEILING_SECS: u64 = 7_200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimeContract {
@@ -251,6 +255,111 @@ pub struct CodexRuntimeClient {
     connection: Arc<Mutex<CodexAppServerConnection>>,
     codex_home: CodexHome,
     listen_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnWatchdogConfig {
+    pub soft_silence: Duration,
+    pub hard_ceiling: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnWatchdogState {
+    Healthy,
+    Quiet,
+    Suspect,
+    Stalled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnWatchdogObservation {
+    pub state: TurnWatchdogState,
+    pub elapsed_seconds: u64,
+    pub silent_seconds: u64,
+    pub thread_updated_at: i64,
+    pub turn_count: usize,
+    pub turn_status: Option<String>,
+    pub turn_items: usize,
+    pub progress_signal: Option<String>,
+    pub app_server_log_modified_at: Option<i64>,
+    pub app_server_log_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnWatchdogSnapshot {
+    thread_updated_at: i64,
+    turn_count: usize,
+    turn_status: Option<String>,
+    turn_items: usize,
+    app_server_log_modified_at: Option<i64>,
+    app_server_log_size: Option<u64>,
+    progress_signal: Option<String>,
+}
+
+impl TurnWatchdogSnapshot {
+    fn from_thread_and_turn(
+        thread: &protocol::Thread,
+        turn: Option<&protocol::Turn>,
+        app_server_log_path: Option<&Path>,
+    ) -> Self {
+        let (app_server_log_modified_at, app_server_log_size) = app_server_log_path
+            .and_then(progress_marker)
+            .unwrap_or((None, None));
+        Self {
+            thread_updated_at: thread.updated_at,
+            turn_count: thread.turns.len(),
+            turn_status: turn.map(|turn| format!("{:?}", turn.status)),
+            turn_items: turn.map(|turn| turn.items.len()).unwrap_or(0),
+            app_server_log_modified_at,
+            app_server_log_size,
+            progress_signal: None,
+        }
+    }
+
+    fn progress_signal(&self, previous: &Option<Self>) -> Option<String> {
+        let Some(previous) = previous.as_ref() else {
+            return Some("first observation".to_string());
+        };
+        if self.thread_updated_at != previous.thread_updated_at {
+            return Some("thread.updated_at changed".to_string());
+        }
+        if self.turn_count != previous.turn_count {
+            return Some("thread.turn_count changed".to_string());
+        }
+        if self.turn_status != previous.turn_status {
+            return Some("turn.status changed".to_string());
+        }
+        if self.turn_items != previous.turn_items {
+            return Some("turn.items changed".to_string());
+        }
+        if self.app_server_log_modified_at != previous.app_server_log_modified_at {
+            return Some("app-server log changed".to_string());
+        }
+        if self.app_server_log_size != previous.app_server_log_size {
+            return Some("app-server log size changed".to_string());
+        }
+        None
+    }
+
+    fn state(
+        &self,
+        last_progress_at: &std::time::Instant,
+        soft_silence: Duration,
+        deadline: std::time::Instant,
+    ) -> TurnWatchdogState {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return TurnWatchdogState::Stalled;
+        }
+        let silent_for = now.duration_since(*last_progress_at);
+        if silent_for.as_secs() >= soft_silence.as_secs().saturating_mul(2) {
+            TurnWatchdogState::Suspect
+        } else if silent_for >= soft_silence {
+            TurnWatchdogState::Quiet
+        } else {
+            TurnWatchdogState::Healthy
+        }
+    }
 }
 
 impl CodexRuntimeClient {
@@ -519,8 +628,30 @@ impl CodexRuntimeClient {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<protocol::Turn> {
-        let turn_wait_timeout = turn_wait_timeout();
-        let deadline = std::time::Instant::now() + turn_wait_timeout;
+        self.wait_for_turn_completion_with_watchdog(
+            thread_id,
+            turn_id,
+            turn_watchdog_config(),
+            |_| {},
+        )
+    }
+
+    pub fn wait_for_turn_completion_with_watchdog<F>(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        watchdog: TurnWatchdogConfig,
+        mut on_progress: F,
+    ) -> Result<protocol::Turn>
+    where
+        F: FnMut(&TurnWatchdogObservation),
+    {
+        let started_at = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + watchdog.hard_ceiling;
+        let mut last_progress_at = std::time::Instant::now();
+        let mut last_snapshot: Option<TurnWatchdogSnapshot> = None;
+        let mut last_reported_state: Option<TurnWatchdogState> = None;
+        let app_server_log_path = env::var_os("TT_CODEX_APP_SERVER_LOG_PATH").map(PathBuf::from);
         loop {
             let thread = match self.read_thread_full(thread_id, true) {
                 Ok(Some(thread)) => thread,
@@ -531,7 +662,7 @@ impl CodexRuntimeClient {
                             "timed out waiting for turn `{}` in thread `{}` after {:?}",
                             turn_id,
                             thread_id,
-                            turn_wait_timeout
+                            watchdog.hard_ceiling
                         );
                     }
                     std::thread::sleep(TURN_POLL_INTERVAL);
@@ -539,13 +670,48 @@ impl CodexRuntimeClient {
                 }
                 Err(error) => return Err(error),
             };
-            let Some(turn) = thread.turns.into_iter().find(|turn| turn.id == turn_id) else {
+            let current_turn = thread.turns.iter().find(|turn| turn.id == turn_id);
+            let current_snapshot = TurnWatchdogSnapshot::from_thread_and_turn(
+                &thread,
+                current_turn,
+                app_server_log_path.as_deref(),
+            );
+            let progress_signal = current_snapshot.progress_signal(&last_snapshot);
+            let mut state =
+                current_snapshot.state(&last_progress_at, watchdog.soft_silence, deadline);
+            if progress_signal.is_some() {
+                last_progress_at = std::time::Instant::now();
+                state = TurnWatchdogState::Healthy;
+            }
+            let silent_seconds = std::time::Instant::now()
+                .duration_since(last_progress_at)
+                .as_secs();
+            let observation = TurnWatchdogObservation {
+                state,
+                elapsed_seconds: started_at.elapsed().as_secs(),
+                silent_seconds,
+                thread_updated_at: thread.updated_at,
+                turn_count: thread.turns.len(),
+                turn_status: current_turn.map(|turn| format!("{:?}", turn.status)),
+                turn_items: current_turn.map(|turn| turn.items.len()).unwrap_or(0),
+                progress_signal,
+                app_server_log_modified_at: current_snapshot.app_server_log_modified_at,
+                app_server_log_size: current_snapshot.app_server_log_size,
+            };
+            if last_reported_state != Some(observation.state)
+                || observation.progress_signal.is_some()
+            {
+                on_progress(&observation);
+                last_reported_state = Some(observation.state);
+            }
+
+            let Some(turn) = current_turn.cloned() else {
                 if std::time::Instant::now() >= deadline {
                     anyhow::bail!(
                         "timed out waiting for turn `{}` in thread `{}` after {:?}",
                         turn_id,
                         thread_id,
-                        turn_wait_timeout
+                        watchdog.hard_ceiling
                     );
                 }
                 std::thread::sleep(TURN_POLL_INTERVAL);
@@ -558,12 +724,19 @@ impl CodexRuntimeClient {
                 protocol::TurnStatus::InProgress => {}
             }
 
-            if std::time::Instant::now() >= deadline {
+            last_snapshot = Some(current_snapshot);
+            if state == TurnWatchdogState::Stalled {
                 anyhow::bail!(
-                    "timed out waiting for turn `{}` in thread `{}` after {:?}",
+                    "watchdog stalled waiting for turn `{}` in thread `{}` after {:?} (soft={}s hard={}s, last_signal={})",
                     turn_id,
                     thread_id,
-                    turn_wait_timeout
+                    watchdog.hard_ceiling,
+                    watchdog.soft_silence.as_secs(),
+                    watchdog.hard_ceiling.as_secs(),
+                    last_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.progress_signal.as_deref())
+                        .unwrap_or("<none>")
                 );
             }
             std::thread::sleep(TURN_POLL_INTERVAL);
@@ -654,13 +827,41 @@ fn can_retry_after_turn_completion(error: &anyhow::Error) -> bool {
     })
 }
 
-fn turn_wait_timeout() -> Duration {
-    let secs = env::var(TURN_WAIT_TIMEOUT_SECS_ENV)
+fn turn_watchdog_config() -> TurnWatchdogConfig {
+    let soft_silence = env::var(TURN_SOFT_SILENCE_SECS_ENV)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_TURN_WAIT_TIMEOUT_SECS);
-    Duration::from_secs(secs)
+        .unwrap_or(DEFAULT_TURN_SOFT_SILENCE_SECS);
+    let hard_ceiling = env::var(TURN_HARD_CEILING_SECS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            env::var(TURN_WAIT_TIMEOUT_SECS_ENV)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_TURN_HARD_CEILING_SECS)
+        });
+    TurnWatchdogConfig {
+        soft_silence: Duration::from_secs(soft_silence),
+        hard_ceiling: Duration::from_secs(hard_ceiling),
+    }
+}
+
+fn turn_wait_timeout() -> Duration {
+    turn_watchdog_config().hard_ceiling
+}
+
+fn progress_marker(path: &Path) -> Option<(Option<i64>, Option<u64>)> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|value: SystemTime| value.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration: std::time::Duration| duration.as_secs() as i64);
+    Some((modified_at, Some(metadata.len())))
 }
 
 struct CodexAppServerConnection {

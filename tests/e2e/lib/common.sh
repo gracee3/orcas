@@ -51,7 +51,7 @@ e2e_load_scenario_metadata() {
   local scenario_env="$scenario_dir/scenario.env"
   [[ -f "$scenario_env" ]] || e2e_fail "missing scenario metadata: $scenario_env"
 
-  unset NAME MODE TAGS DEFAULT_ENABLED TIMEOUT_SECONDS REQUIRES_RUNTIME REQUIRES_NETWORK REQUIRES_CLEAN_GIT REQUIRES_EXTRACTED_HANDOFFS
+  unset NAME MODE TAGS DEFAULT_ENABLED TIMEOUT_SECONDS REQUIRES_RUNTIME REQUIRES_NETWORK REQUIRES_CLEAN_GIT REQUIRES_EXTRACTED_HANDOFFS EXPECTED_LONG_BUILD REQUIRES_PROGRESS_UPDATES SOFT_SILENCE_SECONDS HARD_CEILING_SECONDS
   # shellcheck disable=SC1090
   source "$scenario_env"
 
@@ -83,6 +83,16 @@ e2e_load_scenario_metadata() {
     true|false) ;;
     *) e2e_fail "scenario $scenario_name has invalid REQUIRES_EXTRACTED_HANDOFFS=${REQUIRES_EXTRACTED_HANDOFFS:-<unset>}" ;;
   esac
+  case "${EXPECTED_LONG_BUILD:-}" in
+    true|false) ;;
+    *) e2e_fail "scenario $scenario_name has invalid EXPECTED_LONG_BUILD=${EXPECTED_LONG_BUILD:-<unset>}" ;;
+  esac
+  case "${REQUIRES_PROGRESS_UPDATES:-}" in
+    true|false) ;;
+    *) e2e_fail "scenario $scenario_name has invalid REQUIRES_PROGRESS_UPDATES=${REQUIRES_PROGRESS_UPDATES:-<unset>}" ;;
+  esac
+  [[ "${SOFT_SILENCE_SECONDS:-}" =~ ^[0-9]+$ ]] || e2e_fail "scenario $scenario_name has invalid SOFT_SILENCE_SECONDS=${SOFT_SILENCE_SECONDS:-<unset>}"
+  [[ "${HARD_CEILING_SECONDS:-}" =~ ^[0-9]+$ ]] || e2e_fail "scenario $scenario_name has invalid HARD_CEILING_SECONDS=${HARD_CEILING_SECONDS:-<unset>}"
   [[ "${TIMEOUT_SECONDS:-}" =~ ^[0-9]+$ ]] || e2e_fail "scenario $scenario_name has invalid TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-<unset>}"
   TAGS="${TAGS:-}"
   TAGS="${TAGS// /}"
@@ -438,6 +448,7 @@ e2e_start_codex_app_server_for_repo() {
   [[ -f "$HOME/.codex/auth.json" ]] || e2e_fail "Codex auth file is missing: $HOME/.codex/auth.json"
 
   printf 'starting codex-app-server via %s on %s\n' "$app_server_bin" "$TT_RUNTIME_LISTEN_URL" >>"$app_server_log"
+  export TT_CODEX_APP_SERVER_LOG_PATH="$app_server_log"
   (
     export CODEX_HOME="$HOME/.codex"
     export XDG_DATA_HOME="$E2E_SCENARIO_XDG_DATA_HOME"
@@ -572,7 +583,13 @@ EOF
   export TT_RUNTIME_LISTEN_URL="$listen_url"
   export TT_APP_SERVER_LISTEN_URL="$listen_url"
   export CODEX_APP_SERVER_LISTEN_URL="$listen_url"
-  export TT_CODEX_TURN_WAIT_TIMEOUT_SECS="${TT_CODEX_TURN_WAIT_TIMEOUT_SECS:-900}"
+  export TT_CODEX_TURN_SOFT_SILENCE_SECS="${SOFT_SILENCE_SECONDS:-900}"
+  export TT_CODEX_TURN_HARD_CEILING_SECS="${HARD_CEILING_SECONDS:-7200}"
+  export TT_CODEX_TURN_WAIT_TIMEOUT_SECS="${TT_CODEX_TURN_WAIT_TIMEOUT_SECS:-${TT_CODEX_TURN_HARD_CEILING_SECS}}"
+  export TT_MANAGED_PROJECT_EXPECTED_LONG_BUILD="${EXPECTED_LONG_BUILD:-false}"
+  export TT_MANAGED_PROJECT_REQUIRES_PROGRESS_UPDATES="${REQUIRES_PROGRESS_UPDATES:-true}"
+  export TT_MANAGED_PROJECT_SOFT_SILENCE_SECONDS="${SOFT_SILENCE_SECONDS:-900}"
+  export TT_MANAGED_PROJECT_HARD_CEILING_SECONDS="${HARD_CEILING_SECONDS:-7200}"
 }
 
 e2e_prepare_fixture_repo_with_worktree() {

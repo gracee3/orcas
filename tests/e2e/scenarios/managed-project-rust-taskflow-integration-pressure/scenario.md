@@ -8,5 +8,6 @@ It verifies:
 
 - TT can keep the same multi-round project moving when integration is blocked.
 - The seeded worker handoff contract captures blockers and next steps explicitly.
+- TT records watchdog progress and liveness policy so long waits remain diagnosable.
 - The final round resolves the blocker and reaches a merge-ready completed state.
 - The final repo still builds and tests cleanly as a Rust crate.

@@ -17,7 +17,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap as _;
 use codex_app_server_protocol as protocol;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -369,9 +369,44 @@ pub struct ManagedProjectScenarioState {
     pub operator_seed: String,
     pub current_round: usize,
     pub current_phase: String,
+    #[serde(default)]
+    pub liveness_policy: ManagedProjectLivenessPolicy,
+    pub watchdog: Option<ManagedProjectWatchdogState>,
     pub pending_approval: Option<ManagedProjectApprovalState>,
     pub rounds: Vec<ManagedProjectRoundState>,
     pub completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedProjectLivenessPolicy {
+    pub expected_long_build: bool,
+    pub require_progress_updates: bool,
+    pub soft_silence_seconds: u64,
+    pub hard_ceiling_seconds: u64,
+}
+
+impl Default for ManagedProjectLivenessPolicy {
+    fn default() -> Self {
+        Self {
+            expected_long_build: false,
+            require_progress_updates: true,
+            soft_silence_seconds: 900,
+            hard_ceiling_seconds: 7_200,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedProjectWatchdogState {
+    pub state: String,
+    pub last_signal: Option<String>,
+    pub last_observed_at: Option<DateTime<Utc>>,
+    pub last_progress_at: Option<DateTime<Utc>>,
+    pub role: Option<String>,
+    pub round: Option<usize>,
+    pub turn_id: Option<String>,
+    pub silence_seconds: u64,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,6 +531,7 @@ struct ManagedProjectTurnOutcome {
     summary: String,
     extraction: WorkerHandoffExtraction,
     attempts: Vec<ManagedProjectTurnAttempt>,
+    watchdog: Option<ManagedProjectWatchdogState>,
 }
 
 #[derive(Debug, Clone)]
@@ -1976,26 +2012,35 @@ fn render_agent_file(
         output.push_str(line);
         output.push('\n');
     }
+    output.push_str(
+        "Liveness expectations:\n\
+- Prefer short progress updates before and after long-running builds, tests, or waits.\n\
+- If the repository is known to have slow builds, say so explicitly and mention what signal will show forward motion.\n\
+- Keep commits and handoffs frequent enough that quiet periods are meaningful, not accidental.\n\
+- If progress is quiet but plausible, the director should classify it as quiet or suspect rather than failing immediately.\n",
+    );
+    output.push_str(managed_project_progress_guidance());
     match role {
         ThreadRole::Director => {
             output.push_str("Your job is to turn operator intent into a plan, todo list, and dispatch decisions.\n");
             output.push_str(
                 "Own branch strategy, worker assignment, phase transitions, and readiness.\n",
             );
-            output.push_str("Keep the operator informed, request approval for merges or destructive cleanup, and summarize outcomes after each phase.\n");
+            output.push_str("Keep the operator informed, request approval for merges or destructive cleanup, summarize outcomes after each phase, and watch for quiet or suspect progress periods.\n");
             output.push_str("Do not implement product code unless explicitly instructed.\n");
         }
         ThreadRole::Develop => {
             output.push_str("Implement only the assigned slice in the provided worktree.\n");
             output.push_str("You report to the director, not to other workers or the operator.\n");
             output.push_str("Treat test as the validator and integration as the landing worker.\n");
-            output.push_str("Report changed files, tests run, blockers, and next step.\n");
+            output.push_str("Report changed files, tests run, blockers, next step, and whether you are actively building, testing, or waiting on I/O.\n");
         }
         ThreadRole::Test => {
             output.push_str("Validate the assigned changes and report exact failures.\n");
             output.push_str("You report to the director, not to other workers or the operator.\n");
             output.push_str("Assume dev produced the change and integration will handle landing if tests pass.\n");
             output.push_str("Do not widen scope or rewrite implementation code.\n");
+            output.push_str("Include progress checkpoints if tests are long-running or flaky so the director can distinguish quiet from stalled.\n");
         }
         ThreadRole::Integrate => {
             output
@@ -2004,7 +2049,7 @@ fn render_agent_file(
             output.push_str(
                 "Assume dev implemented the slice and test validated it before landing.\n",
             );
-            output.push_str("Keep the landing path narrow and evidence-driven.\n");
+            output.push_str("Keep the landing path narrow, evidence-driven, and punctuated with short status updates if merge prep takes a while.\n");
         }
         ThreadRole::Review => {
             output.push_str("Review correctness, regressions, and missing tests.\n");
@@ -2031,6 +2076,7 @@ fn render_agent_file(
 
 fn render_worker_contract(repo_root: &Path, project_slug: &str, base_branch: &str) -> String {
     let role_roster = managed_project_role_roster();
+    let liveness_policy = managed_project_liveness_policy_from_env();
     format!(
         "# TT Managed Project Contract\n\n\
 Project: `{project_slug}`\n\
@@ -2062,12 +2108,22 @@ Base branch: `{base_branch}`\n\n\
 - Workers escalate questions and blockers to the director.\n\
 - The director escalates merge/landing approval to the operator when needed.\n\
 - Workers do not change branch strategy or project topology on their own.\n\n\
+## Liveness Policy\n\
+- Expected long builds: `{expected_long_build}`\n\
+- Progress updates required: `{require_progress_updates}`\n\
+- Soft silence threshold: `{soft_silence_seconds}` seconds\n\
+- Hard ceiling: `{hard_ceiling_seconds}` seconds\n\
+\n\
 ## Rules\n\
 - Stay inside the assigned worktree and scope.\n\
 - Do not widen scope without director approval.\n\
 - Keep evidence in the handoff, not in prose alone.\n",
         repo_root.display(),
-        role_roster = role_roster
+        role_roster = role_roster,
+        expected_long_build = liveness_policy.expected_long_build,
+        require_progress_updates = liveness_policy.require_progress_updates,
+        soft_silence_seconds = liveness_policy.soft_silence_seconds,
+        hard_ceiling_seconds = liveness_policy.hard_ceiling_seconds
     )
 }
 
@@ -2196,6 +2252,46 @@ fn managed_project_role_roster() -> String {
         "integration: prepares landing, merge readiness, and cleanup.",
     ]
     .join("\n")
+}
+
+fn managed_project_progress_guidance() -> &'static str {
+    "Progress guidance:\n\
+- Report progress before and after long-running build, test, or I/O-heavy operations.\n\
+- If a task may take a while, mention what is still running and what signal will show completion.\n\
+- Prefer concise status updates at phase boundaries so the director can distinguish progress from silence.\n\
+- Keep stable milestone commits frequent enough that the director can distinguish live work from a stall.\n\
+- The director should summarize quiet periods, classify them as healthy/quiet/suspect, and only escalate when the watchdog reaches its hard ceiling.\n"
+}
+
+fn managed_project_liveness_policy_from_env() -> ManagedProjectLivenessPolicy {
+    fn parse_bool_env(key: &str, default: bool) -> bool {
+        std::env::var(key)
+            .ok()
+            .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(default)
+    }
+
+    fn parse_u64_env(key: &str, default: u64) -> u64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    ManagedProjectLivenessPolicy {
+        expected_long_build: parse_bool_env("TT_MANAGED_PROJECT_EXPECTED_LONG_BUILD", false),
+        require_progress_updates: parse_bool_env(
+            "TT_MANAGED_PROJECT_REQUIRES_PROGRESS_UPDATES",
+            true,
+        ),
+        soft_silence_seconds: parse_u64_env("TT_MANAGED_PROJECT_SOFT_SILENCE_SECONDS", 900),
+        hard_ceiling_seconds: parse_u64_env("TT_MANAGED_PROJECT_HARD_CEILING_SECONDS", 7_200),
+    }
 }
 
 fn managed_project_thread_binding_id(project_slug: &str, role: ThreadRole) -> String {
@@ -2586,6 +2682,18 @@ impl DaemonService {
             operator_seed: seed.operator_seed.clone(),
             current_round: 0,
             current_phase: "plan".to_string(),
+            liveness_policy: managed_project_liveness_policy_from_env(),
+            watchdog: Some(ManagedProjectWatchdogState {
+                state: "healthy".to_string(),
+                last_signal: Some("scenario initialized".to_string()),
+                last_observed_at: Some(Utc::now()),
+                last_progress_at: Some(Utc::now()),
+                role: None,
+                round: None,
+                turn_id: None,
+                silence_seconds: 0,
+                note: Some("waiting for the first director turn".to_string()),
+            }),
             pending_approval: None,
             rounds: Vec::new(),
             completed: false,
@@ -2638,6 +2746,7 @@ impl DaemonService {
             );
             round.director_turn_id = Some(director_turn.turn_id.clone());
             round.director_summary = Some(director_turn.summary.clone());
+            state.watchdog = director_turn.watchdog.clone();
 
             if spec.requires_landing_approval {
                 state.pending_approval = Some(ManagedProjectApprovalState {
@@ -2685,6 +2794,7 @@ impl DaemonService {
                     thread_id,
                     &worker_prompt,
                 )?;
+                state.watchdog = handoff.watchdog.clone();
                 let extraction = handoff.extraction;
                 let (structured_handoff, handoff_source, handoff_parse_error, raw_handoff_text) =
                     match extraction.handoff {
@@ -2841,6 +2951,17 @@ impl DaemonService {
         )
         .then(worker_handoff_output_schema);
         let mut attempts = Vec::new();
+        let mut latest_watchdog = Some(ManagedProjectWatchdogState {
+            state: "healthy".to_string(),
+            last_signal: Some("turn prompt dispatched".to_string()),
+            last_observed_at: Some(Utc::now()),
+            last_progress_at: Some(Utc::now()),
+            role: Some(role_slug(role_bootstrap.role).to_string()),
+            round: Some(round_number),
+            turn_id: None,
+            silence_seconds: 0,
+            note: Some("waiting for the first turn observation".to_string()),
+        });
 
         for attempt_number in 1..=LIVE_TURN_MAX_ATTEMPTS {
             let attempt_result: Result<ManagedProjectTurnOutcome> = (|| {
@@ -2858,7 +2979,50 @@ impl DaemonService {
                     turn.id,
                     attempt_number
                 );
-                let completed = client.wait_for_turn_completion(thread_id, &turn.id)?;
+                let watchdog_config = tt_codex::TurnWatchdogConfig {
+                    soft_silence: std::time::Duration::from_secs(
+                        managed_project_liveness_policy_from_env().soft_silence_seconds,
+                    ),
+                    hard_ceiling: std::time::Duration::from_secs(
+                        managed_project_liveness_policy_from_env().hard_ceiling_seconds,
+                    ),
+                };
+                let completed = client.wait_for_turn_completion_with_watchdog(
+                    thread_id,
+                    &turn.id,
+                    watchdog_config,
+                    |observation| {
+                        let watchdog_state = ManagedProjectWatchdogState {
+                            state: format!("{:?}", observation.state).to_lowercase(),
+                            last_signal: observation.progress_signal.clone(),
+                            last_observed_at: Some(Utc::now()),
+                            last_progress_at: (observation.silent_seconds == 0)
+                                .then_some(Utc::now()),
+                            role: Some(role_slug(role_bootstrap.role).to_string()),
+                            round: Some(round_number),
+                            turn_id: Some(turn.id.clone()),
+                            silence_seconds: observation.silent_seconds,
+                            note: Some(format!(
+                                "thread_updated_at={} turn_count={} status={} items={} app_server_log_mtime={:?}",
+                                observation.thread_updated_at,
+                                observation.turn_count,
+                                observation.turn_status.as_deref().unwrap_or("<unknown>"),
+                                observation.turn_items,
+                                observation.app_server_log_modified_at
+                            )),
+                        };
+                        latest_watchdog = Some(watchdog_state);
+                        if let Some(watchdog_state) = latest_watchdog.as_ref() {
+                            let _ = write_scenario_artifact(
+                                bootstrap,
+                                scenario_id,
+                                round_number,
+                                &format!("{}-watchdog.txt", role_slug(role_bootstrap.role)),
+                                &render_watchdog_state(watchdog_state),
+                            );
+                        }
+                    },
+                )?;
                 eprintln!(
                     "tt director role {} observed turn {} status {:?} attempt {}",
                     role_slug(role_bootstrap.role),
@@ -2884,6 +3048,7 @@ impl DaemonService {
                             summary: summarize_turn_items(&finished_turn.items),
                             extraction,
                             attempts: Vec::new(),
+                            watchdog: latest_watchdog.clone(),
                         })
                     }
                     protocol::TurnStatus::Failed => anyhow::bail!(
@@ -3965,6 +4130,30 @@ fn render_attempt_log(attempts: &[ManagedProjectTurnAttempt]) -> String {
         .map(render_single_attempt)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_watchdog_state(state: &ManagedProjectWatchdogState) -> String {
+    format!(
+        "state: {}\nlast_signal: {}\nlast_observed_at: {}\nlast_progress_at: {}\nrole: {}\nround: {}\nturn_id: {}\nsilence_seconds: {}\nnote: {}\n",
+        state.state,
+        state.last_signal.as_deref().unwrap_or("<none>"),
+        state
+            .last_observed_at
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| "<none>".to_string()),
+        state
+            .last_progress_at
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| "<none>".to_string()),
+        state.role.as_deref().unwrap_or("<none>"),
+        state
+            .round
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        state.turn_id.as_deref().unwrap_or("<none>"),
+        state.silence_seconds,
+        state.note.as_deref().unwrap_or("<none>")
+    )
 }
 
 fn format_error_chain(error: &anyhow::Error) -> String {

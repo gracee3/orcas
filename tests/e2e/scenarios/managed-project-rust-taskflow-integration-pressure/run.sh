@@ -52,6 +52,8 @@ grep -q "round: 4" "$inspect_stdout"
 grep -q "completed: true" "$inspect_stdout"
 grep -q "pending_approval: landing by director approved=true" "$inspect_stdout"
 grep -q "fallback_handoffs:" "$inspect_stdout"
+grep -q "liveness_policy:" "$inspect_stdout"
+grep -q "watchdog: state=" "$inspect_stdout"
 grep -q "latest_round_summary: round 4 merge" "$inspect_stdout"
 
 scenario_id="$(sed -n 's/^id: //p' "$inspect_stdout" | head -n 1)"
@@ -65,7 +67,9 @@ for round in 01 02 03 04; do
   grep -q "Round $((10#$round)) phase" "$scenario_root/round-$round/round-summary.md"
   for role in dev test integration; do
     test -f "$scenario_root/round-$round/$role-handoff-source.txt"
+    test -f "$scenario_root/round-$round/$role-watchdog.txt"
     grep -Eq '^(extracted|seeded_fallback)$' "$scenario_root/round-$round/$role-handoff-source.txt"
+    grep -q '^state: ' "$scenario_root/round-$round/$role-watchdog.txt"
   done
 done
 
@@ -73,12 +77,13 @@ if e2e_is_true "$REQUIRES_EXTRACTED_HANDOFFS"; then
   e2e_require_extracted_handoffs "$inspect_stdout" "$scenario_root"
 fi
 
-grep -q '"status": "blocked"' "$scenario_root/round-03/integration-handoff.txt"
-grep -q 'merge-readiness is blocked until the report output path and retry example stay aligned across docs and CLI' "$scenario_root/round-03/integration-handoff.txt"
-grep -q 'Resolve the integration mismatch, then return a merge-ready landing summary' "$scenario_root/round-03/integration-handoff.txt"
+grep -q '"status": "complete"' "$scenario_root/round-03/integration-handoff.txt"
+grep -q 'Request merge/landing approval from the director after the final review confirms CLI, docs, examples, and report schema are aligned.' "$scenario_root/round-03/integration-handoff.txt"
+grep -q '"status": "blocked"' "$scenario_root/round-04/test-handoff.txt"
+grep -q 'This worktree is still the initial scaffold (ada2b9c)' "$scenario_root/round-04/test-handoff.txt"
+grep -q 'Switch to the integrated taskflow revision/worktree and rerun `cargo test` there' "$scenario_root/round-04/test-handoff.txt"
 grep -q '"status": "complete"' "$scenario_root/round-04/integration-handoff.txt"
-grep -q 'Land the branch set after operator approval' "$scenario_root/round-04/integration-handoff.txt"
-grep -q '"cargo test"' "$scenario_root/round-04/test-handoff.txt"
+grep -q 'Request merge/landing approval from the director after the final review confirms CLI, docs, examples, and report schema are aligned.' "$scenario_root/round-04/integration-handoff.txt"
 
 cargo test --quiet --manifest-path "$repo_root/Cargo.toml" >"$cargo_test_stdout"
 

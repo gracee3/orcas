@@ -9,4 +9,5 @@ It verifies:
 - TT can create a new repo and bootstrap a managed project without a preexisting checkout.
 - `tt project director --scenario rust-taskflow-four-round` drives a multi-round project run.
 - TT records scenario state, round progression, and landing approval in managed-project state.
+- TT records liveness policy and watchdog progress so slow but healthy turns do not look hung.
 - The final repo still builds and tests cleanly as a Rust crate.

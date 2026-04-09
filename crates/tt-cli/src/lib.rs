@@ -965,10 +965,31 @@ fn render_managed_project_bootstrap(bootstrap: &tt_daemon::ManagedProjectBootstr
         output.push_str(&format!("phase: {}\n", scenario.current_phase));
         output.push_str(&format!("round: {}\n", scenario.current_round));
         output.push_str(&format!("completed: {}\n", scenario.completed));
+        output.push_str(&format!(
+            "liveness_policy: expected_long_build={} progress_updates_required={} soft_silence_seconds={} hard_ceiling_seconds={}\n",
+            scenario.liveness_policy.expected_long_build,
+            scenario.liveness_policy.require_progress_updates,
+            scenario.liveness_policy.soft_silence_seconds,
+            scenario.liveness_policy.hard_ceiling_seconds
+        ));
         if let Some(approval) = scenario.pending_approval.as_ref() {
             output.push_str(&format!(
                 "pending_approval: {} by {} approved={}\n",
                 approval.approval_kind, approval.requested_by_role, approval.approved
+            ));
+        }
+        if let Some(watchdog) = scenario.watchdog.as_ref() {
+            output.push_str(&format!(
+                "watchdog: state={} role={} round={} turn={} silence={}s signal={}\n",
+                watchdog.state,
+                watchdog.role.as_deref().unwrap_or("<none>"),
+                watchdog
+                    .round
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+                watchdog.turn_id.as_deref().unwrap_or("<none>"),
+                watchdog.silence_seconds,
+                watchdog.last_signal.as_deref().unwrap_or("<none>")
             ));
         }
         let fallback_rounds = scenario
@@ -1394,6 +1415,18 @@ mod tests {
                 scenario_kind: "rust-taskflow-four-round".into(),
                 current_round: 4,
                 current_phase: "completed".into(),
+                liveness_policy: tt_daemon::ManagedProjectLivenessPolicy::default(),
+                watchdog: Some(tt_daemon::ManagedProjectWatchdogState {
+                    state: "healthy".into(),
+                    last_signal: Some("worker progress".into()),
+                    last_observed_at: Some(ts()),
+                    last_progress_at: Some(ts()),
+                    role: Some("dev".into()),
+                    round: Some(4),
+                    turn_id: Some("turn-dev".into()),
+                    silence_seconds: 0,
+                    note: Some("progress is moving".into()),
+                }),
                 operator_seed: "build taskflow".into(),
                 pending_approval: Some(tt_daemon::ManagedProjectApprovalState {
                     approval_kind: "landing".into(),
@@ -1474,6 +1507,8 @@ mod tests {
         assert!(text.contains("merge-ready: true"));
         assert!(text.contains("dev"));
         assert!(text.contains("thread-1"));
+        assert!(text.contains("liveness_policy: expected_long_build=false"));
+        assert!(text.contains("watchdog: state=healthy"));
         assert!(text.contains("fallback_handoffs: 1"));
         assert!(text.contains("strict_extraction_ready: false"));
         assert!(text.contains("latest_round_summary: round 4 merge"));
