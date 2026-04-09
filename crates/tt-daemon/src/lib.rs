@@ -71,6 +71,19 @@ pub struct CodexDoctorReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAppServerSummary {
+    pub repo_root: PathBuf,
+    pub daemon_socket_path: PathBuf,
+    pub daemon_socket_exists: bool,
+    pub daemon_socket_reachable: bool,
+    pub configured_listen_url: String,
+    pub listen_reachable: bool,
+    pub listen_error: Option<String>,
+    pub source: String,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorReport {
     pub cwd: PathBuf,
     pub tt_cli_generation: String,
@@ -248,6 +261,9 @@ pub enum DaemonRequest {
         selector: String,
         include_turns: bool,
     },
+    InspectCodexAppServers {
+        cwd: PathBuf,
+    },
     StartCodexThread {
         cwd: PathBuf,
         model: Option<String>,
@@ -333,6 +349,7 @@ pub enum DaemonResponse {
     CodexThread(Option<CodexThreadSummary>),
     CodexThreadDetails(Vec<CodexThreadDetail>),
     CodexThreadDetail(Option<CodexThreadDetail>),
+    CodexAppServers(Vec<CodexAppServerSummary>),
     ManagedProject(ManagedProjectBootstrap),
 }
 
@@ -1440,6 +1457,13 @@ impl DaemonService {
         codex_doctor_for_cwd(cwd, true)
     }
 
+    pub fn inspect_codex_app_servers(
+        &self,
+        cwd: impl AsRef<Path>,
+    ) -> Result<Vec<CodexAppServerSummary>> {
+        Ok(vec![codex_app_server_summary_for_cwd(cwd)])
+    }
+
     pub fn doctor(&self, cwd: impl AsRef<Path>, check_listen: bool) -> DoctorReport {
         doctor_for_cwd(cwd, check_listen)
     }
@@ -1967,6 +1991,9 @@ impl DaemonService {
                 &selector,
                 include_turns,
             )?),
+            InspectCodexAppServers { cwd } => {
+                DaemonResponse::CodexAppServers(self.inspect_codex_app_servers(cwd)?)
+            }
             StartCodexThread {
                 cwd,
                 model,
@@ -2462,17 +2489,17 @@ fn build_managed_project_manifest(
 ) -> ManagedProjectManifest {
     let mut role_map = BTreeMap::new();
     for role in roles {
-            role_map.insert(
-                role_slug(role.role).to_string(),
-                ManagedProjectManifestRole {
-                    work_unit_id: role.work_unit.id.clone(),
-                    agent_path: role.agent_path.display().to_string(),
-                    model: role.model.clone(),
-                    reasoning_effort: role.reasoning_effort.clone(),
-                    control_mode: role.control_mode,
-                    branch_name: role.branch_name.clone(),
-                    worktree_path: role
-                        .worktree_path
+        role_map.insert(
+            role_slug(role.role).to_string(),
+            ManagedProjectManifestRole {
+                work_unit_id: role.work_unit.id.clone(),
+                agent_path: role.agent_path.display().to_string(),
+                model: role.model.clone(),
+                reasoning_effort: role.reasoning_effort.clone(),
+                control_mode: role.control_mode,
+                branch_name: role.branch_name.clone(),
+                worktree_path: role
+                    .worktree_path
                     .as_ref()
                     .map(|path| path.display().to_string()),
                 thread_id: role.thread_id.clone(),
@@ -3314,11 +3341,7 @@ impl DaemonService {
                     .and_then(|watchdog| watchdog.last_signal.clone()),
                 message: format!(
                     "director thread {director_thread_id} {} managed project with roles director/dev/test/integration",
-                    if resumed {
-                        "resuming"
-                    } else {
-                        "starting"
-                    }
+                    if resumed { "resuming" } else { "starting" }
                 ),
                 timestamp: Utc::now(),
             },
@@ -3479,7 +3502,8 @@ impl DaemonService {
                 match control_mode {
                     ManagedProjectThreadControlMode::Director => {}
                     ManagedProjectThreadControlMode::ManualNextTurn => {
-                        bootstrap.roles[role_index].control_mode = ManagedProjectThreadControlMode::Manual;
+                        bootstrap.roles[role_index].control_mode =
+                            ManagedProjectThreadControlMode::Manual;
                         state.current_phase = format!("manual-override-{}", role_name);
                         state.watchdog = Some(ManagedProjectWatchdogState {
                             state: "quiet".to_string(),
@@ -3545,7 +3569,9 @@ impl DaemonService {
                                 timestamp: Utc::now(),
                             },
                         )?;
-                        state.rounds.retain(|existing| existing.round_number != round.round_number);
+                        state
+                            .rounds
+                            .retain(|existing| existing.round_number != round.round_number);
                         state.rounds.push(round.clone());
                         bootstrap.scenario = Some(state.clone());
                         self.save_managed_project_bootstrap(bootstrap)?;
@@ -3556,10 +3582,7 @@ impl DaemonService {
                         state.current_phase = format!("paused-{}", role_name);
                         state.watchdog = Some(ManagedProjectWatchdogState {
                             state: "quiet".to_string(),
-                            last_signal: Some(format!(
-                                "director paused before {} turn",
-                                role_name
-                            )),
+                            last_signal: Some(format!("director paused before {} turn", role_name)),
                             last_observed_at: Some(Utc::now()),
                             last_progress_at: Some(Utc::now()),
                             role: Some(role_name.clone()),
@@ -3571,10 +3594,7 @@ impl DaemonService {
                             turn_items: 0,
                             app_server_log_modified_at: None,
                             app_server_log_size: None,
-                            note: Some(format!(
-                                "manual control remains active for {}",
-                                role_name
-                            )),
+                            note: Some(format!("manual control remains active for {}", role_name)),
                         });
                         round.director_summary = Some(format!(
                             "paused before {} turn because control mode is {}",
@@ -3618,7 +3638,9 @@ impl DaemonService {
                                 timestamp: Utc::now(),
                             },
                         )?;
-                        state.rounds.retain(|existing| existing.round_number != round.round_number);
+                        state
+                            .rounds
+                            .retain(|existing| existing.round_number != round.round_number);
                         state.rounds.push(round.clone());
                         bootstrap.scenario = Some(state.clone());
                         self.save_managed_project_bootstrap(bootstrap)?;
@@ -5489,6 +5511,45 @@ fn doctor_for_cwd(cwd: impl AsRef<Path>, check_listen: bool) -> DoctorReport {
     }
 }
 
+fn codex_app_server_summary_for_cwd(cwd: impl AsRef<Path>) -> CodexAppServerSummary {
+    let cwd = cwd.as_ref().to_path_buf();
+    let daemon_socket_path = socket_path_for(&cwd);
+    let daemon_socket_exists = daemon_socket_path.exists();
+    let daemon_socket_reachable = DaemonClient::connect(&daemon_socket_path).is_ok();
+    let configured_listen_url = configured_app_server_listen_url();
+    let (listen_reachable, listen_error) = match check_listen_reachability(&configured_listen_url) {
+        Ok(reachable) => (reachable, None),
+        Err(error) => (false, Some(format!("{error:#}"))),
+    };
+    let source = if std::env::var_os("CODEX_APP_SERVER_LISTEN_URL").is_some() {
+        "CODEX_APP_SERVER_LISTEN_URL"
+    } else if std::env::var_os("TT_APP_SERVER_LISTEN_URL").is_some() {
+        "TT_APP_SERVER_LISTEN_URL"
+    } else {
+        "default"
+    }
+    .to_string();
+    let note = if source == "default" {
+        Some(
+            "listen URL came from the default runtime fallback and is not repo-owned metadata"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    CodexAppServerSummary {
+        repo_root: cwd,
+        daemon_socket_path,
+        daemon_socket_exists,
+        daemon_socket_reachable,
+        configured_listen_url,
+        listen_reachable,
+        listen_error,
+        source,
+        note,
+    }
+}
+
 fn codex_doctor_for_cwd(cwd: impl AsRef<Path>, check_listen: bool) -> CodexDoctorReport {
     let configured_listen_url = configured_app_server_listen_url();
     let (listen_reachable, listen_error) = if check_listen {
@@ -5820,6 +5881,33 @@ mod tests {
         let encoded = serde_json::to_string(&request).expect("serialize request");
         let decoded: DaemonRequest = serde_json::from_str(&encoded).expect("deserialize request");
         assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn codex_app_servers_request_round_trips() {
+        let request = DaemonRequest::InspectCodexAppServers {
+            cwd: PathBuf::from("/repo"),
+        };
+        let encoded = serde_json::to_string(&request).expect("serialize request");
+        let decoded: DaemonRequest = serde_json::from_str(&encoded).expect("deserialize request");
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn codex_app_server_summary_reports_repo_scoped_defaults() {
+        let dir = tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".tt/runtime")).expect("create runtime dir");
+        let summary = codex_app_server_summary_for_cwd(&repo);
+        assert_eq!(summary.repo_root, repo);
+        assert_eq!(
+            summary.daemon_socket_path,
+            summary.repo_root.join(".tt/runtime/tt-daemon.sock")
+        );
+        assert!(!summary.daemon_socket_exists);
+        assert!(!summary.daemon_socket_reachable);
+        assert_eq!(summary.source, "default");
+        assert!(summary.note.is_some());
     }
 
     #[test]

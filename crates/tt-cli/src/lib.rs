@@ -11,8 +11,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::de::DeserializeOwned;
 use tt_daemon::{
-    DaemonRequest, DaemonResponse, ManagedProjectThreadAttachment,
-    ManagedProjectThreadControlMode, request_for_cwd,
+    DaemonRequest, DaemonResponse, ManagedProjectThreadAttachment, ManagedProjectThreadControlMode,
+    request_for_cwd,
 };
 use tt_domain as _;
 use tt_domain::{
@@ -68,6 +68,7 @@ pub enum CodexCommand {
         #[command(subcommand)]
         command: CodexThreadsCommand,
     },
+    AppServers,
 }
 
 #[derive(Debug, Subcommand)]
@@ -524,6 +525,9 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
                     }
                 }
             },
+            CodexCommand::AppServers => DaemonRequest::InspectCodexAppServers {
+                cwd: cwd.to_path_buf(),
+            },
         },
         Command::Workspace { command } => match command {
             WorkspaceCommand::Binding { command } => match command {
@@ -930,6 +934,27 @@ fn render_response(response: &DaemonResponse) -> String {
             thread.workspace_binding_count
         ),
         DaemonResponse::CodexThreadDetail(None) => "codex thread not found".to_string(),
+        DaemonResponse::CodexAppServers(servers) => format!(
+            "{}",
+            servers
+                .iter()
+                .map(|server| {
+                    format!(
+                        "repo={}\ndaemon_socket={}\ndaemon_socket_exists={}\ndaemon_socket_reachable={}\nlisten_url={}\nlisten_source={}\nlisten_reachable={}\nlisten_error={}\nnote={}\n",
+                        server.repo_root.display(),
+                        server.daemon_socket_path.display(),
+                        server.daemon_socket_exists,
+                        server.daemon_socket_reachable,
+                        server.configured_listen_url,
+                        server.source,
+                        server.listen_reachable,
+                        server.listen_error.as_deref().unwrap_or("-"),
+                        server.note.as_deref().unwrap_or("-"),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
         DaemonResponse::ManagedProject(bootstrap) => render_managed_project_bootstrap(bootstrap),
         DaemonResponse::ManagedProjectInspection(inspection) => {
             render_managed_project_inspection(inspection)
@@ -1553,6 +1578,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_codex_app_servers_command() {
+        let cli = Cli::parse_from(["tt", "codex", "app-servers"]);
+        assert!(matches!(
+            cli.command,
+            Command::Codex {
+                command: CodexCommand::AppServers
+            }
+        ));
+    }
+
+    #[test]
     fn can_serialize_project_round_trip() {
         let project = Project {
             id: "p1".into(),
@@ -2051,5 +2087,29 @@ mod tests {
         assert!(text.contains("daemon_api_version: v2"));
         assert!(text.contains("codex_contract_ok: true"));
         assert!(text.contains("codex_listen_reachable: true"));
+    }
+
+    #[test]
+    fn renders_codex_app_servers_report() {
+        let text = render_response(&DaemonResponse::CodexAppServers(vec![
+            tt_daemon::CodexAppServerSummary {
+                repo_root: "/repo".into(),
+                daemon_socket_path: "/repo/.tt/runtime/tt-daemon.sock".into(),
+                daemon_socket_exists: true,
+                daemon_socket_reachable: false,
+                configured_listen_url: "ws://127.0.0.1:4500".into(),
+                listen_reachable: false,
+                listen_error: Some("connection refused".into()),
+                source: "TT_APP_SERVER_LISTEN_URL".into(),
+                note: Some("repo scoped metadata only".into()),
+            },
+        ]));
+
+        assert!(text.contains("repo=/repo"));
+        assert!(text.contains("daemon_socket=/repo/.tt/runtime/tt-daemon.sock"));
+        assert!(text.contains("listen_url=ws://127.0.0.1:4500"));
+        assert!(text.contains("listen_source=TT_APP_SERVER_LISTEN_URL"));
+        assert!(text.contains("listen_error=connection refused"));
+        assert!(text.contains("note=repo scoped metadata only"));
     }
 }

@@ -161,6 +161,7 @@ TT should add an explicit compatibility check surface, preferably through:
 - `tt doctor`
 - `tt doctor --codex`
 - `tt doctor --codex --check-listen`
+- `tt codex app-servers`
 
 That output should include:
 - resolved `codex` binary path
@@ -170,6 +171,12 @@ That output should include:
 - compatibility status
 - project `.codex` root
 - project `.tt` root
+
+Current repo-scoped runtime inspection:
+- `tt codex app-servers` reports TT's repo-local daemon socket path plus the
+  effective configured Codex app-server listen URL for the current repo
+- it performs repo-scoped metadata and reachability inspection only
+- it does not enumerate host-wide processes or listening ports
 
 ## CI Expectations
 
