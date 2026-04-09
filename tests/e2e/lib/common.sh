@@ -19,6 +19,7 @@ export E2E_TAG="$e2e_tag_filter"
 export E2E_SCENARIO="$e2e_requested_scenario"
 
 e2e_daemon_pid=""
+e2e_codex_app_server_pid=""
 
 e2e_fail() {
   echo "e2e: $*" >&2
@@ -354,9 +355,118 @@ e2e_start_managed_daemon() {
   e2e_daemon_pid=""
 }
 
+e2e_resolve_codex_rs_root() {
+  if [[ -n "${TT_E2E_CODEX_RS_ROOT:-}" ]]; then
+    printf '%s\n' "$TT_E2E_CODEX_RS_ROOT"
+    return 0
+  fi
+
+  local candidate="$e2e_repo_root/../codex/codex-rs"
+  if [[ -d "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  e2e_fail "could not resolve codex-rs root; export TT_E2E_CODEX_RS_ROOT=/path/to/codex-rs"
+}
+
+e2e_resolve_codex_app_server_bin() {
+  local build_log="${1:-}"
+  if [[ -n "${TT_E2E_CODEX_APP_SERVER_BIN:-}" ]]; then
+    [[ -x "$TT_E2E_CODEX_APP_SERVER_BIN" ]] || e2e_fail "TT_E2E_CODEX_APP_SERVER_BIN is not executable: $TT_E2E_CODEX_APP_SERVER_BIN"
+    printf '%s\n' "$TT_E2E_CODEX_APP_SERVER_BIN"
+    return 0
+  fi
+
+  local codex_rs_root
+  codex_rs_root="$(e2e_resolve_codex_rs_root)"
+  local bin_path="$codex_rs_root/target/debug/codex-app-server"
+  if [[ ! -x "$bin_path" ]]; then
+    if [[ -n "$build_log" ]]; then
+      printf 'building codex-app-server from %s\n' "$codex_rs_root" >>"$build_log"
+      cargo build --manifest-path "$codex_rs_root/Cargo.toml" -p codex-app-server >>"$build_log" 2>&1
+      printf 'finished building codex-app-server\n' >>"$build_log"
+    else
+      cargo build --manifest-path "$codex_rs_root/Cargo.toml" -p codex-app-server
+    fi
+  fi
+  [[ -x "$bin_path" ]] || e2e_fail "codex-app-server binary not found after build: $bin_path"
+  printf '%s\n' "$bin_path"
+}
+
+e2e_wait_for_ws_listen_url() {
+  local listen_url="$1"
+  local timeout_seconds="${2:-15}"
+  local socket_addr="${listen_url#ws://}"
+  local host="${socket_addr%%:*}"
+  local port="${socket_addr##*:}"
+
+  [[ "$listen_url" == ws://* ]] || e2e_fail "unsupported websocket listen URL: $listen_url"
+  [[ -n "$host" && -n "$port" ]] || e2e_fail "invalid websocket listen URL: $listen_url"
+
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    if bash -lc "exec 3<>/dev/tcp/$host/$port" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  return 1
+}
+
+e2e_start_codex_app_server_for_repo() {
+  local repo_root="$1"
+  local app_server_log="$2"
+
+  if e2e_is_true "${TT_E2E_REUSE_CURRENT_DAEMON:-false}"; then
+    [[ -n "${TT_RUNTIME_LISTEN_URL:-}" ]] || e2e_fail "TT_RUNTIME_LISTEN_URL is required when reusing a shared Codex app-server"
+    e2e_wait_for_ws_listen_url "$TT_RUNTIME_LISTEN_URL" 5 \
+      || e2e_fail "shared Codex app-server is not reachable at $TT_RUNTIME_LISTEN_URL"
+    printf 'shared Codex app-server reused via %s\n' "$TT_RUNTIME_LISTEN_URL" >>"$app_server_log"
+    e2e_codex_app_server_pid=""
+    return 0
+  fi
+
+  [[ -n "${TT_RUNTIME_LISTEN_URL:-}" ]] || e2e_fail "TT_RUNTIME_LISTEN_URL is not set for live scenario $E2E_SCENARIO_NAME"
+  [[ -d "$repo_root/.codex" ]] || e2e_fail "repo-local .codex home does not exist: $repo_root/.codex"
+
+  local app_server_bin
+  : >"$app_server_log"
+  printf 'preparing codex-app-server for repo %s\n' "$repo_root" >>"$app_server_log"
+  app_server_bin="$(e2e_resolve_codex_app_server_bin "$app_server_log")"
+
+  printf 'starting codex-app-server via %s on %s\n' "$app_server_bin" "$TT_RUNTIME_LISTEN_URL" >>"$app_server_log"
+  (
+    export CODEX_HOME="$repo_root/.codex"
+    export XDG_DATA_HOME="$E2E_SCENARIO_XDG_DATA_HOME"
+    export XDG_CONFIG_HOME="$E2E_SCENARIO_XDG_CONFIG_HOME"
+    export XDG_RUNTIME_DIR="$E2E_SCENARIO_XDG_RUNTIME_HOME"
+    exec "$app_server_bin" --listen "$TT_RUNTIME_LISTEN_URL"
+  ) >>"$app_server_log" 2>&1 &
+  e2e_codex_app_server_pid="$!"
+
+  e2e_wait_for_ws_listen_url "$TT_RUNTIME_LISTEN_URL" 15 || {
+    echo "Codex app-server failed to become ready at $TT_RUNTIME_LISTEN_URL" >&2
+    echo "app-server log: $app_server_log" >&2
+    if [[ -n "$e2e_codex_app_server_pid" ]]; then
+      kill "$e2e_codex_app_server_pid" >/dev/null 2>&1 || true
+      wait "$e2e_codex_app_server_pid" >/dev/null 2>&1 || true
+      e2e_codex_app_server_pid=""
+    fi
+    return 1
+  }
+  printf 'codex-app-server ready at %s\n' "$TT_RUNTIME_LISTEN_URL" >>"$app_server_log"
+}
+
 e2e_stop_managed_daemon() {
   if e2e_is_true "${TT_E2E_REUSE_CURRENT_DAEMON:-false}"; then
     return 0
+  fi
+  if [[ -n "$e2e_codex_app_server_pid" ]]; then
+    kill "$e2e_codex_app_server_pid" >/dev/null 2>&1 || true
+    wait "$e2e_codex_app_server_pid" >/dev/null 2>&1 || true
+    e2e_codex_app_server_pid=""
   fi
   if [[ -n "$e2e_daemon_pid" ]]; then
     kill "$e2e_daemon_pid" >/dev/null 2>&1 || true
@@ -450,6 +560,8 @@ auto_create_on_report_recorded = false
 EOF
 
   export TT_RUNTIME_LISTEN_URL="$listen_url"
+  export TT_APP_SERVER_LISTEN_URL="$listen_url"
+  export CODEX_APP_SERVER_LISTEN_URL="$listen_url"
 }
 
 e2e_prepare_fixture_repo_with_worktree() {

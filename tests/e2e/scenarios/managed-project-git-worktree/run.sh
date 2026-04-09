@@ -17,6 +17,7 @@ worktree_path="$E2E_SCENARIO_WORKTREES_DIR/${scenario_name}-worktree"
 branch_suffix="${E2E_RUN_ID//[^a-zA-Z0-9]/-}"
 branch_name="tt/$scenario_name/$branch_suffix"
 daemon_log="$E2E_SCENARIO_LOGS_DIR/tt-daemon.log"
+app_server_log="$E2E_SCENARIO_LOGS_DIR/codex-app-server.log"
 
 mkdir -p "$artifacts_dir" "$reports_dir"
 e2e_prepare_empty_repo_with_worktree "$repo_root" "$worktree_path" "$branch_name" "$base_ref" "$reports_dir" "repo"
@@ -57,6 +58,8 @@ director_agent_path="$project_root/.codex/agents/director.toml"
 dev_agent_path="$project_root/.codex/agents/dev.toml"
 test_agent_path="$project_root/.codex/agents/test.toml"
 integration_agent_path="$project_root/.codex/agents/integration.toml"
+
+e2e_start_codex_app_server_for_repo "$project_root" "$app_server_log"
 
 grep -q "The operator talks to the director." "$contract_path"
 grep -q "Workers only communicate with the director." "$contract_path"

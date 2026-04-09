@@ -10,6 +10,7 @@ e2e_prepare_live_tt_environment "mprt" 6400
 
 repo_root="$E2E_SCENARIO_ARTIFACTS_DIR/taskflow-repo"
 daemon_log="$E2E_SCENARIO_LOGS_DIR/tt-daemon.log"
+app_server_log="$E2E_SCENARIO_LOGS_DIR/codex-app-server.log"
 reports_dir="$E2E_SCENARIO_REPORTS_DIR"
 seed_file="$scenario_dir/taskflow-seed.toml"
 
@@ -35,6 +36,8 @@ e2e_tt project init \
   --objective "Build a seeded multi-round Rust workflow runner" \
   --template rust-taskflow \
   >"$init_stdout"
+
+e2e_start_codex_app_server_for_repo "$repo_root" "$app_server_log"
 
 e2e_tt --cwd "$repo_root" project director \
   --scenario rust-taskflow-four-round \
