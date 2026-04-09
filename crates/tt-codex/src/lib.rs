@@ -539,10 +539,32 @@ impl CodexRuntimeClient {
         cwd: Option<&Path>,
         model: Option<String>,
     ) -> Result<Option<protocol::Turn>> {
-        let Some(thread) = self.resume_thread_full(selector, cwd, model)? else {
-            return Ok(None);
-        };
-        Ok(thread.turns.into_iter().find(|turn| turn.id == turn_id))
+        let deadline = std::time::Instant::now() + TURN_WAIT_TIMEOUT;
+        let mut last_seen = None;
+        loop {
+            if let Some(thread) = self.read_thread_full(selector, true)? {
+                if let Some(turn) = thread.turns.into_iter().find(|turn| turn.id == turn_id) {
+                    if !turn.items.is_empty() {
+                        return Ok(Some(turn));
+                    }
+                    last_seen = Some(turn);
+                }
+            }
+
+            if let Some(thread) = self.resume_thread_full(selector, cwd, model.clone())? {
+                if let Some(turn) = thread.turns.into_iter().find(|turn| turn.id == turn_id) {
+                    if !turn.items.is_empty() {
+                        return Ok(Some(turn));
+                    }
+                    last_seen = Some(turn);
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return Ok(last_seen);
+            }
+            std::thread::sleep(TURN_POLL_INTERVAL);
+        }
     }
 
     fn resolve_selector(&self, selector: &str) -> Result<Option<String>> {

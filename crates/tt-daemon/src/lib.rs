@@ -2852,6 +2852,7 @@ impl DaemonService {
             )),
             developer_instructions: Some(agent_file.developer_instructions.clone()),
             ephemeral: Some(false),
+            persist_extended_history: true,
             ..protocol::ThreadStartParams::default()
         })
     }
@@ -3250,47 +3251,136 @@ fn summarize_turn_items(items: &[protocol::ThreadItem]) -> String {
     }
 }
 
-fn worker_handoff_text(items: &[protocol::ThreadItem]) -> Option<String> {
-    items.iter().find_map(|item| match item {
-        protocol::ThreadItem::AgentMessage { text, .. } => {
-            let trimmed = text.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
+fn worker_handoff_text_candidates(items: &[protocol::ThreadItem]) -> Vec<String> {
+    items.iter()
+        .filter_map(|item| match item {
+            protocol::ThreadItem::AgentMessage { text, .. } => {
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn normalize_worker_handoff_json_candidate(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.starts_with("```") {
+        let mut lines = trimmed.lines();
+        let header = lines.next()?;
+        if header.starts_with("```") {
+            let mut body = Vec::new();
+            for line in lines {
+                if line.trim_start().starts_with("```") {
+                    break;
+                }
+                body.push(line);
+            }
+            let fenced = body.join("\n").trim().to_string();
+            if !fenced.is_empty() {
+                return Some(fenced);
+            }
         }
-        _ => None,
-    })
+    }
+
+    extract_first_json_object(trimmed).or_else(|| Some(trimmed.to_string()))
+}
+
+fn extract_first_json_object(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, byte) in bytes.iter().enumerate() {
+        let ch = *byte as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if start.is_none() {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth == 0 {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start_index) = start {
+                        return Some(text[start_index..=index].to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn extract_worker_handoff(items: &[protocol::ThreadItem]) -> WorkerHandoffExtraction {
-    let raw_text = worker_handoff_text(items);
-    let Some(raw_text_value) = raw_text.clone() else {
+    let raw_candidates = worker_handoff_text_candidates(items);
+    if raw_candidates.is_empty() {
         return WorkerHandoffExtraction {
             handoff: None,
             raw_text: None,
             source: WorkerHandoffSource::SeededFallback,
             parse_error: Some("no agent message found in completed turn".to_string()),
         };
-    };
-    match serde_json::from_str::<StructuredWorkerHandoff>(&raw_text_value) {
-        Ok(handoff) => match validate_structured_worker_handoff(&handoff) {
-            Ok(()) => WorkerHandoffExtraction {
-                handoff: Some(handoff),
-                raw_text: Some(raw_text_value),
-                source: WorkerHandoffSource::Extracted,
-                parse_error: None,
+    }
+
+    let mut last_raw = None;
+    let mut last_error = None;
+    for raw in raw_candidates.iter().rev() {
+        let Some(candidate) = normalize_worker_handoff_json_candidate(raw) else {
+            continue;
+        };
+        last_raw = Some(raw.clone());
+        match serde_json::from_str::<StructuredWorkerHandoff>(&candidate) {
+            Ok(handoff) => match validate_structured_worker_handoff(&handoff) {
+                Ok(()) => {
+                    return WorkerHandoffExtraction {
+                        handoff: Some(handoff),
+                        raw_text: Some(raw.clone()),
+                        source: WorkerHandoffSource::Extracted,
+                        parse_error: None,
+                    };
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                }
             },
-            Err(error) => WorkerHandoffExtraction {
-                handoff: None,
-                raw_text: Some(raw_text_value),
-                source: WorkerHandoffSource::SeededFallback,
-                parse_error: Some(error.to_string()),
-            },
-        },
-        Err(error) => WorkerHandoffExtraction {
-            handoff: None,
-            raw_text: Some(raw_text_value),
-            source: WorkerHandoffSource::SeededFallback,
-            parse_error: Some(format!("parse structured worker handoff JSON: {error}")),
-        },
+            Err(error) => {
+                last_error = Some(format!("parse structured worker handoff JSON: {error}"));
+            }
+        }
+    }
+
+    WorkerHandoffExtraction {
+        handoff: None,
+        raw_text: last_raw,
+        source: WorkerHandoffSource::SeededFallback,
+        parse_error: last_error.or_else(|| Some("no parseable worker handoff JSON found".to_string())),
     }
 }
 
@@ -4039,6 +4129,59 @@ mod tests {
         assert!(contract.contains("## Roles"));
         assert!(contract.contains("plan"));
         assert!(contract.contains("merge"));
+    }
+
+    #[test]
+    fn extract_worker_handoff_accepts_exact_json_agent_message() {
+        let extraction = extract_worker_handoff(&[protocol::ThreadItem::AgentMessage {
+            id: "item-1".into(),
+            text: r#"{"status":"complete","changed_files":["src/main.rs"],"tests_run":["cargo test"],"blockers":[],"next_step":"Hand off to integration."}"#.into(),
+            phase: None,
+            memory_citation: None,
+        }]);
+
+        assert_eq!(extraction.source, WorkerHandoffSource::Extracted);
+        let handoff = extraction.handoff.expect("handoff");
+        assert_eq!(handoff.status, "complete");
+        assert_eq!(handoff.changed_files, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn extract_worker_handoff_accepts_fenced_json_from_last_agent_message() {
+        let extraction = extract_worker_handoff(&[
+            protocol::ThreadItem::AgentMessage {
+                id: "item-1".into(),
+                text: "Planning complete.".into(),
+                phase: None,
+                memory_citation: None,
+            },
+            protocol::ThreadItem::AgentMessage {
+                id: "item-2".into(),
+                text: "```json\n{\"status\":\"needs-review\",\"changed_files\":[\"src/lib.rs\"],\"tests_run\":[\"cargo test\"],\"blockers\":[],\"next_step\":\"Request review.\"}\n```".into(),
+                phase: None,
+                memory_citation: None,
+            },
+        ]);
+
+        assert_eq!(extraction.source, WorkerHandoffSource::Extracted);
+        let handoff = extraction.handoff.expect("handoff");
+        assert_eq!(handoff.status, "needs-review");
+        assert_eq!(handoff.next_step, "Request review.");
+    }
+
+    #[test]
+    fn extract_worker_handoff_reports_missing_agent_messages() {
+        let extraction = extract_worker_handoff(&[protocol::ThreadItem::Plan {
+            id: "item-1".into(),
+            text: "work plan".into(),
+        }]);
+
+        assert_eq!(extraction.source, WorkerHandoffSource::SeededFallback);
+        assert!(extraction.handoff.is_none());
+        assert_eq!(
+            extraction.parse_error.as_deref(),
+            Some("no agent message found in completed turn")
+        );
     }
 
     #[test]
