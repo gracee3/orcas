@@ -1,0 +1,90 @@
+.TH TT-DAEMON 1 "2026-04-08" "TT 0.1.0" "User Commands"
+.SH NAME
+tt-daemon \- TT daemon for local TT orchestration
+.SH SYNOPSIS
+.B tt-daemon
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+The
+.B tt-daemon
+binary is the long-lived TT daemon. It owns the local control plane,
+maintains managed-project overlay state, serves the Unix domain socket used by
+clients, and coordinates Codex-backed worker activation.
+
+The daemon is normally managed by
+.BR systemd (1)
+through
+.I tt-daemon.service
+and is designed to run under the user service manager so it shares the same
+TT home, socket, and workspace conventions as the CLI rather than acting as a
+public network daemon.
+.SH OPTIONS
+.TP
+.B --cwd \fIPATH\fR
+Override the default working directory used for daemon-scoped operations.
+
+.TP
+.B --listen-url \fIURL\fR
+Override the upstream TT app-server WebSocket URL.
+
+.TP
+.B --connect-only
+Require connect-only mode instead of spawning a local TT app-server.
+
+.TP
+.B --force-spawn
+Require spawn mode instead of connect-only mode. This option conflicts with
+.BR --connect-only .
+.SH FILES
+.TP
+.I ~/.tt/config.toml
+User configuration file.
+
+.TP
+.I ~/.tt/overlay.db
+TT overlay state database.
+
+.TP
+.I ~/.tt/logs/tt-daemon.log
+Daemon log file.
+
+.TP
+.I ${TT_HOME}/runtime/tt-daemon.sock or ~/.tt/runtime/tt-daemon.sock
+Local IPC socket used by CLI and TUI clients.
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Controls tracing verbosity for the daemon.
+
+.TP
+.B TT_RUNTIME_BIN
+Overrides the path to the local TT CLI binary.
+
+.TP
+.B TT_RUNTIME_LISTEN_URL
+Overrides the upstream TT listen URL.
+
+.TP
+.B TT_DEFAULT_CWD
+Overrides the default working directory used for daemon-launched work.
+
+.TP
+.B TT_DEFAULT_MODEL
+Overrides the default model used for daemon-launched work.
+
+.TP
+.B TT_CONNECTION_MODE
+Accepts
+.B connect_only
+or
+.B spawn_always .
+If unset, TT keeps the configured or default
+.B spawn_if_needed
+behavior.
+.SH SEE ALSO
+.BR tt-cli (1),
+.BR systemd (1)
+.SH AUTHOR
+TT contributors.
+.SH LICENSE
+Licensed under the Apache License, Version 2.0.

@@ -2,12 +2,12 @@
 
 This directory holds the checked-in end-to-end harness for TT.
 
-The goal is to keep the normal developer path fast while still making the operator workflows reproducible and inspectable when you want them.
+The harness is split into deterministic smoke tests and live managed-project scenarios.
 
 ## Layout
 
 - `tests/e2e/bin/tt.sh` wraps the local TT CLI with a repo-local `TT_HOME`.
-- `tests/e2e/lib/common.sh` centralizes path setup, scenario metadata loading, selection, shared helpers, and legacy XDG shim paths for older scenarios.
+- `tests/e2e/lib/common.sh` centralizes path setup, scenario metadata loading, shared helpers, and live daemon wiring.
 - `tests/e2e/run_all.sh` discovers and runs scenarios by metadata.
 - `tests/e2e/run_scenario.sh` runs one scenario by name or path.
 - `tests/e2e/scenarios/<name>/scenario.md` explains the scenario.
@@ -25,7 +25,7 @@ Generated output is written only under `target/e2e/`:
 
 ## Scenario Metadata
 
-Each scenario must provide `scenario.env` with shell-friendly key/value pairs:
+Each scenario provides `scenario.env` with shell-friendly key/value pairs:
 
 - `NAME`
 - `MODE` (`deterministic`, `hybrid-live`, `full-live`, or `recovery`)
@@ -38,18 +38,6 @@ Each scenario must provide `scenario.env` with shell-friendly key/value pairs:
 
 Metadata is validated before execution. Missing or malformed metadata fails the run.
 
-Lane contract:
-
-- the default daily deterministic lane is expected to work from a normal dirty developer checkout
-- scenarios that require a clean git tree are opt-in and must not be default-enabled
-
-Aligned live lane contract for the current tracked-thread/workspace migration:
-
-- lane-centric live scenarios create the workstream first, then declare the tracked-thread workspace before the first live assignment
-- the harness inspects the workstream runtime through `tt workstreams runtime get` and `tt tt threads list --workstream`
-- the first live assignment must auto-bind into the declared tracked-thread lane; the harness must not repair binding manually after the report appears
-- the currently aligned scenarios are `git-worktrees`, `phased-fibonacci`, `live-worker-direct-patch`, `live-supervisor-micro-proposal`, `live-reject-redirect`, `live-restart-resume`, `live-worktree-lifecycle`, `live-multi-phase-lane`, and `live-concurrent-lanes`
-
 ## Running Scenarios
 
 Run the default deterministic lane:
@@ -57,8 +45,6 @@ Run the default deterministic lane:
 ```bash
 make test-e2e
 ```
-
-That default lane is the daily confidence path. It should stay usable from an ordinary in-progress checkout.
 
 Run the live-only lane:
 
@@ -81,7 +67,7 @@ make test-e2e SCENARIO=hello
 Filter by tag:
 
 ```bash
-make test-e2e TAG=deterministic
+make test-e2e TAG=managed-project
 ```
 
 You can also invoke the runner directly:
@@ -90,77 +76,6 @@ You can also invoke the runner directly:
 tests/e2e/run_all.sh
 tests/e2e/run_scenario.sh tests/e2e/scenarios/hello
 ```
-
-### Shared UI Lab For Live Scenarios
-
-If you want to launch live scenarios from the terminal and inspect them immediately in the operator web UI, use the shared UI lab instead of the default scenario-local XDG roots.
-
-The lab uses a dedicated TT state under `target/ui-e2e-lab/`, so it does not overwrite your normal `~/.tt` state.
-
-Reset and start the lab:
-
-```bash
-tests/e2e/bin/ui_lab_live.sh restart
-```
-
-Run one supported live scenario into that shared lab:
-
-```bash
-tests/e2e/bin/ui_lab_live.sh run live-worker-direct-patch
-```
-
-Run the supported shared-lab suite sequentially:
-
-```bash
-tests/e2e/bin/ui_lab_live.sh run-all
-```
-
-Supported shared-lab scenarios:
-
-- `live-worker-direct-patch`
-- `live-supervisor-micro-proposal`
-- `live-reject-redirect`
-- `live-worktree-lifecycle`
-- `supervisor-planning`
-
-These scenarios reuse the existing lab daemon and lab XDG roots, so their workstreams, work units, assignments, reports, and bound threads appear in the UI immediately.
-
-Not every live scenario is suitable for the shared lab. Scenarios that intentionally restart or stop the daemon, such as `live-restart-resume`, should still be run in their normal isolated mode.
-
-### Local Supervisor Models
-
-Only scenarios that actually generate a live supervisor proposal require a local OpenAI-compatible supervisor endpoint.
-
-Current live supervisor proposal scenarios:
-
-- `supervisor-planning`
-- `live-supervisor-micro-proposal`
-- `live-reject-redirect`
-- `live-multi-phase-lane`
-
-These scenarios are opt-in. They are not part of the default daily deterministic lane.
-
-Seeded proposal scenarios remain model-free:
-
-- `proposals-decisions`
-
-These seeded scenarios now round-trip their `state.json` inputs through the same `StoredState`
-serializer/deserializer path the daemon uses, so deterministic fixtures stay aligned with the
-live persisted collaboration shape.
-
-For live supervisor proposal scenarios, export:
-
-```bash
-export TT_E2E_SUPERVISOR_BASE_URL="http://127.0.0.1:8000/v1"
-export TT_E2E_SUPERVISOR_MODEL="gpt-oss-20b"
-export TT_E2E_SUPERVISOR_API_KEY_ENV=""
-export TT_E2E_SUPERVISOR_REASONING_EFFORT=""
-export TT_E2E_SUPERVISOR_MAX_OUTPUT_TOKENS="2048"
-```
-
-The scenario runner probes `.../models` before it starts. If those variables are unset, or if the endpoint is unreachable, the scenario fails immediately with an actionable message instead of silently depending on a hidden local model setup.
-
-The harness still accepts the older `TT_E2E_QWEN_*` variable names as a fallback, but the intended contract is provider-neutral: any local OpenAI-compatible endpoint is acceptable for these opt-in proposal scenarios.
 
 ## Cleanup
 
@@ -175,17 +90,12 @@ That removes `target/e2e/` and nothing else.
 ## Current Scenarios
 
 - `hello`
-- `repo-local-logs`
-- `proposals-decisions`
-- `supervisor-planning`
-- `git-worktrees`
-- `phased-fibonacci`
-- `live-worker-direct-patch`
-- `live-supervisor-micro-proposal`
-- `live-reject-redirect`
-- `live-restart-resume`
-- `live-worktree-lifecycle`
-- `live-multi-phase-lane`
-- `live-concurrent-lanes`
+- `managed-project-phased-director`
+- `managed-project-git-worktree`
 
-The current migration now treats the workstream runtime as the app-server ownership unit and the tracked-thread workspace as the execution lane. The aligned live scenarios prove first-assignment lane binding, tracked-thread/worktree continuity, tracked-thread lifecycle transitions, and concurrent lane isolation on top of that model, including the phased Fibonacci lane and the full git-worktrees lifecycle lane.
+The managed-project scenarios exercise the current TT v2 workflow:
+
+- scaffold a managed project
+- activate director/dev/test/integration roles in phases
+- inspect attachment state through the daemon
+- verify the commands work from a linked git worktree path

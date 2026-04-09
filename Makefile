@@ -17,8 +17,8 @@ E2E_RUNNER := tests/e2e/run_all.sh
 SCENARIO ?=
 TAG ?=
 
-MAIN_BIN := tt
-AUX_BINS := ttd
+MAIN_BIN := tt-cli
+AUX_BINS := tt-daemon
 ALL_BINS := $(MAIN_BIN) $(AUX_BINS)
 
 RELEASE_DIR := target/$(TARGET)/release
@@ -66,7 +66,7 @@ doc:
 install: build
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -m 0755 "$(RELEASE_DIR)/$(MAIN_BIN)" "$(DESTDIR)$(BINDIR)/$(MAIN_BIN)"
-	install -m 0755 "$(RELEASE_DIR)/ttd" "$(DESTDIR)$(BINDIR)/ttd"
+	install -m 0755 "$(RELEASE_DIR)/tt-daemon" "$(DESTDIR)$(BINDIR)/tt-daemon"
 
 .PHONY: install-user
 install-user:
@@ -75,7 +75,7 @@ install-user:
 .PHONY: install-systemd
 install-systemd:
 	install -d "$(DESTDIR)$(SYSTEMD_DIR)"
-	sed 's|^ExecStart=.*|ExecStart=$(BINDIR)/ttd|' \
+	sed 's|^ExecStart=.*|ExecStart=$(BINDIR)/tt-daemon|' \
 		packaging/systemd/tt-daemon.service \
 		> "$(DESTDIR)$(SYSTEMD_DIR)/tt-daemon.service"
 	chmod 0644 "$(DESTDIR)$(SYSTEMD_DIR)/tt-daemon.service"
@@ -91,8 +91,8 @@ disable-systemd:
 
 .PHONY: uninstall
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/tt"
-	rm -f "$(DESTDIR)$(BINDIR)/ttd"
+	rm -f "$(DESTDIR)$(BINDIR)/tt-cli"
+	rm -f "$(DESTDIR)$(BINDIR)/tt-daemon"
 
 .PHONY: uninstall-systemd
 uninstall-systemd:
@@ -103,8 +103,8 @@ dist: build
 	rm -rf "$(DIST_DIR)"
 	install -d "$(DIST_DIR)/bin"
 	install -d "$(DIST_DIR)/packaging/systemd"
-	install -m 0755 "$(RELEASE_DIR)/tt" "$(DIST_DIR)/bin/tt"
-	install -m 0755 "$(RELEASE_DIR)/ttd" "$(DIST_DIR)/bin/ttd"
+	install -m 0755 "$(RELEASE_DIR)/tt-cli" "$(DIST_DIR)/bin/tt-cli"
+	install -m 0755 "$(RELEASE_DIR)/tt-daemon" "$(DIST_DIR)/bin/tt-daemon"
 	install -m 0644 packaging/systemd/tt-daemon.service \
 		"$(DIST_DIR)/packaging/systemd/tt-daemon.service"
 	test ! -f README.md || install -m 0644 README.md "$(DIST_DIR)/README.md"

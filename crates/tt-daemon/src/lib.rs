@@ -1101,10 +1101,9 @@ impl DaemonService {
         cwd: impl AsRef<Path>,
     ) -> Result<ManagedProjectInspection> {
         let cwd = cwd.as_ref();
-        let Some(repository) = GitRepository::discover(cwd)? else {
+        let Some(repo_root) = managed_project_repo_root(cwd)? else {
             anyhow::bail!("managed project inspect requires a git repository");
         };
-        let repo_root = repository.repository_root.clone();
         let manifest_path = repo_root.join(".tt").join("managed-project.toml");
         if !manifest_path.exists() {
             anyhow::bail!(
@@ -1133,11 +1132,12 @@ impl DaemonService {
         integration_model: Option<String>,
     ) -> Result<ManagedProjectBootstrap> {
         let cwd = cwd.as_ref();
-        let Some(repository) = GitRepository::discover(cwd)? else {
+        let Some(repo_root) = managed_project_repo_root(cwd)? else {
             anyhow::bail!("managed project open requires a git repository");
         };
+        let repository = GitRepository::discover(&repo_root)?
+            .ok_or_else(|| anyhow::anyhow!("managed project open requires a git repository"))?;
         let inspection = repository.inspect_repository()?;
-        let repo_root = repository.repository_root.clone();
         let repo_name = repo_root
             .file_name()
             .and_then(|value| value.to_str())
@@ -1949,10 +1949,11 @@ impl DaemonService {
         roles: Option<Vec<ThreadRole>>,
     ) -> Result<ManagedProjectBootstrap> {
         let cwd = cwd.as_ref();
-        let Some(repository) = GitRepository::discover(cwd)? else {
+        let Some(repo_root) = managed_project_repo_root(cwd)? else {
             anyhow::bail!("managed project spawn requires a git repository");
         };
-        let repo_root = repository.repository_root.clone();
+        let repository = GitRepository::discover(&repo_root)?
+            .ok_or_else(|| anyhow::anyhow!("managed project spawn requires a git repository"))?;
         let manifest_path = repo_root.join(".tt").join("managed-project.toml");
         let manifest = load_managed_project_manifest(&manifest_path)?;
         let mut bootstrap =
@@ -1992,10 +1993,11 @@ impl DaemonService {
         bindings: Vec<ManagedProjectThreadAttachment>,
     ) -> Result<ManagedProjectBootstrap> {
         let cwd = cwd.as_ref();
-        let Some(repository) = GitRepository::discover(cwd)? else {
+        let Some(repo_root) = managed_project_repo_root(cwd)? else {
             anyhow::bail!("managed project director requires a git repository");
         };
-        let repo_root = repository.repository_root.clone();
+        let repository = GitRepository::discover(&repo_root)?
+            .ok_or_else(|| anyhow::anyhow!("managed project director requires a git repository"))?;
         let manifest_path = repo_root.join(".tt").join("managed-project.toml");
         let mut bootstrap = if manifest_path.exists() {
             let manifest = load_managed_project_manifest(&manifest_path)?;
@@ -2085,10 +2087,11 @@ impl DaemonService {
         bindings: Vec<ManagedProjectThreadAttachment>,
     ) -> Result<ManagedProjectBootstrap> {
         let cwd = cwd.as_ref();
-        let Some(repository) = GitRepository::discover(cwd)? else {
+        let Some(repo_root) = managed_project_repo_root(cwd)? else {
             anyhow::bail!("managed project attach requires a git repository");
         };
-        let repo_root = repository.repository_root.clone();
+        let repository = GitRepository::discover(&repo_root)?
+            .ok_or_else(|| anyhow::anyhow!("managed project attach requires a git repository"))?;
         let manifest_path = repo_root.join(".tt").join("managed-project.toml");
         let manifest = load_managed_project_manifest(&manifest_path)?;
         let mut bootstrap =
@@ -2367,6 +2370,10 @@ fn resolve_path(base: &Path, path: PathBuf) -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+fn managed_project_repo_root(cwd: &Path) -> Result<Option<PathBuf>> {
+    Ok(GitRepository::discover(cwd)?.map(|repository| repository.repository_root))
 }
 
 fn default_worktree_root(repo_root: &Path, project_slug: &str) -> PathBuf {

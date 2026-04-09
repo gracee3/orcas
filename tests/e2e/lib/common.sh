@@ -342,10 +342,13 @@ e2e_require_clean_git() {
 }
 
 e2e_require_tt() {
+  if [[ -x "$e2e_repo_root/target/debug/tt-cli" ]]; then
+    return 0
+  fi
   if [[ -n "${TT_RUNTIME_BIN:-}" && -x "$TT_RUNTIME_BIN" ]]; then
     return 0
   fi
-  command -v tt >/dev/null 2>&1 || e2e_fail "scenario $E2E_SCENARIO_NAME requires tt on PATH or TT_RUNTIME_BIN"
+  command -v tt-cli >/dev/null 2>&1 || e2e_fail "scenario $E2E_SCENARIO_NAME requires tt-cli on PATH or TT_RUNTIME_BIN"
 }
 
 e2e_print_scenario_begin() {
@@ -363,42 +366,6 @@ e2e_print_scenario_end() {
 
 e2e_tt() {
   "$e2e_bin_dir/tt.sh" "$@"
-}
-
-e2e_tt_state_seed() {
-  local seed_bin="$e2e_repo_root/target/debug/tt-state-seed"
-
-  if [[ ! -x "$seed_bin" || "${TT_E2E_FORCE_CARGO_RUN:-0}" == "1" ]]; then
-    cargo build -q --manifest-path "$e2e_repo_root/Cargo.toml" -p tt -p ttd
-  fi
-
-  "$seed_bin" "$@"
-}
-
-e2e_normalize_state_json() {
-  local input="$1"
-  local output="${2:-$1}"
-
-  e2e_tt_state_seed --input "$input" --output "$output"
-}
-
-e2e_ttd() {
-  local ttd_bin="$e2e_repo_root/target/debug/ttd"
-  local xdg_data_home="${TT_E2E_XDG_DATA_HOME:-$e2e_output_root/xdg/default/data}"
-  local xdg_config_home="${TT_E2E_XDG_CONFIG_HOME:-$e2e_output_root/xdg/default/config}"
-  local xdg_runtime_home="${TT_E2E_XDG_RUNTIME_HOME:-$e2e_output_root/xdg/default/runtime}"
-  local tt_home="${TT_E2E_TT_HOME:-$e2e_output_root/tt/default}"
-
-  mkdir -p "$xdg_data_home" "$xdg_config_home" "$xdg_runtime_home"
-  e2e_sync_legacy_xdg_into_tt_home "$xdg_data_home" "$xdg_config_home" "$xdg_runtime_home" "$tt_home"
-  chmod 700 "$xdg_runtime_home" || true
-
-  if [[ ! -x "$ttd_bin" || "${TT_E2E_FORCE_CARGO_RUN:-0}" == "1" ]]; then
-    cargo build -q --manifest-path "$e2e_repo_root/Cargo.toml" -p tt -p ttd
-  fi
-
-  TT_HOME="$tt_home" \
-    "$ttd_bin" "$@"
 }
 
 e2e_field_value() {
@@ -423,7 +390,7 @@ e2e_prepare_live_tt_environment() {
   local supervisor_api_key_env="${TT_SUPERVISOR_API_KEY_ENV:-}"
   local supervisor_reasoning_effort="${TT_SUPERVISOR_REASONING_EFFORT:-}"
   local supervisor_temperature="${TT_SUPERVISOR_TEMPERATURE:-0.0}"
-  local tt_bin="${TT_RUNTIME_BIN:-$(command -v tt)}"
+  local tt_bin="${TT_RUNTIME_BIN:-$e2e_repo_root/target/debug/tt-cli}"
 
   e2e_use_short_xdg_paths "$suffix"
   mkdir -p "$E2E_SCENARIO_XDG_CONFIG_HOME/tt"
