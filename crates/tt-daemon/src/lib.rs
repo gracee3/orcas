@@ -2289,27 +2289,17 @@ impl DaemonService {
             }
         }
 
-        let role_refs: Vec<_> = bootstrap.roles.iter().collect();
+        self.save_managed_project_bootstrap(&bootstrap)?;
         if let Some(scenario_kind) = scenario.as_deref() {
             let seed = load_managed_project_seed(seed_file.as_deref())?;
             let scenario_state = self.run_managed_project_scenario(
-                &bootstrap,
+                &mut bootstrap,
                 scenario_kind,
                 &seed,
             )?;
             bootstrap.scenario = Some(scenario_state);
         }
-        let manifest = build_managed_project_manifest(
-            &bootstrap.project,
-            &bootstrap.repo_root,
-            &bootstrap.base_branch,
-            &bootstrap.worktree_root,
-            &bootstrap.contract_path,
-            &bootstrap.codex_config_path,
-            bootstrap.scenario.clone(),
-            &role_refs,
-        );
-        save_managed_project_manifest(&bootstrap.manifest_path, &manifest)?;
+        self.save_managed_project_bootstrap(&bootstrap)?;
         Ok(bootstrap)
     }
 
@@ -2350,7 +2340,7 @@ impl DaemonService {
 
     fn run_managed_project_scenario(
         &self,
-        bootstrap: &ManagedProjectBootstrap,
+        bootstrap: &mut ManagedProjectBootstrap,
         scenario_kind: &str,
         seed: &ManagedProjectScenarioSeed,
     ) -> Result<ManagedProjectScenarioState> {
@@ -2362,6 +2352,7 @@ impl DaemonService {
             .roles
             .iter()
             .find(|role| role.role == ThreadRole::Director)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("managed project director role missing"))?;
         let director_thread_id = director
             .thread_id
@@ -2372,16 +2363,19 @@ impl DaemonService {
             .roles
             .iter()
             .find(|role| role.role == ThreadRole::Develop)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("managed project dev role missing"))?;
         let test = bootstrap
             .roles
             .iter()
             .find(|role| role.role == ThreadRole::Test)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("managed project test role missing"))?;
         let integration = bootstrap
             .roles
             .iter()
             .find(|role| role.role == ThreadRole::Integrate)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("managed project integration role missing"))?;
 
         let mut state = ManagedProjectScenarioState {
@@ -2401,6 +2395,10 @@ impl DaemonService {
         for spec in &round_specs {
             state.current_round = spec.round_number;
             state.current_phase = spec.phase.to_string();
+            eprintln!(
+                "tt director scenario {} round {} phase {} starting",
+                scenario_kind, spec.round_number, spec.phase
+            );
 
             let mut round = ManagedProjectRoundState {
                 round_number: spec.round_number,
@@ -2419,10 +2417,14 @@ impl DaemonService {
             );
             let director_turn = self.run_role_prompt(
                 &bootstrap.repo_root,
-                director,
+                &director,
                 director_thread_id,
                 &director_prompt,
             )?;
+            eprintln!(
+                "tt director scenario {} round {} director completed turn {}",
+                scenario_kind, spec.round_number, director_turn.turn_id
+            );
             round.director_turn_id = Some(director_turn.turn_id.clone());
             round.director_summary = Some(director_turn.summary.clone());
 
@@ -2436,10 +2438,17 @@ impl DaemonService {
                 });
             }
 
-            for role in [dev, test, integration] {
+            for role in [&dev, &test, &integration] {
                 let thread_id = role.thread_id.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("managed project role `{}` is not attached", role_slug(role.role))
                 })?;
+                eprintln!(
+                    "tt director scenario {} round {} dispatching {} on thread {}",
+                    scenario_kind,
+                    spec.round_number,
+                    role_slug(role.role),
+                    thread_id
+                );
                 let worker_prompt = build_worker_round_prompt(
                     bootstrap,
                     spec,
@@ -2449,6 +2458,13 @@ impl DaemonService {
                 );
                 let handoff =
                     self.run_role_prompt(&bootstrap.repo_root, role, thread_id, &worker_prompt)?;
+                eprintln!(
+                    "tt director scenario {} round {} {} completed turn {}",
+                    scenario_kind,
+                    spec.round_number,
+                    role_slug(role.role),
+                    handoff.turn_id
+                );
                 round.role_handoffs.insert(
                     role_slug(role.role).to_string(),
                     ManagedProjectRoleHandoff {
@@ -2464,10 +2480,19 @@ impl DaemonService {
 
             worker_context = render_round_handoffs(&round);
             state.rounds.push(round);
+            bootstrap.scenario = Some(state.clone());
+            self.save_managed_project_bootstrap(bootstrap)?;
+            eprintln!(
+                "tt director scenario {} round {} phase {} recorded",
+                scenario_kind, spec.round_number, spec.phase
+            );
         }
 
         state.current_phase = "completed".to_string();
         state.completed = true;
+        bootstrap.scenario = Some(state.clone());
+        self.save_managed_project_bootstrap(bootstrap)?;
+        eprintln!("tt director scenario {} completed", scenario_kind);
         Ok(state)
     }
 
@@ -2482,9 +2507,26 @@ impl DaemonService {
             .worktree_path
             .as_deref()
             .unwrap_or(repo_root);
+        eprintln!(
+            "tt director prompting role {} thread {} cwd {}",
+            role_slug(role_bootstrap.role),
+            thread_id,
+            cwd.display()
+        );
         let client = self.codex_runtime_client(cwd)?;
         let turn = client.start_turn(thread_id, prompt, Some(cwd), role_bootstrap.model.clone())?;
+        eprintln!(
+            "tt director role {} started turn {}",
+            role_slug(role_bootstrap.role),
+            turn.id
+        );
         let completed = client.wait_for_turn_completion(thread_id, &turn.id)?;
+        eprintln!(
+            "tt director role {} observed turn {} status {:?}",
+            role_slug(role_bootstrap.role),
+            completed.id,
+            completed.status
+        );
         let thread = client
             .read_thread_full(thread_id, true)?
             .ok_or_else(|| anyhow::anyhow!("thread `{thread_id}` not found after turn"))?;
@@ -2514,6 +2556,21 @@ impl DaemonService {
                 role_slug(role_bootstrap.role)
             ),
         }
+    }
+
+    fn save_managed_project_bootstrap(&self, bootstrap: &ManagedProjectBootstrap) -> Result<()> {
+        let role_refs: Vec<_> = bootstrap.roles.iter().collect();
+        let manifest = build_managed_project_manifest(
+            &bootstrap.project,
+            &bootstrap.repo_root,
+            &bootstrap.base_branch,
+            &bootstrap.worktree_root,
+            &bootstrap.contract_path,
+            &bootstrap.codex_config_path,
+            bootstrap.scenario.clone(),
+            &role_refs,
+        );
+        save_managed_project_manifest(&bootstrap.manifest_path, &manifest)
     }
 
     fn spawn_managed_project_role(
@@ -2782,7 +2839,7 @@ fn scaffold_managed_project_template(path: &Path, template: Option<&str>) -> Res
             }
             write_managed_file(
                 &path.join("Cargo.toml"),
-                "[package]\nname = \"taskflow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\nserde_json = \"1\"\nserde_yaml = \"0.9\"\n",
+                "[package]\nname = \"taskflow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\nserde_json = \"1\"\nserde_yaml = \"0.9\"\n",
             )?;
             write_managed_file(
                 &path.join("src").join("main.rs"),
