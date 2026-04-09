@@ -87,6 +87,10 @@ for round in 01 02 03 04; do
   done
 done
 
+if e2e_is_true "$REQUIRES_EXTRACTED_HANDOFFS"; then
+  e2e_require_extracted_handoffs "$inspect_stdout" "$scenario_root"
+fi
+
 grep -q '"Cargo.toml"' "$scenario_root/round-01/dev-handoff.txt"
 grep -q 'validation fixtures for cycles and missing dependencies' "$scenario_root/round-01/test-handoff.txt"
 grep -q '"cargo check --bin taskflow"' "$scenario_root/round-02/integration-handoff.txt"

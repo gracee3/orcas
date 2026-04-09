@@ -35,6 +35,7 @@ Each scenario provides `scenario.env` with shell-friendly key/value pairs:
 - `REQUIRES_RUNTIME`
 - `REQUIRES_NETWORK`
 - `REQUIRES_CLEAN_GIT`
+- `REQUIRES_EXTRACTED_HANDOFFS`
 
 Metadata is validated before execution. Missing or malformed metadata fails the run.
 

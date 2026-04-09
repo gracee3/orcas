@@ -893,6 +893,10 @@ fn render_managed_project_bootstrap(bootstrap: &tt_daemon::ManagedProjectBootstr
             .filter(|handoff| handoff.handoff_source == "seeded_fallback")
             .count();
         output.push_str(&format!("fallback_handoffs: {}\n", fallback_rounds));
+        output.push_str(&format!(
+            "strict_extraction_ready: {}\n",
+            if fallback_rounds == 0 { "true" } else { "false" }
+        ));
         if let Some(round) = scenario.rounds.last() {
             output.push_str(&format!(
                 "latest_round_summary: round {} {}\n",
@@ -1356,6 +1360,7 @@ mod tests {
         assert!(text.contains("dev"));
         assert!(text.contains("thread-1"));
         assert!(text.contains("fallback_handoffs: 1"));
+        assert!(text.contains("strict_extraction_ready: false"));
         assert!(text.contains("latest_round_summary: round 4 merge"));
         assert!(text.contains("dev: source=extracted status=complete"));
         assert!(text.contains("test: source=seeded_fallback status=complete"));

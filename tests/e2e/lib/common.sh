@@ -50,7 +50,7 @@ e2e_load_scenario_metadata() {
   local scenario_env="$scenario_dir/scenario.env"
   [[ -f "$scenario_env" ]] || e2e_fail "missing scenario metadata: $scenario_env"
 
-  unset NAME MODE TAGS DEFAULT_ENABLED TIMEOUT_SECONDS REQUIRES_RUNTIME REQUIRES_NETWORK REQUIRES_CLEAN_GIT
+  unset NAME MODE TAGS DEFAULT_ENABLED TIMEOUT_SECONDS REQUIRES_RUNTIME REQUIRES_NETWORK REQUIRES_CLEAN_GIT REQUIRES_EXTRACTED_HANDOFFS
   # shellcheck disable=SC1090
   source "$scenario_env"
 
@@ -78,9 +78,39 @@ e2e_load_scenario_metadata() {
     true|false) ;;
     *) e2e_fail "scenario $scenario_name has invalid REQUIRES_CLEAN_GIT=${REQUIRES_CLEAN_GIT:-<unset>}" ;;
   esac
+  case "${REQUIRES_EXTRACTED_HANDOFFS:-}" in
+    true|false) ;;
+    *) e2e_fail "scenario $scenario_name has invalid REQUIRES_EXTRACTED_HANDOFFS=${REQUIRES_EXTRACTED_HANDOFFS:-<unset>}" ;;
+  esac
   [[ "${TIMEOUT_SECONDS:-}" =~ ^[0-9]+$ ]] || e2e_fail "scenario $scenario_name has invalid TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-<unset>}"
   TAGS="${TAGS:-}"
   TAGS="${TAGS// /}"
+}
+
+e2e_require_extracted_handoffs() {
+  local inspect_file="$1"
+  local scenario_root="$2"
+
+  grep -q "fallback_handoffs: 0" "$inspect_file" || {
+    echo "strict handoff failure: project inspect reported fallback handoffs" >&2
+    echo "inspect file: $inspect_file" >&2
+    echo "scenario artifacts: $scenario_root" >&2
+    return 1
+  }
+
+  local source_file
+  while IFS= read -r source_file; do
+    [[ -n "$source_file" ]] || continue
+    if ! grep -qx 'extracted' "$source_file"; then
+      echo "strict handoff failure: non-extracted handoff source in $source_file" >&2
+      echo "scenario artifacts: $scenario_root" >&2
+      local parse_error="${source_file%-source.txt}-parse-error.txt"
+      local raw_file="${source_file%-source.txt}-raw.txt"
+      [[ -f "$parse_error" ]] && { echo "--- parse error ---" >&2; cat "$parse_error" >&2; }
+      [[ -f "$raw_file" ]] && { echo "--- raw handoff ---" >&2; cat "$raw_file" >&2; }
+      return 1
+    fi
+  done < <(find "$scenario_root" -name '*-handoff-source.txt' -type f | sort)
 }
 
 e2e_scenario_has_tag() {

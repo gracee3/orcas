@@ -66,6 +66,10 @@ for round in 01 02 03 04; do
   done
 done
 
+if e2e_is_true "$REQUIRES_EXTRACTED_HANDOFFS"; then
+  e2e_require_extracted_handoffs "$inspect_stdout" "$scenario_root"
+fi
+
 grep -q '"status": "blocked"' "$scenario_root/round-03/integration-handoff.txt"
 grep -q 'merge-readiness is blocked until the report output path and retry example stay aligned across docs and CLI' "$scenario_root/round-03/integration-handoff.txt"
 grep -q 'Resolve the integration mismatch, then return a merge-ready landing summary' "$scenario_root/round-03/integration-handoff.txt"
