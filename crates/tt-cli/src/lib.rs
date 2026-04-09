@@ -91,6 +91,28 @@ pub enum CodexThreadsCommand {
 pub enum ProjectFlowCommand {
     #[command(alias = "status")]
     Inspect,
+    Init {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        objective: Option<String>,
+        #[arg(long)]
+        template: Option<String>,
+        #[arg(long)]
+        base_branch: Option<String>,
+        #[arg(long)]
+        worktree_root: Option<PathBuf>,
+        #[arg(long)]
+        director_model: Option<String>,
+        #[arg(long)]
+        dev_model: Option<String>,
+        #[arg(long)]
+        test_model: Option<String>,
+        #[arg(long)]
+        integration_model: Option<String>,
+    },
     Open {
         #[arg(long)]
         title: Option<String>,
@@ -130,6 +152,10 @@ pub enum ProjectFlowCommand {
         role: Vec<String>,
         #[arg(long)]
         binding: Vec<String>,
+        #[arg(long)]
+        scenario: Option<String>,
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
     },
     Spawn {
         #[arg(long)]
@@ -296,9 +322,19 @@ pub enum MergeRunCommand {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
-    let response = request_for_cwd(&cwd, command_to_request(cli.command, &cwd)?)?;
+    let request_cwd = request_cwd_for_command(&cwd, &cli.command);
+    let response = request_for_cwd(&request_cwd, command_to_request(cli.command, &cwd)?)?;
     println!("{}", render_response(&response));
     Ok(())
+}
+
+fn request_cwd_for_command(cwd: &Path, command: &Command) -> PathBuf {
+    match command {
+        Command::Project {
+            command: ProjectFlowCommand::Init { path, .. },
+        } => resolve_cli_path(cwd, path.clone()),
+        _ => cwd.to_path_buf(),
+    }
 }
 
 fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
@@ -310,6 +346,29 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
         Command::Project { command } => match command {
             ProjectFlowCommand::Inspect => DaemonRequest::InspectManagedProject {
                 cwd: cwd.to_path_buf(),
+            },
+            ProjectFlowCommand::Init {
+                path,
+                title,
+                objective,
+                template,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+            } => DaemonRequest::InitManagedProject {
+                path: resolve_cli_path(cwd, path),
+                title,
+                objective,
+                template,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
             },
             ProjectFlowCommand::Open {
                 title,
@@ -342,6 +401,8 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
                 integration_model,
                 role,
                 binding,
+                scenario,
+                seed_file,
             } => DaemonRequest::DirectManagedProject {
                 cwd: cwd.to_path_buf(),
                 title,
@@ -358,6 +419,8 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
                     Some(parse_thread_roles(&role)?)
                 },
                 bindings: parse_thread_bindings(&binding)?,
+                scenario,
+                seed_file: seed_file.map(|path| resolve_cli_path(cwd, path)),
             },
             ProjectFlowCommand::Spawn { role } => DaemonRequest::SpawnManagedProject {
                 cwd: cwd.to_path_buf(),
@@ -806,6 +869,21 @@ fn render_managed_project_bootstrap(bootstrap: &tt_daemon::ManagedProjectBootstr
         "Codex config: {}\n",
         bootstrap.codex_config_path.display()
     ));
+    if let Some(scenario) = bootstrap.scenario.as_ref() {
+        output.push_str("\nScenario\n");
+        output.push_str("--------\n");
+        output.push_str(&format!("id: {}\n", scenario.scenario_id));
+        output.push_str(&format!("kind: {}\n", scenario.scenario_kind));
+        output.push_str(&format!("phase: {}\n", scenario.current_phase));
+        output.push_str(&format!("round: {}\n", scenario.current_round));
+        output.push_str(&format!("completed: {}\n", scenario.completed));
+        if let Some(approval) = scenario.pending_approval.as_ref() {
+            output.push_str(&format!(
+                "pending_approval: {} by {} approved={}\n",
+                approval.approval_kind, approval.requested_by_role, approval.approved
+            ));
+        }
+    }
     output.push_str("\nRoles\n");
     output.push_str("-----\n");
     let attached_roles = bootstrap
@@ -841,6 +919,14 @@ fn render_managed_project_bootstrap(bootstrap: &tt_daemon::ManagedProjectBootstr
         ));
     }
     output
+}
+
+fn resolve_cli_path(cwd: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
 }
 
 fn role_name(role: ThreadRole) -> &'static str {
@@ -1152,6 +1238,7 @@ mod tests {
             manifest_path: "/repo/.tt/managed-project.toml".into(),
             contract_path: "/repo/.tt/contracts/worker-contract.md".into(),
             codex_config_path: "/repo/.codex/config.toml".into(),
+            scenario: None,
             roles,
         };
         let inspection = tt_daemon::ManagedProjectInspection {

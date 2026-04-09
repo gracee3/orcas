@@ -30,11 +30,14 @@ escalations flow through the director.
 
 ## Lifecycle
 
+- `tt project init --path <target-dir>` creates a fresh git repo plus a minimal
+  managed-project scaffold for a supported template.
 - `tt project open` writes the manifest, contract, and agent files.
 - `tt project inspect` / `tt project status` reads back the manifest, role
   bindings, worktrees, and repository state without changing anything.
 - `tt project director` creates or reuses the scaffold, chooses the role
-  topology, and activates the selected roles in one shot.
+  topology, activates the selected roles in one shot, and can optionally run a
+  built-in seeded scenario.
 - `tt project spawn` starts live Codex threads for the selected roles and
   records the resulting thread ids in `.tt/managed-project.toml`.
 - `tt project attach` binds existing Codex thread ids to the corresponding
@@ -52,10 +55,12 @@ The director owns the phase flow:
 Example:
 
 ```bash
+tt project init --path /tmp/taskflow --template rust-taskflow
 tt project open --cwd /path/to/repo
 tt project inspect --cwd /path/to/repo
 tt project status --cwd /path/to/repo
 tt project director --cwd /path/to/repo
+tt project director --cwd /path/to/repo --scenario rust-taskflow-four-round --seed-file /path/to/seed.toml
 tt project spawn --cwd /path/to/repo
 tt project spawn --cwd /path/to/repo --role dev --role test
 tt project attach --cwd /path/to/repo \
@@ -88,3 +93,11 @@ Each handoff should include:
 
 The contract is intentionally explicit so the director can coordinate workers
 with prompts, skills, and agent definitions without relying on hidden state.
+
+## Seeded Scenario
+
+The built-in `rust-taskflow-four-round` scenario uses real Codex threads and a
+TT-owned round state record in the managed-project manifest. It seeds the
+director with an initial operator prompt, records round handoffs for `dev`,
+`test`, and `integration`, and stores a deterministic landing approval before
+the final round completes.

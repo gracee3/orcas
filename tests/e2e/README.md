@@ -90,12 +90,13 @@ That removes `target/e2e/` and nothing else.
 ## Current Scenarios
 
 - `hello`
-- `managed-project-phased-director`
 - `managed-project-git-worktree`
+- `managed-project-rust-taskflow-four-round`
 
 The managed-project scenarios exercise the current TT v2 workflow:
 
-- scaffold a managed project
-- activate director/dev/test/integration roles in phases
+- create a new managed project repo from TT
+- activate director/dev/test/integration roles
+- run a seeded multi-round Rust project scenario
 - inspect attachment state through the daemon
 - verify the commands work from a linked git worktree path

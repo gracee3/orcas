@@ -37,6 +37,8 @@ const APP_SERVER_CONNECT_ATTEMPTS: usize = 5;
 const APP_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_SERVER_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TURN_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const TURN_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexHome {
@@ -297,6 +299,31 @@ impl CodexRuntimeClient {
         })
     }
 
+    pub fn read_thread_full(
+        &self,
+        selector: &str,
+        include_turns: bool,
+    ) -> Result<Option<protocol::Thread>> {
+        let Some(thread_id) = self.resolve_selector(selector)? else {
+            return Ok(None);
+        };
+        let connection = Arc::clone(&self.connection);
+        self.runtime.block_on(async {
+            let mut connection = connection.lock().await;
+            let request_id = connection.next_request_id();
+            let response: protocol::ThreadReadResponse = connection
+                .request_typed(protocol::ClientRequest::ThreadRead {
+                    request_id,
+                    params: protocol::ThreadReadParams {
+                        thread_id: thread_id.to_string(),
+                        include_turns,
+                    },
+                })
+                .await?;
+            Ok(Some(response.thread))
+        })
+    }
+
     pub fn start_thread(
         &self,
         cwd: &Path,
@@ -368,6 +395,73 @@ impl CodexRuntimeClient {
                 .map_err(anyhow::Error::from)?;
             Ok(Some(thread_to_snapshot(response.thread)))
         })
+    }
+
+    pub fn start_turn(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        cwd: Option<&Path>,
+        model: Option<String>,
+    ) -> Result<protocol::Turn> {
+        let connection = Arc::clone(&self.connection);
+        let thread_id = thread_id.to_string();
+        let cwd = cwd.map(|path| path.to_path_buf());
+        let prompt = prompt.to_string();
+        self.runtime.block_on(async {
+            let mut connection = connection.lock().await;
+            let request_id = connection.next_request_id();
+            let response: protocol::TurnStartResponse = connection
+                .request_typed(protocol::ClientRequest::TurnStart {
+                    request_id,
+                    params: protocol::TurnStartParams {
+                        thread_id,
+                        input: vec![protocol::UserInput::Text {
+                            text: prompt,
+                            text_elements: Vec::new(),
+                        }],
+                        cwd,
+                        model,
+                        ..protocol::TurnStartParams::default()
+                    },
+                })
+                .await?;
+            Ok(response.turn)
+        })
+    }
+
+    pub fn wait_for_turn_completion(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<protocol::Turn> {
+        let deadline = std::time::Instant::now() + TURN_WAIT_TIMEOUT;
+        loop {
+            let thread = self
+                .read_thread_full(thread_id, true)?
+                .ok_or_else(|| anyhow::anyhow!("codex thread `{thread_id}` disappeared"))?;
+            let turn = thread
+                .turns
+                .into_iter()
+                .find(|turn| turn.id == turn_id)
+                .ok_or_else(|| anyhow::anyhow!("turn `{turn_id}` not found in thread `{thread_id}`"))?;
+            match turn.status {
+                protocol::TurnStatus::Completed
+                | protocol::TurnStatus::Failed
+                | protocol::TurnStatus::Interrupted => return Ok(turn),
+                protocol::TurnStatus::InProgress => {}
+            }
+
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for turn `{}` in thread `{}` after {:?}",
+                    turn_id,
+                    thread_id,
+                    TURN_WAIT_TIMEOUT
+                );
+            }
+            std::thread::sleep(TURN_POLL_INTERVAL);
+        }
     }
 
     fn resolve_selector(&self, selector: &str) -> Result<Option<String>> {

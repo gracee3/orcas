@@ -4,6 +4,7 @@
 //! It owns the local request/response API used by the TUI and CLI.
 
 use std::collections::BTreeMap;
+use std::process::Command;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -210,6 +211,18 @@ pub enum DaemonRequest {
         test_model: Option<String>,
         integration_model: Option<String>,
     },
+    InitManagedProject {
+        path: PathBuf,
+        title: Option<String>,
+        objective: Option<String>,
+        template: Option<String>,
+        base_branch: Option<String>,
+        worktree_root: Option<PathBuf>,
+        director_model: Option<String>,
+        dev_model: Option<String>,
+        test_model: Option<String>,
+        integration_model: Option<String>,
+    },
     DirectManagedProject {
         cwd: PathBuf,
         title: Option<String>,
@@ -222,6 +235,8 @@ pub enum DaemonRequest {
         integration_model: Option<String>,
         roles: Option<Vec<ThreadRole>>,
         bindings: Vec<ManagedProjectThreadAttachment>,
+        scenario: Option<String>,
+        seed_file: Option<PathBuf>,
     },
     SpawnManagedProject {
         cwd: PathBuf,
@@ -281,6 +296,7 @@ pub struct ManagedProjectBootstrap {
     pub manifest_path: PathBuf,
     pub contract_path: PathBuf,
     pub codex_config_path: PathBuf,
+    pub scenario: Option<ManagedProjectScenarioState>,
     pub roles: Vec<ManagedProjectRoleBootstrap>,
 }
 
@@ -297,6 +313,52 @@ pub struct ManagedProjectThreadAttachment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedProjectScenarioState {
+    pub scenario_id: String,
+    pub scenario_kind: String,
+    pub operator_seed: String,
+    pub current_round: usize,
+    pub current_phase: String,
+    pub pending_approval: Option<ManagedProjectApprovalState>,
+    pub rounds: Vec<ManagedProjectRoundState>,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedProjectApprovalState {
+    pub approval_kind: String,
+    pub requested_by_role: String,
+    pub prompt: String,
+    pub approved: bool,
+    pub response: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedProjectRoundState {
+    pub round_number: usize,
+    pub phase: String,
+    pub director_turn_id: Option<String>,
+    pub director_summary: Option<String>,
+    pub role_handoffs: BTreeMap<String, ManagedProjectRoleHandoff>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedProjectRoleHandoff {
+    pub role: String,
+    pub thread_id: String,
+    pub turn_id: Option<String>,
+    pub prompt_summary: String,
+    pub handoff_summary: Option<String>,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ManagedProjectScenarioSeed {
+    operator_seed: String,
+    landing_approval: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ManagedProjectManifest {
     schema: String,
     project_id: String,
@@ -308,6 +370,7 @@ struct ManagedProjectManifest {
     worktree_root: String,
     contract_path: String,
     codex_config_path: String,
+    scenario: Option<ManagedProjectScenarioState>,
     roles: BTreeMap<String, ManagedProjectManifestRole>,
 }
 
@@ -330,6 +393,23 @@ struct ManagedAgentFile {
     model: Option<String>,
     sandbox_mode: String,
     developer_instructions: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManagedProjectRoundSpec {
+    round_number: usize,
+    phase: &'static str,
+    director_goal: &'static str,
+    dev_goal: &'static str,
+    test_goal: &'static str,
+    integration_goal: &'static str,
+    requires_landing_approval: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedProjectTurnOutcome {
+    turn_id: String,
+    summary: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1228,6 +1308,7 @@ impl DaemonService {
             &worktree_root,
             &contract_path,
             &codex_config_path,
+            None,
             &[&director_role, &dev_role, &test_role, &integration_role],
         );
         save_managed_project_manifest(&manifest_path, &manifest)?;
@@ -1240,6 +1321,7 @@ impl DaemonService {
             manifest_path,
             contract_path,
             codex_config_path,
+            scenario: None,
             roles: vec![director_role, dev_role, test_role, integration_role],
         })
     }
@@ -1495,6 +1577,29 @@ impl DaemonService {
                 test_model,
                 integration_model,
             )?),
+            InitManagedProject {
+                path,
+                title,
+                objective,
+                template,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+            } => DaemonResponse::ManagedProject(self.init_managed_project(
+                path,
+                title,
+                objective,
+                template,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+            )?),
             DirectManagedProject {
                 cwd,
                 title,
@@ -1507,6 +1612,8 @@ impl DaemonService {
                 integration_model,
                 roles,
                 bindings,
+                scenario,
+                seed_file,
             } => DaemonResponse::ManagedProject(self.direct_managed_project(
                 cwd,
                 title,
@@ -1519,6 +1626,8 @@ impl DaemonService {
                 integration_model,
                 roles,
                 bindings,
+                scenario,
+                seed_file,
             )?),
             SpawnManagedProject { cwd, roles } => {
                 DaemonResponse::ManagedProject(self.spawn_managed_project(cwd, roles)?)
@@ -1785,6 +1894,7 @@ fn build_managed_project_manifest(
     worktree_root: &Path,
     contract_path: &Path,
     codex_config_path: &Path,
+    scenario: Option<ManagedProjectScenarioState>,
     roles: &[&ManagedProjectRoleBootstrap],
 ) -> ManagedProjectManifest {
     let mut role_map = BTreeMap::new();
@@ -1818,6 +1928,7 @@ fn build_managed_project_manifest(
         worktree_root: worktree_root.display().to_string(),
         contract_path: contract_path.display().to_string(),
         codex_config_path: codex_config_path.display().to_string(),
+        scenario,
         roles: role_map,
     }
 }
@@ -1839,6 +1950,26 @@ fn save_managed_project_manifest(path: &Path, manifest: &ManagedProjectManifest)
 fn load_managed_project_manifest(path: &Path) -> Result<ManagedProjectManifest> {
     let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))
+}
+
+fn load_managed_project_seed(path: Option<&Path>) -> Result<ManagedProjectScenarioSeed> {
+    if let Some(path) = path {
+        let contents =
+            fs::read_to_string(path).with_context(|| format!("read scenario seed {}", path.display()))?;
+        return toml::from_str(&contents)
+            .with_context(|| format!("parse scenario seed {}", path.display()));
+    }
+    Ok(ManagedProjectScenarioSeed {
+        operator_seed: default_taskflow_operator_seed(),
+        landing_approval: Some(
+            "Approved. Proceed with final integration and landing if validation is green."
+                .to_string(),
+        ),
+    })
+}
+
+fn default_taskflow_operator_seed() -> String {
+    "Build a Rust CLI called taskflow.\n\nRequirements:\n- Read a YAML workflow file describing tasks with ids, commands, dependencies, and retry counts.\n- Validate dependency graphs and reject cycles or missing dependencies.\n- Execute tasks in topological order.\n- Retry failed tasks up to the configured retry count.\n- Write a JSON report summarizing task results, retries, execution order, and overall outcome.\n- Expose:\n  - taskflow validate <workflow.yml>\n  - taskflow run <workflow.yml> --report <report.json>\n- Include unit tests, integration tests, example workflows, and a README.\n".to_string()
 }
 
 fn managed_project_roles_in_order(
@@ -1955,6 +2086,36 @@ fn ordered_managed_project_roles(
 }
 
 impl DaemonService {
+    pub fn init_managed_project(
+        &self,
+        path: impl AsRef<Path>,
+        title: Option<String>,
+        objective: Option<String>,
+        template: Option<String>,
+        base_branch: Option<String>,
+        worktree_root: Option<PathBuf>,
+        director_model: Option<String>,
+        dev_model: Option<String>,
+        test_model: Option<String>,
+        integration_model: Option<String>,
+    ) -> Result<ManagedProjectBootstrap> {
+        let path = path.as_ref();
+        fs::create_dir_all(path)?;
+        initialize_git_repository(path, base_branch.as_deref())?;
+        scaffold_managed_project_template(path, template.as_deref())?;
+        self.open_managed_project(
+            path,
+            title,
+            objective,
+            base_branch,
+            worktree_root,
+            director_model,
+            dev_model,
+            test_model,
+            integration_model,
+        )
+    }
+
     fn managed_project_bootstrap_from_manifest(
         &self,
         manifest_path: &Path,
@@ -1996,6 +2157,7 @@ impl DaemonService {
             manifest_path: manifest_path.to_path_buf(),
             contract_path: PathBuf::from(&manifest.contract_path),
             codex_config_path: PathBuf::from(&manifest.codex_config_path),
+            scenario: manifest.scenario.clone(),
             roles: ordered_managed_project_roles(roles),
         })
     }
@@ -2029,6 +2191,7 @@ impl DaemonService {
             &bootstrap.worktree_root,
             &bootstrap.contract_path,
             &bootstrap.codex_config_path,
+            bootstrap.scenario.clone(),
             &role_refs,
         );
         save_managed_project_manifest(&bootstrap.manifest_path, &manifest)?;
@@ -2048,6 +2211,8 @@ impl DaemonService {
         integration_model: Option<String>,
         roles: Option<Vec<ThreadRole>>,
         bindings: Vec<ManagedProjectThreadAttachment>,
+        scenario: Option<String>,
+        seed_file: Option<PathBuf>,
     ) -> Result<ManagedProjectBootstrap> {
         let cwd = cwd.as_ref();
         let Some(repo_root) = managed_project_repo_root(cwd)? else {
@@ -2125,6 +2290,15 @@ impl DaemonService {
         }
 
         let role_refs: Vec<_> = bootstrap.roles.iter().collect();
+        if let Some(scenario_kind) = scenario.as_deref() {
+            let seed = load_managed_project_seed(seed_file.as_deref())?;
+            let scenario_state = self.run_managed_project_scenario(
+                &bootstrap,
+                scenario_kind,
+                &seed,
+            )?;
+            bootstrap.scenario = Some(scenario_state);
+        }
         let manifest = build_managed_project_manifest(
             &bootstrap.project,
             &bootstrap.repo_root,
@@ -2132,6 +2306,7 @@ impl DaemonService {
             &bootstrap.worktree_root,
             &bootstrap.contract_path,
             &bootstrap.codex_config_path,
+            bootstrap.scenario.clone(),
             &role_refs,
         );
         save_managed_project_manifest(&bootstrap.manifest_path, &manifest)?;
@@ -2166,10 +2341,179 @@ impl DaemonService {
             &bootstrap.worktree_root,
             &bootstrap.contract_path,
             &bootstrap.codex_config_path,
+            bootstrap.scenario.clone(),
             &role_refs,
         );
         save_managed_project_manifest(&bootstrap.manifest_path, &manifest)?;
         Ok(bootstrap)
+    }
+
+    fn run_managed_project_scenario(
+        &self,
+        bootstrap: &ManagedProjectBootstrap,
+        scenario_kind: &str,
+        seed: &ManagedProjectScenarioSeed,
+    ) -> Result<ManagedProjectScenarioState> {
+        if scenario_kind != "rust-taskflow-four-round" {
+            anyhow::bail!("unsupported managed project scenario `{scenario_kind}`");
+        }
+
+        let director = bootstrap
+            .roles
+            .iter()
+            .find(|role| role.role == ThreadRole::Director)
+            .ok_or_else(|| anyhow::anyhow!("managed project director role missing"))?;
+        let director_thread_id = director
+            .thread_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("managed project director thread is not attached"))?;
+
+        let dev = bootstrap
+            .roles
+            .iter()
+            .find(|role| role.role == ThreadRole::Develop)
+            .ok_or_else(|| anyhow::anyhow!("managed project dev role missing"))?;
+        let test = bootstrap
+            .roles
+            .iter()
+            .find(|role| role.role == ThreadRole::Test)
+            .ok_or_else(|| anyhow::anyhow!("managed project test role missing"))?;
+        let integration = bootstrap
+            .roles
+            .iter()
+            .find(|role| role.role == ThreadRole::Integrate)
+            .ok_or_else(|| anyhow::anyhow!("managed project integration role missing"))?;
+
+        let mut state = ManagedProjectScenarioState {
+            scenario_id: uuid::Uuid::now_v7().to_string(),
+            scenario_kind: scenario_kind.to_string(),
+            operator_seed: seed.operator_seed.clone(),
+            current_round: 0,
+            current_phase: "plan".to_string(),
+            pending_approval: None,
+            rounds: Vec::new(),
+            completed: false,
+        };
+
+        let round_specs = taskflow_round_specs();
+        let mut worker_context = String::new();
+
+        for spec in &round_specs {
+            state.current_round = spec.round_number;
+            state.current_phase = spec.phase.to_string();
+
+            let mut round = ManagedProjectRoundState {
+                round_number: spec.round_number,
+                phase: spec.phase.to_string(),
+                director_turn_id: None,
+                director_summary: None,
+                role_handoffs: BTreeMap::new(),
+            };
+
+            let director_prompt = build_director_round_prompt(
+                bootstrap,
+                spec,
+                &seed.operator_seed,
+                &worker_context,
+                state.pending_approval.as_ref(),
+            );
+            let director_turn = self.run_role_prompt(
+                &bootstrap.repo_root,
+                director,
+                director_thread_id,
+                &director_prompt,
+            )?;
+            round.director_turn_id = Some(director_turn.turn_id.clone());
+            round.director_summary = Some(director_turn.summary.clone());
+
+            if spec.requires_landing_approval {
+                state.pending_approval = Some(ManagedProjectApprovalState {
+                    approval_kind: "landing".to_string(),
+                    requested_by_role: "director".to_string(),
+                    prompt: director_turn.summary.clone(),
+                    approved: true,
+                    response: seed.landing_approval.clone(),
+                });
+            }
+
+            for role in [dev, test, integration] {
+                let thread_id = role.thread_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("managed project role `{}` is not attached", role_slug(role.role))
+                })?;
+                let worker_prompt = build_worker_round_prompt(
+                    bootstrap,
+                    spec,
+                    role,
+                    &director_turn.summary,
+                    state.pending_approval.as_ref(),
+                );
+                let handoff =
+                    self.run_role_prompt(&bootstrap.repo_root, role, thread_id, &worker_prompt)?;
+                round.role_handoffs.insert(
+                    role_slug(role.role).to_string(),
+                    ManagedProjectRoleHandoff {
+                        role: role_slug(role.role).to_string(),
+                        thread_id: thread_id.to_string(),
+                        turn_id: Some(handoff.turn_id),
+                        prompt_summary: worker_prompt.lines().next().unwrap_or("").to_string(),
+                        handoff_summary: Some(handoff.summary),
+                        completed: true,
+                    },
+                );
+            }
+
+            worker_context = render_round_handoffs(&round);
+            state.rounds.push(round);
+        }
+
+        state.current_phase = "completed".to_string();
+        state.completed = true;
+        Ok(state)
+    }
+
+    fn run_role_prompt(
+        &self,
+        repo_root: &Path,
+        role_bootstrap: &ManagedProjectRoleBootstrap,
+        thread_id: &str,
+        prompt: &str,
+    ) -> Result<ManagedProjectTurnOutcome> {
+        let cwd = role_bootstrap
+            .worktree_path
+            .as_deref()
+            .unwrap_or(repo_root);
+        let client = self.codex_runtime_client(cwd)?;
+        let turn = client.start_turn(thread_id, prompt, Some(cwd), role_bootstrap.model.clone())?;
+        let completed = client.wait_for_turn_completion(thread_id, &turn.id)?;
+        let thread = client
+            .read_thread_full(thread_id, true)?
+            .ok_or_else(|| anyhow::anyhow!("thread `{thread_id}` not found after turn"))?;
+        let finished_turn = thread
+            .turns
+            .into_iter()
+            .find(|candidate| candidate.id == completed.id)
+            .ok_or_else(|| anyhow::anyhow!("turn `{}` not found after completion", completed.id))?;
+        match finished_turn.status {
+            protocol::TurnStatus::Completed => Ok(ManagedProjectTurnOutcome {
+                turn_id: finished_turn.id,
+                summary: summarize_turn_items(&finished_turn.items),
+            }),
+            protocol::TurnStatus::Failed => anyhow::bail!(
+                "turn `{}` for role `{}` failed",
+                finished_turn.id,
+                role_slug(role_bootstrap.role)
+            ),
+            protocol::TurnStatus::Interrupted => anyhow::bail!(
+                "turn `{}` for role `{}` was interrupted",
+                finished_turn.id,
+                role_slug(role_bootstrap.role)
+            ),
+            protocol::TurnStatus::InProgress => anyhow::bail!(
+                "turn `{}` for role `{}` did not complete",
+                finished_turn.id,
+                role_slug(role_bootstrap.role)
+            ),
+        }
     }
 
     fn spawn_managed_project_role(
@@ -2421,6 +2765,74 @@ fn write_managed_file(path: &Path, contents: &str) -> Result<()> {
     }
 }
 
+fn initialize_git_repository(path: &Path, base_branch: Option<&str>) -> Result<()> {
+    if path.join(".git").exists() {
+        return Ok(());
+    }
+    let branch = base_branch.unwrap_or("main");
+    run_command(path, "git", ["init", "-b", branch])?;
+    Ok(())
+}
+
+fn scaffold_managed_project_template(path: &Path, template: Option<&str>) -> Result<()> {
+    match template.unwrap_or("rust-taskflow") {
+        "rust-taskflow" => {
+            run_command(
+                path,
+                "cargo",
+                ["init", "--name", "taskflow", "--bin", "--vcs", "none", "."],
+            )?;
+            write_managed_file(
+                &path.join("src").join("lib.rs"),
+                "pub fn project_name() -> &'static str {\n    \"taskflow\"\n}\n",
+            )?;
+            write_managed_file(
+                &path.join(".gitignore"),
+                "/target\n/.tt\n/.codex\n*.log\n",
+            )?;
+            if !path.join("tests").exists() {
+                fs::create_dir_all(path.join("tests"))?;
+            }
+            write_managed_file(
+                &path.join("README.md"),
+                "# taskflow\n\nA Rust workflow runner managed by TT.\n",
+            )?;
+            ensure_initial_repository_commit(path)?;
+            Ok(())
+        }
+        other => anyhow::bail!("unsupported managed project template `{other}`"),
+    }
+}
+
+fn run_command<I, S>(cwd: &Path, program: &str, args: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let status = Command::new(program).current_dir(cwd).args(args).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("command `{program}` failed in {}", cwd.display())
+    }
+}
+
+fn ensure_initial_repository_commit(path: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    run_command(path, "git", ["config", "user.email", "tt@example.invalid"])?;
+    run_command(path, "git", ["config", "user.name", "TT Scenario"])?;
+    run_command(path, "git", ["add", "."])?;
+    run_command(path, "git", ["commit", "-m", "Initial scaffold"])?;
+    Ok(())
+}
+
 fn resolve_path(base: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
@@ -2460,6 +2872,153 @@ fn sanitize_project_slug(raw: &str) -> String {
     } else {
         output
     }
+}
+
+fn taskflow_round_specs() -> [ManagedProjectRoundSpec; 4] {
+    [
+        ManagedProjectRoundSpec {
+            round_number: 1,
+            phase: "plan",
+            director_goal: "Create the first architecture and work plan for the taskflow CLI. Convert the operator seed into a concrete plan, todo list, and role assignments.",
+            dev_goal: "Create the initial Rust crate structure for taskflow and implement the workflow/task model plus YAML parsing and validation scaffolding.",
+            test_goal: "Design the test matrix and create fixture workflows covering valid graphs, missing dependencies, and cycles.",
+            integration_goal: "Define the CLI shape, example workflow expectations, README outline, and the merge constraints for later rounds.",
+            requires_landing_approval: false,
+        },
+        ManagedProjectRoundSpec {
+            round_number: 2,
+            phase: "develop",
+            director_goal: "Review the first worker handoffs and dispatch the second round focused on execution order, dependency validation, and CLI cohesion.",
+            dev_goal: "Implement dependency validation and the executor foundation for topological task execution.",
+            test_goal: "Add automated tests for validation failures, invalid graphs, and the first execution-path fixtures.",
+            integration_goal: "Wire the CLI commands so validate and run are coherent with the implementation direction and update docs/examples to match.",
+            requires_landing_approval: false,
+        },
+        ManagedProjectRoundSpec {
+            round_number: 3,
+            phase: "integrate",
+            director_goal: "Use the round-two reports to dispatch retry behavior, JSON reporting, and end-to-end usage alignment.",
+            dev_goal: "Implement retry behavior and JSON report generation for taskflow runs.",
+            test_goal: "Add retry, failure, and report-output assertions to the test suite.",
+            integration_goal: "Add sample workflows, ensure CLI/report path behavior is usable, and prepare a merge-readiness summary.",
+            requires_landing_approval: false,
+        },
+        ManagedProjectRoundSpec {
+            round_number: 4,
+            phase: "merge",
+            director_goal: "Review the final worker reports, request landing approval, and coordinate final stabilization and landing preparation.",
+            dev_goal: "Fix remaining defects surfaced by validation and keep the implementation scope narrow.",
+            test_goal: "Run the full cargo test pass and produce a final validation summary with any remaining blockers.",
+            integration_goal: "Finalize README and examples, verify merge readiness, and prepare the repo for landing after approval.",
+            requires_landing_approval: true,
+        },
+    ]
+}
+
+fn build_director_round_prompt(
+    bootstrap: &ManagedProjectBootstrap,
+    spec: &ManagedProjectRoundSpec,
+    operator_seed: &str,
+    prior_handoffs: &str,
+    approval: Option<&ManagedProjectApprovalState>,
+) -> String {
+    let approval_text = approval
+        .map(|approval| {
+            format!(
+                "Approval state: kind={} approved={} response={}\n",
+                approval.approval_kind,
+                approval.approved,
+                approval.response.as_deref().unwrap_or("<none>")
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "Managed project round {} phase `{}` for project `{}`.\n{}\nOperator seed:\n{}\n\nPrior worker handoffs:\n{}\n\nWrite a concrete project update for this round. Include: plan, todo, dispatch decisions, blockers, and next step.",
+        spec.round_number,
+        spec.phase,
+        bootstrap.project.slug,
+        approval_text,
+        operator_seed,
+        if prior_handoffs.trim().is_empty() {
+            "<none yet>"
+        } else {
+            prior_handoffs
+        }
+    )
+}
+
+fn build_worker_round_prompt(
+    bootstrap: &ManagedProjectBootstrap,
+    spec: &ManagedProjectRoundSpec,
+    role: &ManagedProjectRoleBootstrap,
+    director_summary: &str,
+    approval: Option<&ManagedProjectApprovalState>,
+) -> String {
+    let role_goal = match role.role {
+        ThreadRole::Develop => spec.dev_goal,
+        ThreadRole::Test => spec.test_goal,
+        ThreadRole::Integrate => spec.integration_goal,
+        _ => spec.director_goal,
+    };
+    let approval_text = approval
+        .map(|value| {
+            format!(
+                "\nApproval state: kind={} approved={} response={}",
+                value.approval_kind,
+                value.approved,
+                value.response.as_deref().unwrap_or("<none>")
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "Director dispatch for project `{}` round {} phase `{}`.\nRole: {}\nAssigned goal: {}\nDirector summary:\n{}\n{}\n\nStay in your assigned worktree and return a structured handoff covering status, changed_files, tests_run, blockers, and next_step.",
+        bootstrap.project.slug,
+        spec.round_number,
+        spec.phase,
+        role_slug(role.role),
+        role_goal,
+        director_summary,
+        approval_text
+    )
+}
+
+fn summarize_turn_items(items: &[protocol::ThreadItem]) -> String {
+    let mut chunks = Vec::new();
+    for item in items {
+        match item {
+            protocol::ThreadItem::AgentMessage { text, .. } | protocol::ThreadItem::Plan { text, .. } => {
+                if !text.trim().is_empty() {
+                    chunks.push(text.trim().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    if chunks.is_empty() {
+        "<no agent summary captured>".to_string()
+    } else {
+        chunks.join("\n\n")
+    }
+}
+
+fn render_round_handoffs(round: &ManagedProjectRoundState) -> String {
+    let mut output = format!("Round {} phase `{}`\n", round.round_number, round.phase);
+    if let Some(summary) = round.director_summary.as_ref() {
+        output.push_str("Director summary:\n");
+        output.push_str(summary);
+        output.push_str("\n");
+    }
+    for (role, handoff) in &round.role_handoffs {
+        output.push_str(&format!(
+            "\n{} handoff:\n{}\n",
+            role,
+            handoff
+                .handoff_summary
+                .as_deref()
+                .unwrap_or("<missing handoff>")
+        ));
+    }
+    output
 }
 
 fn workspace_status_from_git(inspection: &tt_git::GitRepositoryInspection) -> WorkspaceStatus {
@@ -2712,6 +3271,8 @@ mod tests {
                 role: ThreadRole::Director,
                 thread_id: "thread-1".into(),
             }],
+            scenario: Some("rust-taskflow-four-round".into()),
+            seed_file: Some(PathBuf::from("/repo/seed.toml")),
         };
         let encoded = serde_json::to_string(&request).expect("serialize request");
         let decoded: DaemonRequest = serde_json::from_str(&encoded).expect("deserialize request");
@@ -2894,6 +3455,7 @@ mod tests {
             &dir.path().join(".tt-worktrees/alpha"),
             &dir.path().join(".tt/contracts/worker-contract.md"),
             &dir.path().join(".codex/config.toml"),
+            None,
             &[&role],
         );
         let path = dir.path().join("managed-project.toml");
