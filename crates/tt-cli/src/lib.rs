@@ -32,6 +32,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    Doctor {
+        #[arg(long, default_value_t = false)]
+        codex: bool,
+    },
     Status,
     Repo,
     Project {
@@ -339,6 +343,9 @@ fn request_cwd_for_command(cwd: &Path, command: &Command) -> PathBuf {
 
 fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
     Ok(match command {
+        Command::Doctor { codex: _ } => DaemonRequest::DoctorCodex {
+            cwd: cwd.to_path_buf(),
+        },
         Command::Status => DaemonRequest::Status,
         Command::Repo => DaemonRequest::RepositorySummary {
             cwd: cwd.to_path_buf(),
@@ -629,6 +636,29 @@ fn render_response(response: &DaemonResponse) -> String {
     match response {
         DaemonResponse::Unit => "ok".to_string(),
         DaemonResponse::Count(count) => format!("updated {count}"),
+        DaemonResponse::CodexDoctor(report) => format!(
+            "codex doctor\ncontract_ok: {}\ncodex_bin: {}\ncodex_version: {}\napp_server_bin: {}\napp_server_version: {}\nlisten_url: {}\ncodex_home: {}\nerror: {}\n",
+            report.contract_ok,
+            report
+                .codex_bin
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unresolved>".to_string()),
+            report.codex_version.as_deref().unwrap_or("<unknown>"),
+            report
+                .app_server_bin
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unresolved>".to_string()),
+            report.app_server_version.as_deref().unwrap_or("<unknown>"),
+            report.configured_listen_url,
+            report
+                .codex_home
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unresolved>".to_string()),
+            report.error.as_deref().unwrap_or("<none>")
+        ),
         DaemonResponse::Status(status) => format!(
             "status\nprojects: {}\nwork-units: {}\nbound-threads: {}\nready-workspaces: {}\n",
             status.project_count,
@@ -1054,6 +1084,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_doctor_codex_command() {
+        let cli = Cli::parse_from(["tt", "doctor", "--codex"]);
+        assert!(matches!(cli.command, Command::Doctor { codex: true }));
+    }
+
+    #[test]
     fn parses_project_open_command() {
         let cli = Cli::parse_from(["tt", "project", "open", "--title", "Alpha"]);
         assert!(matches!(
@@ -1395,5 +1431,25 @@ mod tests {
         assert!(text.contains("latest_turn_status=Failed"));
         assert!(text.contains("latest_turn_error=model backend failed"));
         assert!(text.contains("latest_turn_summary=plan"));
+    }
+
+    #[test]
+    fn renders_codex_doctor_report() {
+        let text = render_response(&DaemonResponse::CodexDoctor(tt_daemon::CodexDoctorReport {
+            contract_ok: false,
+            codex_bin: Some("/home/me/.local/bin/codex".into()),
+            app_server_bin: None,
+            codex_version: Some("codex 1.2.3".into()),
+            app_server_version: None,
+            configured_listen_url: "ws://127.0.0.1:4500".into(),
+            codex_home: Some("/repo/.codex".into()),
+            error: Some("missing app-server".into()),
+        }));
+
+        assert!(text.contains("codex doctor"));
+        assert!(text.contains("contract_ok: false"));
+        assert!(text.contains("codex_bin: /home/me/.local/bin/codex"));
+        assert!(text.contains("app_server_bin: <unresolved>"));
+        assert!(text.contains("error: missing app-server"));
     }
 }

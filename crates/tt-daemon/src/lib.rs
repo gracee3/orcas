@@ -21,7 +21,10 @@ use clap as _;
 use codex_app_server_protocol as protocol;
 use codex_protocol::openai_models::ReasoningEffort;
 use serde::{Deserialize, Serialize};
-use tt_codex::{CodexHome, CodexRuntimeClient, CodexThreadRuntimeSnapshot};
+use tt_codex::{
+    CodexHome, CodexRuntimeClient, CodexThreadRuntimeSnapshot, configured_app_server_listen_url,
+    validate_runtime_contract,
+};
 use tt_domain::{
     MergeAuthorizationStatus, MergeExecutionStatus, MergeReadiness, MergeRun, Project,
     ProjectStatus, ThreadBinding, ThreadBindingStatus, ThreadRole, WorkUnit, WorkUnitStatus,
@@ -49,8 +52,23 @@ pub struct DaemonStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexDoctorReport {
+    pub contract_ok: bool,
+    pub codex_bin: Option<PathBuf>,
+    pub app_server_bin: Option<PathBuf>,
+    pub codex_version: Option<String>,
+    pub app_server_version: Option<String>,
+    pub configured_listen_url: String,
+    pub codex_home: Option<PathBuf>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum DaemonRequest {
+    DoctorCodex {
+        cwd: PathBuf,
+    },
     Status,
     DashboardSummary,
     RepositorySummary {
@@ -254,6 +272,7 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
     Unit,
     Count(usize),
+    CodexDoctor(CodexDoctorReport),
     Status(DaemonStatus),
     DashboardSummary(DashboardSummary),
     RepositorySummary(Option<GitRepositorySummary>),
@@ -1183,6 +1202,10 @@ impl DaemonService {
         })
     }
 
+    pub fn codex_doctor(&self, cwd: impl AsRef<Path>) -> CodexDoctorReport {
+        codex_doctor_for_cwd(cwd)
+    }
+
     pub fn dashboard_summary(&self) -> Result<DashboardSummary> {
         let status = self.status()?;
         Ok(DashboardSummary {
@@ -1434,6 +1457,7 @@ impl DaemonService {
     pub fn handle_request(&self, request: DaemonRequest) -> Result<DaemonResponse> {
         use DaemonRequest::*;
         Ok(match request {
+            DoctorCodex { cwd } => DaemonResponse::CodexDoctor(self.codex_doctor(cwd)),
             Status => DaemonResponse::Status(self.status()?),
             DashboardSummary => DaemonResponse::DashboardSummary(self.dashboard_summary()?),
             RepositorySummary { cwd } => {
@@ -3763,6 +3787,15 @@ pub fn socket_path_for(cwd: impl AsRef<Path>) -> PathBuf {
 
 pub fn request_for_cwd(cwd: impl AsRef<Path>, request: DaemonRequest) -> Result<DaemonResponse> {
     let cwd = cwd.as_ref();
+    if let DaemonRequest::DoctorCodex { cwd } = request.clone() {
+        let socket_path = socket_path_for(cwd.as_path());
+        if let Ok(client) = DaemonClient::connect(&socket_path)
+            && let Ok(response) = client.request(DaemonRequest::DoctorCodex { cwd: cwd.clone() })
+        {
+            return Ok(response);
+        }
+        return Ok(DaemonResponse::CodexDoctor(codex_doctor_for_cwd(cwd)));
+    }
     let socket_path = socket_path_for(cwd);
     if let Ok(client) = DaemonClient::connect(&socket_path) {
         if let Ok(response) = client.request(request.clone()) {
@@ -3811,6 +3844,47 @@ fn handle_connection(runtime: &DaemonRuntime, mut stream: UnixStream) -> Result<
     stream.write_all(&line)?;
     stream.flush()?;
     Ok(())
+}
+
+fn codex_doctor_for_cwd(cwd: impl AsRef<Path>) -> CodexDoctorReport {
+    let configured_listen_url = configured_app_server_listen_url();
+    match validate_runtime_contract() {
+        Ok(contract) => CodexDoctorReport {
+            contract_ok: true,
+            codex_version: read_binary_version(contract.codex_bin()),
+            app_server_version: read_binary_version(contract.app_server_bin()),
+            codex_bin: Some(contract.codex_bin().to_path_buf()),
+            app_server_bin: Some(contract.app_server_bin().to_path_buf()),
+            codex_home: CodexHome::discover_in(cwd)
+                .ok()
+                .map(|home| home.root().to_path_buf()),
+            configured_listen_url,
+            error: None,
+        },
+        Err(error) => CodexDoctorReport {
+            contract_ok: false,
+            codex_bin: None,
+            app_server_bin: None,
+            codex_version: None,
+            app_server_version: None,
+            codex_home: None,
+            configured_listen_url,
+            error: Some(format!("{error:#}")),
+        },
+    }
+}
+
+fn read_binary_version(path: &Path) -> Option<String> {
+    let output = Command::new(path).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        None
+    } else {
+        Some(stdout)
+    }
 }
 
 #[cfg(test)]

@@ -873,6 +873,10 @@ fn resolve_app_server_listen_url() -> String {
         .unwrap_or_else(|| DEFAULT_APP_SERVER_LISTEN_URL.to_string())
 }
 
+pub fn configured_app_server_listen_url() -> String {
+    resolve_app_server_listen_url()
+}
+
 fn resolve_required_binary(env_key: &str, binary_name: &str, label: &str) -> Result<PathBuf> {
     let path = if let Some(value) = env::var_os(env_key) {
         PathBuf::from(value)
