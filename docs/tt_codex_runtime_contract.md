@@ -152,6 +152,7 @@ Recommended lanes:
 TT should add an explicit compatibility check surface, preferably through:
 - `tt doctor`
 - `tt doctor --codex`
+- `tt doctor --codex --check-listen`
 
 That output should include:
 - resolved `codex` binary path
@@ -231,6 +232,11 @@ but it should not be the default product assumption.
 2. Add compatibility reporting in `tt doctor --codex`
 3. Teach TT CI to consume prebuilt Codex stable and alpha artifacts
 4. Keep live managed-project scenarios as the runtime compatibility gate
+
+The current TT repo CI shape should include:
+- a TT-only lane with Codex shim binaries
+- a Codex stable lane using prebuilt artifacts
+- a Codex alpha lane using prebuilt artifacts
 
 ## Handoff Summary
 

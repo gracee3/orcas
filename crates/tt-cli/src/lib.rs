@@ -35,6 +35,8 @@ pub enum Command {
     Doctor {
         #[arg(long, default_value_t = false)]
         codex: bool,
+        #[arg(long = "check-listen", default_value_t = false)]
+        check_listen: bool,
     },
     Status,
     Repo,
@@ -343,9 +345,22 @@ fn request_cwd_for_command(cwd: &Path, command: &Command) -> PathBuf {
 
 fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
     Ok(match command {
-        Command::Doctor { codex: _ } => DaemonRequest::DoctorCodex {
-            cwd: cwd.to_path_buf(),
-        },
+        Command::Doctor {
+            codex,
+            check_listen,
+        } => {
+            if codex {
+                DaemonRequest::DoctorCodex {
+                    cwd: cwd.to_path_buf(),
+                    check_listen,
+                }
+            } else {
+                DaemonRequest::Doctor {
+                    cwd: cwd.to_path_buf(),
+                    check_listen,
+                }
+            }
+        }
         Command::Status => DaemonRequest::Status,
         Command::Repo => DaemonRequest::RepositorySummary {
             cwd: cwd.to_path_buf(),
@@ -636,8 +651,33 @@ fn render_response(response: &DaemonResponse) -> String {
     match response {
         DaemonResponse::Unit => "ok".to_string(),
         DaemonResponse::Count(count) => format!("updated {count}"),
+        DaemonResponse::Doctor(report) => format!(
+            "doctor\ncwd: {}\ntt_cli_generation: {}\ndaemon_api_version: {}\ntt_project_root: {}\ncodex_project_root: {}\ndaemon_socket: {}\ncodex_contract_ok: {}\ncodex_listen_url: {}\ncodex_listen_reachable: {}\ncodex_listen_error: {}\ncodex_error: {}\n",
+            report.cwd.display(),
+            report.tt_cli_generation,
+            report.daemon_api_version,
+            report
+                .tt_project_root
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            report
+                .codex_project_root
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            report.daemon_socket_path.display(),
+            report.codex_contract_ok,
+            report.codex_listen_url,
+            report
+                .codex_listen_reachable
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<not-checked>".to_string()),
+            report.codex_listen_error.as_deref().unwrap_or("<none>"),
+            report.codex_error.as_deref().unwrap_or("<none>")
+        ),
         DaemonResponse::CodexDoctor(report) => format!(
-            "codex doctor\ncontract_ok: {}\ncodex_bin: {}\ncodex_version: {}\napp_server_bin: {}\napp_server_version: {}\nlisten_url: {}\ncodex_home: {}\nerror: {}\n",
+            "codex doctor\ncontract_ok: {}\ncodex_bin: {}\ncodex_version: {}\napp_server_bin: {}\napp_server_version: {}\nlisten_url: {}\nlisten_reachable: {}\nlisten_error: {}\ncodex_home: {}\nerror: {}\n",
             report.contract_ok,
             report
                 .codex_bin
@@ -652,6 +692,11 @@ fn render_response(response: &DaemonResponse) -> String {
                 .unwrap_or_else(|| "<unresolved>".to_string()),
             report.app_server_version.as_deref().unwrap_or("<unknown>"),
             report.configured_listen_url,
+            report
+                .listen_reachable
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<not-checked>".to_string()),
+            report.listen_error.as_deref().unwrap_or("<none>"),
             report
                 .codex_home
                 .as_deref()
@@ -1086,7 +1131,25 @@ mod tests {
     #[test]
     fn parses_doctor_codex_command() {
         let cli = Cli::parse_from(["tt", "doctor", "--codex"]);
-        assert!(matches!(cli.command, Command::Doctor { codex: true }));
+        assert!(matches!(
+            cli.command,
+            Command::Doctor {
+                codex: true,
+                check_listen: false
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_doctor_codex_check_listen_command() {
+        let cli = Cli::parse_from(["tt", "doctor", "--codex", "--check-listen"]);
+        assert!(matches!(
+            cli.command,
+            Command::Doctor {
+                codex: true,
+                check_listen: true
+            }
+        ));
     }
 
     #[test]
@@ -1442,6 +1505,8 @@ mod tests {
             codex_version: Some("codex 1.2.3".into()),
             app_server_version: None,
             configured_listen_url: "ws://127.0.0.1:4500".into(),
+            listen_reachable: Some(false),
+            listen_error: Some("connection refused".into()),
             codex_home: Some("/repo/.codex".into()),
             error: Some("missing app-server".into()),
         }));
@@ -1450,6 +1515,31 @@ mod tests {
         assert!(text.contains("contract_ok: false"));
         assert!(text.contains("codex_bin: /home/me/.local/bin/codex"));
         assert!(text.contains("app_server_bin: <unresolved>"));
+        assert!(text.contains("listen_reachable: false"));
         assert!(text.contains("error: missing app-server"));
+    }
+
+    #[test]
+    fn renders_general_doctor_report() {
+        let text = render_response(&DaemonResponse::Doctor(tt_daemon::DoctorReport {
+            cwd: "/repo".into(),
+            tt_cli_generation: "v2".into(),
+            daemon_api_version: "v2".into(),
+            tt_project_root: Some("/repo".into()),
+            codex_project_root: Some("/repo".into()),
+            daemon_socket_path: "/repo/.tt/runtime/tt-daemon.sock".into(),
+            codex_contract_ok: true,
+            codex_error: None,
+            codex_listen_url: "ws://127.0.0.1:4500".into(),
+            codex_listen_reachable: Some(true),
+            codex_listen_error: None,
+        }));
+
+        assert!(text.contains("doctor"));
+        assert!(text.contains("cwd: /repo"));
+        assert!(text.contains("tt_cli_generation: v2"));
+        assert!(text.contains("daemon_api_version: v2"));
+        assert!(text.contains("codex_contract_ok: true"));
+        assert!(text.contains("codex_listen_reachable: true"));
     }
 }

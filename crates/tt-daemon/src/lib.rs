@@ -4,6 +4,7 @@
 //! It owns the local request/response API used by the TUI and CLI.
 
 use std::collections::BTreeMap;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -34,11 +35,13 @@ use tt_domain::{
 use tt_git::GitRepository;
 use tt_store::OverlayStore;
 use tt_ui_core::{CodexThreadDetail, CodexThreadSummary, DashboardSummary, GitRepositorySummary};
+use url::Url;
 
 pub const TT_DAEMON_API_VERSION: &str = "v2";
 pub const TT_DAEMON_SOCKET_NAME: &str = "tt-daemon.sock";
 const DEFAULT_AGENT_CONFIG_MAX_THREADS: usize = 6;
 const DEFAULT_AGENT_CONFIG_MAX_DEPTH: usize = 1;
+const DOCTOR_LISTEN_TIMEOUT_MS: u64 = 1500;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
@@ -59,15 +62,37 @@ pub struct CodexDoctorReport {
     pub codex_version: Option<String>,
     pub app_server_version: Option<String>,
     pub configured_listen_url: String,
+    pub listen_reachable: Option<bool>,
+    pub listen_error: Option<String>,
     pub codex_home: Option<PathBuf>,
     pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub cwd: PathBuf,
+    pub tt_cli_generation: String,
+    pub daemon_api_version: String,
+    pub tt_project_root: Option<PathBuf>,
+    pub codex_project_root: Option<PathBuf>,
+    pub daemon_socket_path: PathBuf,
+    pub codex_contract_ok: bool,
+    pub codex_error: Option<String>,
+    pub codex_listen_url: String,
+    pub codex_listen_reachable: Option<bool>,
+    pub codex_listen_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum DaemonRequest {
+    Doctor {
+        cwd: PathBuf,
+        check_listen: bool,
+    },
     DoctorCodex {
         cwd: PathBuf,
+        check_listen: bool,
     },
     Status,
     DashboardSummary,
@@ -272,6 +297,7 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
     Unit,
     Count(usize),
+    Doctor(DoctorReport),
     CodexDoctor(CodexDoctorReport),
     Status(DaemonStatus),
     DashboardSummary(DashboardSummary),
@@ -1203,7 +1229,15 @@ impl DaemonService {
     }
 
     pub fn codex_doctor(&self, cwd: impl AsRef<Path>) -> CodexDoctorReport {
-        codex_doctor_for_cwd(cwd)
+        codex_doctor_for_cwd(cwd, false)
+    }
+
+    pub fn codex_doctor_with_listen_check(&self, cwd: impl AsRef<Path>) -> CodexDoctorReport {
+        codex_doctor_for_cwd(cwd, true)
+    }
+
+    pub fn doctor(&self, cwd: impl AsRef<Path>, check_listen: bool) -> DoctorReport {
+        doctor_for_cwd(cwd, check_listen)
     }
 
     pub fn dashboard_summary(&self) -> Result<DashboardSummary> {
@@ -1457,7 +1491,12 @@ impl DaemonService {
     pub fn handle_request(&self, request: DaemonRequest) -> Result<DaemonResponse> {
         use DaemonRequest::*;
         Ok(match request {
-            DoctorCodex { cwd } => DaemonResponse::CodexDoctor(self.codex_doctor(cwd)),
+            Doctor { cwd, check_listen } => DaemonResponse::Doctor(self.doctor(cwd, check_listen)),
+            DoctorCodex { cwd, check_listen } => DaemonResponse::CodexDoctor(if check_listen {
+                self.codex_doctor_with_listen_check(cwd)
+            } else {
+                self.codex_doctor(cwd)
+            }),
             Status => DaemonResponse::Status(self.status()?),
             DashboardSummary => DaemonResponse::DashboardSummary(self.dashboard_summary()?),
             RepositorySummary { cwd } => {
@@ -3787,14 +3826,32 @@ pub fn socket_path_for(cwd: impl AsRef<Path>) -> PathBuf {
 
 pub fn request_for_cwd(cwd: impl AsRef<Path>, request: DaemonRequest) -> Result<DaemonResponse> {
     let cwd = cwd.as_ref();
-    if let DaemonRequest::DoctorCodex { cwd } = request.clone() {
+    if let DaemonRequest::Doctor { cwd, check_listen } = request.clone() {
         let socket_path = socket_path_for(cwd.as_path());
         if let Ok(client) = DaemonClient::connect(&socket_path)
-            && let Ok(response) = client.request(DaemonRequest::DoctorCodex { cwd: cwd.clone() })
+            && let Ok(response) = client.request(DaemonRequest::Doctor {
+                cwd: cwd.clone(),
+                check_listen,
+            })
         {
             return Ok(response);
         }
-        return Ok(DaemonResponse::CodexDoctor(codex_doctor_for_cwd(cwd)));
+        return Ok(DaemonResponse::Doctor(doctor_for_cwd(cwd, check_listen)));
+    }
+    if let DaemonRequest::DoctorCodex { cwd, check_listen } = request.clone() {
+        let socket_path = socket_path_for(cwd.as_path());
+        if let Ok(client) = DaemonClient::connect(&socket_path)
+            && let Ok(response) = client.request(DaemonRequest::DoctorCodex {
+                cwd: cwd.clone(),
+                check_listen,
+            })
+        {
+            return Ok(response);
+        }
+        return Ok(DaemonResponse::CodexDoctor(codex_doctor_for_cwd(
+            cwd,
+            check_listen,
+        )));
     }
     let socket_path = socket_path_for(cwd);
     if let Ok(client) = DaemonClient::connect(&socket_path) {
@@ -3846,8 +3903,34 @@ fn handle_connection(runtime: &DaemonRuntime, mut stream: UnixStream) -> Result<
     Ok(())
 }
 
-fn codex_doctor_for_cwd(cwd: impl AsRef<Path>) -> CodexDoctorReport {
+fn doctor_for_cwd(cwd: impl AsRef<Path>, check_listen: bool) -> DoctorReport {
+    let cwd = cwd.as_ref().to_path_buf();
+    let codex_doctor = codex_doctor_for_cwd(&cwd, check_listen);
+    DoctorReport {
+        cwd: cwd.clone(),
+        tt_cli_generation: "v2".to_string(),
+        daemon_api_version: TT_DAEMON_API_VERSION.to_string(),
+        tt_project_root: cwd.join(".tt").is_dir().then_some(cwd.clone()),
+        codex_project_root: cwd.join(".codex").is_dir().then_some(cwd.clone()),
+        daemon_socket_path: socket_path_for(&cwd),
+        codex_contract_ok: codex_doctor.contract_ok,
+        codex_error: codex_doctor.error.clone(),
+        codex_listen_url: codex_doctor.configured_listen_url.clone(),
+        codex_listen_reachable: codex_doctor.listen_reachable,
+        codex_listen_error: codex_doctor.listen_error.clone(),
+    }
+}
+
+fn codex_doctor_for_cwd(cwd: impl AsRef<Path>, check_listen: bool) -> CodexDoctorReport {
     let configured_listen_url = configured_app_server_listen_url();
+    let (listen_reachable, listen_error) = if check_listen {
+        match check_listen_reachability(&configured_listen_url) {
+            Ok(reachable) => (Some(reachable), None),
+            Err(error) => (Some(false), Some(format!("{error:#}"))),
+        }
+    } else {
+        (None, None)
+    };
     match validate_runtime_contract() {
         Ok(contract) => CodexDoctorReport {
             contract_ok: true,
@@ -3859,6 +3942,8 @@ fn codex_doctor_for_cwd(cwd: impl AsRef<Path>) -> CodexDoctorReport {
                 .ok()
                 .map(|home| home.root().to_path_buf()),
             configured_listen_url,
+            listen_reachable,
+            listen_error,
             error: None,
         },
         Err(error) => CodexDoctorReport {
@@ -3869,9 +3954,36 @@ fn codex_doctor_for_cwd(cwd: impl AsRef<Path>) -> CodexDoctorReport {
             app_server_version: None,
             codex_home: None,
             configured_listen_url,
+            listen_reachable,
+            listen_error,
             error: Some(format!("{error:#}")),
         },
     }
+}
+
+fn check_listen_reachability(listen_url: &str) -> Result<bool> {
+    let url = Url::parse(listen_url)
+        .with_context(|| format!("invalid configured listen URL `{listen_url}`"))?;
+    let host = url
+        .host_str()
+        .with_context(|| format!("listen URL `{listen_url}` has no host"))?;
+    let port = url
+        .port_or_known_default()
+        .with_context(|| format!("listen URL `{listen_url}` has no port"))?;
+    let timeout = std::time::Duration::from_millis(DOCTOR_LISTEN_TIMEOUT_MS);
+    let addrs: Vec<_> = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve `{host}:{port}` for `{listen_url}`"))?
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("no socket addresses resolved for `{listen_url}`");
+    }
+    for addr in addrs {
+        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn read_binary_version(path: &Path) -> Option<String> {
@@ -3891,6 +4003,7 @@ fn read_binary_version(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use std::net::TcpListener;
     use std::process::Command;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -3901,6 +4014,14 @@ mod tests {
 
     fn ts() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 4, 8, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn check_listen_reachability_reports_true_for_open_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let url = format!("ws://127.0.0.1:{}", addr.port());
+        assert!(check_listen_reachability(&url).expect("reachability"));
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {

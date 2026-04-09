@@ -1,0 +1,127 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      codex_stable_url:
+        description: "Optional override URL for the Codex stable artifact tarball"
+        required: false
+        type: string
+      codex_alpha_url:
+        description: "Optional override URL for the Codex alpha artifact tarball"
+        required: false
+        type: string
+  schedule:
+    - cron: "0 7 * * *"
+
+jobs:
+  tt-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install TT-only Codex shims
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          cat >"$HOME/.local/bin/codex" <<'EOF'
+          #!/usr/bin/env bash
+          if [[ "${1:-}" == "--version" ]]; then
+            echo "codex shim 0.0.0"
+            exit 0
+          fi
+          echo "codex shim does not execute runtime commands" >&2
+          exit 1
+          EOF
+          cat >"$HOME/.local/bin/codex-app-server" <<'EOF'
+          #!/usr/bin/env bash
+          if [[ "${1:-}" == "--version" ]]; then
+            echo "codex-app-server shim 0.0.0"
+            exit 0
+          fi
+          echo "codex-app-server shim does not execute runtime commands" >&2
+          exit 1
+          EOF
+          chmod +x "$HOME/.local/bin/codex" "$HOME/.local/bin/codex-app-server"
+      - name: Cargo tests
+        run: |
+          export TT_CODEX_BIN="$HOME/.local/bin/codex"
+          export TT_CODEX_APP_SERVER_BIN="$HOME/.local/bin/codex-app-server"
+          cargo test --workspace --quiet
+      - name: Deterministic e2e
+        run: |
+          export TT_CODEX_BIN="$HOME/.local/bin/codex"
+          export TT_CODEX_APP_SERVER_BIN="$HOME/.local/bin/codex-app-server"
+          tests/e2e/run_all.sh
+
+  codex-stable:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.CODEX_STABLE_URL != '' }}
+    runs-on: ubuntu-latest
+    env:
+      CODEX_ARTIFACT_URL: ${{ inputs.codex_stable_url || vars.CODEX_STABLE_URL }}
+      CODEX_CHANNEL: stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Codex artifact
+        run: |
+          test -n "$CODEX_ARTIFACT_URL"
+          mkdir -p "$HOME/.local/bin" /tmp/codex-dist
+          curl -fsSL "$CODEX_ARTIFACT_URL" -o /tmp/codex-artifact.tgz
+          tar -xzf /tmp/codex-artifact.tgz -C /tmp/codex-dist
+          install "$(find /tmp/codex-dist -type f -name codex | head -n1)" "$HOME/.local/bin/codex"
+          install "$(find /tmp/codex-dist -type f -name codex-app-server | head -n1)" "$HOME/.local/bin/codex-app-server"
+      - name: Validate Codex contract
+        run: |
+          export TT_CODEX_BIN="$HOME/.local/bin/codex"
+          export TT_CODEX_APP_SERVER_BIN="$HOME/.local/bin/codex-app-server"
+          cargo run -q -p tt-cli -- doctor --codex
+      - name: Focused Rust tests
+        run: |
+          export TT_CODEX_BIN="$HOME/.local/bin/codex"
+          export TT_CODEX_APP_SERVER_BIN="$HOME/.local/bin/codex-app-server"
+          cargo test -p tt-codex -p tt-daemon -p tt-cli --quiet
+      - name: Live topology e2e
+        run: |
+          export TT_CODEX_BIN="$HOME/.local/bin/codex"
+          export TT_CODEX_APP_SERVER_BIN="$HOME/.local/bin/codex-app-server"
+          tests/e2e/run_scenario.sh managed-project-git-worktree
+
+  codex-alpha:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.CODEX_ALPHA_URL != '' }}
+    runs-on: ubuntu-latest
+    env:
+      CODEX_ARTIFACT_URL: ${{ inputs.codex_alpha_url || vars.CODEX_ALPHA_URL }}
+      CODEX_CHANNEL: alpha
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Codex artifact
+        run: |
+          test -n "$CODEX_ARTIFACT_URL"
+          mkdir -p "$HOME/.local/bin" /tmp/codex-dist
+          curl -fsSL "$CODEX_ARTIFACT_URL" -o /tmp/codex-artifact.tgz
+          tar -xzf /tmp/codex-artifact.tgz -C /tmp/codex-dist
+          install "$(find /tmp/codex-dist -type f -name codex | head -n1)" "$HOME/.local/bin/codex"
+          install "$(find /tmp/codex-dist -type f -name codex-app-server | head -n1)" "$HOME/.local/bin/codex-app-server"
+      - name: Validate Codex contract
+        run: |
+          export TT_CODEX_BIN="$HOME/.local/bin/codex"
+          export TT_CODEX_APP_SERVER_BIN="$HOME/.local/bin/codex-app-server"
+          cargo run -q -p tt-cli -- doctor --codex
+      - name: Focused Rust tests
+        run: |
+          export TT_CODEX_BIN="$HOME/.local/bin/codex"
+          export TT_CODEX_APP_SERVER_BIN="$HOME/.local/bin/codex-app-server"
+          cargo test -p tt-codex -p tt-daemon -p tt-cli --quiet
+      - name: Live topology e2e
+        run: |
+          export TT_CODEX_BIN="$HOME/.local/bin/codex"
+          export TT_CODEX_APP_SERVER_BIN="$HOME/.local/bin/codex-app-server"
+          tests/e2e/run_scenario.sh managed-project-git-worktree
