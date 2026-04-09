@@ -55,8 +55,8 @@ can inspect what the director and subagents are doing while a run is live.
   bindings, worktrees, repository state, and effective project plan without
   changing anything.
 - `tt project plan show` prints the current plan artifact.
-- `tt project plan refresh` normalizes the on-disk plan artifact from the
-  current managed-project state.
+- `tt project plan refresh` reloads the current managed-project plan and
+  renders the effective state without mutating the on-disk artifact.
 - `tt project director` creates or reuses the scaffold, chooses the role
   topology, activates the selected roles in one shot, and can optionally run a
   built-in seeded scenario. The director plan-checks against `.tt/plan.toml`

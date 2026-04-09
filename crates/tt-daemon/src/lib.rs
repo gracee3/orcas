@@ -1480,7 +1480,6 @@ impl DaemonService {
         }
         let manifest = load_managed_project_manifest(&manifest_path)?;
         let bootstrap = self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
-        self.save_managed_project_bootstrap(&bootstrap)?;
         Ok(ManagedProjectInspection {
             bootstrap,
             repository_summary: self.repository_summary(&repo_root)?,
@@ -5458,6 +5457,33 @@ mod tests {
         let encoded = serde_json::to_string(&request).expect("serialize request");
         let decoded: DaemonRequest = serde_json::from_str(&encoded).expect("deserialize request");
         assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn refresh_managed_project_plan_is_read_only() {
+        let (repo, _worktree) = setup_repo();
+        let dir = tempdir().expect("tempdir");
+        let service = DaemonService::new(OverlayStore::open_in_dir(dir.path()).expect("store"));
+        let bootstrap = service
+            .open_managed_project(
+                &repo,
+                Some("Alpha".to_string()),
+                Some("Ship the alpha slice".to_string()),
+                None,
+                None,
+                Some("director-model".to_string()),
+                Some("dev-model".to_string()),
+                Some("test-model".to_string()),
+                Some("integration-model".to_string()),
+            )
+            .expect("open managed project");
+        let plan_before = std::fs::read_to_string(&bootstrap.plan_path).expect("read plan");
+        let refreshed = service
+            .refresh_managed_project_plan(&repo)
+            .expect("refresh managed project plan");
+        let plan_after = std::fs::read_to_string(&bootstrap.plan_path).expect("read plan");
+        assert_eq!(plan_before, plan_after);
+        assert_eq!(refreshed.bootstrap.plan, bootstrap.plan);
     }
 
     #[test]
