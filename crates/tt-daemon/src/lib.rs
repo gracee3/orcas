@@ -1510,13 +1510,7 @@ impl DaemonService {
         let Some(repo_root) = managed_project_repo_root(cwd)? else {
             anyhow::bail!("managed project inspect requires a git repository");
         };
-        let manifest_path = repo_root.join(".tt").join("state.toml");
-        if !manifest_path.exists() {
-            anyhow::bail!(
-                "managed project state not found at {}",
-                manifest_path.display()
-            );
-        }
+        let manifest_path = require_initialized_managed_project(&repo_root)?;
         let manifest = load_managed_project_manifest(&manifest_path)?;
         let bootstrap = self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
         Ok(ManagedProjectInspection {
@@ -1540,13 +1534,7 @@ impl DaemonService {
         let Some(repo_root) = managed_project_repo_root(cwd)? else {
             anyhow::bail!("managed project plan refresh requires a git repository");
         };
-        let manifest_path = repo_root.join(".tt").join("state.toml");
-        if !manifest_path.exists() {
-            anyhow::bail!(
-                "managed project state not found at {}",
-                manifest_path.display()
-            );
-        }
+        let manifest_path = require_initialized_managed_project(&repo_root)?;
         let manifest = load_managed_project_manifest(&manifest_path)?;
         let bootstrap = self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
         Ok(ManagedProjectInspection {
@@ -1565,13 +1553,7 @@ impl DaemonService {
         let Some(repo_root) = managed_project_repo_root(cwd)? else {
             anyhow::bail!("managed project control requires a git repository");
         };
-        let manifest_path = repo_root.join(".tt").join("state.toml");
-        if !manifest_path.exists() {
-            anyhow::bail!(
-                "managed project state not found at {}",
-                manifest_path.display()
-            );
-        }
+        let manifest_path = require_initialized_managed_project(&repo_root)?;
         let manifest = load_managed_project_manifest(&manifest_path)?;
         let mut bootstrap =
             self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
@@ -3081,7 +3063,7 @@ impl DaemonService {
         };
         let repository = GitRepository::discover(&repo_root)?
             .ok_or_else(|| anyhow::anyhow!("managed project spawn requires a git repository"))?;
-        let manifest_path = repo_root.join(".tt").join("state.toml");
+        let manifest_path = require_initialized_managed_project(&repo_root)?;
         let manifest = load_managed_project_manifest(&manifest_path)?;
         let mut bootstrap =
             self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
@@ -3113,14 +3095,14 @@ impl DaemonService {
     fn direct_managed_project(
         &self,
         cwd: impl AsRef<Path>,
-        title: Option<String>,
-        objective: Option<String>,
-        base_branch: Option<String>,
-        worktree_root: Option<PathBuf>,
-        director_model: Option<String>,
-        dev_model: Option<String>,
-        test_model: Option<String>,
-        integration_model: Option<String>,
+        _title: Option<String>,
+        _objective: Option<String>,
+        _base_branch: Option<String>,
+        _worktree_root: Option<PathBuf>,
+        _director_model: Option<String>,
+        _dev_model: Option<String>,
+        _test_model: Option<String>,
+        _integration_model: Option<String>,
         roles: Option<Vec<ThreadRole>>,
         bindings: Vec<ManagedProjectThreadAttachment>,
         scenario: Option<String>,
@@ -3132,23 +3114,10 @@ impl DaemonService {
         };
         let repository = GitRepository::discover(&repo_root)?
             .ok_or_else(|| anyhow::anyhow!("managed project director requires a git repository"))?;
-        let manifest_path = repo_root.join(".tt").join("state.toml");
-        let mut bootstrap = if manifest_path.exists() {
-            let manifest = load_managed_project_manifest(&manifest_path)?;
-            self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?
-        } else {
-            self.open_managed_project(
-                cwd,
-                title,
-                objective,
-                base_branch,
-                worktree_root,
-                director_model,
-                dev_model,
-                test_model,
-                integration_model,
-            )?
-        };
+        let manifest_path = require_initialized_managed_project(&repo_root)?;
+        let manifest = load_managed_project_manifest(&manifest_path)?;
+        let mut bootstrap =
+            self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
         self.save_managed_project_bootstrap(&bootstrap)?;
 
         let selected_roles = roles.unwrap_or_else(default_managed_project_roles);
@@ -3224,7 +3193,7 @@ impl DaemonService {
         };
         let repository = GitRepository::discover(&repo_root)?
             .ok_or_else(|| anyhow::anyhow!("managed project attach requires a git repository"))?;
-        let manifest_path = repo_root.join(".tt").join("state.toml");
+        let manifest_path = require_initialized_managed_project(&repo_root)?;
         let manifest = load_managed_project_manifest(&manifest_path)?;
         let mut bootstrap =
             self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
@@ -4606,6 +4575,27 @@ fn managed_project_repo_root(cwd: &Path) -> Result<Option<PathBuf>> {
     Ok(GitRepository::discover(cwd)?.map(|repository| repository.repository_root))
 }
 
+fn require_initialized_managed_project(repo_root: &Path) -> Result<PathBuf> {
+    let tt_root = repo_root.join(".tt");
+    if !tt_root.is_dir() {
+        anyhow::bail!(
+            "no project initialized in {}; .tt/ not found",
+            repo_root.display()
+        );
+    }
+
+    let manifest_path = tt_root.join("state.toml");
+    if !manifest_path.exists() {
+        anyhow::bail!(
+            "no project initialized in {}; managed project state not found at {}",
+            repo_root.display(),
+            manifest_path.display()
+        );
+    }
+
+    Ok(manifest_path)
+}
+
 fn default_worktree_root(repo_root: &Path, project_slug: &str) -> PathBuf {
     let base = repo_root.parent().unwrap_or(repo_root);
     base.join(".tt-worktrees").join(project_slug)
@@ -5884,6 +5874,34 @@ mod tests {
             manifest_role.control_mode,
             ManagedProjectThreadControlMode::ManualNextTurn
         );
+    }
+
+    #[test]
+    fn director_requires_initialized_project_state() {
+        let (repo, _worktree) = setup_repo();
+        let dir = tempdir().expect("tempdir");
+        let service = DaemonService::new(OverlayStore::open_in_dir(dir.path()).expect("store"));
+
+        let error = service
+            .direct_managed_project(
+                &repo,
+                Some("Alpha".to_string()),
+                Some("Ship".to_string()),
+                None,
+                None,
+                Some("director-model".to_string()),
+                Some("dev-model".to_string()),
+                Some("test-model".to_string()),
+                Some("integration-model".to_string()),
+                None,
+                Vec::new(),
+                None,
+                None,
+            )
+            .expect_err("director should require initialized project state");
+        let message = error.to_string();
+        assert!(message.contains("no project initialized in"));
+        assert!(message.contains(".tt/ not found"));
     }
 
     #[test]
