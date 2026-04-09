@@ -464,6 +464,7 @@ pub struct ManagedProjectProjectConfig {
     pub objective: String,
     pub base_branch: String,
     pub branch_prefix: String,
+    pub tt_runtime_bin: Option<String>,
     pub plan_first: bool,
     pub commit_policy: String,
     pub require_operator_merge_approval: bool,
@@ -1642,6 +1643,7 @@ impl DaemonService {
         let plan_path = repo_root.join(".tt").join("plan.toml");
         let project_config = load_or_seed_managed_project_config(
             &project_config_path,
+            &repo_root,
             title.as_str(),
             objective.as_str(),
             &base_branch,
@@ -2652,17 +2654,25 @@ fn managed_project_liveness_policy_from_env() -> ManagedProjectLivenessPolicy {
 }
 
 fn default_managed_project_project_config(
+    repo_root: &Path,
     project_title: &str,
     project_objective: &str,
     base_branch: &str,
 ) -> ManagedProjectProjectConfig {
     let liveness = managed_project_liveness_policy_from_env();
+    let tt_runtime_bin = repo_root
+        .join("target")
+        .join("debug")
+        .join("tt-cli")
+        .exists()
+        .then_some("./target/debug/tt-cli".to_string());
     ManagedProjectProjectConfig {
         schema: "tt-managed-project-config-v1".to_string(),
         title: project_title.to_string(),
         objective: project_objective.to_string(),
         base_branch: base_branch.to_string(),
         branch_prefix: "tt".to_string(),
+        tt_runtime_bin,
         plan_first: true,
         commit_policy: "checkpoint-enforced".to_string(),
         require_operator_merge_approval: true,
@@ -2708,6 +2718,7 @@ fn save_managed_project_project_config(
 
 fn load_or_seed_managed_project_config(
     path: &Path,
+    repo_root: &Path,
     title: &str,
     objective: &str,
     base_branch: &str,
@@ -2715,7 +2726,7 @@ fn load_or_seed_managed_project_config(
     if path.exists() {
         return load_managed_project_project_config(path);
     }
-    let config = default_managed_project_project_config(title, objective, base_branch);
+    let config = default_managed_project_project_config(repo_root, title, objective, base_branch);
     save_managed_project_project_config(path, &config)?;
     Ok(config)
 }
@@ -3020,6 +3031,7 @@ impl DaemonService {
                 match load_managed_project_project_config(&config_path) {
                     Ok(config) => config,
                     Err(_) => default_managed_project_project_config(
+                        Path::new(&manifest.repo_root),
                         &project.title,
                         &project.objective,
                         &manifest.base_branch,
@@ -3034,6 +3046,7 @@ impl DaemonService {
                         &PathBuf::from(&manifest.repo_root)
                             .join(".tt")
                             .join("project.toml"),
+                        Path::new(&manifest.repo_root),
                         &project.title,
                         &project.objective,
                         &manifest.base_branch,
@@ -6093,6 +6106,7 @@ mod tests {
             objective: "Ship".into(),
             base_branch: "main".into(),
             branch_prefix: "tt".into(),
+            tt_runtime_bin: None,
             plan_first: true,
             commit_policy: "checkpoint-enforced".into(),
             require_operator_merge_approval: true,
@@ -6126,6 +6140,19 @@ mod tests {
                 .open_questions
                 .iter()
                 .any(|question| question.contains("merge"))
+        );
+    }
+
+    #[test]
+    fn default_managed_project_project_config_detects_repo_local_tt_runtime_bin() {
+        let dir = tempdir().expect("tempdir");
+        let tt_bin = dir.path().join("target").join("debug").join("tt-cli");
+        std::fs::create_dir_all(tt_bin.parent().expect("parent")).expect("create target dir");
+        std::fs::write(&tt_bin, "").expect("write tt-cli placeholder");
+        let config = default_managed_project_project_config(dir.path(), "Alpha", "Ship", "main");
+        assert_eq!(
+            config.tt_runtime_bin.as_deref(),
+            Some("./target/debug/tt-cli")
         );
     }
 
@@ -6169,6 +6196,7 @@ mod tests {
             objective: "Ship".into(),
             base_branch: "main".into(),
             branch_prefix: "tt".into(),
+            tt_runtime_bin: None,
             plan_first: true,
             commit_policy: "checkpoint-enforced".into(),
             require_operator_merge_approval: true,
@@ -6246,6 +6274,7 @@ mod tests {
                 objective: "Ship".into(),
                 base_branch: "main".into(),
                 branch_prefix: "tt".into(),
+                tt_runtime_bin: None,
                 plan_first: true,
                 commit_policy: "checkpoint-enforced".into(),
                 require_operator_merge_approval: true,
@@ -6307,6 +6336,7 @@ mod tests {
                 objective: "Ship".into(),
                 base_branch: "main".into(),
                 branch_prefix: "tt".into(),
+                tt_runtime_bin: None,
                 plan_first: true,
                 commit_policy: "checkpoint-enforced".into(),
                 require_operator_merge_approval: true,
@@ -6409,6 +6439,7 @@ mod tests {
             objective: "Ship the alpha slice".into(),
             base_branch: "main".into(),
             branch_prefix: "tt".into(),
+            tt_runtime_bin: None,
             plan_first: true,
             commit_policy: "checkpoint-enforced".into(),
             require_operator_merge_approval: true,

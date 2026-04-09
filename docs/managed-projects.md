@@ -20,6 +20,7 @@ can see what the director and subagents are doing while a run is live.
 - `.codex/agents/test.toml`
 - `.codex/agents/integration.toml`
 - `.tt/project.toml` with repo-local project policy and liveness overrides
+  - optional `tt_runtime_bin` can pin the preferred repo-local `tt-cli` path for development checkouts such as `./target/debug/tt-cli`
 - `.tt/plan.toml` with the director's current plan and checkpoints
 - `.tt/contracts/worker-contract.md`
 - `.tt/managed-project.toml`

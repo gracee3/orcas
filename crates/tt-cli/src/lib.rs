@@ -1152,6 +1152,9 @@ fn render_managed_project_bootstrap(bootstrap: &tt_daemon::ManagedProjectBootstr
         bootstrap.project_config.soft_silence_seconds,
         bootstrap.project_config.hard_ceiling_seconds
     ));
+    if let Some(tt_runtime_bin) = bootstrap.project_config.tt_runtime_bin.as_deref() {
+        output.push_str(&format!("TT runtime bin: {}\n", tt_runtime_bin));
+    }
     if !bootstrap
         .project_config
         .default_validation_commands
@@ -1715,6 +1718,7 @@ mod tests {
                 objective: "Ship".into(),
                 base_branch: "main".into(),
                 branch_prefix: "tt".into(),
+                tt_runtime_bin: Some("./target/debug/tt-cli".into()),
                 plan_first: true,
                 commit_policy: "checkpoint-enforced".into(),
                 require_operator_merge_approval: true,
@@ -1858,6 +1862,7 @@ mod tests {
         assert!(text.contains("Project config: /repo/.tt/project.toml"));
         assert!(text.contains("Plan: /repo/.tt/plan.toml"));
         assert!(text.contains("Plan summary: status=draft milestones=1 work_items=1"));
+        assert!(text.contains("TT runtime bin: ./target/debug/tt-cli"));
         assert!(text.contains("state: partial"));
         assert!(text.contains("Repository"));
         assert!(text.contains("merge-ready: true"));
@@ -1943,6 +1948,7 @@ mod tests {
                 objective: "Ship".into(),
                 base_branch: "main".into(),
                 branch_prefix: "tt".into(),
+                tt_runtime_bin: Some("./target/debug/tt-cli".into()),
                 plan_first: true,
                 commit_policy: "checkpoint-enforced".into(),
                 require_operator_merge_approval: true,
