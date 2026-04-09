@@ -1,0 +1,43 @@
+schema = "tt-managed-project-plan-v1"
+status = "draft"
+objective = "Coordinate dev, test, and integration work for tt"
+updated_at = "2026-04-09T22:15:59.885056875+00:00"
+work_items = []
+
+[[milestones]]
+id = "milestone-1"
+title = "Plan and scope the work"
+success_criteria = [
+    "The director has an explicit plan",
+    "Workers have clear ownership",
+]
+evidence = []
+
+[[milestones]]
+id = "milestone-2"
+title = "Implement and validate the change set"
+success_criteria = [
+    "The director has an explicit plan",
+    "Workers have clear ownership",
+]
+evidence = []
+
+[[milestones]]
+id = "milestone-3"
+title = "Prepare merge readiness"
+success_criteria = [
+    "The director has an explicit plan",
+    "Workers have clear ownership",
+]
+evidence = []
+
+[notes]
+risks = []
+pitfalls = []
+open_questions = [
+    "What exact scope and non-goals should the director enforce for `tt`?",
+    "Which validation commands are required before the director can mark the plan ready to dispatch?",
+    "What repo-specific pitfalls or exceptions should the director carry forward during execution?",
+    "What operator approval or landing gate must be satisfied before merge?",
+]
+operator_constraints = []

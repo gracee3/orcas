@@ -42,3 +42,4 @@ Base branch: `main`
 - Stay inside the assigned worktree and scope.
 - Do not widen scope without director approval.
 - Keep evidence in the handoff, not in prose alone.
+- For this repository, the preferred local TT client entrypoint is `./target/debug/tt-cli`.
