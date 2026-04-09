@@ -27,6 +27,8 @@ sleep 5
 
 init_stdout="$reports_dir/project-init.txt"
 inspect_stdout="$reports_dir/project-inspect.txt"
+plan_stdout="$reports_dir/project-plan.txt"
+plan_refresh_stdout="$reports_dir/project-plan-refresh.txt"
 director_stdout="$reports_dir/project-director.txt"
 cargo_test_stdout="$reports_dir/cargo-test.txt"
 
@@ -45,6 +47,8 @@ e2e_tt --cwd "$repo_root" project director \
   >"$director_stdout"
 
 e2e_tt --cwd "$repo_root" project inspect >"$inspect_stdout"
+e2e_tt --cwd "$repo_root" project plan show >"$plan_stdout"
+e2e_tt --cwd "$repo_root" project plan refresh >"$plan_refresh_stdout"
 
 grep -q "kind: rust-taskflow-integration-pressure" "$inspect_stdout"
 grep -q "phase: completed" "$inspect_stdout"
@@ -55,6 +59,9 @@ grep -q "fallback_handoffs:" "$inspect_stdout"
 grep -q "liveness_policy:" "$inspect_stdout"
 grep -q "watchdog: state=" "$inspect_stdout"
 grep -q "latest_round_summary: round 4 merge" "$inspect_stdout"
+grep -q "managed project plan" "$plan_stdout"
+grep -q "Plan file: $repo_root/.tt/plan.toml" "$plan_stdout"
+grep -q "managed project" "$plan_refresh_stdout"
 
 scenario_id="$(sed -n 's/^id: //p' "$inspect_stdout" | head -n 1)"
 scenario_root="$repo_root/.tt/scenarios/$scenario_id"
@@ -72,6 +79,10 @@ for round in 01 02 03 04; do
     grep -q '^state: ' "$scenario_root/round-$round/$role-watchdog.txt"
   done
 done
+
+test -f "$repo_root/.tt/managed-project.toml"
+test -f "$repo_root/.tt/project.toml"
+test -f "$repo_root/.tt/plan.toml"
 
 if e2e_is_true "$REQUIRES_EXTRACTED_HANDOFFS"; then
   e2e_require_extracted_handoffs "$inspect_stdout" "$scenario_root"

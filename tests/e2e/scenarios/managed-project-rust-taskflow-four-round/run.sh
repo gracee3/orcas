@@ -27,6 +27,8 @@ sleep 5
 
 init_stdout="$reports_dir/project-init.txt"
 inspect_stdout="$reports_dir/project-inspect.txt"
+plan_stdout="$reports_dir/project-plan.txt"
+plan_refresh_stdout="$reports_dir/project-plan-refresh.txt"
 director_stdout="$reports_dir/project-director.txt"
 cargo_test_stdout="$reports_dir/cargo-test.txt"
 
@@ -45,6 +47,8 @@ e2e_tt --cwd "$repo_root" project director \
   >"$director_stdout"
 
 e2e_tt --cwd "$repo_root" project inspect >"$inspect_stdout"
+e2e_tt --cwd "$repo_root" project plan show >"$plan_stdout"
+e2e_tt --cwd "$repo_root" project plan refresh >"$plan_refresh_stdout"
 
 grep -q "kind: rust-taskflow-four-round" "$inspect_stdout"
 grep -q "phase: completed" "$inspect_stdout"
@@ -59,8 +63,14 @@ grep -q "director |" "$inspect_stdout"
 grep -q "dev |" "$inspect_stdout"
 grep -q "test |" "$inspect_stdout"
 grep -q "integration |" "$inspect_stdout"
+grep -q "managed project plan" "$plan_stdout"
+grep -q "Plan file: $repo_root/.tt/plan.toml" "$plan_stdout"
+grep -q "Work items:" "$plan_stdout"
+grep -q "managed project" "$plan_refresh_stdout"
 
 test -f "$repo_root/.tt/managed-project.toml"
+test -f "$repo_root/.tt/project.toml"
+test -f "$repo_root/.tt/plan.toml"
 test -f "$repo_root/.tt/contracts/worker-contract.md"
 test -f "$repo_root/Cargo.toml"
 test -f "$repo_root/src/main.rs"

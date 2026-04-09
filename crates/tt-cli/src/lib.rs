@@ -97,6 +97,10 @@ pub enum CodexThreadsCommand {
 pub enum ProjectFlowCommand {
     #[command(alias = "status")]
     Inspect,
+    Plan {
+        #[command(subcommand)]
+        command: ProjectPlanCommand,
+    },
     Init {
         #[arg(long)]
         path: PathBuf,
@@ -171,6 +175,12 @@ pub enum ProjectFlowCommand {
         #[arg(long)]
         binding: Vec<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProjectPlanCommand {
+    Show,
+    Refresh,
 }
 
 #[derive(Debug, Subcommand)]
@@ -368,6 +378,14 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
         Command::Project { command } => match command {
             ProjectFlowCommand::Inspect => DaemonRequest::InspectManagedProject {
                 cwd: cwd.to_path_buf(),
+            },
+            ProjectFlowCommand::Plan { command } => match command {
+                ProjectPlanCommand::Show => DaemonRequest::InspectManagedProjectPlan {
+                    cwd: cwd.to_path_buf(),
+                },
+                ProjectPlanCommand::Refresh => DaemonRequest::RefreshManagedProjectPlan {
+                    cwd: cwd.to_path_buf(),
+                },
             },
             ProjectFlowCommand::Init {
                 path,
@@ -900,7 +918,120 @@ fn render_response(response: &DaemonResponse) -> String {
         DaemonResponse::ManagedProjectInspection(inspection) => {
             render_managed_project_inspection(inspection)
         }
+        DaemonResponse::ManagedProjectPlan(inspection) => render_managed_project_plan(inspection),
     }
+}
+
+fn render_managed_project_plan(inspection: &tt_daemon::ManagedProjectInspection) -> String {
+    let mut output = String::new();
+    output.push_str("managed project plan\n");
+    output.push_str("===================\n");
+    output.push_str(&format!(
+        "Project: {} ({})\n",
+        inspection.bootstrap.project.title, inspection.bootstrap.project.slug
+    ));
+    output.push_str(&format!(
+        "Plan file: {}\n",
+        inspection.bootstrap.plan_path.display()
+    ));
+    output.push_str(&format!("Status: {}\n", inspection.bootstrap.plan.status));
+    output.push_str(&format!(
+        "Milestones: {}\n",
+        inspection.bootstrap.plan.milestones.len()
+    ));
+    for milestone in &inspection.bootstrap.plan.milestones {
+        output.push_str(&format!(
+            "- {}: {} (criteria: {})\n",
+            milestone.id,
+            milestone.title,
+            milestone.success_criteria.join(" | ")
+        ));
+    }
+    output.push_str(&format!(
+        "Work items: {}\n",
+        inspection.bootstrap.plan.work_items.len()
+    ));
+    for work_item in &inspection.bootstrap.plan.work_items {
+        output.push_str(&format!(
+            "- {} [{}] owner={} phase={} commit_required={} status={}\n",
+            work_item.id,
+            work_item.title,
+            work_item.owner_role,
+            work_item.phase,
+            work_item.commit_required,
+            work_item.status
+        ));
+        if !work_item.depends_on.is_empty() {
+            output.push_str(&format!(
+                "  depends_on: {}\n",
+                work_item.depends_on.join(", ")
+            ));
+        }
+        if !work_item.acceptance_criteria.is_empty() {
+            output.push_str(&format!(
+                "  acceptance: {}\n",
+                work_item.acceptance_criteria.join(" | ")
+            ));
+        }
+        if !work_item.validation_commands.is_empty() {
+            output.push_str(&format!(
+                "  validation: {}\n",
+                work_item.validation_commands.join(" ; ")
+            ));
+        }
+    }
+    if !inspection.bootstrap.plan.notes.risks.is_empty() {
+        output.push_str(&format!(
+            "Risks: {}\n",
+            inspection.bootstrap.plan.notes.risks.join(" | ")
+        ));
+    }
+    if !inspection.bootstrap.plan.notes.pitfalls.is_empty() {
+        output.push_str(&format!(
+            "Pitfalls: {}\n",
+            inspection.bootstrap.plan.notes.pitfalls.join(" | ")
+        ));
+    }
+    if !inspection.bootstrap.plan.notes.open_questions.is_empty() {
+        output.push_str(&format!(
+            "Open questions: {}\n",
+            inspection.bootstrap.plan.notes.open_questions.join(" | ")
+        ));
+    }
+    if !inspection
+        .bootstrap
+        .plan
+        .notes
+        .operator_constraints
+        .is_empty()
+    {
+        output.push_str(&format!(
+            "Operator constraints: {}\n",
+            inspection
+                .bootstrap
+                .plan
+                .notes
+                .operator_constraints
+                .join(" | ")
+        ));
+    }
+    if let Some(repository) = inspection.repository_summary.as_ref() {
+        output.push_str("\nRepository\n");
+        output.push_str("----------\n");
+        output.push_str(&format!("root: {}\n", repository.repository_root));
+        output.push_str(&format!(
+            "branch: {}\n",
+            repository.current_branch.as_deref().unwrap_or("<detached>")
+        ));
+        output.push_str(&format!(
+            "head: {}\n",
+            repository
+                .current_head_commit
+                .as_deref()
+                .unwrap_or("<unknown>")
+        ));
+    }
+    output
 }
 
 fn render_managed_project_inspection(inspection: &tt_daemon::ManagedProjectInspection) -> String {
@@ -1269,6 +1400,19 @@ mod tests {
             cli.command,
             Command::Project {
                 command: ProjectFlowCommand::Inspect
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_project_plan_show_command() {
+        let cli = Cli::parse_from(["tt", "project", "plan", "show"]);
+        assert!(matches!(
+            cli.command,
+            Command::Project {
+                command: ProjectFlowCommand::Plan {
+                    command: ProjectPlanCommand::Show
+                }
             }
         ));
     }
@@ -1643,6 +1787,105 @@ mod tests {
         assert!(text.contains("latest_round_summary: round 4 merge"));
         assert!(text.contains("dev: source=extracted status=complete"));
         assert!(text.contains("test: source=seeded_fallback status=complete"));
+    }
+
+    #[test]
+    fn renders_managed_project_plan_details() {
+        let project = Project {
+            id: "p-plan".into(),
+            slug: "alpha".into(),
+            title: "Alpha".into(),
+            objective: "Ship".into(),
+            status: ProjectStatus::Active,
+            created_at: ts(),
+            updated_at: ts(),
+        };
+        let bootstrap = tt_daemon::ManagedProjectBootstrap {
+            project,
+            repo_root: "/repo".into(),
+            base_branch: "main".into(),
+            worktree_root: "/repo/.tt-worktrees/alpha".into(),
+            manifest_path: "/repo/.tt/managed-project.toml".into(),
+            project_config_path: "/repo/.tt/project.toml".into(),
+            plan_path: "/repo/.tt/plan.toml".into(),
+            contract_path: "/repo/.tt/contracts/worker-contract.md".into(),
+            codex_config_path: "/repo/.codex/config.toml".into(),
+            project_config: tt_daemon::ManagedProjectProjectConfig {
+                schema: "tt-managed-project-config-v1".into(),
+                title: "Alpha".into(),
+                objective: "Ship".into(),
+                base_branch: "main".into(),
+                branch_prefix: "tt".into(),
+                plan_first: true,
+                commit_policy: "checkpoint-enforced".into(),
+                require_operator_merge_approval: true,
+                expected_long_build: true,
+                require_progress_updates: true,
+                soft_silence_seconds: 900,
+                hard_ceiling_seconds: 7200,
+                default_validation_commands: vec!["cargo test".into()],
+                smoke_validation_commands: vec!["cargo check".into()],
+                checkpoint_triggers: vec!["after_plan".into(), "before_merge".into()],
+                pitfalls: vec!["slow clean builds".into()],
+                hints: vec!["run cargo test".into()],
+                exceptions: vec!["merge approval required".into()],
+            },
+            plan: tt_daemon::ManagedProjectPlan {
+                schema: "tt-managed-project-plan-v1".into(),
+                status: "draft".into(),
+                objective: "Ship".into(),
+                updated_at: ts().to_rfc3339(),
+                milestones: vec![tt_daemon::ManagedProjectPlanMilestone {
+                    id: "milestone-1".into(),
+                    title: "Plan".into(),
+                    success_criteria: vec!["plan exists".into()],
+                    evidence: vec!["file created".into()],
+                }],
+                work_items: vec![tt_daemon::ManagedProjectPlanWorkItem {
+                    id: "alpha-director".into(),
+                    title: "Director".into(),
+                    owner_role: "director".into(),
+                    phase: "plan".into(),
+                    depends_on: vec![],
+                    acceptance_criteria: vec!["director has plan".into()],
+                    validation_commands: vec!["cargo test".into()],
+                    commit_required: false,
+                    status: "planned".into(),
+                }],
+                notes: tt_daemon::ManagedProjectPlanNotes {
+                    risks: vec!["slow test lane".into()],
+                    pitfalls: vec!["clean builds are expensive".into()],
+                    open_questions: vec!["should we split validation?".into()],
+                    operator_constraints: vec!["wait for approval".into()],
+                },
+            },
+            scenario: None,
+            roles: vec![],
+        };
+        let text = render_response(&DaemonResponse::ManagedProjectPlan(
+            tt_daemon::ManagedProjectInspection {
+                bootstrap,
+                repository_summary: Some(tt_ui_core::GitRepositorySummary {
+                    repository_root: "/repo".into(),
+                    current_worktree: Some("/repo".into()),
+                    current_branch: Some("main".into()),
+                    current_head_commit: Some("abc123".into()),
+                    dirty: false,
+                    upstream: Some("origin/main".into()),
+                    ahead_by: Some(0),
+                    behind_by: Some(0),
+                    merge_ready: true,
+                    worktree_count: 3,
+                }),
+            },
+        ));
+        assert!(text.contains("managed project plan"));
+        assert!(text.contains("Plan file: /repo/.tt/plan.toml"));
+        assert!(text.contains("Milestones: 1"));
+        assert!(text.contains("Work items: 1"));
+        assert!(text.contains("Risks: slow test lane"));
+        assert!(text.contains("Operator constraints: wait for approval"));
+        assert!(text.contains("Repository"));
     }
 
     #[test]

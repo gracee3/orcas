@@ -105,6 +105,12 @@ pub enum DaemonRequest {
     InspectManagedProject {
         cwd: PathBuf,
     },
+    InspectManagedProjectPlan {
+        cwd: PathBuf,
+    },
+    RefreshManagedProjectPlan {
+        cwd: PathBuf,
+    },
     ListProjects,
     GetProject {
         id_or_slug: String,
@@ -306,6 +312,7 @@ pub enum DaemonResponse {
     DashboardSummary(DashboardSummary),
     RepositorySummary(Option<GitRepositorySummary>),
     ManagedProjectInspection(ManagedProjectInspection),
+    ManagedProjectPlan(ManagedProjectInspection),
     Projects(Vec<Project>),
     Project(Option<Project>),
     WorkUnits(Vec<WorkUnit>),
@@ -1426,6 +1433,37 @@ impl DaemonService {
         })
     }
 
+    pub fn inspect_managed_project_plan(
+        &self,
+        cwd: impl AsRef<Path>,
+    ) -> Result<ManagedProjectInspection> {
+        self.inspect_managed_project(cwd)
+    }
+
+    pub fn refresh_managed_project_plan(
+        &self,
+        cwd: impl AsRef<Path>,
+    ) -> Result<ManagedProjectInspection> {
+        let cwd = cwd.as_ref();
+        let Some(repo_root) = managed_project_repo_root(cwd)? else {
+            anyhow::bail!("managed project plan refresh requires a git repository");
+        };
+        let manifest_path = repo_root.join(".tt").join("managed-project.toml");
+        if !manifest_path.exists() {
+            anyhow::bail!(
+                "managed project manifest not found at {}",
+                manifest_path.display()
+            );
+        }
+        let manifest = load_managed_project_manifest(&manifest_path)?;
+        let bootstrap = self.managed_project_bootstrap_from_manifest(&manifest_path, &manifest)?;
+        self.save_managed_project_bootstrap(&bootstrap)?;
+        Ok(ManagedProjectInspection {
+            bootstrap,
+            repository_summary: self.repository_summary(&repo_root)?,
+        })
+    }
+
     pub fn open_managed_project(
         &self,
         cwd: impl AsRef<Path>,
@@ -1669,6 +1707,12 @@ impl DaemonService {
             }
             InspectManagedProject { cwd } => {
                 DaemonResponse::ManagedProjectInspection(self.inspect_managed_project(cwd)?)
+            }
+            InspectManagedProjectPlan { cwd } => {
+                DaemonResponse::ManagedProjectPlan(self.inspect_managed_project_plan(cwd)?)
+            }
+            RefreshManagedProjectPlan { cwd } => {
+                DaemonResponse::ManagedProjectPlan(self.refresh_managed_project_plan(cwd)?)
             }
             ListProjects => DaemonResponse::Projects(self.list_projects()?),
             GetProject { id_or_slug } => DaemonResponse::Project(self.get_project(&id_or_slug)?),
@@ -2125,10 +2169,8 @@ fn render_agent_file(
         project_config.hard_ceiling_seconds
     ));
     output.push_str(&format!(
-        "Plan status: {} with {} milestone(s) and {} work item(s)\n",
-        plan.status,
-        plan.milestones.len(),
-        plan.work_items.len()
+        "Plan status: {}\n",
+        plan.status
     ));
     output.push_str("Project protocol:\n");
     output.push_str("- The operator talks to the director.\n");
@@ -2932,6 +2974,7 @@ impl DaemonService {
                 integration_model,
             )?
         };
+        self.save_managed_project_bootstrap(&bootstrap)?;
 
         let selected_roles = roles.unwrap_or_else(default_managed_project_roles);
         let mut binding_map = BTreeMap::new();
@@ -5086,6 +5129,16 @@ mod tests {
     }
 
     #[test]
+    fn plan_request_round_trips() {
+        let request = DaemonRequest::InspectManagedProjectPlan {
+            cwd: PathBuf::from("/repo"),
+        };
+        let encoded = serde_json::to_string(&request).expect("serialize request");
+        let decoded: DaemonRequest = serde_json::from_str(&encoded).expect("deserialize request");
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
     fn runtime_supports_request_api_and_repo_summary() {
         let (repo, worktree) = setup_repo();
         let dir = tempdir().expect("tempdir");
@@ -5165,7 +5218,10 @@ mod tests {
         assert!(bootstrap.plan_path.exists());
         assert!(bootstrap.manifest_path.exists());
         assert!(bootstrap.project_config.plan_first);
-        assert_eq!(bootstrap.project_config.commit_policy, "checkpoint-enforced");
+        assert_eq!(
+            bootstrap.project_config.commit_policy,
+            "checkpoint-enforced"
+        );
         assert_eq!(bootstrap.plan.status, "draft");
         assert_eq!(bootstrap.roles.len(), 4);
         assert!(bootstrap.roles.iter().all(|role| role.agent_path.exists()));

@@ -74,6 +74,8 @@ grep -q "Role roster:" "$director_agent_path"
 grep -q "You report to the director, not to other workers or the operator." "$dev_agent_path"
 grep -q "You report to the director, not to other workers or the operator." "$test_agent_path"
 grep -q "You report to the director, not to other workers or the operator." "$integration_agent_path"
+test -f "$project_root/.tt/project.toml"
+test -f "$project_root/.tt/plan.toml"
 
 e2e_tt --cwd "$worktree_path" project inspect >"$inspect_before_stdout"
 grep -q "state: scaffolded (0/4)" "$inspect_before_stdout"

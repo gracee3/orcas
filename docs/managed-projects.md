@@ -46,6 +46,9 @@ escalations flow through the director.
 - `tt project inspect` / `tt project status` reads back the manifest, role
   bindings, worktrees, repository state, and effective project plan without
   changing anything.
+- `tt project plan show` prints the current plan artifact.
+- `tt project plan refresh` normalizes the on-disk plan artifact from the
+  current managed-project state.
 - `tt project director` creates or reuses the scaffold, chooses the role
   topology, activates the selected roles in one shot, and can optionally run a
   built-in seeded scenario. The director now plan-checks against `.tt/plan.toml`
