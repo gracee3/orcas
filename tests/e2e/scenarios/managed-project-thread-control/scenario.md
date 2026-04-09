@@ -2,14 +2,15 @@
 
 This scenario verifies the per-thread control loop for a managed project:
 
+- `tt project spawn` creates live managed threads that the operator can watch in Codex TUI
 - `tt project control` can mark a worker role `manual_next_turn`
-- the director pauses before the next worker turn and records that the thread is now under manual control
-- the thread remains attached and inspectable while Codex TUI can watch it live
-- switching the same role back to `director` resumes the director-led workflow
+- `tt project inspect` shows the updated per-thread control mode immediately
+- switching the same role back to `director` restores automatic control
 
-The scenario uses the seeded `taskflow` project shape so the control toggle is
-tested against the same live managed-project runtime as the multi-round
-scenarios. The director keeps the worker thread live while the operator can
-watch it in Codex TUI, then the demo pauses the `test` role at the next worker
-boundary, records the manual takeover, and finally resumes director control to
-finish the seeded run.
+The demo keeps the thread lifecycle short on purpose. It does not wait for the
+full multi-round `taskflow` project to finish; it only proves that TT can:
+
+1. create a live managed thread
+2. mark that thread as manually controlled for the next turn
+3. show that state in inspection output
+4. switch the thread back to director control
