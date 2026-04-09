@@ -45,7 +45,8 @@ const APP_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_SERVER_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const TURN_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+const TURN_WAIT_TIMEOUT_SECS_ENV: &str = "TT_CODEX_TURN_WAIT_TIMEOUT_SECS";
+const DEFAULT_TURN_WAIT_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimeContract {
@@ -518,7 +519,8 @@ impl CodexRuntimeClient {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<protocol::Turn> {
-        let deadline = std::time::Instant::now() + TURN_WAIT_TIMEOUT;
+        let turn_wait_timeout = turn_wait_timeout();
+        let deadline = std::time::Instant::now() + turn_wait_timeout;
         loop {
             let thread = match self.read_thread_full(thread_id, true) {
                 Ok(Some(thread)) => thread,
@@ -529,7 +531,7 @@ impl CodexRuntimeClient {
                             "timed out waiting for turn `{}` in thread `{}` after {:?}",
                             turn_id,
                             thread_id,
-                            TURN_WAIT_TIMEOUT
+                            turn_wait_timeout
                         );
                     }
                     std::thread::sleep(TURN_POLL_INTERVAL);
@@ -543,7 +545,7 @@ impl CodexRuntimeClient {
                         "timed out waiting for turn `{}` in thread `{}` after {:?}",
                         turn_id,
                         thread_id,
-                        TURN_WAIT_TIMEOUT
+                        turn_wait_timeout
                     );
                 }
                 std::thread::sleep(TURN_POLL_INTERVAL);
@@ -561,7 +563,7 @@ impl CodexRuntimeClient {
                     "timed out waiting for turn `{}` in thread `{}` after {:?}",
                     turn_id,
                     thread_id,
-                    TURN_WAIT_TIMEOUT
+                    turn_wait_timeout
                 );
             }
             std::thread::sleep(TURN_POLL_INTERVAL);
@@ -575,10 +577,22 @@ impl CodexRuntimeClient {
         cwd: Option<&Path>,
         model: Option<String>,
     ) -> Result<Option<protocol::Turn>> {
-        let deadline = std::time::Instant::now() + TURN_WAIT_TIMEOUT;
+        let turn_wait_timeout = turn_wait_timeout();
+        let deadline = std::time::Instant::now() + turn_wait_timeout;
         let mut last_seen = None;
         loop {
-            if let Some(thread) = self.read_thread_full(selector, true)? {
+            let thread = match self.read_thread_full(selector, true) {
+                Ok(thread) => thread,
+                Err(error) if can_retry_after_turn_completion(&error) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    std::thread::sleep(TURN_POLL_INTERVAL);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(thread) = thread {
                 if let Some(turn) = thread.turns.into_iter().find(|turn| turn.id == turn_id) {
                     if !turn.items.is_empty() {
                         return Ok(Some(turn));
@@ -587,7 +601,18 @@ impl CodexRuntimeClient {
                 }
             }
 
-            if let Some(thread) = self.resume_thread_full(selector, cwd, model.clone())? {
+            let thread = match self.resume_thread_full(selector, cwd, model.clone()) {
+                Ok(thread) => thread,
+                Err(error) if can_retry_after_turn_completion(&error) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    std::thread::sleep(TURN_POLL_INTERVAL);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(thread) = thread {
                 if let Some(turn) = thread.turns.into_iter().find(|turn| turn.id == turn_id) {
                     if !turn.items.is_empty() {
                         return Ok(Some(turn));
@@ -620,6 +645,22 @@ fn can_retry_without_turns(error: &anyhow::Error) -> bool {
         message.contains("includeTurns is unavailable before first user message")
             || message.contains("ephemeral threads do not support includeTurns")
     })
+}
+
+fn can_retry_after_turn_completion(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("failed to load rollout") && message.contains("empty session file")
+    })
+}
+
+fn turn_wait_timeout() -> Duration {
+    let secs = env::var(TURN_WAIT_TIMEOUT_SECS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_TURN_WAIT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
 }
 
 struct CodexAppServerConnection {
@@ -1109,5 +1150,21 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("Codex app-server"));
         assert!(message.contains(&missing_app_server.display().to_string()));
+    }
+
+    #[test]
+    fn retry_after_turn_completion_matches_empty_session_rollout() {
+        let error = anyhow::anyhow!(
+            "Codex app-server `ws://127.0.0.1:4500` request failed: failed to load rollout `/home/me/.codex/sessions/2026/04/09/rollout.jsonl` for thread 123: empty session file"
+        );
+        assert!(can_retry_after_turn_completion(&error));
+    }
+
+    #[test]
+    fn retry_after_turn_completion_rejects_other_failures() {
+        let error = anyhow::anyhow!(
+            "Codex app-server `ws://127.0.0.1:4500` request failed: model provider rejected request"
+        );
+        assert!(!can_retry_after_turn_completion(&error));
     }
 }

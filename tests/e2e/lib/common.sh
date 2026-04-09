@@ -572,6 +572,7 @@ EOF
   export TT_RUNTIME_LISTEN_URL="$listen_url"
   export TT_APP_SERVER_LISTEN_URL="$listen_url"
   export CODEX_APP_SERVER_LISTEN_URL="$listen_url"
+  export TT_CODEX_TURN_WAIT_TIMEOUT_SECS="${TT_CODEX_TURN_WAIT_TIMEOUT_SECS:-900}"
 }
 
 e2e_prepare_fixture_repo_with_worktree() {

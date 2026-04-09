@@ -22,7 +22,7 @@ workers report only to the director.
 
 - `director`: speaks with the operator, turns intent into a plan, and dispatches workers
 - `dev`: implements the assigned slice only
-- `test`: validates the assigned branch and reports failures exactly
+- `test`: validates the assigned branch and reports failures exactly; it uses `danger-full-access` so build tools like `cargo test` can create their target artifacts without sandbox namespace issues
 - `integration`: prepares landing and merge readiness
 
 Default managed-project model roster:
@@ -89,6 +89,9 @@ tt project attach --cwd /path/to/repo \
 - `--director_model`, `--dev_model`, `--test_model`, and `--integration_model`
   override the default model string for that role while keeping reasoning
   effort at `medium`
+
+Managed-project worker roles default to `danger-full-access` so live builds and
+integration tests do not trip over sandbox setup in the Codex app-server.
 
 ## Contract
 

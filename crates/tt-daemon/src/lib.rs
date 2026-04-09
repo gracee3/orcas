@@ -1913,11 +1913,10 @@ fn role_description(role: ThreadRole) -> &'static str {
 
 fn role_sandbox_mode(role: ThreadRole) -> &'static str {
     match role {
-        ThreadRole::Director | ThreadRole::Test | ThreadRole::Review | ThreadRole::Learn => {
-            "read-only"
-        }
-        ThreadRole::Develop | ThreadRole::Integrate | ThreadRole::Handoff => "workspace-write",
-        ThreadRole::Todo | ThreadRole::Chat | ThreadRole::Custom => "workspace-write",
+        ThreadRole::Director | ThreadRole::Review | ThreadRole::Learn => "read-only",
+        ThreadRole::Test => "danger-full-access",
+        ThreadRole::Develop | ThreadRole::Integrate | ThreadRole::Handoff => "danger-full-access",
+        ThreadRole::Todo | ThreadRole::Chat | ThreadRole::Custom => "danger-full-access",
     }
 }
 
@@ -4007,6 +4006,8 @@ fn is_retryable_live_turn_failure(message: &str) -> bool {
     normalized.contains("responses_websocket")
         && normalized.contains("500 internal server error")
         && normalized.contains("wss://api.openai.com/v1/responses")
+        || normalized.contains("failed to load rollout")
+            && normalized.contains("empty session file")
 }
 
 fn live_turn_backoff_delay(attempt_number: usize) -> std::time::Duration {
@@ -4693,6 +4694,12 @@ mod tests {
     fn retryable_live_turn_failure_does_not_match_model_rejections() {
         let error = "turn `turn-1` for role `director` failed (model=gpt-5.4, reasoning_effort=medium): invalid model `gpt-5.4` for current provider";
         assert!(!is_retryable_live_turn_failure(error));
+    }
+
+    #[test]
+    fn retryable_live_turn_failure_matches_empty_session_rollout() {
+        let error = "Codex app-server `ws://127.0.0.1:4500` request failed: failed to load rollout `/home/me/.codex/sessions/2026/04/09/rollout.jsonl` for thread 123: empty session file";
+        assert!(is_retryable_live_turn_failure(error));
     }
 
     #[test]
