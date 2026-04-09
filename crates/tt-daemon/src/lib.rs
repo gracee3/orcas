@@ -344,8 +344,12 @@ pub struct ManagedProjectBootstrap {
     pub base_branch: String,
     pub worktree_root: PathBuf,
     pub manifest_path: PathBuf,
+    pub project_config_path: PathBuf,
+    pub plan_path: PathBuf,
     pub contract_path: PathBuf,
     pub codex_config_path: PathBuf,
+    pub project_config: ManagedProjectProjectConfig,
+    pub plan: ManagedProjectPlan,
     pub scenario: Option<ManagedProjectScenarioState>,
     pub roles: Vec<ManagedProjectRoleBootstrap>,
 }
@@ -394,6 +398,68 @@ impl Default for ManagedProjectLivenessPolicy {
             hard_ceiling_seconds: 7_200,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ManagedProjectProjectConfig {
+    pub schema: String,
+    pub title: String,
+    pub objective: String,
+    pub base_branch: String,
+    pub branch_prefix: String,
+    pub plan_first: bool,
+    pub commit_policy: String,
+    pub require_operator_merge_approval: bool,
+    pub expected_long_build: bool,
+    pub require_progress_updates: bool,
+    pub soft_silence_seconds: u64,
+    pub hard_ceiling_seconds: u64,
+    pub default_validation_commands: Vec<String>,
+    pub smoke_validation_commands: Vec<String>,
+    pub checkpoint_triggers: Vec<String>,
+    pub pitfalls: Vec<String>,
+    pub hints: Vec<String>,
+    pub exceptions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ManagedProjectPlan {
+    pub schema: String,
+    pub status: String,
+    pub objective: String,
+    pub updated_at: String,
+    pub milestones: Vec<ManagedProjectPlanMilestone>,
+    pub work_items: Vec<ManagedProjectPlanWorkItem>,
+    pub notes: ManagedProjectPlanNotes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedProjectPlanMilestone {
+    pub id: String,
+    pub title: String,
+    pub success_criteria: Vec<String>,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedProjectPlanWorkItem {
+    pub id: String,
+    pub title: String,
+    pub owner_role: String,
+    pub phase: String,
+    pub depends_on: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub validation_commands: Vec<String>,
+    pub commit_required: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ManagedProjectPlanNotes {
+    pub risks: Vec<String>,
+    pub pitfalls: Vec<String>,
+    pub open_questions: Vec<String>,
+    pub operator_constraints: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -490,8 +556,16 @@ struct ManagedProjectManifest {
     repo_root: String,
     base_branch: String,
     worktree_root: String,
+    #[serde(default)]
+    project_config_path: String,
+    #[serde(default)]
+    plan_path: String,
     contract_path: String,
     codex_config_path: String,
+    #[serde(default)]
+    project_config: ManagedProjectProjectConfig,
+    #[serde(default)]
+    plan: ManagedProjectPlan,
     scenario: Option<ManagedProjectScenarioState>,
     roles: BTreeMap<String, ManagedProjectManifestRole>,
 }
@@ -1404,6 +1478,15 @@ impl DaemonService {
             .join("contracts")
             .join("worker-contract.md");
         let codex_config_path = repo_root.join(".codex").join("config.toml");
+        let project_config_path = repo_root.join(".tt").join("project.toml");
+        let plan_path = repo_root.join(".tt").join("plan.toml");
+        let project_config = load_or_seed_managed_project_config(
+            &project_config_path,
+            title.as_str(),
+            objective.as_str(),
+            &base_branch,
+        )?;
+        let initial_plan = default_managed_project_plan(&project, &project_config, &[]);
         write_managed_file(
             &codex_config_path,
             &render_codex_config(
@@ -1413,7 +1496,7 @@ impl DaemonService {
         )?;
         write_managed_file(
             &contract_path,
-            &render_worker_contract(&repo_root, &slug, &base_branch),
+            &render_worker_contract(&repo_root, &slug, &base_branch, &project_config),
         )?;
 
         let director_role = self.build_role_bootstrap(
@@ -1424,6 +1507,8 @@ impl DaemonService {
             director_model,
             &worktree_root,
             false,
+            &project_config,
+            &initial_plan,
         )?;
         let dev_role = self.build_role_bootstrap(
             &repository,
@@ -1433,6 +1518,8 @@ impl DaemonService {
             dev_model,
             &worktree_root,
             true,
+            &project_config,
+            &initial_plan,
         )?;
         let test_role = self.build_role_bootstrap(
             &repository,
@@ -1442,6 +1529,8 @@ impl DaemonService {
             test_model,
             &worktree_root,
             true,
+            &project_config,
+            &initial_plan,
         )?;
         let integration_role = self.build_role_bootstrap(
             &repository,
@@ -1451,6 +1540,14 @@ impl DaemonService {
             integration_model,
             &worktree_root,
             true,
+            &project_config,
+            &initial_plan,
+        )?;
+        let plan = load_or_seed_managed_project_plan(
+            &plan_path,
+            &project_config,
+            &project,
+            &[&director_role, &dev_role, &test_role, &integration_role],
         )?;
 
         let manifest_path = repo_root.join(".tt").join("managed-project.toml");
@@ -1459,8 +1556,12 @@ impl DaemonService {
             &repo_root,
             &base_branch,
             &worktree_root,
+            &project_config_path,
+            &plan_path,
             &contract_path,
             &codex_config_path,
+            &project_config,
+            &plan,
             None,
             &[&director_role, &dev_role, &test_role, &integration_role],
         );
@@ -1472,8 +1573,12 @@ impl DaemonService {
             base_branch,
             worktree_root,
             manifest_path,
+            project_config_path,
+            plan_path,
             contract_path,
             codex_config_path,
+            project_config,
+            plan,
             scenario: None,
             roles: vec![director_role, dev_role, test_role, integration_role],
         })
@@ -1488,6 +1593,8 @@ impl DaemonService {
         model: Option<String>,
         worktree_root: &Path,
         create_worktree: bool,
+        project_config: &ManagedProjectProjectConfig,
+        plan: &ManagedProjectPlan,
     ) -> Result<ManagedProjectRoleBootstrap> {
         let now = Utc::now();
         let role_slug = role_slug(role);
@@ -1518,6 +1625,8 @@ impl DaemonService {
                 reasoning_effort.as_deref(),
                 &project.title,
                 &project.objective,
+                project_config,
+                plan,
             ),
         )?;
 
@@ -1983,6 +2092,8 @@ fn render_agent_file(
     reasoning_effort: Option<&str>,
     project_title: &str,
     project_objective: &str,
+    project_config: &ManagedProjectProjectConfig,
+    plan: &ManagedProjectPlan,
 ) -> String {
     let role_roster = managed_project_role_roster();
     let model = model.unwrap_or_else(|| role_default_model(role));
@@ -2002,6 +2113,23 @@ fn render_agent_file(
         role_slug(role)
     ));
     output.push_str(&format!("Project objective: {project_objective}\n"));
+    output.push_str(&format!(
+        "Project config: plan_first={} commit_policy={} checkpoint_triggers={:?}\n",
+        project_config.plan_first, project_config.commit_policy, project_config.checkpoint_triggers
+    ));
+    output.push_str(&format!(
+        "Liveness policy: expected_long_build={} progress_updates_required={} soft_silence_seconds={} hard_ceiling_seconds={}\n",
+        project_config.expected_long_build,
+        project_config.require_progress_updates,
+        project_config.soft_silence_seconds,
+        project_config.hard_ceiling_seconds
+    ));
+    output.push_str(&format!(
+        "Plan status: {} with {} milestone(s) and {} work item(s)\n",
+        plan.status,
+        plan.milestones.len(),
+        plan.work_items.len()
+    ));
     output.push_str("Project protocol:\n");
     output.push_str("- The operator talks to the director.\n");
     output.push_str("- The director is the only coordinator and speaks to the operator on behalf of the project.\n");
@@ -2009,7 +2137,7 @@ fn render_agent_file(
         "- Workers do not coordinate directly with each other; all assignments and escalations go through the director.\n",
     );
     output.push_str(
-        "- Use the shared contract in .tt/contracts/worker-contract.md as the source of truth.\n",
+        "- Use `.tt/contracts/worker-contract.md`, `.tt/project.toml`, and `.tt/plan.toml` as the source of truth.\n",
     );
     output.push_str("Role roster:\n");
     for line in role_roster.lines() {
@@ -2024,6 +2152,12 @@ fn render_agent_file(
 - Keep commits and handoffs frequent enough that quiet periods are meaningful, not accidental.\n\
 - If progress is quiet but plausible, the director should classify it as quiet or suspect rather than failing immediately.\n",
     );
+    output.push_str(
+        "Planning expectations:\n\
+- Start with the plan before dispatching workers.\n\
+- Keep checkpoint commits aligned with the plan's checkpoint triggers.\n\
+- Prefer concise milestone updates over broad status prose.\n",
+    );
     output.push_str(managed_project_progress_guidance());
     match role {
         ThreadRole::Director => {
@@ -2032,6 +2166,9 @@ fn render_agent_file(
                 "Own branch strategy, worker assignment, phase transitions, and readiness.\n",
             );
             output.push_str("Keep the operator informed, request approval for merges or destructive cleanup, summarize outcomes after each phase, and watch for quiet or suspect progress periods.\n");
+            output.push_str(
+                "Review `.tt/project.toml` and `.tt/plan.toml` before dispatching any worker.\n",
+            );
             output.push_str("Do not implement product code unless explicitly instructed.\n");
         }
         ThreadRole::Develop => {
@@ -2039,6 +2176,7 @@ fn render_agent_file(
             output.push_str("You report to the director, not to other workers or the operator.\n");
             output.push_str("Treat test as the validator and integration as the landing worker.\n");
             output.push_str("Report changed files, tests run, blockers, next step, and whether you are actively building, testing, or waiting on I/O.\n");
+            output.push_str("Honor checkpoint commits required by the project plan.\n");
         }
         ThreadRole::Test => {
             output.push_str("Validate the assigned changes and report exact failures.\n");
@@ -2046,6 +2184,7 @@ fn render_agent_file(
             output.push_str("Assume dev produced the change and integration will handle landing if tests pass.\n");
             output.push_str("Do not widen scope or rewrite implementation code.\n");
             output.push_str("Include progress checkpoints if tests are long-running or flaky so the director can distinguish quiet from stalled.\n");
+            output.push_str("Honor checkpoint commits required by the project plan.\n");
         }
         ThreadRole::Integrate => {
             output
@@ -2055,6 +2194,7 @@ fn render_agent_file(
                 "Assume dev implemented the slice and test validated it before landing.\n",
             );
             output.push_str("Keep the landing path narrow, evidence-driven, and punctuated with short status updates if merge prep takes a while.\n");
+            output.push_str("Honor checkpoint commits required by the project plan.\n");
         }
         ThreadRole::Review => {
             output.push_str("Review correctness, regressions, and missing tests.\n");
@@ -2079,9 +2219,13 @@ fn render_agent_file(
     output
 }
 
-fn render_worker_contract(repo_root: &Path, project_slug: &str, base_branch: &str) -> String {
+fn render_worker_contract(
+    repo_root: &Path,
+    project_slug: &str,
+    base_branch: &str,
+    project_config: &ManagedProjectProjectConfig,
+) -> String {
     let role_roster = managed_project_role_roster();
-    let liveness_policy = managed_project_liveness_policy_from_env();
     format!(
         "# TT Managed Project Contract\n\n\
 Project: `{project_slug}`\n\
@@ -2094,6 +2238,12 @@ Base branch: `{base_branch}`\n\n\
 - Peer-to-peer worker coordination is out of scope.\n\n\
 ## Roles\n\
 {role_roster}\n\n\
+## Project Policy\n\
+- Plan-first: `{plan_first}`\n\
+- Commit policy: `{commit_policy}`\n\
+- Require operator merge approval: `{require_operator_merge_approval}`\n\
+- Checkpoint triggers: `{checkpoint_triggers:#?}`\n\
+\n\
 ## Phase Vocabulary\n\
 - `plan`: turn operator intent into scope and milestones.\n\
 - `todo`: capture actionable items and traceability.\n\
@@ -2125,10 +2275,14 @@ Base branch: `{base_branch}`\n\n\
 - Keep evidence in the handoff, not in prose alone.\n",
         repo_root.display(),
         role_roster = role_roster,
-        expected_long_build = liveness_policy.expected_long_build,
-        require_progress_updates = liveness_policy.require_progress_updates,
-        soft_silence_seconds = liveness_policy.soft_silence_seconds,
-        hard_ceiling_seconds = liveness_policy.hard_ceiling_seconds
+        plan_first = project_config.plan_first,
+        commit_policy = project_config.commit_policy,
+        require_operator_merge_approval = project_config.require_operator_merge_approval,
+        checkpoint_triggers = project_config.checkpoint_triggers,
+        expected_long_build = project_config.expected_long_build,
+        require_progress_updates = project_config.require_progress_updates,
+        soft_silence_seconds = project_config.soft_silence_seconds,
+        hard_ceiling_seconds = project_config.hard_ceiling_seconds
     )
 }
 
@@ -2137,8 +2291,12 @@ fn build_managed_project_manifest(
     repo_root: &Path,
     base_branch: &str,
     worktree_root: &Path,
+    project_config_path: &Path,
+    plan_path: &Path,
     contract_path: &Path,
     codex_config_path: &Path,
+    project_config: &ManagedProjectProjectConfig,
+    plan: &ManagedProjectPlan,
     scenario: Option<ManagedProjectScenarioState>,
     roles: &[&ManagedProjectRoleBootstrap],
 ) -> ManagedProjectManifest {
@@ -2172,8 +2330,14 @@ fn build_managed_project_manifest(
         repo_root: repo_root.display().to_string(),
         base_branch: base_branch.to_string(),
         worktree_root: worktree_root.display().to_string(),
+        project_config_path: project_config_path.display().to_string(),
+        plan_path: plan_path.display().to_string(),
         contract_path: contract_path.display().to_string(),
         codex_config_path: codex_config_path.display().to_string(),
+        // Persist the effective project config and plan with the manifest so
+        // inspect/attach paths can rebuild the same bootstrap view later.
+        project_config: project_config.clone(),
+        plan: plan.clone(),
         scenario,
         roles: role_map,
     }
@@ -2297,6 +2461,177 @@ fn managed_project_liveness_policy_from_env() -> ManagedProjectLivenessPolicy {
         soft_silence_seconds: parse_u64_env("TT_MANAGED_PROJECT_SOFT_SILENCE_SECONDS", 900),
         hard_ceiling_seconds: parse_u64_env("TT_MANAGED_PROJECT_HARD_CEILING_SECONDS", 7_200),
     }
+}
+
+fn default_managed_project_project_config(
+    project_title: &str,
+    project_objective: &str,
+    base_branch: &str,
+) -> ManagedProjectProjectConfig {
+    let liveness = managed_project_liveness_policy_from_env();
+    ManagedProjectProjectConfig {
+        schema: "tt-managed-project-config-v1".to_string(),
+        title: project_title.to_string(),
+        objective: project_objective.to_string(),
+        base_branch: base_branch.to_string(),
+        branch_prefix: "tt".to_string(),
+        plan_first: true,
+        commit_policy: "checkpoint-enforced".to_string(),
+        require_operator_merge_approval: true,
+        expected_long_build: liveness.expected_long_build,
+        require_progress_updates: liveness.require_progress_updates,
+        soft_silence_seconds: liveness.soft_silence_seconds,
+        hard_ceiling_seconds: liveness.hard_ceiling_seconds,
+        default_validation_commands: vec!["cargo test".to_string()],
+        smoke_validation_commands: vec!["cargo check".to_string()],
+        checkpoint_triggers: vec![
+            "after_plan".to_string(),
+            "after_develop".to_string(),
+            "after_test".to_string(),
+            "before_merge".to_string(),
+        ],
+        pitfalls: Vec::new(),
+        hints: Vec::new(),
+        exceptions: Vec::new(),
+    }
+}
+
+fn load_managed_project_project_config(path: &Path) -> Result<ManagedProjectProjectConfig> {
+    let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))
+}
+
+fn save_managed_project_project_config(
+    path: &Path,
+    config: &ManagedProjectProjectConfig,
+) -> Result<()> {
+    let contents = toml::to_string_pretty(config)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::read_to_string(path) {
+        Ok(existing) if existing == contents => Ok(()),
+        _ => {
+            fs::write(path, contents)?;
+            Ok(())
+        }
+    }
+}
+
+fn load_or_seed_managed_project_config(
+    path: &Path,
+    title: &str,
+    objective: &str,
+    base_branch: &str,
+) -> Result<ManagedProjectProjectConfig> {
+    if path.exists() {
+        return load_managed_project_project_config(path);
+    }
+    let config = default_managed_project_project_config(title, objective, base_branch);
+    save_managed_project_project_config(path, &config)?;
+    Ok(config)
+}
+
+fn default_managed_project_plan(
+    project: &Project,
+    config: &ManagedProjectProjectConfig,
+    roles: &[&ManagedProjectRoleBootstrap],
+) -> ManagedProjectPlan {
+    let milestone_titles = [
+        "Plan and scope the work",
+        "Implement and validate the change set",
+        "Prepare merge readiness",
+    ];
+    let milestones = milestone_titles
+        .iter()
+        .enumerate()
+        .map(|(index, title)| ManagedProjectPlanMilestone {
+            id: format!("milestone-{}", index + 1),
+            title: (*title).to_string(),
+            success_criteria: vec![
+                "The director has an explicit plan".to_string(),
+                "Workers have clear ownership".to_string(),
+            ],
+            evidence: Vec::new(),
+        })
+        .collect();
+    let work_items = roles
+        .iter()
+        .map(|role| ManagedProjectPlanWorkItem {
+            id: format!("{}-{}", project.slug, role_slug(role.role)),
+            title: role_title(role.role).to_string(),
+            owner_role: role_slug(role.role).to_string(),
+            phase: match role.role {
+                ThreadRole::Director => "plan",
+                ThreadRole::Develop => "develop",
+                ThreadRole::Test => "test",
+                ThreadRole::Integrate => "integrate",
+                _ => "plan",
+            }
+            .to_string(),
+            depends_on: match role.role {
+                ThreadRole::Director => Vec::new(),
+                ThreadRole::Develop => vec![format!("{}-director", project.slug)],
+                ThreadRole::Test => vec![format!("{}-dev", project.slug)],
+                ThreadRole::Integrate => vec![format!("{}-test", project.slug)],
+                _ => Vec::new(),
+            },
+            acceptance_criteria: vec![
+                "The handoff is explicit".to_string(),
+                "Validation evidence is recorded".to_string(),
+            ],
+            validation_commands: config.default_validation_commands.clone(),
+            commit_required: !matches!(role.role, ThreadRole::Director),
+            status: "planned".to_string(),
+        })
+        .collect();
+    ManagedProjectPlan {
+        schema: "tt-managed-project-plan-v1".to_string(),
+        status: "draft".to_string(),
+        objective: project.objective.clone(),
+        updated_at: Utc::now().to_rfc3339(),
+        milestones,
+        work_items,
+        notes: ManagedProjectPlanNotes {
+            risks: Vec::new(),
+            pitfalls: config.pitfalls.clone(),
+            open_questions: Vec::new(),
+            operator_constraints: config.exceptions.clone(),
+        },
+    }
+}
+
+fn load_managed_project_plan(path: &Path) -> Result<ManagedProjectPlan> {
+    let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))
+}
+
+fn save_managed_project_plan(path: &Path, plan: &ManagedProjectPlan) -> Result<()> {
+    let contents = toml::to_string_pretty(plan)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::read_to_string(path) {
+        Ok(existing) if existing == contents => Ok(()),
+        _ => {
+            fs::write(path, contents)?;
+            Ok(())
+        }
+    }
+}
+
+fn load_or_seed_managed_project_plan(
+    path: &Path,
+    config: &ManagedProjectProjectConfig,
+    project: &Project,
+    roles: &[&ManagedProjectRoleBootstrap],
+) -> Result<ManagedProjectPlan> {
+    if path.exists() {
+        return load_managed_project_plan(path);
+    }
+    let plan = default_managed_project_plan(project, config, roles);
+    save_managed_project_plan(path, &plan)?;
+    Ok(plan)
 }
 
 fn managed_project_thread_binding_id(project_slug: &str, role: ThreadRole) -> String {
@@ -2453,13 +2788,66 @@ impl DaemonService {
         }
 
         Ok(ManagedProjectBootstrap {
-            project,
+            project: project.clone(),
             repo_root: PathBuf::from(&manifest.repo_root),
             base_branch: manifest.base_branch.clone(),
             worktree_root: PathBuf::from(&manifest.worktree_root),
             manifest_path: manifest_path.to_path_buf(),
+            project_config_path: if manifest.project_config_path.is_empty() {
+                PathBuf::from(&manifest.repo_root)
+                    .join(".tt")
+                    .join("project.toml")
+            } else {
+                PathBuf::from(&manifest.project_config_path)
+            },
+            plan_path: if manifest.plan_path.is_empty() {
+                PathBuf::from(&manifest.repo_root)
+                    .join(".tt")
+                    .join("plan.toml")
+            } else {
+                PathBuf::from(&manifest.plan_path)
+            },
             contract_path: PathBuf::from(&manifest.contract_path),
             codex_config_path: PathBuf::from(&manifest.codex_config_path),
+            project_config: if manifest.project_config.schema.is_empty() {
+                let config_path = PathBuf::from(&manifest.repo_root)
+                    .join(".tt")
+                    .join("project.toml");
+                match load_managed_project_project_config(&config_path) {
+                    Ok(config) => config,
+                    Err(_) => default_managed_project_project_config(
+                        &project.title,
+                        &project.objective,
+                        &manifest.base_branch,
+                    ),
+                }
+            } else {
+                manifest.project_config.clone()
+            },
+            plan: if manifest.plan.schema.is_empty() {
+                let config = if manifest.project_config.schema.is_empty() {
+                    load_or_seed_managed_project_config(
+                        &PathBuf::from(&manifest.repo_root)
+                            .join(".tt")
+                            .join("project.toml"),
+                        &project.title,
+                        &project.objective,
+                        &manifest.base_branch,
+                    )?
+                } else {
+                    manifest.project_config.clone()
+                };
+                load_or_seed_managed_project_plan(
+                    &PathBuf::from(&manifest.repo_root)
+                        .join(".tt")
+                        .join("plan.toml"),
+                    &config,
+                    &project,
+                    &[],
+                )?
+            } else {
+                manifest.plan.clone()
+            },
             scenario: manifest.scenario.clone(),
             roles: ordered_managed_project_roles(roles),
         })
@@ -2492,8 +2880,12 @@ impl DaemonService {
             &bootstrap.repo_root,
             &bootstrap.base_branch,
             &bootstrap.worktree_root,
+            &bootstrap.project_config_path,
+            &bootstrap.plan_path,
             &bootstrap.contract_path,
             &bootstrap.codex_config_path,
+            &bootstrap.project_config,
+            &bootstrap.plan,
             bootstrap.scenario.clone(),
             &role_refs,
         );
@@ -2629,8 +3021,12 @@ impl DaemonService {
             &bootstrap.repo_root,
             &bootstrap.base_branch,
             &bootstrap.worktree_root,
+            &bootstrap.project_config_path,
+            &bootstrap.plan_path,
             &bootstrap.contract_path,
             &bootstrap.codex_config_path,
+            &bootstrap.project_config,
+            &bootstrap.plan,
             bootstrap.scenario.clone(),
             &role_refs,
         );
@@ -3209,14 +3605,23 @@ impl DaemonService {
     }
 
     fn save_managed_project_bootstrap(&self, bootstrap: &ManagedProjectBootstrap) -> Result<()> {
+        save_managed_project_project_config(
+            &bootstrap.project_config_path,
+            &bootstrap.project_config,
+        )?;
+        save_managed_project_plan(&bootstrap.plan_path, &bootstrap.plan)?;
         let role_refs: Vec<_> = bootstrap.roles.iter().collect();
         let manifest = build_managed_project_manifest(
             &bootstrap.project,
             &bootstrap.repo_root,
             &bootstrap.base_branch,
             &bootstrap.worktree_root,
+            &bootstrap.project_config_path,
+            &bootstrap.plan_path,
             &bootstrap.contract_path,
             &bootstrap.codex_config_path,
+            &bootstrap.project_config,
+            &bootstrap.plan,
             bootstrap.scenario.clone(),
             &role_refs,
         );
@@ -4756,7 +5161,12 @@ mod tests {
         assert_eq!(bootstrap.project.slug, "alpha");
         assert!(bootstrap.contract_path.exists());
         assert!(bootstrap.codex_config_path.exists());
+        assert!(bootstrap.project_config_path.exists());
+        assert!(bootstrap.plan_path.exists());
         assert!(bootstrap.manifest_path.exists());
+        assert!(bootstrap.project_config.plan_first);
+        assert_eq!(bootstrap.project_config.commit_policy, "checkpoint-enforced");
+        assert_eq!(bootstrap.plan.status, "draft");
         assert_eq!(bootstrap.roles.len(), 4);
         assert!(bootstrap.roles.iter().all(|role| role.agent_path.exists()));
 
@@ -4844,13 +5254,46 @@ mod tests {
             thread_name: Some("alpha-dev".into()),
             workspace_binding_id: Some("alpha:dev".into()),
         };
+        let project_config = ManagedProjectProjectConfig {
+            schema: "tt-managed-project-config-v1".into(),
+            title: "Alpha".into(),
+            objective: "Ship".into(),
+            base_branch: "main".into(),
+            branch_prefix: "tt".into(),
+            plan_first: true,
+            commit_policy: "checkpoint-enforced".into(),
+            require_operator_merge_approval: true,
+            expected_long_build: false,
+            require_progress_updates: true,
+            soft_silence_seconds: 900,
+            hard_ceiling_seconds: 7200,
+            default_validation_commands: vec!["cargo test".into()],
+            smoke_validation_commands: vec!["cargo check".into()],
+            checkpoint_triggers: vec!["after_plan".into(), "before_merge".into()],
+            pitfalls: vec!["pitfall".into()],
+            hints: vec!["hint".into()],
+            exceptions: vec!["exception".into()],
+        };
+        let plan = ManagedProjectPlan {
+            schema: "tt-managed-project-plan-v1".into(),
+            status: "draft".into(),
+            objective: "Ship".into(),
+            updated_at: ts().to_rfc3339(),
+            milestones: vec![],
+            work_items: vec![],
+            notes: ManagedProjectPlanNotes::default(),
+        };
         let manifest = build_managed_project_manifest(
             &project,
             dir.path(),
             "main",
             &dir.path().join(".tt-worktrees/alpha"),
+            &dir.path().join(".tt/project.toml"),
+            &dir.path().join(".tt/plan.toml"),
             &dir.path().join(".tt/contracts/worker-contract.md"),
             &dir.path().join(".codex/config.toml"),
+            &project_config,
+            &plan,
             None,
             &[&role],
         );
@@ -4870,7 +5313,31 @@ mod tests {
 
     #[test]
     fn managed_project_contract_mentions_director_and_workers() {
-        let contract = render_worker_contract(Path::new("/repo"), "alpha", "main");
+        let contract = render_worker_contract(
+            Path::new("/repo"),
+            "alpha",
+            "main",
+            &ManagedProjectProjectConfig {
+                schema: "tt-managed-project-config-v1".into(),
+                title: "Alpha".into(),
+                objective: "Ship".into(),
+                base_branch: "main".into(),
+                branch_prefix: "tt".into(),
+                plan_first: true,
+                commit_policy: "checkpoint-enforced".into(),
+                require_operator_merge_approval: true,
+                expected_long_build: false,
+                require_progress_updates: true,
+                soft_silence_seconds: 900,
+                hard_ceiling_seconds: 7200,
+                default_validation_commands: vec!["cargo test".into()],
+                smoke_validation_commands: vec!["cargo check".into()],
+                checkpoint_triggers: vec!["after_plan".into(), "before_merge".into()],
+                pitfalls: vec![],
+                hints: vec![],
+                exceptions: vec![],
+            },
+        );
         assert!(contract.contains("TT Managed Project Contract"));
         assert!(contract.contains("Coordination Model"));
         assert!(contract.contains("The operator talks to the director."));
@@ -4952,12 +5419,43 @@ mod tests {
 
     #[test]
     fn director_agent_instructions_include_operator_and_roster() {
+        let project_config = ManagedProjectProjectConfig {
+            schema: "tt-managed-project-config-v1".into(),
+            title: "Alpha".into(),
+            objective: "Ship the alpha slice".into(),
+            base_branch: "main".into(),
+            branch_prefix: "tt".into(),
+            plan_first: true,
+            commit_policy: "checkpoint-enforced".into(),
+            require_operator_merge_approval: true,
+            expected_long_build: true,
+            require_progress_updates: true,
+            soft_silence_seconds: 900,
+            hard_ceiling_seconds: 7200,
+            default_validation_commands: vec!["cargo test".into()],
+            smoke_validation_commands: vec!["cargo check".into()],
+            checkpoint_triggers: vec!["after_plan".into(), "after_test".into()],
+            pitfalls: vec![],
+            hints: vec![],
+            exceptions: vec![],
+        };
+        let plan = ManagedProjectPlan {
+            schema: "tt-managed-project-plan-v1".into(),
+            status: "draft".into(),
+            objective: "Ship the alpha slice".into(),
+            updated_at: ts().to_rfc3339(),
+            milestones: vec![],
+            work_items: vec![],
+            notes: ManagedProjectPlanNotes::default(),
+        };
         let instructions = render_agent_file(
             ThreadRole::Director,
             Some("gpt-5.4"),
             Some("medium"),
             "Alpha",
             "Ship the alpha slice",
+            &project_config,
+            &plan,
         );
         assert!(instructions.contains("model = \"gpt-5.4\""));
         assert!(instructions.contains("model_reasoning_effort = \"medium\""));

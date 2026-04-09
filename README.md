@@ -15,7 +15,8 @@ The current direction is:
 - `tt-daemon` as the local API boundary
 - `tt-tui` as the primary operator surface
 - `tt-cli` as a thin client over the daemon
-- `.tt` as the TT-owned overlay for orchestration metadata
+- `.tt` as the TT-owned overlay for orchestration metadata, including repo-local
+  project policy and director plans
 - `tt-git` as the repo/worktree authority for merge readiness and checkout inspection
 
 The design stays local first. State lives on the machine, operators inspect it directly, and merge/cleanup decisions stay visible instead of hidden behind a remote service.

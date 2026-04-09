@@ -957,6 +957,45 @@ fn render_managed_project_bootstrap(bootstrap: &tt_daemon::ManagedProjectBootstr
         "Codex config: {}\n",
         bootstrap.codex_config_path.display()
     ));
+    output.push_str(&format!(
+        "Project config: {}\n",
+        bootstrap.project_config_path.display()
+    ));
+    output.push_str(&format!("Plan: {}\n", bootstrap.plan_path.display()));
+    output.push_str(&format!(
+        "Plan summary: status={} milestones={} work_items={} commit_policy={} plan_first={}\n",
+        bootstrap.plan.status,
+        bootstrap.plan.milestones.len(),
+        bootstrap.plan.work_items.len(),
+        bootstrap.project_config.commit_policy,
+        bootstrap.project_config.plan_first
+    ));
+    output.push_str(&format!(
+        "Liveness config: expected_long_build={} progress_updates_required={} soft_silence_seconds={} hard_ceiling_seconds={}\n",
+        bootstrap.project_config.expected_long_build,
+        bootstrap.project_config.require_progress_updates,
+        bootstrap.project_config.soft_silence_seconds,
+        bootstrap.project_config.hard_ceiling_seconds
+    ));
+    if !bootstrap
+        .project_config
+        .default_validation_commands
+        .is_empty()
+    {
+        output.push_str(&format!(
+            "Default validation: {}\n",
+            bootstrap
+                .project_config
+                .default_validation_commands
+                .join(", ")
+        ));
+    }
+    if !bootstrap.project_config.pitfalls.is_empty() {
+        output.push_str(&format!(
+            "Pitfalls: {}\n",
+            bootstrap.project_config.pitfalls.join(" | ")
+        ));
+    }
     if let Some(scenario) = bootstrap.scenario.as_ref() {
         output.push_str("\nScenario\n");
         output.push_str("--------\n");
@@ -1434,8 +1473,59 @@ mod tests {
             base_branch: "main".into(),
             worktree_root: "/repo/.tt-worktrees/alpha".into(),
             manifest_path: "/repo/.tt/managed-project.toml".into(),
+            project_config_path: "/repo/.tt/project.toml".into(),
+            plan_path: "/repo/.tt/plan.toml".into(),
             contract_path: "/repo/.tt/contracts/worker-contract.md".into(),
             codex_config_path: "/repo/.codex/config.toml".into(),
+            project_config: tt_daemon::ManagedProjectProjectConfig {
+                schema: "tt-managed-project-config-v1".into(),
+                title: "Alpha".into(),
+                objective: "Ship".into(),
+                base_branch: "main".into(),
+                branch_prefix: "tt".into(),
+                plan_first: true,
+                commit_policy: "checkpoint-enforced".into(),
+                require_operator_merge_approval: true,
+                expected_long_build: true,
+                require_progress_updates: true,
+                soft_silence_seconds: 900,
+                hard_ceiling_seconds: 7200,
+                default_validation_commands: vec!["cargo test".into()],
+                smoke_validation_commands: vec!["cargo check".into()],
+                checkpoint_triggers: vec![
+                    "after_plan".into(),
+                    "after_develop".into(),
+                    "after_test".into(),
+                    "before_merge".into(),
+                ],
+                pitfalls: vec!["clean target directories are slow".into()],
+                hints: vec!["use incremental builds".into()],
+                exceptions: vec!["merge approval required".into()],
+            },
+            plan: tt_daemon::ManagedProjectPlan {
+                schema: "tt-managed-project-plan-v1".into(),
+                status: "draft".into(),
+                objective: "Ship".into(),
+                updated_at: ts().to_rfc3339(),
+                milestones: vec![tt_daemon::ManagedProjectPlanMilestone {
+                    id: "milestone-1".into(),
+                    title: "Plan".into(),
+                    success_criteria: vec!["plan exists".into()],
+                    evidence: vec![],
+                }],
+                work_items: vec![tt_daemon::ManagedProjectPlanWorkItem {
+                    id: "alpha-director".into(),
+                    title: "Director".into(),
+                    owner_role: "director".into(),
+                    phase: "plan".into(),
+                    depends_on: vec![],
+                    acceptance_criteria: vec!["director has plan".into()],
+                    validation_commands: vec!["cargo test".into()],
+                    commit_required: false,
+                    status: "planned".into(),
+                }],
+                notes: tt_daemon::ManagedProjectPlanNotes::default(),
+            },
             scenario: Some(tt_daemon::ManagedProjectScenarioState {
                 scenario_id: "scn-1".into(),
                 scenario_kind: "rust-taskflow-four-round".into(),
@@ -1533,6 +1623,9 @@ mod tests {
         };
         let text = render_response(&DaemonResponse::ManagedProjectInspection(inspection));
         assert!(text.contains("managed project"));
+        assert!(text.contains("Project config: /repo/.tt/project.toml"));
+        assert!(text.contains("Plan: /repo/.tt/plan.toml"));
+        assert!(text.contains("Plan summary: status=draft milestones=1 work_items=1"));
         assert!(text.contains("state: partial"));
         assert!(text.contains("Repository"));
         assert!(text.contains("merge-ready: true"));
@@ -1541,7 +1634,9 @@ mod tests {
         assert!(text.contains("liveness_policy: expected_long_build=false"));
         assert!(text.contains("watchdog: state=healthy"));
         assert!(text.contains("watchdog_summary: healthy"));
-        assert!(text.contains("watchdog_detail: elapsed=42s status=InProgress items=8 log_size=456"));
+        assert!(
+            text.contains("watchdog_detail: elapsed=42s status=InProgress items=8 log_size=456")
+        );
         assert!(text.contains("watchdog_note: progress is moving"));
         assert!(text.contains("fallback_handoffs: 1"));
         assert!(text.contains("strict_extraction_ready: false"));

@@ -14,6 +14,8 @@ workers report only to the director.
 - `.codex/agents/dev.toml`
 - `.codex/agents/test.toml`
 - `.codex/agents/integration.toml`
+- `.tt/project.toml` with repo-local project policy and liveness overrides
+- `.tt/plan.toml` with the director's current plan and checkpoints
 - `.tt/contracts/worker-contract.md`
 - `.tt/managed-project.toml`
 - one worktree each for `dev`, `test`, and `integration`
@@ -40,11 +42,14 @@ escalations flow through the director.
 - `tt project init --path <target-dir>` creates a fresh git repo plus a minimal
   managed-project scaffold for a supported template.
 - `tt project open` writes the manifest, contract, and agent files.
+- `tt project open` writes the repo-local project policy and plan sidecars.
 - `tt project inspect` / `tt project status` reads back the manifest, role
-  bindings, worktrees, and repository state without changing anything.
+  bindings, worktrees, repository state, and effective project plan without
+  changing anything.
 - `tt project director` creates or reuses the scaffold, chooses the role
   topology, activates the selected roles in one shot, and can optionally run a
-  built-in seeded scenario.
+  built-in seeded scenario. The director now plan-checks against `.tt/plan.toml`
+  before it dispatches workers.
 - `tt project spawn` starts live Codex threads for the selected roles and
   records the resulting thread ids in `.tt/managed-project.toml`.
 - `tt project attach` binds existing Codex thread ids to the corresponding
@@ -105,7 +110,8 @@ Each handoff should include:
 - `next_step`
 
 The contract is intentionally explicit so the director can coordinate workers
-with prompts, skills, and agent definitions without relying on hidden state.
+with prompts, skills, agent definitions, and repo-local project policy without
+relying on hidden state.
 
 ## Seeded Scenarios
 
