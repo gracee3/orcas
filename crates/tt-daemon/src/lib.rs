@@ -2926,7 +2926,9 @@ impl DaemonService {
         let path = path.as_ref();
         fs::create_dir_all(path)?;
         initialize_git_repository(path, base_branch.as_deref())?;
-        scaffold_managed_project_template(path, template.as_deref())?;
+        if template.is_some() || repo_root_has_no_non_git_entries(path)? {
+            scaffold_managed_project_template(path, template.as_deref())?;
+        }
         self.open_managed_project(
             path,
             title,
@@ -4533,6 +4535,16 @@ fn scaffold_managed_project_template(path: &Path, template: Option<&str>) -> Res
         }
         other => anyhow::bail!("unsupported managed project template `{other}`"),
     }
+}
+
+fn repo_root_has_no_non_git_entries(path: &Path) -> Result<bool> {
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry.with_context(|| format!("read entry in {}", path.display()))?;
+        if entry.file_name() != ".git" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn run_command<I, S>(cwd: &Path, program: &str, args: I) -> Result<()>

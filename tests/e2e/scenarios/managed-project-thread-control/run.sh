@@ -32,7 +32,7 @@ inspect_control_stdout="$reports_dir/project-inspect-control.txt"
 resume_control_stdout="$reports_dir/project-control-resume.txt"
 inspect_resume_stdout="$reports_dir/project-inspect-resume.txt"
 
-e2e_tt project init \
+e2e_tt init \
   --path "$repo_root" \
   --title "Taskflow Control Demo" \
   --objective "Demonstrate per-thread manual takeover and director resume" \
@@ -41,34 +41,34 @@ e2e_tt project init \
 
 e2e_start_codex_app_server_for_repo "$repo_root" "$app_server_log"
 
-e2e_tt --cwd "$repo_root" project spawn \
+e2e_tt --cwd "$repo_root" internal project spawn \
   --role test \
   >"$spawn_stdout"
 
-e2e_tt --cwd "$repo_root" project inspect >"$inspect_spawn_stdout"
+e2e_tt --cwd "$repo_root" internal project inspect >"$inspect_spawn_stdout"
 
 grep -q "state: partial" "$inspect_spawn_stdout"
 grep -q "test |" "$inspect_spawn_stdout"
 grep -Eq 'thread=[^<]' "$inspect_spawn_stdout"
 grep -q "control=director" "$inspect_spawn_stdout"
 
-e2e_tt --cwd "$repo_root" project control \
+e2e_tt --cwd "$repo_root" internal project control \
   --role test \
   --mode manual_next_turn \
   >"$pause_control_stdout"
 
-e2e_tt --cwd "$repo_root" project inspect >"$inspect_control_stdout"
+e2e_tt --cwd "$repo_root" internal project inspect >"$inspect_control_stdout"
 
 grep -q "test |" "$inspect_control_stdout"
 grep -q "control=manual_next_turn" "$inspect_control_stdout"
 grep -q "state: partial" "$inspect_control_stdout"
 
-e2e_tt --cwd "$repo_root" project control \
+e2e_tt --cwd "$repo_root" internal project control \
   --role test \
   --mode director \
   >"$resume_control_stdout"
 
-e2e_tt --cwd "$repo_root" project inspect >"$inspect_resume_stdout"
+e2e_tt --cwd "$repo_root" internal project inspect >"$inspect_resume_stdout"
 
 grep -q "test |" "$inspect_resume_stdout"
 grep -q "control=director" "$inspect_resume_stdout"

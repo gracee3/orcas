@@ -2,9 +2,9 @@
 
 This scenario verifies the per-thread control loop for a managed project:
 
-- `tt project spawn` creates live managed threads that the operator can watch in Codex TUI
-- `tt project control` can mark a worker role `manual_next_turn`
-- `tt project inspect` shows the updated per-thread control mode immediately
+- hidden internal spawn creates live managed threads that the operator can watch in Codex TUI
+- hidden internal control can mark a worker role `manual_next_turn`
+- hidden internal inspect shows the updated per-thread control mode immediately
 - switching the same role back to `director` restores automatic control
 
 The demo keeps the thread lifecycle short on purpose. It does not wait for the

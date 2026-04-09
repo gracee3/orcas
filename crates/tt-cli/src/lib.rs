@@ -35,21 +35,82 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    Init {
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        objective: Option<String>,
+        #[arg(long)]
+        template: Option<String>,
+        #[arg(long)]
+        base_branch: Option<String>,
+        #[arg(long)]
+        worktree_root: Option<PathBuf>,
+        #[arg(long)]
+        director_model: Option<String>,
+        #[arg(long)]
+        dev_model: Option<String>,
+        #[arg(long)]
+        test_model: Option<String>,
+        #[arg(long)]
+        integration_model: Option<String>,
+    },
+    Open {
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        objective: Option<String>,
+        #[arg(long)]
+        base_branch: Option<String>,
+        #[arg(long)]
+        worktree_root: Option<PathBuf>,
+        #[arg(long)]
+        director_model: Option<String>,
+        #[arg(long)]
+        dev_model: Option<String>,
+        #[arg(long)]
+        test_model: Option<String>,
+        #[arg(long)]
+        integration_model: Option<String>,
+    },
+    Docs {
+        #[command(subcommand)]
+        command: DocsCommand,
+    },
+    Codex {
+        #[command(subcommand)]
+        command: CodexCommand,
+    },
+    Status,
     Doctor {
         #[arg(long, default_value_t = false)]
         codex: bool,
         #[arg(long = "check-listen", default_value_t = false)]
         check_listen: bool,
     },
-    Status,
+    #[command(hide = true)]
+    Internal {
+        #[command(subcommand)]
+        command: InternalCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DocsCommand {
+    ExportCli {
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InternalCommand {
     Repo,
     Project {
         #[command(subcommand)]
-        command: ProjectFlowCommand,
-    },
-    Codex {
-        #[command(subcommand)]
-        command: CodexCommand,
+        command: InternalProjectCommand,
     },
     Workspace {
         #[command(subcommand)]
@@ -59,18 +120,6 @@ pub enum Command {
     Records {
         #[command(subcommand)]
         command: RecordsCommand,
-    },
-    Docs {
-        #[command(subcommand)]
-        command: DocsCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum DocsCommand {
-    ExportCliRef {
-        #[arg(long)]
-        output: Option<PathBuf>,
     },
 }
 
@@ -110,7 +159,7 @@ pub enum CodexThreadsCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum ProjectFlowCommand {
+pub enum InternalProjectCommand {
     #[command(alias = "status")]
     Inspect,
     Plan {
@@ -373,7 +422,7 @@ pub fn run() -> Result<()> {
 fn local_command_output(command: &Command, cli_cwd: &Option<PathBuf>) -> Result<Option<String>> {
     match command {
         Command::Docs {
-            command: DocsCommand::ExportCliRef { output },
+            command: DocsCommand::ExportCli { output },
         } => {
             let markdown = render_cli_reference_markdown();
             if let Some(path) = output {
@@ -400,8 +449,15 @@ fn local_command_output(command: &Command, cli_cwd: &Option<PathBuf>) -> Result<
 
 fn request_cwd_for_command(cwd: &Path, command: &Command) -> PathBuf {
     match command {
-        Command::Project {
-            command: ProjectFlowCommand::Init { path, .. },
+        Command::Init { path, .. } => path
+            .as_ref()
+            .map(|path| resolve_cli_path(cwd, path.clone()))
+            .unwrap_or_else(|| cwd.to_path_buf()),
+        Command::Internal {
+            command:
+                InternalCommand::Project {
+                    command: InternalProjectCommand::Init { path, .. },
+                },
         } => path
             .as_ref()
             .map(|path| resolve_cli_path(cwd, path.clone()))
@@ -412,6 +468,56 @@ fn request_cwd_for_command(cwd: &Path, command: &Command) -> PathBuf {
 
 fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
     Ok(match command {
+        Command::Init {
+            path,
+            title,
+            objective,
+            template,
+            base_branch,
+            worktree_root,
+            director_model,
+            dev_model,
+            test_model,
+            integration_model,
+        } => DaemonRequest::InitManagedProject {
+            path: path
+                .map(|path| resolve_cli_path(cwd, path))
+                .unwrap_or_else(|| cwd.to_path_buf()),
+            title,
+            objective,
+            template,
+            base_branch,
+            worktree_root,
+            director_model,
+            dev_model,
+            test_model,
+            integration_model,
+        },
+        Command::Open {
+            title,
+            objective,
+            base_branch,
+            worktree_root,
+            director_model,
+            dev_model,
+            test_model,
+            integration_model,
+        } => DaemonRequest::DirectManagedProject {
+            cwd: cwd.to_path_buf(),
+            title,
+            objective,
+            base_branch,
+            worktree_root,
+            director_model,
+            dev_model,
+            test_model,
+            integration_model,
+            roles: None,
+            bindings: vec![],
+            scenario: None,
+            seed_file: None,
+        },
+        Command::Docs { .. } => anyhow::bail!("docs commands are handled locally"),
         Command::Doctor {
             codex,
             check_listen,
@@ -429,118 +535,6 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
             }
         }
         Command::Status => DaemonRequest::Status,
-        Command::Repo => DaemonRequest::RepositorySummary {
-            cwd: cwd.to_path_buf(),
-        },
-        Command::Project { command } => match command {
-            ProjectFlowCommand::Inspect => DaemonRequest::InspectManagedProject {
-                cwd: cwd.to_path_buf(),
-            },
-            ProjectFlowCommand::Plan { command } => match command {
-                ProjectPlanCommand::Show => DaemonRequest::InspectManagedProjectPlan {
-                    cwd: cwd.to_path_buf(),
-                },
-                ProjectPlanCommand::Refresh => DaemonRequest::RefreshManagedProjectPlan {
-                    cwd: cwd.to_path_buf(),
-                },
-            },
-            ProjectFlowCommand::Init {
-                path,
-                title,
-                objective,
-                template,
-                base_branch,
-                worktree_root,
-                director_model,
-                dev_model,
-                test_model,
-                integration_model,
-            } => DaemonRequest::InitManagedProject {
-                path: path
-                    .map(|path| resolve_cli_path(cwd, path))
-                    .unwrap_or_else(|| cwd.to_path_buf()),
-                title,
-                objective,
-                template,
-                base_branch,
-                worktree_root,
-                director_model,
-                dev_model,
-                test_model,
-                integration_model,
-            },
-            ProjectFlowCommand::Open {
-                title,
-                objective,
-                base_branch,
-                worktree_root,
-                director_model,
-                dev_model,
-                test_model,
-                integration_model,
-            } => DaemonRequest::OpenManagedProject {
-                cwd: cwd.to_path_buf(),
-                title,
-                objective,
-                base_branch,
-                worktree_root,
-                director_model,
-                dev_model,
-                test_model,
-                integration_model,
-            },
-            ProjectFlowCommand::Director {
-                title,
-                objective,
-                base_branch,
-                worktree_root,
-                director_model,
-                dev_model,
-                test_model,
-                integration_model,
-                role,
-                binding,
-                scenario,
-                seed_file,
-            } => DaemonRequest::DirectManagedProject {
-                cwd: cwd.to_path_buf(),
-                title,
-                objective,
-                base_branch,
-                worktree_root,
-                director_model,
-                dev_model,
-                test_model,
-                integration_model,
-                roles: if role.is_empty() {
-                    None
-                } else {
-                    Some(parse_thread_roles(&role)?)
-                },
-                bindings: parse_thread_bindings(&binding)?,
-                scenario,
-                seed_file: seed_file.map(|path| resolve_cli_path(cwd, path)),
-            },
-            ProjectFlowCommand::Control { role, mode } => {
-                DaemonRequest::SetManagedProjectThreadControl {
-                    cwd: cwd.to_path_buf(),
-                    role: ThreadRole::from_str(&role).map_err(|error| anyhow::anyhow!(error))?,
-                    mode: parse_thread_control_mode(&mode)?,
-                }
-            }
-            ProjectFlowCommand::Spawn { role } => DaemonRequest::SpawnManagedProject {
-                cwd: cwd.to_path_buf(),
-                roles: if role.is_empty() {
-                    None
-                } else {
-                    Some(parse_thread_roles(&role)?)
-                },
-            },
-            ProjectFlowCommand::Attach { binding } => DaemonRequest::AttachManagedProject {
-                cwd: cwd.to_path_buf(),
-                bindings: parse_thread_bindings(&binding)?,
-            },
-        },
         Command::Codex { command } => match command {
             CodexCommand::Threads { command } => match command {
                 CodexThreadsCommand::List { limit } => DaemonRequest::ListCodexThreads {
@@ -578,7 +572,120 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
                 cwd: cwd.to_path_buf(),
             },
         },
-        Command::Workspace { command } => match command {
+        Command::Internal { command } => match command {
+            InternalCommand::Repo => DaemonRequest::RepositorySummary {
+                cwd: cwd.to_path_buf(),
+            },
+            InternalCommand::Project { command } => match command {
+            InternalProjectCommand::Inspect => DaemonRequest::InspectManagedProject {
+                cwd: cwd.to_path_buf(),
+            },
+            InternalProjectCommand::Plan { command } => match command {
+                ProjectPlanCommand::Show => DaemonRequest::InspectManagedProjectPlan {
+                    cwd: cwd.to_path_buf(),
+                },
+                ProjectPlanCommand::Refresh => DaemonRequest::RefreshManagedProjectPlan {
+                    cwd: cwd.to_path_buf(),
+                },
+            },
+            InternalProjectCommand::Init {
+                path,
+                title,
+                objective,
+                template,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+            } => DaemonRequest::InitManagedProject {
+                path: path
+                    .map(|path| resolve_cli_path(cwd, path))
+                    .unwrap_or_else(|| cwd.to_path_buf()),
+                title,
+                objective,
+                template,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+            },
+            InternalProjectCommand::Open {
+                title,
+                objective,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+            } => DaemonRequest::OpenManagedProject {
+                cwd: cwd.to_path_buf(),
+                title,
+                objective,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+            },
+            InternalProjectCommand::Director {
+                title,
+                objective,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+                role,
+                binding,
+                scenario,
+                seed_file,
+            } => DaemonRequest::DirectManagedProject {
+                cwd: cwd.to_path_buf(),
+                title,
+                objective,
+                base_branch,
+                worktree_root,
+                director_model,
+                dev_model,
+                test_model,
+                integration_model,
+                roles: if role.is_empty() {
+                    None
+                } else {
+                    Some(parse_thread_roles(&role)?)
+                },
+                bindings: parse_thread_bindings(&binding)?,
+                scenario,
+                seed_file: seed_file.map(|path| resolve_cli_path(cwd, path)),
+            },
+            InternalProjectCommand::Control { role, mode } => {
+                DaemonRequest::SetManagedProjectThreadControl {
+                    cwd: cwd.to_path_buf(),
+                    role: ThreadRole::from_str(&role).map_err(|error| anyhow::anyhow!(error))?,
+                    mode: parse_thread_control_mode(&mode)?,
+                }
+            }
+            InternalProjectCommand::Spawn { role } => DaemonRequest::SpawnManagedProject {
+                cwd: cwd.to_path_buf(),
+                roles: if role.is_empty() {
+                    None
+                } else {
+                    Some(parse_thread_roles(&role)?)
+                },
+            },
+            InternalProjectCommand::Attach { binding } => DaemonRequest::AttachManagedProject {
+                cwd: cwd.to_path_buf(),
+                bindings: parse_thread_bindings(&binding)?,
+            },
+        },
+        InternalCommand::Workspace { command } => match command {
             WorkspaceCommand::Binding { command } => match command {
                 WorkspaceBindingCommand::List => DaemonRequest::ListWorkspaceBindings,
                 WorkspaceBindingCommand::Get { id } => DaemonRequest::GetWorkspaceBinding { id },
@@ -671,7 +778,7 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
                 },
             },
         },
-        Command::Records { command } => match command {
+        InternalCommand::Records { command } => match command {
             RecordsCommand::Project { command } => match command {
                 ProjectCommand::List => DaemonRequest::ListProjects,
                 ProjectCommand::Get { id_or_slug } => DaemonRequest::GetProject { id_or_slug },
@@ -724,7 +831,7 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
                 }
             },
         },
-        Command::Docs { .. } => anyhow::bail!("docs commands are handled locally"),
+        },
     })
 }
 
@@ -1540,8 +1647,13 @@ fn parse_thread_bindings(values: &[String]) -> Result<Vec<ManagedProjectThreadAt
 
 pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
     let cli = Cli::parse_from(args);
+    if let Some(output) = local_command_output(&cli.command, &cli.cwd)? {
+        print!("{output}");
+        return Ok(());
+    }
     let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
-    let response = request_for_cwd(&cwd, command_to_request(cli.command, &cwd)?)?;
+    let request_cwd = request_cwd_for_command(&cwd, &cli.command);
+    let response = request_for_cwd(&request_cwd, command_to_request(cli.command, &cwd)?)?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
@@ -1565,13 +1677,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_project_list_command() {
-        let cli = Cli::parse_from(["tt", "records", "project", "list"]);
+    fn parses_internal_project_list_command() {
+        let cli = Cli::parse_from(["tt", "internal", "records", "project", "list"]);
         assert!(matches!(
             cli.command,
-            Command::Records {
-                command: RecordsCommand::Project {
-                    command: ProjectCommand::List
+            Command::Internal {
+                command: InternalCommand::Records {
+                    command: RecordsCommand::Project {
+                        command: ProjectCommand::List
+                    }
                 }
             }
         ));
@@ -1602,75 +1716,78 @@ mod tests {
     }
 
     #[test]
-    fn parses_project_open_command() {
-        let cli = Cli::parse_from(["tt", "project", "open", "--title", "Alpha"]);
+    fn parses_open_command() {
+        let cli = Cli::parse_from(["tt", "open", "--title", "Alpha"]);
         assert!(matches!(
             cli.command,
-            Command::Project {
-                command: ProjectFlowCommand::Open {
-                    title: Some(ref title),
-                    ..
-                }
+            Command::Open {
+                title: Some(ref title),
+                ..
             } if title == "Alpha"
         ));
     }
 
     #[test]
-    fn parses_project_init_command_without_path() {
-        let cli = Cli::parse_from(["tt", "project", "init", "--title", "Alpha"]);
+    fn parses_init_command_without_path() {
+        let cli = Cli::parse_from(["tt", "init", "--title", "Alpha"]);
         assert!(matches!(
             cli.command,
-            Command::Project {
-                command: ProjectFlowCommand::Init {
-                    path: None,
-                    title: Some(ref title),
-                    ..
-                }
+            Command::Init {
+                path: None,
+                title: Some(ref title),
+                ..
             } if title == "Alpha"
         ));
     }
 
     #[test]
-    fn parses_project_status_alias_for_inspect_command() {
-        let cli = Cli::parse_from(["tt", "project", "status"]);
+    fn parses_internal_project_status_alias_for_inspect_command() {
+        let cli = Cli::parse_from(["tt", "internal", "project", "status"]);
         assert!(matches!(
             cli.command,
-            Command::Project {
-                command: ProjectFlowCommand::Inspect
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_project_plan_show_command() {
-        let cli = Cli::parse_from(["tt", "project", "plan", "show"]);
-        assert!(matches!(
-            cli.command,
-            Command::Project {
-                command: ProjectFlowCommand::Plan {
-                    command: ProjectPlanCommand::Show
+            Command::Internal {
+                command: InternalCommand::Project {
+                    command: InternalProjectCommand::Inspect
                 }
             }
         ));
     }
 
     #[test]
-    fn parses_legacy_alias_for_records_command() {
-        let cli = Cli::parse_from(["tt", "legacy", "project", "list"]);
+    fn parses_internal_project_plan_show_command() {
+        let cli = Cli::parse_from(["tt", "internal", "project", "plan", "show"]);
         assert!(matches!(
             cli.command,
-            Command::Records {
-                command: RecordsCommand::Project {
-                    command: ProjectCommand::List
+            Command::Internal {
+                command: InternalCommand::Project {
+                    command: InternalProjectCommand::Plan {
+                        command: ProjectPlanCommand::Show
+                    }
                 }
             }
         ));
     }
 
     #[test]
-    fn parses_project_director_command() {
+    fn parses_legacy_alias_for_internal_records_command() {
+        let cli = Cli::parse_from(["tt", "internal", "legacy", "project", "list"]);
+        assert!(matches!(
+            cli.command,
+            Command::Internal {
+                command: InternalCommand::Records {
+                    command: RecordsCommand::Project {
+                        command: ProjectCommand::List
+                    }
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_internal_project_director_command() {
         let cli = Cli::parse_from([
             "tt",
+            "internal",
             "project",
             "director",
             "--role",
@@ -1680,8 +1797,10 @@ mod tests {
         ]);
         assert!(matches!(
             cli.command,
-            Command::Project {
-                command: ProjectFlowCommand::Director { ref role, ref binding, .. }
+            Command::Internal {
+                command: InternalCommand::Project {
+                    command: InternalProjectCommand::Director { ref role, ref binding, .. }
+                }
             } if role == &vec!["dev".to_string()] && binding == &vec!["director=thread-1".to_string()]
         ));
     }
@@ -1690,19 +1809,17 @@ mod tests {
     fn project_init_without_path_uses_cwd() {
         let cwd = Path::new("/repo");
         let request = command_to_request(
-            Command::Project {
-                command: ProjectFlowCommand::Init {
-                    path: None,
-                    title: Some("Alpha".into()),
-                    objective: None,
-                    template: None,
-                    base_branch: None,
-                    worktree_root: None,
-                    director_model: None,
-                    dev_model: None,
-                    test_model: None,
-                    integration_model: None,
-                },
+            Command::Init {
+                path: None,
+                title: Some("Alpha".into()),
+                objective: None,
+                template: None,
+                base_branch: None,
+                worktree_root: None,
+                director_model: None,
+                dev_model: None,
+                test_model: None,
+                integration_model: None,
             },
             cwd,
         )
@@ -1718,20 +1835,32 @@ mod tests {
     }
 
     #[test]
-    fn parses_project_spawn_command() {
-        let cli = Cli::parse_from(["tt", "project", "spawn", "--role", "dev", "--role", "test"]);
+    fn parses_internal_project_spawn_command() {
+        let cli = Cli::parse_from([
+            "tt",
+            "internal",
+            "project",
+            "spawn",
+            "--role",
+            "dev",
+            "--role",
+            "test",
+        ]);
         assert!(matches!(
             cli.command,
-            Command::Project {
-                command: ProjectFlowCommand::Spawn { ref role }
+            Command::Internal {
+                command: InternalCommand::Project {
+                    command: InternalProjectCommand::Spawn { ref role }
+                }
             } if role == &vec!["dev".to_string(), "test".to_string()]
         ));
     }
 
     #[test]
-    fn parses_project_attach_command() {
+    fn parses_internal_project_attach_command() {
         let cli = Cli::parse_from([
             "tt",
+            "internal",
             "project",
             "attach",
             "--binding",
@@ -1741,8 +1870,10 @@ mod tests {
         ]);
         assert!(matches!(
             cli.command,
-            Command::Project {
-                command: ProjectFlowCommand::Attach { ref binding }
+            Command::Internal {
+                command: InternalCommand::Project {
+                    command: InternalProjectCommand::Attach { ref binding }
+                }
             } if binding == &vec![
                 "dev=thread-123".to_string(),
                 "test=thread-456".to_string()
@@ -2092,10 +2223,12 @@ mod tests {
     #[test]
     fn project_control_command_maps_to_daemon_request() {
         let request = command_to_request(
-            Command::Project {
-                command: ProjectFlowCommand::Control {
-                    role: "dev".into(),
-                    mode: "manual_next_turn".into(),
+            Command::Internal {
+                command: InternalCommand::Project {
+                    command: InternalProjectCommand::Control {
+                        role: "dev".into(),
+                        mode: "manual_next_turn".into(),
+                    },
                 },
             },
             Path::new("/repo"),
@@ -2314,9 +2447,12 @@ mod tests {
         let markdown = render_cli_reference_markdown();
         assert!(markdown.contains("# TT CLI Reference"));
         assert!(markdown.contains("## `tt`"));
-        assert!(markdown.contains("### `tt project`"));
+        assert!(markdown.contains("### `tt init`"));
+        assert!(markdown.contains("### `tt open`"));
         assert!(markdown.contains("#### `tt codex threads`"));
         assert!(markdown.contains("`docs`"));
-        assert!(markdown.contains("`export-cli-ref`"));
+        assert!(markdown.contains("`export-cli`"));
+        assert!(!markdown.contains("`internal`"));
+        assert!(!markdown.contains("`project`"));
     }
 }

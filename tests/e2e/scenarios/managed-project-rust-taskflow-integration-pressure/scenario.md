@@ -1,6 +1,6 @@
 # Managed Project Rust Taskflow Integration Pressure
 
-This scenario creates a brand-new git repo with `tt project init`, activates the
+This scenario creates a brand-new git repo with `tt init`, activates the
 director/dev/test/integration topology, and runs a seeded four-round managed
 project scenario that introduces a deterministic integration blocker in round 3.
 

@@ -31,7 +31,7 @@ trap cleanup EXIT
 
 sleep 5
 
-open_stdout="$reports_dir/project-open.txt"
+init_stdout="$reports_dir/project-init.txt"
 inspect_before_stdout="$reports_dir/project-inspect-before-director.txt"
 contract_path="$repo_root/.tt/contracts/worker-contract.md"
 director_agent_path="$repo_root/.codex/agents/director.toml"
@@ -43,10 +43,10 @@ inspect_after_worktree_stdout="$reports_dir/project-inspect-after-worktree.txt"
 status_after_worktree_stdout="$reports_dir/project-status-after-worktree.txt"
 repo_after_worktree_stdout="$reports_dir/repo-after-worktree.txt"
 
-e2e_tt --cwd "$worktree_path" project open \
+e2e_tt --cwd "$worktree_path" init \
   --title "Managed Project Git Worktree" \
   --objective "Prove managed-project commands work from a linked child worktree path" \
-  >"$open_stdout"
+  >"$init_stdout"
 
 project_root="$repo_root"
 if [ -f "$worktree_path/.tt/state.toml" ]; then
@@ -77,14 +77,14 @@ grep -q "You report to the director, not to other workers or the operator." "$in
 test -f "$project_root/.tt/project.toml"
 test -f "$project_root/.tt/plan.toml"
 
-e2e_tt --cwd "$worktree_path" project inspect >"$inspect_before_stdout"
+e2e_tt --cwd "$worktree_path" internal project inspect >"$inspect_before_stdout"
 grep -q "state: scaffolded (0/4)" "$inspect_before_stdout"
 
-e2e_tt --cwd "$worktree_path" project director >"$director_stdout"
+e2e_tt --cwd "$worktree_path" open >"$director_stdout"
 
-e2e_tt --cwd "$worktree_path" project inspect >"$inspect_after_worktree_stdout"
-e2e_tt --cwd "$worktree_path" project status >"$status_after_worktree_stdout"
-e2e_tt --cwd "$worktree_path" repo >"$repo_after_worktree_stdout"
+e2e_tt --cwd "$worktree_path" internal project inspect >"$inspect_after_worktree_stdout"
+e2e_tt --cwd "$worktree_path" internal project inspect >"$status_after_worktree_stdout"
+e2e_tt --cwd "$worktree_path" internal repo >"$repo_after_worktree_stdout"
 
 grep -q "state: attached (4/4)" "$inspect_after_worktree_stdout"
 grep -q "state: attached (4/4)" "$status_after_worktree_stdout"

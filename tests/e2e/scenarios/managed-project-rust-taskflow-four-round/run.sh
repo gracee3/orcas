@@ -32,7 +32,7 @@ plan_refresh_stdout="$reports_dir/project-plan-refresh.txt"
 director_stdout="$reports_dir/project-director.txt"
 cargo_test_stdout="$reports_dir/cargo-test.txt"
 
-e2e_tt project init \
+e2e_tt init \
   --path "$repo_root" \
   --title "Taskflow" \
   --objective "Build a seeded multi-round Rust workflow runner" \
@@ -41,14 +41,14 @@ e2e_tt project init \
 
 e2e_start_codex_app_server_for_repo "$repo_root" "$app_server_log"
 
-e2e_tt --cwd "$repo_root" project director \
+e2e_tt --cwd "$repo_root" internal project director \
   --scenario rust-taskflow-four-round \
   --seed-file "$seed_file" \
   >"$director_stdout"
 
-e2e_tt --cwd "$repo_root" project inspect >"$inspect_stdout"
-e2e_tt --cwd "$repo_root" project plan show >"$plan_stdout"
-e2e_tt --cwd "$repo_root" project plan refresh >"$plan_refresh_stdout"
+e2e_tt --cwd "$repo_root" internal project inspect >"$inspect_stdout"
+e2e_tt --cwd "$repo_root" internal project plan show >"$plan_stdout"
+e2e_tt --cwd "$repo_root" internal project plan refresh >"$plan_refresh_stdout"
 
 grep -q "kind: rust-taskflow-four-round" "$inspect_stdout"
 grep -q "phase: completed" "$inspect_stdout"

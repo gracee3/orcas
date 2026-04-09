@@ -108,9 +108,9 @@ The managed-project scenarios exercise the current TT v2 workflow:
 
 - create a new managed project repo from TT
 - activate director/dev/test/integration roles
-- pause and resume a specific worker thread with `tt project control`
+- pause and resume a specific worker thread with hidden internal control commands
 - run a seeded multi-round Rust project scenario
 - run a seeded multi-round Rust project scenario with integration pressure
-- inspect attachment state through the daemon
+- inspect attachment state through the hidden internal CLI
 - inspect the JSONL progress stream while the director/subagents are running
 - verify the commands work from a linked git worktree path
