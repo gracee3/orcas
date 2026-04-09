@@ -42,6 +42,7 @@ pub const TT_DAEMON_SOCKET_NAME: &str = "tt-daemon.sock";
 const DEFAULT_AGENT_CONFIG_MAX_THREADS: usize = 6;
 const DEFAULT_AGENT_CONFIG_MAX_DEPTH: usize = 1;
 const DOCTOR_LISTEN_TIMEOUT_MS: u64 = 1500;
+const LIVE_TURN_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
@@ -492,6 +493,18 @@ struct ManagedProjectTurnOutcome {
     turn_id: String,
     summary: String,
     extraction: WorkerHandoffExtraction,
+    attempts: Vec<ManagedProjectTurnAttempt>,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedProjectTurnAttempt {
+    attempt_number: usize,
+    model: String,
+    reasoning_effort: String,
+    thread_id: String,
+    turn_id: Option<String>,
+    status: Option<String>,
+    failure_summary: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2611,7 +2624,9 @@ impl DaemonService {
                 &director_prompt,
             )?;
             let director_turn = self.run_role_prompt(
-                &bootstrap.repo_root,
+                bootstrap,
+                &state.scenario_id,
+                spec.round_number,
                 &director,
                 director_thread_id,
                 &director_prompt,
@@ -2661,8 +2676,14 @@ impl DaemonService {
                     &format!("{}-prompt.txt", role_slug(role.role)),
                     &worker_prompt,
                 )?;
-                let handoff =
-                    self.run_role_prompt(&bootstrap.repo_root, role, thread_id, &worker_prompt)?;
+                let handoff = self.run_role_prompt(
+                    bootstrap,
+                    &state.scenario_id,
+                    spec.round_number,
+                    role,
+                    thread_id,
+                    &worker_prompt,
+                )?;
                 let extraction = handoff.extraction;
                 let (structured_handoff, handoff_source, handoff_parse_error, raw_handoff_text) =
                     match extraction.handoff {
@@ -2773,12 +2794,39 @@ impl DaemonService {
 
     fn run_role_prompt(
         &self,
-        repo_root: &Path,
+        bootstrap: &ManagedProjectBootstrap,
+        scenario_id: &str,
+        round_number: usize,
         role_bootstrap: &ManagedProjectRoleBootstrap,
         thread_id: &str,
         prompt: &str,
     ) -> Result<ManagedProjectTurnOutcome> {
-        let cwd = role_bootstrap.worktree_path.as_deref().unwrap_or(repo_root);
+        let cwd = role_bootstrap
+            .worktree_path
+            .as_deref()
+            .unwrap_or(&bootstrap.repo_root);
+        let model = role_bootstrap
+            .model
+            .clone()
+            .unwrap_or_else(|| role_default_model(role_bootstrap.role).to_string());
+        let reasoning_effort = role_bootstrap
+            .reasoning_effort
+            .clone()
+            .unwrap_or_else(|| role_default_reasoning_effort(role_bootstrap.role).to_string());
+        write_scenario_artifact(
+            bootstrap,
+            scenario_id,
+            round_number,
+            &format!("{}-runtime.txt", role_slug(role_bootstrap.role)),
+            &format!(
+                "role: {}\nmodel: {}\nmodel_reasoning_effort: {}\nthread_id: {}\ncwd: {}\n",
+                role_slug(role_bootstrap.role),
+                model,
+                reasoning_effort,
+                thread_id,
+                cwd.display()
+            ),
+        )?;
         eprintln!(
             "tt director prompting role {} thread {} cwd {}",
             role_slug(role_bootstrap.role),
@@ -2791,63 +2839,159 @@ impl DaemonService {
             ThreadRole::Develop | ThreadRole::Test | ThreadRole::Integrate
         )
         .then(worker_handoff_output_schema);
-        let turn = client.start_turn(
-            thread_id,
-            prompt,
-            Some(cwd),
-            role_bootstrap.model.clone(),
-            role_bootstrap
-                .reasoning_effort
-                .as_deref()
-                .map(parse_managed_project_reasoning_effort)
-                .transpose()?,
-            output_schema,
-        )?;
-        eprintln!(
-            "tt director role {} started turn {}",
-            role_slug(role_bootstrap.role),
-            turn.id
-        );
-        let completed = client.wait_for_turn_completion(thread_id, &turn.id)?;
-        eprintln!(
-            "tt director role {} observed turn {} status {:?}",
-            role_slug(role_bootstrap.role),
-            completed.id,
-            completed.status
-        );
-        let finished_turn = client
-            .load_completed_turn_with_history(
-                thread_id,
-                &completed.id,
-                Some(cwd),
-                role_bootstrap.model.clone(),
-            )?
-            .ok_or_else(|| anyhow::anyhow!("turn `{}` not found after completion", completed.id))?;
-        match finished_turn.status {
-            protocol::TurnStatus::Completed => {
-                let extraction = extract_worker_handoff(&finished_turn.items);
-                Ok(ManagedProjectTurnOutcome {
-                    turn_id: finished_turn.id,
-                    summary: summarize_turn_items(&finished_turn.items),
-                    extraction,
-                })
+        let mut attempts = Vec::new();
+
+        for attempt_number in 1..=LIVE_TURN_MAX_ATTEMPTS {
+            let attempt_result: Result<ManagedProjectTurnOutcome> = (|| {
+                let turn = client.start_turn(
+                    thread_id,
+                    prompt,
+                    Some(cwd),
+                    Some(model.clone()),
+                    Some(parse_managed_project_reasoning_effort(&reasoning_effort)?),
+                    output_schema.clone(),
+                )?;
+                eprintln!(
+                    "tt director role {} started turn {} attempt {}",
+                    role_slug(role_bootstrap.role),
+                    turn.id,
+                    attempt_number
+                );
+                let completed = client.wait_for_turn_completion(thread_id, &turn.id)?;
+                eprintln!(
+                    "tt director role {} observed turn {} status {:?} attempt {}",
+                    role_slug(role_bootstrap.role),
+                    completed.id,
+                    completed.status,
+                    attempt_number
+                );
+                let finished_turn = client
+                    .load_completed_turn_with_history(
+                        thread_id,
+                        &completed.id,
+                        Some(cwd),
+                        Some(model.clone()),
+                    )?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("turn `{}` not found after completion", completed.id)
+                    })?;
+                match finished_turn.status {
+                    protocol::TurnStatus::Completed => {
+                        let extraction = extract_worker_handoff(&finished_turn.items);
+                        Ok(ManagedProjectTurnOutcome {
+                            turn_id: finished_turn.id,
+                            summary: summarize_turn_items(&finished_turn.items),
+                            extraction,
+                            attempts: Vec::new(),
+                        })
+                    }
+                    protocol::TurnStatus::Failed => anyhow::bail!(
+                        "{}",
+                        render_turn_failure(
+                            &finished_turn,
+                            role_slug(role_bootstrap.role),
+                            &model,
+                            &reasoning_effort
+                        )
+                    ),
+                    protocol::TurnStatus::Interrupted => anyhow::bail!(
+                        "turn `{}` for role `{}` was interrupted (model={}, reasoning_effort={})",
+                        finished_turn.id,
+                        role_slug(role_bootstrap.role),
+                        model,
+                        reasoning_effort
+                    ),
+                    protocol::TurnStatus::InProgress => anyhow::bail!(
+                        "turn `{}` for role `{}` did not complete (model={}, reasoning_effort={})",
+                        finished_turn.id,
+                        role_slug(role_bootstrap.role),
+                        model,
+                        reasoning_effort
+                    ),
+                }
+            })();
+
+            match attempt_result {
+                Ok(mut outcome) => {
+                    attempts.push(ManagedProjectTurnAttempt {
+                        attempt_number,
+                        model: model.clone(),
+                        reasoning_effort: reasoning_effort.clone(),
+                        thread_id: thread_id.to_string(),
+                        turn_id: Some(outcome.turn_id.clone()),
+                        status: Some("completed".to_string()),
+                        failure_summary: None,
+                    });
+                    write_role_attempt_artifact(
+                        bootstrap,
+                        scenario_id,
+                        round_number,
+                        role_bootstrap.role,
+                        attempts.last().expect("attempt"),
+                    )?;
+                    write_scenario_artifact(
+                        bootstrap,
+                        scenario_id,
+                        round_number,
+                        &format!("{}-attempts.txt", role_slug(role_bootstrap.role)),
+                        &render_attempt_log(&attempts),
+                    )?;
+                    outcome.attempts = attempts;
+                    return Ok(outcome);
+                }
+                Err(error) => {
+                    let failure_summary = format_error_chain(&error);
+                    attempts.push(ManagedProjectTurnAttempt {
+                        attempt_number,
+                        model: model.clone(),
+                        reasoning_effort: reasoning_effort.clone(),
+                        thread_id: thread_id.to_string(),
+                        turn_id: extract_turn_id_from_error_message(&failure_summary),
+                        status: Some("failed".to_string()),
+                        failure_summary: Some(failure_summary.clone()),
+                    });
+                    write_role_attempt_artifact(
+                        bootstrap,
+                        scenario_id,
+                        round_number,
+                        role_bootstrap.role,
+                        attempts.last().expect("attempt"),
+                    )?;
+                    let is_retryable = is_retryable_live_turn_failure(&failure_summary);
+                    if is_retryable && attempt_number < LIVE_TURN_MAX_ATTEMPTS {
+                        eprintln!(
+                            "tt director role {} retrying transient upstream failure on attempt {}: {}",
+                            role_slug(role_bootstrap.role),
+                            attempt_number,
+                            failure_summary
+                        );
+                        thread::sleep(live_turn_backoff_delay(attempt_number));
+                        continue;
+                    }
+
+                    let attempt_log = render_attempt_log(&attempts);
+                    write_scenario_artifact(
+                        bootstrap,
+                        scenario_id,
+                        round_number,
+                        &format!("{}-attempts.txt", role_slug(role_bootstrap.role)),
+                        &attempt_log,
+                    )?;
+                    return Err(error.context(format!(
+                        "role `{}` failed after {} attempt(s); model={}, reasoning_effort={}",
+                        role_slug(role_bootstrap.role),
+                        attempts.len(),
+                        model,
+                        reasoning_effort
+                    )));
+                }
             }
-            protocol::TurnStatus::Failed => anyhow::bail!(
-                "turn `{}` for role `{}` failed",
-                finished_turn.id,
-                role_slug(role_bootstrap.role)
-            ),
-            protocol::TurnStatus::Interrupted => anyhow::bail!(
-                "turn `{}` for role `{}` was interrupted",
-                finished_turn.id,
-                role_slug(role_bootstrap.role)
-            ),
-            protocol::TurnStatus::InProgress => anyhow::bail!(
-                "turn `{}` for role `{}` did not complete",
-                finished_turn.id,
-                role_slug(role_bootstrap.role)
-            ),
         }
+
+        anyhow::bail!(
+            "role `{}` exhausted live turn attempts without a result",
+            role_slug(role_bootstrap.role)
+        )
     }
 
     fn save_managed_project_bootstrap(&self, bootstrap: &ManagedProjectBootstrap) -> Result<()> {
@@ -3781,6 +3925,103 @@ fn write_scenario_artifact(
     Ok(())
 }
 
+fn write_role_attempt_artifact(
+    bootstrap: &ManagedProjectBootstrap,
+    scenario_id: &str,
+    round_number: usize,
+    role: ThreadRole,
+    attempt: &ManagedProjectTurnAttempt,
+) -> Result<()> {
+    write_scenario_artifact(
+        bootstrap,
+        scenario_id,
+        round_number,
+        &format!(
+            "{}-attempt-{:02}.txt",
+            role_slug(role),
+            attempt.attempt_number
+        ),
+        &render_single_attempt(attempt),
+    )
+}
+
+fn render_single_attempt(attempt: &ManagedProjectTurnAttempt) -> String {
+    format!(
+        "attempt: {}\nmodel: {}\nmodel_reasoning_effort: {}\nthread_id: {}\nturn_id: {}\nstatus: {}\nfailure_summary: {}\n",
+        attempt.attempt_number,
+        attempt.model,
+        attempt.reasoning_effort,
+        attempt.thread_id,
+        attempt.turn_id.as_deref().unwrap_or("<none>"),
+        attempt.status.as_deref().unwrap_or("<unknown>"),
+        attempt.failure_summary.as_deref().unwrap_or("<none>")
+    )
+}
+
+fn render_attempt_log(attempts: &[ManagedProjectTurnAttempt]) -> String {
+    attempts
+        .iter()
+        .map(render_single_attempt)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\ncaused by: ")
+}
+
+fn format_turn_error(error: &protocol::TurnError) -> String {
+    let details = error.additional_details.as_deref().unwrap_or("").trim();
+    if details.is_empty() {
+        error.message.clone()
+    } else {
+        format!("{}\n{}", error.message, details)
+    }
+}
+
+fn render_turn_failure(
+    turn: &protocol::Turn,
+    role_name: &str,
+    model: &str,
+    reasoning_effort: &str,
+) -> String {
+    let error = turn
+        .error
+        .as_ref()
+        .map(format_turn_error)
+        .unwrap_or_else(|| "turn failed without an error payload".to_string());
+    format!(
+        "turn `{}` for role `{}` failed (model={}, reasoning_effort={}): {}",
+        turn.id, role_name, model, reasoning_effort, error
+    )
+}
+
+fn is_retryable_live_turn_failure(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("responses_websocket")
+        && normalized.contains("500 internal server error")
+        && normalized.contains("wss://api.openai.com/v1/responses")
+}
+
+fn live_turn_backoff_delay(attempt_number: usize) -> std::time::Duration {
+    match attempt_number {
+        1 => std::time::Duration::from_secs(1),
+        _ => std::time::Duration::from_secs(2),
+    }
+}
+
+fn extract_turn_id_from_error_message(message: &str) -> Option<String> {
+    let marker = "turn `";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
+}
+
 fn workspace_status_from_git(inspection: &tt_git::GitRepositoryInspection) -> WorkspaceStatus {
     if inspection.dirty {
         WorkspaceStatus::Dirty
@@ -4431,6 +4672,18 @@ mod tests {
             extraction.parse_error.as_deref(),
             Some("no agent message found in completed turn")
         );
+    }
+
+    #[test]
+    fn retryable_live_turn_failure_matches_exact_upstream_websocket_500() {
+        let error = "turn `turn-1` for role `director` failed (model=gpt-5.4, reasoning_effort=medium): responses_websocket failed to connect to websocket: HTTP error: 500 Internal Server Error, url: wss://api.openai.com/v1/responses";
+        assert!(is_retryable_live_turn_failure(error));
+    }
+
+    #[test]
+    fn retryable_live_turn_failure_does_not_match_model_rejections() {
+        let error = "turn `turn-1` for role `director` failed (model=gpt-5.4, reasoning_effort=medium): invalid model `gpt-5.4` for current provider";
+        assert!(!is_retryable_live_turn_failure(error));
     }
 
     #[test]
