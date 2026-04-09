@@ -652,7 +652,7 @@ fn render_response(response: &DaemonResponse) -> String {
         DaemonResponse::Unit => "ok".to_string(),
         DaemonResponse::Count(count) => format!("updated {count}"),
         DaemonResponse::Doctor(report) => format!(
-            "doctor\ncwd: {}\ntt_cli_generation: {}\ndaemon_api_version: {}\ntt_project_root: {}\ncodex_project_root: {}\ndaemon_socket: {}\ncodex_contract_ok: {}\ncodex_listen_url: {}\ncodex_listen_reachable: {}\ncodex_listen_error: {}\ncodex_error: {}\n",
+            "doctor\ncwd: {}\ntt_cli_generation: {}\ndaemon_api_version: {}\ntt_project_root: {}\ncodex_project_root: {}\ndaemon_socket: {}\ncodex_auth_json: {}\ncodex_contract_ok: {}\ncodex_listen_url: {}\ncodex_listen_reachable: {}\ncodex_listen_error: {}\ncodex_error: {}\n",
             report.cwd.display(),
             report.tt_cli_generation,
             report.daemon_api_version,
@@ -667,6 +667,11 @@ fn render_response(response: &DaemonResponse) -> String {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
             report.daemon_socket_path.display(),
+            report
+                .codex_auth_json
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unresolved>".to_string()),
             report.codex_contract_ok,
             report.codex_listen_url,
             report
@@ -677,7 +682,7 @@ fn render_response(response: &DaemonResponse) -> String {
             report.codex_error.as_deref().unwrap_or("<none>")
         ),
         DaemonResponse::CodexDoctor(report) => format!(
-            "codex doctor\ncontract_ok: {}\ncodex_bin: {}\ncodex_version: {}\napp_server_bin: {}\napp_server_version: {}\nlisten_url: {}\nlisten_reachable: {}\nlisten_error: {}\ncodex_home: {}\nerror: {}\n",
+            "codex doctor\ncontract_ok: {}\ncodex_bin: {}\ncodex_version: {}\napp_server_bin: {}\napp_server_version: {}\nauth_json: {}\nlisten_url: {}\nlisten_reachable: {}\nlisten_error: {}\ncodex_home: {}\nerror: {}\n",
             report.contract_ok,
             report
                 .codex_bin
@@ -691,6 +696,11 @@ fn render_response(response: &DaemonResponse) -> String {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "<unresolved>".to_string()),
             report.app_server_version.as_deref().unwrap_or("<unknown>"),
+            report
+                .auth_json
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unresolved>".to_string()),
             report.configured_listen_url,
             report
                 .listen_reachable
@@ -1502,6 +1512,7 @@ mod tests {
             contract_ok: false,
             codex_bin: Some("/home/me/.local/bin/codex".into()),
             app_server_bin: None,
+            auth_json: Some("/home/me/.codex/auth.json".into()),
             codex_version: Some("codex 1.2.3".into()),
             app_server_version: None,
             configured_listen_url: "ws://127.0.0.1:4500".into(),
@@ -1528,6 +1539,7 @@ mod tests {
             tt_project_root: Some("/repo".into()),
             codex_project_root: Some("/repo".into()),
             daemon_socket_path: "/repo/.tt/runtime/tt-daemon.sock".into(),
+            codex_auth_json: Some("/home/me/.codex/auth.json".into()),
             codex_contract_ok: true,
             codex_error: None,
             codex_listen_url: "ws://127.0.0.1:4500".into(),

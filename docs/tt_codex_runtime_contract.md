@@ -50,6 +50,9 @@ Project state:
 - TT user state: `~/.tt/`
 - TT project state: `<repo>/.tt/`
 
+Auth file:
+- Codex auth: `~/.codex/auth.json`
+
 TT should keep its own config and state separate from Codex config and state.
 
 ## Binary Discovery
@@ -74,6 +77,11 @@ Current TT enforcement is stricter than the longer-term discovery model:
 Current app-server listen URL overrides used by TT:
 - `CODEX_APP_SERVER_LISTEN_URL`
 - `TT_APP_SERVER_LISTEN_URL`
+
+Current Codex auth requirement enforced by TT:
+- `~/.codex/auth.json` must exist and be readable
+- live e2e app-server launches use `CODEX_HOME=$HOME/.codex`
+- TT fails fast if the auth file is missing
 
 TT should continue to support explicit listen URL override for testing and
 runtime control.

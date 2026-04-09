@@ -60,6 +60,7 @@ pub struct CodexDoctorReport {
     pub contract_ok: bool,
     pub codex_bin: Option<PathBuf>,
     pub app_server_bin: Option<PathBuf>,
+    pub auth_json: Option<PathBuf>,
     pub codex_version: Option<String>,
     pub app_server_version: Option<String>,
     pub configured_listen_url: String,
@@ -77,6 +78,7 @@ pub struct DoctorReport {
     pub tt_project_root: Option<PathBuf>,
     pub codex_project_root: Option<PathBuf>,
     pub daemon_socket_path: PathBuf,
+    pub codex_auth_json: Option<PathBuf>,
     pub codex_contract_ok: bool,
     pub codex_error: Option<String>,
     pub codex_listen_url: String,
@@ -4154,6 +4156,7 @@ fn doctor_for_cwd(cwd: impl AsRef<Path>, check_listen: bool) -> DoctorReport {
         tt_project_root: cwd.join(".tt").is_dir().then_some(cwd.clone()),
         codex_project_root: cwd.join(".codex").is_dir().then_some(cwd.clone()),
         daemon_socket_path: socket_path_for(&cwd),
+        codex_auth_json: canonical_codex_auth_json_path(),
         codex_contract_ok: codex_doctor.contract_ok,
         codex_error: codex_doctor.error.clone(),
         codex_listen_url: codex_doctor.configured_listen_url.clone(),
@@ -4179,6 +4182,7 @@ fn codex_doctor_for_cwd(cwd: impl AsRef<Path>, check_listen: bool) -> CodexDocto
             app_server_version: read_binary_version(contract.app_server_bin()),
             codex_bin: Some(contract.codex_bin().to_path_buf()),
             app_server_bin: Some(contract.app_server_bin().to_path_buf()),
+            auth_json: Some(contract.auth_json().to_path_buf()),
             codex_home: CodexHome::discover_in(cwd)
                 .ok()
                 .map(|home| home.root().to_path_buf()),
@@ -4191,6 +4195,7 @@ fn codex_doctor_for_cwd(cwd: impl AsRef<Path>, check_listen: bool) -> CodexDocto
             contract_ok: false,
             codex_bin: None,
             app_server_bin: None,
+            auth_json: canonical_codex_auth_json_path(),
             codex_version: None,
             app_server_version: None,
             codex_home: None,
@@ -4200,6 +4205,10 @@ fn codex_doctor_for_cwd(cwd: impl AsRef<Path>, check_listen: bool) -> CodexDocto
             error: Some(format!("{error:#}")),
         },
     }
+}
+
+fn canonical_codex_auth_json_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex").join("auth.json"))
 }
 
 fn check_listen_reachability(listen_url: &str) -> Result<bool> {

@@ -34,6 +34,7 @@ pub const TT_CODEX_BIN_ENV: &str = "TT_CODEX_BIN";
 pub const TT_CODEX_APP_SERVER_BIN_ENV: &str = "TT_CODEX_APP_SERVER_BIN";
 pub const CODEX_BIN_FILENAME: &str = "codex";
 pub const CODEX_APP_SERVER_BIN_FILENAME: &str = "codex-app-server";
+pub const CODEX_AUTH_FILE_NAME: &str = "auth.json";
 pub const SESSION_INDEX_FILE: &str = "session_index.jsonl";
 pub const CODEX_STATE_DB_FILENAME: &str = "state_5.sqlite";
 pub const CODEX_LOGS_DB_FILENAME: &str = "logs_1.sqlite";
@@ -50,6 +51,7 @@ const TURN_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct CodexRuntimeContract {
     codex_bin: PathBuf,
     app_server_bin: PathBuf,
+    auth_json: PathBuf,
 }
 
 impl CodexRuntimeContract {
@@ -59,6 +61,10 @@ impl CodexRuntimeContract {
 
     pub fn app_server_bin(&self) -> &Path {
         &self.app_server_bin
+    }
+
+    pub fn auth_json(&self) -> &Path {
+        &self.auth_json
     }
 }
 
@@ -100,6 +106,10 @@ impl CodexHome {
 
     pub fn session_index_path(&self) -> PathBuf {
         self.root.join(SESSION_INDEX_FILE)
+    }
+
+    pub fn auth_json_path(&self) -> PathBuf {
+        self.root.join(CODEX_AUTH_FILE_NAME)
     }
 
     pub fn session_catalog(&self) -> Result<CodexSessionCatalog> {
@@ -963,7 +973,9 @@ pub fn validate_runtime_contract() -> Result<CodexRuntimeContract> {
         CODEX_APP_SERVER_BIN_FILENAME,
         "Codex app-server",
     )?;
-    validate_runtime_contract_paths(codex_bin, app_server_bin)
+    let contract = validate_runtime_contract_paths(codex_bin, app_server_bin)?;
+    validate_canonical_auth_json()?;
+    Ok(contract)
 }
 
 fn validate_runtime_contract_paths(
@@ -975,7 +987,28 @@ fn validate_runtime_contract_paths(
     Ok(CodexRuntimeContract {
         codex_bin,
         app_server_bin,
+        auth_json: resolve_canonical_auth_json_path()?,
     })
+}
+
+fn resolve_canonical_auth_json_path() -> Result<PathBuf> {
+    let home_dir = dirs::home_dir().context("could not resolve a home directory for Codex auth")?;
+    Ok(home_dir.join(".codex").join(CODEX_AUTH_FILE_NAME))
+}
+
+fn validate_canonical_auth_json() -> Result<PathBuf> {
+    let path = resolve_canonical_auth_json_path()?;
+    ensure_auth_file(path)
+}
+
+fn ensure_auth_file(path: PathBuf) -> Result<PathBuf> {
+    if !path.exists() {
+        anyhow::bail!("Codex auth file is missing: {}", path.display());
+    }
+    if !path.is_file() {
+        anyhow::bail!("Codex auth path is not a file: {}", path.display());
+    }
+    Ok(path)
 }
 
 pub fn codex_state_db_path(codex_home: &Path) -> PathBuf {
