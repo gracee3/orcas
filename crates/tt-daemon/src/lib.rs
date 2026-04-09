@@ -49,6 +49,10 @@ pub struct DaemonStatus {
     pub codex_home: Option<PathBuf>,
     pub codex_state_db: Option<PathBuf>,
     pub codex_session_index: Option<PathBuf>,
+    pub codex_contract_ok: bool,
+    pub codex_listen_url: String,
+    pub codex_runtime_reachable: Option<bool>,
+    pub codex_runtime_error: Option<String>,
     pub project_count: usize,
     pub work_unit_count: usize,
     pub bound_thread_count: usize,
@@ -110,7 +114,9 @@ pub enum DaemonRequest {
         cwd: PathBuf,
         check_listen: bool,
     },
-    Status,
+    Status {
+        cwd: PathBuf,
+    },
     DashboardSummary,
     RepositorySummary {
         cwd: PathBuf,
@@ -1437,12 +1443,17 @@ impl DaemonService {
         Ok(Some(self.enrich_codex_snapshot(snapshot)?))
     }
 
-    pub fn status(&self) -> Result<DaemonStatus> {
+    pub fn status(&self, cwd: impl AsRef<Path>) -> Result<DaemonStatus> {
+        let codex_doctor = self.codex_doctor_with_listen_check(cwd);
         let codex_home = self.codex_home.as_ref();
         Ok(DaemonStatus {
             codex_home: codex_home.map(|home| home.root().to_path_buf()),
             codex_state_db: codex_home.map(|home| home.state_db_path()),
             codex_session_index: codex_home.map(|home| home.session_index_path()),
+            codex_contract_ok: codex_doctor.contract_ok,
+            codex_listen_url: codex_doctor.configured_listen_url,
+            codex_runtime_reachable: codex_doctor.listen_reachable,
+            codex_runtime_error: codex_doctor.listen_error.or(codex_doctor.error),
             project_count: self.store.count_projects()?,
             work_unit_count: self.store.count_work_units()?,
             bound_thread_count: self.store.count_bound_threads()?,
@@ -1470,7 +1481,7 @@ impl DaemonService {
     }
 
     pub fn dashboard_summary(&self) -> Result<DashboardSummary> {
-        let status = self.status()?;
+        let status = self.status(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))?;
         Ok(DashboardSummary {
             active_projects: status.project_count,
             active_work_units: status.work_unit_count,
@@ -1807,7 +1818,7 @@ impl DaemonService {
             } else {
                 self.codex_doctor(cwd)
             }),
-            Status => DaemonResponse::Status(self.status()?),
+            Status { cwd } => DaemonResponse::Status(self.status(cwd)?),
             DashboardSummary => DaemonResponse::DashboardSummary(self.dashboard_summary()?),
             RepositorySummary { cwd } => {
                 DaemonResponse::RepositorySummary(self.repository_summary(cwd)?)
@@ -5782,7 +5793,7 @@ mod tests {
             })
             .expect("upsert workspace");
 
-        let status = service.status().expect("status");
+        let status = service.status(dir.path()).expect("status");
         let summary = service.dashboard_summary().expect("summary");
 
         assert_eq!(status.project_count, 1);
@@ -6635,7 +6646,11 @@ mod tests {
         }
 
         let client = DaemonClient::connect(&socket_path).expect("client connect");
-        let response = client.request(DaemonRequest::Status).expect("status");
+        let response = client
+            .request(DaemonRequest::Status {
+                cwd: dir.path().to_path_buf(),
+            })
+            .expect("status");
         assert!(matches!(response, DaemonResponse::Status(_)));
 
         drop(handle);

@@ -412,9 +412,11 @@ pub fn run() -> Result<()> {
         print!("{output}");
         return Ok(());
     }
+    let is_open_command = matches!(cli.command, Command::Open { .. });
     let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
     let request_cwd = request_cwd_for_command(&cwd, &cli.command);
-    let response = request_for_cwd(&request_cwd, command_to_request(cli.command, &cwd)?)?;
+    let response = request_for_cwd(&request_cwd, command_to_request(cli.command, &cwd)?)
+        .map_err(|error| rewrite_open_runtime_error(&cwd, is_open_command, error))?;
     println!("{}", render_response(&response));
     Ok(())
 }
@@ -534,7 +536,9 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
                 }
             }
         }
-        Command::Status => DaemonRequest::Status,
+        Command::Status => DaemonRequest::Status {
+            cwd: cwd.to_path_buf(),
+        },
         Command::Codex { command } => match command {
             CodexCommand::Threads { command } => match command {
                 CodexThreadsCommand::List { limit } => DaemonRequest::ListCodexThreads {
@@ -842,6 +846,20 @@ where
     T::from_str(raw).map_err(|error| anyhow::anyhow!(error))
 }
 
+fn rewrite_open_runtime_error(cwd: &Path, is_open_command: bool, error: anyhow::Error) -> anyhow::Error {
+    if !is_open_command {
+        return error;
+    }
+    let error_text = format!("{error:#}");
+    if !error_text.contains("connect to Codex app-server") {
+        return error;
+    }
+    anyhow::anyhow!(
+        "cannot open TT project in {} because the Codex app-server is unreachable.\nRun `tt doctor --codex --check-listen` to inspect the runtime contract and listen URL.\n\nOriginal error:\n{error_text}",
+        cwd.display()
+    )
+}
+
 fn render_cli_reference_markdown() -> String {
     let command = Cli::command().name("tt");
     let mut output = String::new();
@@ -1004,7 +1022,17 @@ fn render_response(response: &DaemonResponse) -> String {
             report.error.as_deref().unwrap_or("<none>")
         ),
         DaemonResponse::Status(status) => format!(
-            "status\nprojects: {}\nwork-units: {}\nbound-threads: {}\nready-workspaces: {}\n",
+            "status\ncodex_contract_ok: {}\ncodex_runtime: {}\ncodex_listen_url: {}\ncodex_runtime_error: {}\nprojects: {}\nwork-units: {}\nbound-threads: {}\nready-workspaces: {}\n",
+            status.codex_contract_ok,
+            status
+                .codex_runtime_reachable
+                .map(|reachable| if reachable { "reachable" } else { "unreachable" })
+                .unwrap_or("<unknown>"),
+            status.codex_listen_url,
+            status
+                .codex_runtime_error
+                .as_deref()
+                .unwrap_or("<none>"),
             status.project_count,
             status.work_unit_count,
             status.bound_thread_count,
@@ -1651,9 +1679,11 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
         print!("{output}");
         return Ok(());
     }
+    let is_open_command = matches!(cli.command, Command::Open { .. });
     let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
     let request_cwd = request_cwd_for_command(&cwd, &cli.command);
-    let response = request_for_cwd(&request_cwd, command_to_request(cli.command, &cwd)?)?;
+    let response = request_for_cwd(&request_cwd, command_to_request(cli.command, &cwd)?)
+        .map_err(|error| rewrite_open_runtime_error(&cwd, is_open_command, error))?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
@@ -2416,6 +2446,40 @@ mod tests {
         assert!(text.contains("daemon_api_version: v2"));
         assert!(text.contains("codex_contract_ok: true"));
         assert!(text.contains("codex_listen_reachable: true"));
+    }
+
+    #[test]
+    fn renders_status_with_codex_runtime_health() {
+        let text = render_response(&DaemonResponse::Status(tt_daemon::DaemonStatus {
+            codex_home: Some("/home/me/.codex".into()),
+            codex_state_db: Some("/home/me/.codex/state.db".into()),
+            codex_session_index: Some("/home/me/.codex/session_index.json".into()),
+            codex_contract_ok: true,
+            codex_listen_url: "ws://127.0.0.1:4500".into(),
+            codex_runtime_reachable: Some(false),
+            codex_runtime_error: Some("connection refused".into()),
+            project_count: 2,
+            work_unit_count: 6,
+            bound_thread_count: 4,
+            ready_workspace_count: 3,
+        }));
+
+        assert!(text.contains("codex_contract_ok: true"));
+        assert!(text.contains("codex_runtime: unreachable"));
+        assert!(text.contains("codex_listen_url: ws://127.0.0.1:4500"));
+        assert!(text.contains("codex_runtime_error: connection refused"));
+        assert!(text.contains("projects: 2"));
+    }
+
+    #[test]
+    fn rewrites_open_runtime_connect_error() {
+        let error = anyhow::anyhow!(
+            "connect to Codex app-server `ws://127.0.0.1:4500`\n\nCaused by:\n    Connection refused (os error 111)"
+        );
+        let rewritten = rewrite_open_runtime_error(Path::new("/repo"), true, error);
+        let text = format!("{rewritten:#}");
+        assert!(text.contains("cannot open TT project in /repo because the Codex app-server is unreachable"));
+        assert!(text.contains("tt doctor --codex --check-listen"));
     }
 
     #[test]
