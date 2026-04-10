@@ -5616,7 +5616,7 @@ fn codex_doctor_for_cwd(cwd: impl AsRef<Path>, check_listen: bool) -> CodexDocto
     } else {
         (None, None)
     };
-    match validate_runtime_contract() {
+    match validate_runtime_contract(cwd.as_ref()) {
         Ok(contract) => CodexDoctorReport {
             contract_ok: true,
             codex_version: read_binary_version(contract.codex_bin()),

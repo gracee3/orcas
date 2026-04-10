@@ -239,14 +239,15 @@ pub struct CodexHome {
 impl CodexHome {
     pub fn discover() -> Result<Self> {
         load_repo_settings_env(env::current_dir()?)?;
-        validate_runtime_contract()?;
+        validate_runtime_contract(env::current_dir()?)?;
         Self::discover_from(repo_env_var_os(CODEX_HOME_ENV), dirs::home_dir())
     }
 
     pub fn discover_in(cwd: impl AsRef<Path>) -> Result<Self> {
-        load_repo_settings_env(cwd.as_ref())?;
-        validate_runtime_contract()?;
-        let codex_dir = cwd.as_ref().join(".codex");
+        let cwd = cwd.as_ref();
+        load_repo_settings_env(cwd)?;
+        validate_runtime_contract(cwd)?;
+        let codex_dir = cwd.join(".codex");
         if codex_dir.is_dir() {
             return Ok(Self::from_path(codex_dir));
         }
@@ -525,7 +526,8 @@ impl TurnWatchdogSnapshot {
 impl CodexRuntimeClient {
     pub fn open(cwd: impl AsRef<Path>) -> Result<Self> {
         let cwd = cwd.as_ref();
-        let contract = validate_runtime_contract()?;
+        load_repo_settings_env(cwd)?;
+        let contract = validate_runtime_contract(cwd)?;
         let codex_home = CodexHome::discover_in(cwd)?;
         let runtime = Runtime::new().context("create tokio runtime for Codex client")?;
         let listen_url = resolve_app_server_listen_url();
@@ -1296,7 +1298,12 @@ pub fn configured_app_server_listen_url() -> String {
     resolve_app_server_listen_url()
 }
 
-fn resolve_required_binary(env_key: &str, binary_name: &str, label: &str) -> Result<PathBuf> {
+fn resolve_required_binary(
+    _cwd: &Path,
+    env_key: &str,
+    binary_name: &str,
+    label: &str,
+) -> Result<PathBuf> {
     let path = if let Some(value) = repo_env_var_os(env_key) {
         PathBuf::from(value)
     } else {
@@ -1375,9 +1382,12 @@ pub fn discover_codex_home() -> Result<CodexHome> {
     CodexHome::discover()
 }
 
-pub fn validate_runtime_contract() -> Result<CodexRuntimeContract> {
-    let codex_bin = resolve_required_binary(TT_CODEX_BIN_ENV, CODEX_BIN_FILENAME, "Codex CLI")?;
+pub fn validate_runtime_contract(cwd: impl AsRef<Path>) -> Result<CodexRuntimeContract> {
+    let cwd = cwd.as_ref();
+    let codex_bin =
+        resolve_required_binary(cwd, TT_CODEX_BIN_ENV, CODEX_BIN_FILENAME, "Codex CLI")?;
     let app_server_bin = resolve_required_binary(
+        cwd,
         TT_CODEX_APP_SERVER_BIN_ENV,
         CODEX_APP_SERVER_BIN_FILENAME,
         "Codex app-server",
@@ -1556,43 +1566,30 @@ mod tests {
     fn repo_settings_env_loads_and_resolves_paths() {
         let _guard = SETTINGS_ENV_TEST_LOCK.lock().expect("settings env lock");
         let repo = tempdir().expect("tempdir");
-        let tt_bin = repo.path().join("./target/debug/codex");
-        let app_server_bin = repo.path().join("./target/debug/codex-app-server");
-        std::fs::create_dir_all(tt_bin.parent().expect("tt bin parent"))
-            .expect("create tt bin dir");
-        std::fs::write(&tt_bin, "#!/bin/sh\n").expect("write tt bin");
-        std::fs::write(&app_server_bin, "#!/bin/sh\n").expect("write app-server bin");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            std::fs::set_permissions(&tt_bin, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod tt bin");
-            std::fs::set_permissions(&app_server_bin, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod app-server bin");
-        }
         std::fs::create_dir_all(repo.path().join(".tt")).expect("create tt dir");
         std::fs::write(
             repo.path().join(".tt/settings.env"),
             format!(
-                "TT_RUNTIME_BIN=./target/debug/tt-cli\nTT_CODEX_BIN=./target/debug/codex\nTT_CODEX_APP_SERVER_BIN=./target/debug/codex-app-server\nTT_REPO_SETTINGS_SENTINEL=loaded\n",
+                "TT_RUNTIME_BIN=./target/debug/tt-cli\nTT_CUSTOM_BIN=./target/debug/custom\nTT_CUSTOM_PATH=./target/debug/custom-path\nTT_REPO_SETTINGS_SENTINEL=loaded\n",
             ),
         )
         .expect("write settings env");
 
         load_repo_settings_env(repo.path()).expect("load settings env");
         let tt_runtime_bin = repo.path().join("./target/debug/tt-cli");
-        let tt_bin_str = tt_bin.to_string_lossy().to_string();
-        let app_server_bin_str = app_server_bin.to_string_lossy().to_string();
+        let custom_bin = repo.path().join("./target/debug/custom");
+        let custom_path = repo.path().join("./target/debug/custom-path");
         let tt_runtime_bin_str = tt_runtime_bin.to_string_lossy().to_string();
+        let custom_bin_str = custom_bin.to_string_lossy().to_string();
+        let custom_path_str = custom_path.to_string_lossy().to_string();
 
         assert_eq!(
-            repo_env_var("TT_CODEX_BIN").as_deref(),
-            Some(tt_bin_str.as_str())
+            repo_env_var("TT_CUSTOM_BIN").as_deref(),
+            Some(custom_bin_str.as_str())
         );
         assert_eq!(
-            repo_env_var("TT_CODEX_APP_SERVER_BIN").as_deref(),
-            Some(app_server_bin_str.as_str())
+            repo_env_var("TT_CUSTOM_PATH").as_deref(),
+            Some(custom_path_str.as_str())
         );
         assert_eq!(
             repo_env_var("TT_RUNTIME_BIN").as_deref(),
