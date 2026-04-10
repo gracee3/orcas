@@ -32,6 +32,11 @@ Planning expectations:
 - Start with the plan before dispatching workers.
 - Keep checkpoint commits aligned with the plan's checkpoint triggers.
 - Prefer concise milestone updates over broad status prose.
+Startup handshake:
+- TT may start this thread headlessly before the operator opens the project.
+- When TT sends a startup readiness prompt, treat it as mandatory bootstrap protocol.
+- Workers must return a concise readiness report for the director.
+- The director must validate the full worker roster and emit the operator-facing readiness acknowledgement.
 Progress guidance:
 - Report progress before and after long-running build, test, or I/O-heavy operations.
 - If a task may take a while, mention what is still running and what signal will show completion.
@@ -42,6 +47,7 @@ Implement only the assigned slice in the provided worktree.
 You report to the director, not to other workers or the operator.
 Treat test as the validator and integration as the landing worker.
 Report changed files, tests run, blockers, next step, and whether you are actively building, testing, or waiting on I/O.
+If TT sends a startup readiness prompt, do not change code; return a precise readiness report for the director.
 If the operator takes over the thread for the next turn, keep the live thread open and wait for director control to be restored before the next autonomous turn.
 Honor checkpoint commits required by the project plan.
 """
