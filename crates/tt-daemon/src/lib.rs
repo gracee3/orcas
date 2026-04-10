@@ -1168,13 +1168,13 @@ impl DaemonService {
             for worktree_path in worktree_targets.keys() {
                 let Some(inspection) = tt_git::GitRepository::inspect(&worktree_path)? else {
                     anyhow::bail!(
-                        "workspace binding `{}` has no inspectable git repository; pass --full to clean",
+                        "workspace binding `{}` has no inspectable git repository; pass --all to clean",
                         worktree_path.display()
                     );
                 };
                 if inspection.dirty {
                     anyhow::bail!(
-                        "workspace binding `{}` has dirty changes; pass --full to clean",
+                        "workspace binding `{}` has dirty changes; pass --all to clean",
                         worktree_path.display()
                     );
                 }
@@ -1187,7 +1187,7 @@ impl DaemonService {
                 removed += 1;
             } else if !force {
                 anyhow::bail!(
-                    "failed to prune worktree {}; pass --full to force cleanup",
+                    "failed to prune worktree {}; pass --all to force cleanup",
                     worktree_path.display()
                 );
             }
@@ -1218,6 +1218,9 @@ impl DaemonService {
         )?;
         removed += remove_if_exists(repo_root.join(".tt").join("runtime"))?;
         removed += remove_if_exists(repo_root.join(".tt").join("contracts"))?;
+        if force {
+            removed += prune_repo_codex_runtime_artifacts(&repo_root.join(".codex"))?;
+        }
         Ok(removed)
     }
 
@@ -1729,6 +1732,7 @@ impl DaemonService {
         let codex_config_path = repo_root.join(".codex").join("config.toml");
         let project_config_path = repo_root.join(".tt").join("project.toml");
         let plan_path = repo_root.join(".tt").join("plan.toml");
+        let settings_env_path = repo_root.join(".tt").join("settings.env");
         let project_config = load_or_seed_managed_project_config(
             &project_config_path,
             &repo_root,
@@ -1748,6 +1752,7 @@ impl DaemonService {
             &contract_path,
             &render_worker_contract(&repo_root, &slug, &base_branch, &project_config),
         )?;
+        write_managed_file(&settings_env_path, &render_default_settings_env())?;
 
         let director_role = self.build_role_bootstrap(
             &repository,
@@ -2350,6 +2355,17 @@ fn role_default_reasoning_effort(_role: ThreadRole) -> &'static str {
 
 fn render_codex_config(max_threads: usize, max_depth: usize) -> String {
     format!("[agents]\nmax_threads = {max_threads}\nmax_depth = {max_depth}\n")
+}
+
+fn render_default_settings_env() -> String {
+    [
+        "# Repo-local TT and Codex overrides.",
+        "# TT_CODEX_BIN=~/.local/bin/codex",
+        "# TT_CODEX_APP_SERVER_BIN=~/.local/bin/codex-app-server",
+        "# TT_CODEX_LOGIN_MODE=auto",
+        "",
+    ]
+    .join("\n")
 }
 
 fn render_agent_file(
@@ -4573,6 +4589,27 @@ fn write_managed_file(path: &Path, contents: &str) -> Result<()> {
     }
 }
 
+fn prune_repo_codex_runtime_artifacts(codex_root: &Path) -> Result<usize> {
+    let mut removed = 0usize;
+    removed += remove_if_exists(codex_root.join("auth.json"))?;
+    removed += remove_if_exists(codex_root.join("session_index.jsonl"))?;
+    removed += remove_if_exists(codex_root.join("sessions"))?;
+    removed += remove_if_exists(codex_root.join("archived_sessions"))?;
+    removed += remove_if_exists(codex_root.join("logs"))?;
+
+    if let Ok(entries) = fs::read_dir(codex_root) {
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("sqlite") {
+                removed += remove_if_exists(path)?;
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
 fn initialize_git_repository(path: &Path, base_branch: Option<&str>) -> Result<()> {
     if path.join(".git").exists() {
         return Ok(());
@@ -6135,6 +6172,7 @@ mod tests {
 
         assert!(bootstrap.manifest_path.exists());
         assert!(bootstrap.contract_path.exists());
+        assert!(repo.join(".tt/settings.env").exists());
         assert!(!service.list_projects().expect("list projects").is_empty());
         let dev_worktree = bootstrap
             .roles
@@ -6152,6 +6190,7 @@ mod tests {
         assert!(bootstrap.project_config_path.exists());
         assert!(bootstrap.plan_path.exists());
         assert!(bootstrap.contract_path.exists());
+        assert!(repo.join(".tt/settings.env").exists());
         assert!(!dev_worktree.exists());
         assert!(service.list_projects().expect("list projects").is_empty());
         assert!(
@@ -6160,6 +6199,49 @@ mod tests {
                 .expect("list workspace bindings")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn clean_managed_project_all_prunes_repo_local_codex_runtime_artifacts() {
+        let (repo, _worktree) = setup_repo();
+        let dir = tempdir().expect("tempdir");
+        let service = DaemonService::new(OverlayStore::open_in_dir(dir.path()).expect("store"));
+        let bootstrap = service
+            .open_managed_project(
+                &repo,
+                Some("Alpha".to_string()),
+                Some("Ship the alpha slice".to_string()),
+                None,
+                None,
+                Some("director-model".to_string()),
+                Some("dev-model".to_string()),
+                Some("test-model".to_string()),
+                Some("integration-model".to_string()),
+            )
+            .expect("open managed project");
+
+        let codex_root = repo.join(".codex");
+        std::fs::write(codex_root.join("auth.json"), "{}").expect("write auth");
+        std::fs::write(codex_root.join("session_index.jsonl"), "").expect("write session index");
+        std::fs::create_dir_all(codex_root.join("sessions")).expect("create sessions");
+        std::fs::create_dir_all(codex_root.join("archived_sessions")).expect("create archived");
+        std::fs::create_dir_all(codex_root.join("logs")).expect("create logs");
+        std::fs::write(codex_root.join("state_5.sqlite"), "").expect("write sqlite");
+        std::fs::write(codex_root.join("curated-note.md"), "keep").expect("write curated file");
+
+        let removed = service
+            .clean_managed_project(&repo, true)
+            .expect("clean managed project");
+        assert!(removed > 0);
+        assert!(!codex_root.join("auth.json").exists());
+        assert!(!codex_root.join("session_index.jsonl").exists());
+        assert!(!codex_root.join("sessions").exists());
+        assert!(!codex_root.join("archived_sessions").exists());
+        assert!(!codex_root.join("logs").exists());
+        assert!(!codex_root.join("state_5.sqlite").exists());
+        assert!(bootstrap.codex_config_path.exists());
+        assert!(codex_root.join("agents/director.toml").exists());
+        assert!(codex_root.join("curated-note.md").exists());
     }
 
     #[test]

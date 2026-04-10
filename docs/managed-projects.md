@@ -33,6 +33,12 @@ Resume the director-managed workflow:
 tt open
 ```
 
+On a remote or headless machine, TT uses the repo-local Codex home and can be configured to direct the operator to:
+
+```bash
+CODEX_HOME=.codex codex login --device-auth
+```
+
 Generate the public CLI reference:
 
 ```bash
@@ -61,6 +67,19 @@ Runtime-only state such as `.tt/overlay.db` remains ignored. Repo-local Codex
 runtime artifacts such as `.codex/auth.json`, `.codex/session_index.jsonl`,
 `.codex/sessions/`, `.codex/archived_sessions/`, and `.codex/*.sqlite` should
 also remain ignored.
+
+`.tt/settings.env` may contain non-secret repo-local Codex flags such as:
+
+- `TT_CODEX_BIN`
+- `TT_CODEX_APP_SERVER_BIN`
+- `TT_CODEX_LOGIN_MODE=auto|interactive|device-auth|manual`
+
+Do not store auth tokens or device codes in `.tt/settings.env`.
+
+## Cleanup
+
+- `tt clean` removes TT project runtime state only.
+- `tt clean --all` also prunes repo-local Codex runtime artifacts such as `.codex/auth.json`, sessions, sqlite files, and logs, while preserving `.codex/config.toml`, `.codex/agents/**`, and other curated tracked files.
 
 ## Role Model
 

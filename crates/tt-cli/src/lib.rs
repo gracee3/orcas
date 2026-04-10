@@ -11,7 +11,9 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use clap::{Arg, ArgAction, CommandFactory, Parser, Subcommand};
-use tt_codex::managed_project_codex_home;
+use tt_codex::{
+    TT_CODEX_LOGIN_MODE_ENV, load_repo_settings_env, managed_project_codex_home, repo_env_var,
+};
 use tt_daemon::{
     DaemonRequest, DaemonResponse, ManagedProjectThreadAttachment, ManagedProjectThreadControlMode,
     request_for_cwd,
@@ -20,6 +22,14 @@ use tt_domain as _;
 use tt_domain::ThreadRole;
 
 pub const TT_CLI_GENERATION: &str = "v2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexLoginMode {
+    Auto,
+    Interactive,
+    DeviceAuth,
+    Manual,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "tt", version, about = "TT v2 local client")]
@@ -83,8 +93,8 @@ pub enum Command {
         json: bool,
     },
     Clean {
-        #[arg(long)]
-        full: bool,
+        #[arg(long = "all", alias = "full")]
+        all: bool,
     },
     #[command(hide = true)]
     Internal {
@@ -350,9 +360,9 @@ fn command_to_request(command: Command, cwd: &Path) -> Result<DaemonRequest> {
         Command::Status { .. } => DaemonRequest::Status {
             cwd: cwd.to_path_buf(),
         },
-        Command::Clean { full } => DaemonRequest::CleanManagedProject {
+        Command::Clean { all } => DaemonRequest::CleanManagedProject {
             cwd: cwd.to_path_buf(),
-            force: full,
+            force: all,
         },
         Command::Internal { command } => match command {
             InternalCommand::Repo => DaemonRequest::RepositorySummary {
@@ -1272,6 +1282,75 @@ fn should_launch_codex_tui() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+impl CodexLoginMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "interactive" => Ok(Self::Interactive),
+            "device-auth" | "device_auth" => Ok(Self::DeviceAuth),
+            "manual" => Ok(Self::Manual),
+            other => anyhow::bail!(
+                "unknown {} value `{}`; expected auto, interactive, device-auth, or manual",
+                TT_CODEX_LOGIN_MODE_ENV,
+                other
+            ),
+        }
+    }
+}
+
+fn codex_login_mode_for_cwd(cwd: &Path) -> Result<CodexLoginMode> {
+    load_repo_settings_env(cwd)?;
+    repo_env_var(TT_CODEX_LOGIN_MODE_ENV)
+        .as_deref()
+        .map(CodexLoginMode::parse)
+        .transpose()
+        .map(|mode| mode.unwrap_or(CodexLoginMode::Auto))
+}
+
+fn should_launch_codex_login(mode: CodexLoginMode, interactive_terminal: bool) -> bool {
+    match mode {
+        CodexLoginMode::Auto => interactive_terminal,
+        CodexLoginMode::Interactive => interactive_terminal,
+        CodexLoginMode::DeviceAuth => interactive_terminal,
+        CodexLoginMode::Manual => false,
+    }
+}
+
+fn codex_login_args(mode: CodexLoginMode, interactive_terminal: bool) -> Vec<&'static str> {
+    match mode {
+        CodexLoginMode::Auto => {
+            if interactive_terminal {
+                vec!["login"]
+            } else {
+                vec!["login", "--device-auth"]
+            }
+        }
+        CodexLoginMode::Interactive => vec!["login"],
+        CodexLoginMode::DeviceAuth => vec!["login", "--device-auth"],
+        CodexLoginMode::Manual => {
+            if interactive_terminal {
+                vec!["login"]
+            } else {
+                vec!["login", "--device-auth"]
+            }
+        }
+    }
+}
+
+fn render_codex_login_command(codex_home: &Path, codex_bin: &Path, args: &[&str]) -> String {
+    let suffix = if args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", args.join(" "))
+    };
+    format!(
+        "CODEX_HOME={} {}{}",
+        codex_home.display(),
+        codex_bin.display(),
+        suffix
+    )
+}
+
 fn launch_codex_tui_for_director(
     cwd: &Path,
     bootstrap: &tt_daemon::ManagedProjectBootstrap,
@@ -1470,21 +1549,26 @@ fn ensure_repo_codex_auth_for_open(cwd: &Path) -> Result<()> {
     let codex_home = managed_project_codex_home(cwd);
     fs::create_dir_all(&codex_home)
         .with_context(|| format!("create Codex home {}", codex_home.display()))?;
+    let interactive_terminal = should_launch_codex_tui();
+    let login_mode = codex_login_mode_for_cwd(cwd)?;
+    let login_args = codex_login_args(login_mode, interactive_terminal);
+    let login_command = render_codex_login_command(&codex_home, &codex_bin, &login_args);
 
-    if !should_launch_codex_tui() {
+    if !should_launch_codex_login(login_mode, interactive_terminal) {
         anyhow::bail!(
-            "cannot open TT project in {} because repo-local Codex auth is missing at {}.\nRun `CODEX_HOME={} {} login` and retry.",
+            "cannot open TT project in {} because repo-local Codex auth is missing at {}.\nRun `{}` and retry.",
             cwd.display(),
             codex_home.join("auth.json").display(),
-            codex_home.display(),
-            codex_bin.display()
+            login_command
         );
     }
 
-    let status = ProcessCommand::new(&codex_bin)
-        .current_dir(cwd)
-        .env("CODEX_HOME", &codex_home)
-        .arg("login")
+    let mut command = ProcessCommand::new(&codex_bin);
+    command.current_dir(cwd).env("CODEX_HOME", &codex_home);
+    for arg in &login_args {
+        command.arg(arg);
+    }
+    let status = command
         .status()
         .with_context(|| format!("launch Codex login `{}`", codex_bin.display()))?;
     if !status.success() {
@@ -2000,9 +2084,9 @@ mod tests {
 
     #[test]
     fn parses_clean_command() {
-        let cli = Cli::try_parse_from(["tt", "clean", "--full"]).expect("parse");
+        let cli = Cli::try_parse_from(["tt", "clean", "--all"]).expect("parse");
         match cli.command {
-            Command::Clean { full } => assert!(full),
+            Command::Clean { all } => assert!(all),
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -2010,7 +2094,7 @@ mod tests {
     #[test]
     fn clean_command_maps_to_daemon_request() {
         let request =
-            command_to_request(Command::Clean { full: true }, Path::new("/repo")).expect("request");
+            command_to_request(Command::Clean { all: true }, Path::new("/repo")).expect("request");
         assert_eq!(
             request,
             DaemonRequest::CleanManagedProject {
@@ -2256,6 +2340,44 @@ mod tests {
         assert_eq!(
             text,
             "{\n  \"project\": \"Initialized\",\n  \"repo\": \"/repo\",\n  \"runtime\": \"NeedsAuth\"\n}"
+        );
+    }
+
+    #[test]
+    fn codex_login_mode_defaults_to_auto() {
+        assert_eq!(
+            codex_login_mode_for_cwd(Path::new("/repo")).expect("mode"),
+            CodexLoginMode::Auto
+        );
+    }
+
+    #[test]
+    fn codex_login_args_follow_mode_and_tty() {
+        assert_eq!(codex_login_args(CodexLoginMode::Auto, true), vec!["login"]);
+        assert_eq!(
+            codex_login_args(CodexLoginMode::Auto, false),
+            vec!["login", "--device-auth"]
+        );
+        assert_eq!(
+            codex_login_args(CodexLoginMode::DeviceAuth, true),
+            vec!["login", "--device-auth"]
+        );
+        assert_eq!(
+            codex_login_args(CodexLoginMode::Interactive, false),
+            vec!["login"]
+        );
+    }
+
+    #[test]
+    fn renders_repo_local_device_auth_command() {
+        let command = render_codex_login_command(
+            Path::new("/repo/.codex"),
+            Path::new("/bin/codex"),
+            &["login", "--device-auth"],
+        );
+        assert_eq!(
+            command,
+            "CODEX_HOME=/repo/.codex /bin/codex login --device-auth"
         );
     }
 

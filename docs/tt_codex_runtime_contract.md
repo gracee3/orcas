@@ -57,6 +57,12 @@ Auth file:
 TT should keep its own config and state separate from Codex config and state.
 For repo-local development checkouts, TT may also load `<repo>/.tt/settings.env`
 as a lightweight env overlay for TT/Codex path defaults. Shell env still wins.
+Allowed repo-local Codex settings include:
+- `TT_CODEX_BIN`
+- `TT_CODEX_APP_SERVER_BIN`
+- `TT_CODEX_LOGIN_MODE=auto|interactive|device-auth|manual`
+
+TT should not store device codes, tokens, or other auth material in `.tt/settings.env`.
 
 ## Binary Discovery
 
@@ -84,8 +90,12 @@ Current app-server listen URL overrides used by TT:
 Current Codex auth requirement enforced by TT:
 - TT-managed runs use `CODEX_HOME=<repo>/.codex`
 - `tt open` launches repo-local Codex login automatically when `<repo>/.codex/auth.json` is missing in an interactive terminal
-- non-interactive flows must provide repo-local auth up front
+- in headless or non-interactive flows, TT emits the exact repo-local login command and defaults to `codex login --device-auth`
 - live e2e app-server launches seed `<repo>/.codex/auth.json` from `~/.codex/auth.json` only as test bootstrap
+
+Cleanup behavior:
+- `tt clean` removes TT runtime state only
+- `tt clean --all` prunes repo-local Codex auth/session/sqlite/log artifacts while preserving tracked `.codex/config.toml` and `.codex/agents/**`
 
 TT should continue to support explicit listen URL override for testing and
 runtime control.

@@ -37,6 +37,7 @@ pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
 pub const CODEX_SQLITE_HOME_ENV: &str = "CODEX_SQLITE_HOME";
 pub const TT_CODEX_BIN_ENV: &str = "TT_CODEX_BIN";
 pub const TT_CODEX_APP_SERVER_BIN_ENV: &str = "TT_CODEX_APP_SERVER_BIN";
+pub const TT_CODEX_LOGIN_MODE_ENV: &str = "TT_CODEX_LOGIN_MODE";
 pub const CODEX_BIN_FILENAME: &str = "codex";
 pub const CODEX_APP_SERVER_BIN_FILENAME: &str = "codex-app-server";
 pub const CODEX_AUTH_FILE_NAME: &str = "auth.json";
@@ -245,9 +246,11 @@ impl CodexHome {
     pub fn discover_in(cwd: impl AsRef<Path>) -> Result<Self> {
         let cwd = cwd.as_ref();
         load_repo_settings_env(cwd)?;
-        let codex_dir = managed_project_codex_home(cwd);
-        if codex_dir.is_dir() {
-            return Ok(Self::from_path(codex_dir));
+        if let Some(repo_root) = cwd
+            .ancestors()
+            .find(|ancestor| ancestor.join(".tt").is_dir())
+        {
+            return Ok(Self::from_path(repo_root.join(".codex")));
         }
         Self::discover_from(repo_env_var_os(CODEX_HOME_ENV), dirs::home_dir())
     }
@@ -1689,12 +1692,22 @@ mod tests {
     fn discover_in_prefers_repo_local_codex_home_without_auth() {
         let dir = tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join(".tt")).expect("create tt dir");
-        std::fs::create_dir_all(dir.path().join(".codex")).expect("create codex dir");
 
         let discovered = CodexHome::discover_in(dir.path()).expect("discover codex home");
 
         assert_eq!(discovered.root(), dir.path().join(".codex").as_path());
         assert!(!managed_project_auth_is_present(dir.path()));
+    }
+
+    #[test]
+    fn discover_in_prefers_repo_local_codex_home_without_existing_directory() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".tt")).expect("create tt dir");
+
+        let discovered = CodexHome::discover_in(dir.path()).expect("discover codex home");
+
+        assert_eq!(discovered.root(), dir.path().join(".codex").as_path());
+        assert!(!discovered.root().is_dir());
     }
 
     #[test]
