@@ -4874,8 +4874,12 @@ impl DaemonService {
 
             let outcome =
                 self.run_managed_project_startup_turn(bootstrap, &role_bootstrap, &startup_prompt)?;
-            let report = match parse_bootstrap_worker_report(&outcome.summary, &outcome.extraction)
-            {
+            let report = match parse_bootstrap_worker_report(
+                &outcome.summary,
+                &outcome.extraction,
+                &role_bootstrap,
+                &bootstrap.repo_root,
+            ) {
                 Ok(report) => report,
                 Err(error) => {
                     let raw_text = outcome
@@ -5009,6 +5013,7 @@ impl DaemonService {
         let ack = match parse_bootstrap_director_ack(
             &director_outcome.summary,
             &director_outcome.extraction,
+            &reports,
         ) {
             Ok(ack) => ack,
             Err(error) => {
@@ -5837,6 +5842,7 @@ Assigned branch: {}\n\
 \n\
 Do not change code. This turn is only a startup readiness report to the director.\n\
 Confirm that you loaded `.tt/contract.md` and `.tt/plan.toml`, that you are in the correct cwd/worktree/branch, and whether you are ready or blocked.\n\
+Prefer exactly one JSON object with this shape. If you make a typo or cannot format JSON cleanly, a short plain-text readiness note is acceptable and TT will infer the status.\n\
 Return exactly one JSON object with this shape:\n\
 {{\n\
   \"role\": \"{}\",\n\
@@ -5891,6 +5897,7 @@ fn build_director_startup_prompt(
         "TT managed project startup handshake for project `{}`.\n\
 All worker startup reports have been collected by TT.\n\
 Validate the roster for `dev`, `test`, and `integration`, confirm whether the project is ready for operator handoff, and report any missing or blocked workers.\n\
+Prefer exactly one JSON object with the fields below. If you make a typo or cannot format JSON cleanly, a short plain-text ack is acceptable and TT will infer the status.\n\
 \n\
 Worker reports:\n{}\n\
 \n\
@@ -5913,27 +5920,162 @@ Return exactly one JSON object with this shape:\n\
 fn parse_bootstrap_worker_report(
     summary: &str,
     extraction: &WorkerHandoffExtraction,
+    role_bootstrap: &ManagedProjectRoleBootstrap,
+    repo_root: &Path,
 ) -> Result<ManagedProjectBootstrapWorkerReport> {
-    let candidate = extraction
+    if let Some(candidate) = extraction
         .raw_text
         .as_deref()
         .and_then(normalize_worker_handoff_json_candidate)
         .or_else(|| normalize_worker_handoff_json_candidate(summary))
-        .ok_or_else(|| anyhow::anyhow!("startup worker report did not contain a JSON object"))?;
-    Ok(serde_json::from_str(&candidate)?)
+    {
+        if let Ok(report) = serde_json::from_str::<ManagedProjectBootstrapWorkerReport>(&candidate)
+        {
+            return Ok(report);
+        }
+    }
+    Ok(parse_plaintext_bootstrap_worker_report(
+        summary,
+        extraction.raw_text.as_deref().unwrap_or(summary),
+        role_bootstrap,
+        repo_root,
+    ))
 }
 
 fn parse_bootstrap_director_ack(
     summary: &str,
     extraction: &WorkerHandoffExtraction,
+    reports: &[ManagedProjectBootstrapWorkerReport],
 ) -> Result<ManagedProjectBootstrapDirectorAckPayload> {
-    let candidate = extraction
+    if let Some(candidate) = extraction
         .raw_text
         .as_deref()
         .and_then(normalize_worker_handoff_json_candidate)
         .or_else(|| normalize_worker_handoff_json_candidate(summary))
-        .ok_or_else(|| anyhow::anyhow!("startup director ack did not contain a JSON object"))?;
-    Ok(serde_json::from_str(&candidate)?)
+    {
+        if let Ok(ack) = serde_json::from_str::<ManagedProjectBootstrapDirectorAckPayload>(&candidate)
+        {
+            return Ok(ack);
+        }
+    }
+    Ok(parse_plaintext_bootstrap_director_ack(
+        summary,
+        extraction.raw_text.as_deref().unwrap_or(summary),
+        reports,
+    ))
+}
+
+fn parse_plaintext_bootstrap_worker_report(
+    summary: &str,
+    raw_text: &str,
+    role_bootstrap: &ManagedProjectRoleBootstrap,
+    repo_root: &Path,
+) -> ManagedProjectBootstrapWorkerReport {
+    let text = if raw_text.trim().is_empty() {
+        summary.trim()
+    } else {
+        raw_text.trim()
+    };
+    let status = if is_plaintext_blocked_report(text) {
+        "blocked"
+    } else {
+        "ready"
+    };
+    ManagedProjectBootstrapWorkerReport {
+        role: role_slug(role_bootstrap.role).to_string(),
+        cwd: role_bootstrap
+            .worktree_path
+            .as_deref()
+            .unwrap_or(repo_root)
+            .display()
+            .to_string(),
+        worktree: role_bootstrap
+            .worktree_path
+            .as_deref()
+            .unwrap_or(repo_root)
+            .display()
+            .to_string(),
+        branch: role_bootstrap
+            .branch_name
+            .clone()
+            .unwrap_or_else(|| role_slug(role_bootstrap.role).to_string()),
+        contract_loaded: text.contains("contract") || !text.to_ascii_lowercase().contains("missing"),
+        plan_loaded: text.contains("plan") || !text.to_ascii_lowercase().contains("missing"),
+        status: status.to_string(),
+        blocker: if status == "blocked" {
+            Some(extract_plaintext_blocker_summary(text))
+        } else {
+            None
+        },
+        summary: summarize_plaintext_startup_response(text),
+    }
+}
+
+fn parse_plaintext_bootstrap_director_ack(
+    summary: &str,
+    raw_text: &str,
+    reports: &[ManagedProjectBootstrapWorkerReport],
+) -> ManagedProjectBootstrapDirectorAckPayload {
+    let text = if raw_text.trim().is_empty() {
+        summary.trim()
+    } else {
+        raw_text.trim()
+    };
+    let ready = !is_plaintext_blocked_report(text);
+    let received_roles = reports.iter().map(|report| report.role.clone()).collect();
+    let missing_roles = if ready {
+        Vec::new()
+    } else {
+        reports
+            .iter()
+            .filter(|report| report.status != "ready")
+            .map(|report| report.role.clone())
+            .collect()
+    };
+    ManagedProjectBootstrapDirectorAckPayload {
+        status: if ready { "ready".to_string() } else { "blocked".to_string() },
+        received_roles,
+        missing_roles,
+        summary: summarize_plaintext_startup_response(text),
+    }
+}
+
+fn summarize_plaintext_startup_response(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "ready".to_string();
+    }
+    trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn is_plaintext_blocked_report(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    normalized.contains("blocked")
+        || normalized.contains("not ready")
+        || normalized.contains("cannot")
+        || normalized.contains("can't")
+        || normalized.contains("error")
+        || normalized.contains("issue")
+        || normalized.contains("missing")
+        || normalized.contains("fail")
+}
+
+fn extract_plaintext_blocker_summary(text: &str) -> String {
+    let trimmed = text.trim();
+    for marker in ["blocker:", "because", "due to", "error:"] {
+        if let Some(index) = trimmed.to_ascii_lowercase().find(marker) {
+            let value = trimmed[index + marker.len()..].trim();
+            if !value.is_empty() {
+                return value.lines().next().unwrap_or(value).trim().to_string();
+            }
+        }
+    }
+    summarize_plaintext_startup_response(trimmed)
 }
 
 fn summarize_turn_items(items: &[protocol::ThreadItem]) -> String {
@@ -8229,6 +8371,84 @@ mod tests {
             extraction.parse_error.as_deref(),
             Some("no agent message found in completed turn")
         );
+    }
+
+    #[test]
+    fn parse_bootstrap_worker_report_accepts_plain_text() {
+        let role_bootstrap = ManagedProjectRoleBootstrap {
+            role: ThreadRole::Develop,
+            work_unit: WorkUnit {
+                id: "wu".into(),
+                project_id: "p".into(),
+                slug: None,
+                title: "Dev".into(),
+                task: "Task".into(),
+                status: WorkUnitStatus::Ready,
+                created_at: ts(),
+                updated_at: ts(),
+            },
+            agent_path: PathBuf::from("/repo/.codex/agents/dev.toml"),
+            model: None,
+            reasoning_effort: None,
+            control_mode: ManagedProjectThreadControlMode::Director,
+            branch_name: Some("tt/dev".into()),
+            worktree_path: Some(PathBuf::from("/repo/.tt/worktrees/dev")),
+            thread_id: Some("thread-1".into()),
+            thread_name: None,
+            workspace_binding_id: None,
+        };
+        let extraction = WorkerHandoffExtraction {
+            handoff: None,
+            raw_text: Some("ready. contract loaded and plan loaded.".into()),
+            source: WorkerHandoffSource::SeededFallback,
+            parse_error: Some("not json".into()),
+        };
+        let report = parse_bootstrap_worker_report("ready", &extraction, &role_bootstrap, Path::new("/repo"))
+            .expect("worker report");
+        assert_eq!(report.status, "ready");
+        assert!(report.contract_loaded);
+        assert!(report.plan_loaded);
+        assert_eq!(report.branch, "tt/dev");
+        assert_eq!(report.cwd, "/repo/.tt/worktrees/dev");
+    }
+
+    #[test]
+    fn parse_bootstrap_director_ack_accepts_plain_text() {
+        let reports = vec![
+            ManagedProjectBootstrapWorkerReport {
+                role: "dev".into(),
+                cwd: "/repo/.tt/worktrees/dev".into(),
+                worktree: "/repo/.tt/worktrees/dev".into(),
+                branch: "tt/dev".into(),
+                contract_loaded: true,
+                plan_loaded: true,
+                status: "ready".into(),
+                blocker: None,
+                summary: "ready".into(),
+            },
+            ManagedProjectBootstrapWorkerReport {
+                role: "test".into(),
+                cwd: "/repo/.tt/worktrees/test".into(),
+                worktree: "/repo/.tt/worktrees/test".into(),
+                branch: "tt/test".into(),
+                contract_loaded: true,
+                plan_loaded: true,
+                status: "ready".into(),
+                blocker: None,
+                summary: "ready".into(),
+            },
+        ];
+        let extraction = WorkerHandoffExtraction {
+            handoff: None,
+            raw_text: Some("ready for operator handoff".into()),
+            source: WorkerHandoffSource::SeededFallback,
+            parse_error: Some("not json".into()),
+        };
+        let ack = parse_bootstrap_director_ack("ready", &extraction, &reports).expect("ack");
+        assert_eq!(ack.status, "ready");
+        assert_eq!(ack.received_roles, vec!["dev", "test"]);
+        assert!(ack.missing_roles.is_empty());
+        assert_eq!(ack.summary, "ready for operator handoff");
     }
 
     #[test]
