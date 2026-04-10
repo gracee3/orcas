@@ -764,8 +764,13 @@ fn render_status_response(
     } else {
         "unreachable"
     };
+    let runtime_key = if colorize {
+        "\u{1b}[1mruntime\u{1b}[0m"
+    } else {
+        "runtime"
+    };
     format!(
-        "status\nrepo_root: {}\nproject_initialized: {}\nproject_state: {}\nruntime: {}\nprojects: {}\nwork-units: {}\nbound-threads: {}\nready-workspaces: {}\n",
+        "status\nrepo_root: {}\nproject_initialized: {}\nproject_state: {}\n{}: {}\nprojects: {}\nwork-units: {}\nbound-threads: {}\nready-workspaces: {}\n",
         status
             .repo_root
             .as_deref()
@@ -773,6 +778,7 @@ fn render_status_response(
             .unwrap_or_else(|| "<none>".to_string()),
         status.project_initialized,
         status.project_state.as_deref().unwrap_or("<none>"),
+        runtime_key,
         runtime_label,
         status.project_count,
         status.work_unit_count,
