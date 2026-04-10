@@ -51,6 +51,14 @@ Project state:
 - TT daemon socket: `<repo>/.tt/tt-daemon.sock`
 - Codex app-server log: `<repo>/.tt/codex-app-server.log`
 
+Tracked Codex config:
+- `<repo>/.codex/config.defaults.toml`
+- `<repo>/.codex/agents/`
+
+Generated and local-only Codex config:
+- `<repo>/.codex/config.toml`
+- `<repo>/.codex/config.local.toml`
+
 Auth file:
 - TT-managed Codex auth: `<repo>/.codex/auth.json`
 
@@ -95,7 +103,7 @@ Current Codex auth requirement enforced by TT:
 
 Cleanup behavior:
 - `tt clean` removes TT runtime state only
-- `tt clean --all` prunes repo-local Codex auth/session/sqlite/log artifacts while preserving tracked `.codex/config.toml` and `.codex/agents/**`
+- `tt clean --all` prunes repo-local Codex auth/session/sqlite/log artifacts while preserving `.codex/config.defaults.toml`, `.codex/config.local.toml`, and `.codex/agents/**`
 
 TT should continue to support explicit listen URL override for testing and
 runtime control.

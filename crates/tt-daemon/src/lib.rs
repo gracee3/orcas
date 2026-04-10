@@ -44,6 +44,9 @@ pub const TT_DAEMON_API_VERSION: &str = "v2";
 pub const TT_DAEMON_SOCKET_NAME: &str = "tt-daemon.sock";
 pub const TT_CONTRACT_FILE_NAME: &str = "contract.md";
 pub const TT_CODEX_APP_SERVER_LOG_FILE_NAME: &str = "codex-app-server.log";
+const CODEX_CONFIG_DEFAULTS_FILE_NAME: &str = "config.defaults.toml";
+const CODEX_CONFIG_LOCAL_FILE_NAME: &str = "config.local.toml";
+const CODEX_CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_AGENT_CONFIG_MAX_THREADS: usize = 6;
 const DEFAULT_AGENT_CONFIG_MAX_DEPTH: usize = 1;
 const DOCTOR_LISTEN_TIMEOUT_MS: u64 = 1500;
@@ -1846,7 +1849,6 @@ impl DaemonService {
         fs::create_dir_all(&worktree_root)?;
 
         let contract_path = repo_root.join(".tt").join(TT_CONTRACT_FILE_NAME);
-        let codex_config_path = repo_root.join(".codex").join("config.toml");
         let project_config_path = repo_root.join(".tt").join("project.toml");
         let plan_path = repo_root.join(".tt").join("plan.toml");
         let settings_env_path = repo_root.join(".tt").join("settings.env");
@@ -1858,18 +1860,7 @@ impl DaemonService {
             &base_branch,
         )?;
         let initial_plan = default_managed_project_plan(&project, &project_config, &[]);
-        if let Some(parent) = codex_config_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        if !codex_config_path.exists() {
-            fs::write(
-                &codex_config_path,
-                render_codex_config(
-                    DEFAULT_AGENT_CONFIG_MAX_THREADS,
-                    DEFAULT_AGENT_CONFIG_MAX_DEPTH,
-                ),
-            )?;
-        }
+        let codex_config_path = ensure_layered_codex_config(&repo_root)?;
         write_or_replace_managed_file(
             &contract_path,
             &render_worker_contract(&repo_root, &slug, &base_branch, &project_config),
@@ -2486,8 +2477,145 @@ fn role_default_reasoning_effort(_role: ThreadRole) -> &'static str {
     "medium"
 }
 
-fn render_codex_config(max_threads: usize, max_depth: usize) -> String {
+fn render_codex_config_defaults(max_threads: usize, max_depth: usize) -> String {
     format!("[agents]\nmax_threads = {max_threads}\nmax_depth = {max_depth}\n")
+}
+
+fn render_empty_codex_config_local() -> String {
+    "# Machine-local Codex overrides.\n".to_string()
+}
+
+fn load_toml_table_or_default(path: &Path) -> Result<toml::Table> {
+    if !path.exists() {
+        return Ok(toml::Table::new());
+    }
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("read TOML file {}", path.display()))?;
+    if contents.trim().is_empty() {
+        return Ok(toml::Table::new());
+    }
+    toml::from_str::<toml::Table>(&contents)
+        .with_context(|| format!("parse TOML file {}", path.display()))
+}
+
+fn write_toml_table(path: &Path, table: &toml::Table) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let contents = toml::to_string_pretty(table)
+        .with_context(|| format!("serialize TOML file {}", path.display()))?;
+    fs::write(path, contents).with_context(|| format!("write TOML file {}", path.display()))?;
+    Ok(())
+}
+
+fn merge_toml_tables(base: &toml::Table, overlay: &toml::Table) -> toml::Table {
+    let mut merged = base.clone();
+    for (key, value) in overlay {
+        match (merged.get_mut(key), value) {
+            (Some(toml::Value::Table(base_table)), toml::Value::Table(overlay_table)) => {
+                let nested = merge_toml_tables(base_table, overlay_table);
+                *base_table = nested;
+            }
+            _ => {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    merged
+}
+
+fn layered_codex_config_paths(repo_root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let codex_root = repo_root.join(".codex");
+    (
+        codex_root.join(CODEX_CONFIG_DEFAULTS_FILE_NAME),
+        codex_root.join(CODEX_CONFIG_LOCAL_FILE_NAME),
+        codex_root.join(CODEX_CONFIG_FILE_NAME),
+    )
+}
+
+fn split_legacy_codex_config(table: toml::Table) -> (toml::Table, toml::Table) {
+    let mut defaults = toml::Table::new();
+    let mut local = toml::Table::new();
+    for (key, value) in table {
+        match key.as_str() {
+            "projects" | "plugins" => {
+                local.insert(key, value);
+            }
+            _ => {
+                defaults.insert(key, value);
+            }
+        }
+    }
+    (defaults, local)
+}
+
+fn ensure_layered_codex_config(repo_root: &Path) -> Result<PathBuf> {
+    let (defaults_path, local_path, generated_path) = layered_codex_config_paths(repo_root);
+    if let Some(parent) = generated_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if !defaults_path.exists() {
+        let legacy_table = load_toml_table_or_default(&generated_path)?;
+        let (defaults, local) = if legacy_table.is_empty() {
+            (
+                load_toml_table_from_string(&render_codex_config_defaults(
+                    DEFAULT_AGENT_CONFIG_MAX_THREADS,
+                    DEFAULT_AGENT_CONFIG_MAX_DEPTH,
+                ))?,
+                toml::Table::new(),
+            )
+        } else {
+            split_legacy_codex_config(legacy_table)
+        };
+        write_toml_table(&defaults_path, &defaults)?;
+        if !local_path.exists() {
+            if local.is_empty() {
+                fs::write(&local_path, render_empty_codex_config_local())
+                    .with_context(|| format!("write local Codex config {}", local_path.display()))?;
+            } else {
+                write_toml_table(&local_path, &local)?;
+            }
+        }
+    }
+
+    if !local_path.exists() {
+        fs::write(&local_path, render_empty_codex_config_local())
+            .with_context(|| format!("write local Codex config {}", local_path.display()))?;
+    }
+
+    reconcile_generated_codex_local_overrides(repo_root)?;
+    regenerate_codex_effective_config(repo_root)?;
+    Ok(generated_path)
+}
+
+fn load_toml_table_from_string(contents: &str) -> Result<toml::Table> {
+    toml::from_str::<toml::Table>(contents).context("parse generated TOML contents")
+}
+
+fn reconcile_generated_codex_local_overrides(repo_root: &Path) -> Result<()> {
+    let (_defaults_path, local_path, generated_path) = layered_codex_config_paths(repo_root);
+    let generated = load_toml_table_or_default(&generated_path)?;
+    if generated.is_empty() {
+        return Ok(());
+    }
+    let (_defaults, imported_local) = split_legacy_codex_config(generated);
+    if imported_local.is_empty() {
+        return Ok(());
+    }
+    let local = load_toml_table_or_default(&local_path)?;
+    let merged_local = merge_toml_tables(&local, &imported_local);
+    write_toml_table(&local_path, &merged_local)?;
+    Ok(())
+}
+
+fn regenerate_codex_effective_config(repo_root: &Path) -> Result<()> {
+    let (defaults_path, local_path, generated_path) = layered_codex_config_paths(repo_root);
+    let defaults = load_toml_table_or_default(&defaults_path)?;
+    let local = load_toml_table_or_default(&local_path)?;
+    let merged = merge_toml_tables(&defaults, &local);
+    write_toml_table(&generated_path, &merged)?;
+    Ok(())
 }
 
 fn render_default_settings_env() -> String {
@@ -3316,6 +3444,7 @@ impl DaemonService {
         let role_refs: Vec<_> = roles.iter().collect();
         let plan =
             load_or_seed_managed_project_plan(&plan_path, &project_config, &project, &role_refs)?;
+        let codex_config_path = ensure_layered_codex_config(Path::new(&manifest.repo_root))?;
 
         Ok(ManagedProjectBootstrap {
             project: project.clone(),
@@ -3326,7 +3455,7 @@ impl DaemonService {
             project_config_path,
             plan_path,
             contract_path: PathBuf::from(&manifest.contract_path),
-            codex_config_path: PathBuf::from(&manifest.codex_config_path),
+            codex_config_path,
             project_config,
             plan,
             startup: manifest.startup.clone(),
@@ -5038,7 +5167,7 @@ fn scaffold_managed_project_template(path: &Path, template: Option<&str>) -> Res
             )?;
             write_managed_file(
                 &path.join(".gitignore"),
-                "/target\n/.tt\n/.codex/auth.json\n/.codex/session_index.jsonl\n/.codex/sessions/\n/.codex/archived_sessions/\n/.codex/*.sqlite\n/.codex/logs/\n*.log\n",
+                "/target\n/.tt\n/.codex/config.toml\n/.codex/config.local.toml\n/.codex/auth.json\n/.codex/session_index.jsonl\n/.codex/sessions/\n/.codex/archived_sessions/\n/.codex/*.sqlite\n/.codex/logs/\n*.log\n",
             )?;
             if !path.join("tests").exists() {
                 fs::create_dir_all(path.join("tests"))?;
@@ -6861,6 +6990,8 @@ mod tests {
         assert!(!codex_root.join("logs").exists());
         assert!(!codex_root.join("state_5.sqlite").exists());
         assert!(bootstrap.codex_config_path.exists());
+        assert!(codex_root.join("config.defaults.toml").exists());
+        assert!(codex_root.join("config.local.toml").exists());
         assert!(codex_root.join("agents/director.toml").exists());
         assert!(codex_root.join("curated-note.md").exists());
     }
@@ -7212,12 +7343,16 @@ mod tests {
     }
 
     #[test]
-    fn open_managed_project_preserves_existing_codex_config() {
+    fn open_managed_project_migrates_existing_codex_config_to_layered_files() {
         let (repo, _worktree) = setup_repo();
         let codex_config_path = repo.join(".codex/config.toml");
         std::fs::create_dir_all(codex_config_path.parent().expect("codex parent"))
             .expect("create codex dir");
-        std::fs::write(&codex_config_path, "# local codex config\n").expect("seed config");
+        std::fs::write(
+            &codex_config_path,
+            "[agents]\nmax_threads = 6\nmax_depth = 1\n\n[projects.\"/tmp/repo\"]\ntrust_level = \"trusted\"\n\n[plugins.\"github@openai-curated\"]\nenabled = true\n",
+        )
+        .expect("seed config");
 
         let dir = tempdir().expect("tempdir");
         let service = DaemonService::new(OverlayStore::open_in_dir(dir.path()).expect("store"));
@@ -7236,11 +7371,69 @@ mod tests {
             )
             .expect("open managed project");
 
-        assert_eq!(
-            std::fs::read_to_string(&codex_config_path).expect("read config"),
-            "# local codex config\n"
-        );
+        let defaults_path = repo.join(".codex/config.defaults.toml");
+        let local_path = repo.join(".codex/config.local.toml");
+        let defaults = std::fs::read_to_string(&defaults_path).expect("read defaults");
+        let local = std::fs::read_to_string(&local_path).expect("read local");
+        let generated = std::fs::read_to_string(&codex_config_path).expect("read generated");
+        assert!(defaults.contains("[agents]"));
+        assert!(!defaults.contains("[projects."));
+        assert!(!defaults.contains("[plugins."));
+        assert!(local.contains("[projects."));
+        assert!(local.contains("trust_level = \"trusted\""));
+        assert!(local.contains("[plugins.\"github@openai-curated\"]"));
+        assert!(generated.contains("[agents]"));
+        assert!(generated.contains("[projects.\"/tmp/repo\"]"));
+        assert!(generated.contains("[plugins.\"github@openai-curated\"]"));
         assert_eq!(bootstrap.codex_config_path, codex_config_path);
+    }
+
+    #[test]
+    fn open_managed_project_imports_codex_written_local_overrides_into_local_layer() {
+        let (repo, _worktree) = setup_repo();
+        let dir = tempdir().expect("tempdir");
+        let service = DaemonService::new(OverlayStore::open_in_dir(dir.path()).expect("store"));
+
+        service
+            .open_managed_project(
+                &repo,
+                Some("Alpha".to_string()),
+                Some("Ship the alpha slice".to_string()),
+                None,
+                None,
+                Some("director-model".to_string()),
+                Some("dev-model".to_string()),
+                Some("test-model".to_string()),
+                Some("integration-model".to_string()),
+            )
+            .expect("open managed project");
+
+        let generated_path = repo.join(".codex/config.toml");
+        std::fs::write(
+            &generated_path,
+            "[agents]\nmax_threads = 6\nmax_depth = 1\n\n[projects.\"/tmp/repo\"]\ntrust_level = \"trusted\"\n",
+        )
+        .expect("codex writes generated config");
+
+        service
+            .open_managed_project(
+                &repo,
+                Some("Alpha".to_string()),
+                Some("Ship the alpha slice".to_string()),
+                None,
+                None,
+                Some("director-model".to_string()),
+                Some("dev-model".to_string()),
+                Some("test-model".to_string()),
+                Some("integration-model".to_string()),
+            )
+            .expect("reopen managed project");
+
+        let local = std::fs::read_to_string(repo.join(".codex/config.local.toml"))
+            .expect("read local config");
+        let regenerated = std::fs::read_to_string(&generated_path).expect("read generated config");
+        assert!(local.contains("[projects.\"/tmp/repo\"]"));
+        assert!(regenerated.contains("[projects.\"/tmp/repo\"]"));
     }
 
     #[test]

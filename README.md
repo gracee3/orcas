@@ -36,7 +36,7 @@ This checkout keeps a reference managed-project scaffold in `.tt/`:
 Runtime-only state such as `.tt/overlay.db`, `.tt/tt-daemon.sock`, and
 `.tt/codex-app-server.log` stays ignored.
 
-Use `tt clean` to tear down the live managed-project runtime while keeping the checked-in policy scaffold. Use `tt clean --all` to also prune repo-local Codex runtime artifacts such as auth, sessions, sqlite files, and logs while preserving tracked `.codex/config.toml` and `.codex/agents/`.
+Use `tt clean` to tear down the live managed-project runtime while keeping the checked-in policy scaffold. Use `tt clean --all` to also prune repo-local Codex runtime artifacts such as auth, sessions, sqlite files, and logs while preserving tracked `.codex/config.defaults.toml` and `.codex/agents/`.
 
 ## Development
 

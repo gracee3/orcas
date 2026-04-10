@@ -58,7 +58,9 @@ tt docs export-cli --output docs/cli-reference.md
 
 ## What `tt init` Creates
 
-- `.codex/config.toml`
+- `.codex/config.defaults.toml`
+- `.codex/config.local.toml` for ignored machine-local overrides
+- `.codex/config.toml` as the generated effective Codex config
 - `.codex/auth.json` after the operator signs in for that repo
 - `.codex/agents/director.toml`
 - `.codex/agents/dev.toml`
@@ -90,7 +92,7 @@ Do not store auth tokens or device codes in `.tt/settings.env`.
 ## Cleanup
 
 - `tt clean` removes TT project runtime state only.
-- `tt clean --all` also prunes repo-local Codex runtime artifacts such as `.codex/auth.json`, sessions, sqlite files, and logs, while preserving `.codex/config.toml`, `.codex/agents/**`, and other curated tracked files.
+- `tt clean --all` also prunes repo-local Codex runtime artifacts such as `.codex/auth.json`, sessions, sqlite files, and logs, while preserving `.codex/config.defaults.toml`, `.codex/config.local.toml`, `.codex/agents/**`, and other curated tracked files.
 
 ## Role Model
 

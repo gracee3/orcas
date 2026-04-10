@@ -8,6 +8,8 @@
 .tt/codex-app-server.log
 .tt/scenarios/
 .tt/worktrees/
+.codex/config.toml
+.codex/config.local.toml
 .codex/auth.json
 .codex/session_index.jsonl
 .codex/sessions/
