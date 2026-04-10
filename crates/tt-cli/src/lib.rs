@@ -6,6 +6,7 @@
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
@@ -181,6 +182,13 @@ pub fn run() -> Result<()> {
     let request_cwd = request_cwd_for_command(&cwd, &cli.command);
     let response = request_for_cwd(&request_cwd, command_to_request(cli.command, &cwd)?)
         .map_err(|error| rewrite_open_runtime_error(&cwd, is_open_command, error))?;
+    if is_open_command && should_launch_codex_tui() {
+        let DaemonResponse::ManagedProject(bootstrap) = response else {
+            anyhow::bail!("tt open expected a managed project bootstrap");
+        };
+        launch_codex_tui_for_director(&cwd, &bootstrap)?;
+        return Ok(());
+    }
     let output = match (is_status_command, is_clean_command, response) {
         (true, _, DaemonResponse::Status(status)) => {
             let runtime_ready = request_for_cwd(
@@ -1213,6 +1221,102 @@ fn resolve_cli_path(cwd: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
+fn should_launch_codex_tui() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+fn launch_codex_tui_for_director(
+    cwd: &Path,
+    bootstrap: &tt_daemon::ManagedProjectBootstrap,
+) -> Result<()> {
+    let director_thread_id = bootstrap
+        .roles
+        .iter()
+        .find(|role| role.role == ThreadRole::Director)
+        .and_then(|role| role.thread_id.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("managed project director thread is not attached"))?;
+    let codex_doctor = match request_for_cwd(
+        cwd,
+        DaemonRequest::DoctorCodex {
+            cwd: cwd.to_path_buf(),
+            check_listen: true,
+        },
+    )? {
+        DaemonResponse::CodexDoctor(report) => report,
+        other => anyhow::bail!(
+            "unexpected runtime response while resolving Codex launch info: {other:?}"
+        ),
+    };
+    if !codex_doctor.contract_ok {
+        anyhow::bail!(
+            "cannot open TT project in {} because the Codex runtime contract is not satisfied",
+            cwd.display()
+        );
+    }
+    let codex_bin = codex_doctor
+        .codex_bin
+        .ok_or_else(|| anyhow::anyhow!("Codex CLI binary is unavailable"))?;
+    let listen_url = codex_doctor.configured_listen_url;
+    if !codex_doctor.listen_reachable.unwrap_or(false) {
+        anyhow::bail!(
+            "cannot open TT project in {} because the project app-server is unreachable at {}",
+            cwd.display(),
+            listen_url
+        );
+    }
+
+    let mut command = build_codex_resume_command(
+        &codex_bin,
+        &bootstrap.repo_root,
+        director_thread_id,
+        &listen_url,
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = command.exec();
+        Err(error).context(format!(
+            "exec Codex TUI `{}` for director thread {}",
+            codex_bin.display(),
+            director_thread_id
+        ))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = command
+            .status()
+            .with_context(|| format!("launch Codex TUI `{}`", codex_bin.display()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Codex TUI `{}` exited unsuccessfully while opening director thread {}",
+                codex_bin.display(),
+                director_thread_id
+            );
+        }
+    }
+}
+
+fn build_codex_resume_command(
+    codex_bin: &Path,
+    repo_root: &Path,
+    thread_id: &str,
+    listen_url: &str,
+) -> ProcessCommand {
+    let mut command = ProcessCommand::new(codex_bin);
+    command
+        .arg("--cd")
+        .arg(repo_root)
+        .arg("resume")
+        .arg(thread_id)
+        .arg("--remote")
+        .arg(listen_url);
+    command
+}
+
 fn role_name(role: ThreadRole) -> &'static str {
     match role {
         ThreadRole::Director => "director",
@@ -1283,6 +1387,13 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
     let request_cwd = request_cwd_for_command(&cwd, &cli.command);
     let response = request_for_cwd(&request_cwd, command_to_request(cli.command, &cwd)?)
         .map_err(|error| rewrite_open_runtime_error(&cwd, is_open_command, error))?;
+    if is_open_command && should_launch_codex_tui() {
+        let DaemonResponse::ManagedProject(bootstrap) = response else {
+            anyhow::bail!("tt open expected a managed project bootstrap");
+        };
+        launch_codex_tui_for_director(&cwd, &bootstrap)?;
+        return Ok(());
+    }
     let output = match (is_status_command, response) {
         (true, DaemonResponse::Status(status)) => {
             let runtime_ready = request_for_cwd(
@@ -2052,6 +2163,32 @@ mod tests {
         let text = format!("{error:#}");
         assert!(text.contains("fatal: not a TT project"));
         assert!(text.contains("Run `tt init`"));
+    }
+
+    #[test]
+    fn builds_codex_resume_command_for_director_thread() {
+        let command = build_codex_resume_command(
+            Path::new("/usr/local/bin/codex"),
+            Path::new("/repo"),
+            "thread-123",
+            "ws://127.0.0.1:4500",
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(command.get_program(), Path::new("/usr/local/bin/codex"));
+        assert_eq!(
+            args,
+            vec![
+                "--cd".to_string(),
+                "/repo".to_string(),
+                "resume".to_string(),
+                "thread-123".to_string(),
+                "--remote".to_string(),
+                "ws://127.0.0.1:4500".to_string(),
+            ]
+        );
     }
 
     #[test]

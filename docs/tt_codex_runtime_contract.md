@@ -178,6 +178,9 @@ Current repo-scoped runtime inspection:
   plus the effective configured app-server listen URL for the current repo
 - it performs repo-scoped metadata and reachability inspection only
 - it does not enumerate host-wide processes or listening ports
+- `tt open` uses the same runtime contract to start or connect to the project
+  runtime, then resumes the director thread; in an interactive terminal it
+  hands off to the installed Codex TUI directly
 
 ## CI Expectations
 
