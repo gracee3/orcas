@@ -1024,6 +1024,7 @@ fn can_retry_without_turns(error: &anyhow::Error) -> bool {
         let message = cause.to_string();
         message.contains("includeTurns is unavailable before first user message")
             || message.contains("ephemeral threads do not support includeTurns")
+            || message.contains("failed to load rollout") && message.contains("empty session file")
     })
 }
 
@@ -1034,7 +1035,7 @@ fn can_retry_after_turn_completion(error: &anyhow::Error) -> bool {
     })
 }
 
-fn turn_watchdog_config() -> TurnWatchdogConfig {
+pub fn turn_watchdog_config() -> TurnWatchdogConfig {
     let soft_silence = env::var(TURN_SOFT_SILENCE_SECS_ENV)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -1959,6 +1960,14 @@ mod tests {
             "Codex app-server `ws://127.0.0.1:4500` request failed: failed to load rollout `/home/me/.codex/sessions/2026/04/09/rollout.jsonl` for thread 123: empty session file"
         );
         assert!(can_retry_after_turn_completion(&error));
+    }
+
+    #[test]
+    fn retry_without_turns_matches_empty_session_rollout() {
+        let error = anyhow::anyhow!(
+            "Codex app-server `ws://127.0.0.1:4500` request failed: failed to load rollout `/home/me/.codex/sessions/2026/04/09/rollout.jsonl` for thread 123: empty session file"
+        );
+        assert!(can_retry_without_turns(&error));
     }
 
     #[test]

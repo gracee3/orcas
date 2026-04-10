@@ -389,7 +389,9 @@ fn event_body_text(event: &ManagedProjectEvent) -> String {
             let error = event.error.as_deref().unwrap_or("<unknown error>");
             format!("{}\n\nError: {}", event.text, error)
         }
-        ManagedProjectEventKind::PhaseChanged | ManagedProjectEventKind::SystemNote => {
+        ManagedProjectEventKind::StatusUpdate
+        | ManagedProjectEventKind::PhaseChanged
+        | ManagedProjectEventKind::SystemNote => {
             if let Some(status) = event.status.as_deref() {
                 format!("{}\n\nStatus: {}", event.text, status)
             } else {

@@ -658,6 +658,7 @@ pub enum ManagedProjectEventKind {
     PromptSent,
     ResponseReceived,
     ParseFailed,
+    StatusUpdate,
     TurnFailed,
     PhaseChanged,
     SystemNote,
@@ -5156,15 +5157,72 @@ impl DaemonService {
             .clone()
             .unwrap_or_else(|| role_default_reasoning_effort(role_bootstrap.role).to_string());
         let client = self.codex_runtime_client(cwd)?;
-        let turn = client.start_turn(
+        let effort = parse_managed_project_reasoning_effort(&reasoning_effort)?;
+        let turn = {
+            let mut attempts = 0usize;
+            loop {
+                attempts += 1;
+                match client.start_turn(
+                    thread_id,
+                    prompt,
+                    Some(cwd),
+                    Some(model.clone()),
+                    Some(effort),
+                    None,
+                ) {
+                    Ok(turn) => break turn,
+                    Err(error)
+                        if is_retryable_live_turn_failure(&format_error_chain(&error))
+                            && attempts < LIVE_TURN_MAX_ATTEMPTS =>
+                    {
+                        thread::sleep(live_turn_backoff_delay(attempts));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        let role_name = role_slug(role_bootstrap.role).to_string();
+        let repo_root = bootstrap.repo_root.clone();
+        let project_id = bootstrap.project.id.clone();
+        let phase = managed_project_startup_phase_slug(bootstrap.startup.phase).to_string();
+        let turn_id = turn.id.clone();
+        let completed = client.wait_for_turn_completion_with_watchdog(
             thread_id,
-            prompt,
-            Some(cwd),
-            Some(model.clone()),
-            Some(parse_managed_project_reasoning_effort(&reasoning_effort)?),
-            None,
+            &turn.id,
+            tt_codex::turn_watchdog_config(),
+            |observation| {
+                let state = match observation.state {
+                    tt_codex::TurnWatchdogState::Healthy => "healthy",
+                    tt_codex::TurnWatchdogState::Quiet => "quiet",
+                    tt_codex::TurnWatchdogState::Suspect => "suspect",
+                    tt_codex::TurnWatchdogState::Stalled => "stalled",
+                };
+                let _ = append_managed_project_event(
+                    &repo_root,
+                    &ManagedProjectEvent {
+                        ts: Utc::now(),
+                        project_id: project_id.clone(),
+                        phase: phase.clone(),
+                        kind: ManagedProjectEventKind::StatusUpdate,
+                        role: Some(role_name.clone()),
+                        counterparty_role: Some("director".to_string()),
+                        thread_id: Some(thread_id.to_string()),
+                        turn_id: Some(turn_id.clone()),
+                        text: format!(
+                            "startup turn state={} elapsed={}s silent={}s turn_status={} turn_items={} progress={}",
+                            state,
+                            observation.elapsed_seconds,
+                            observation.silent_seconds,
+                            observation.turn_status.as_deref().unwrap_or("<none>"),
+                            observation.turn_items,
+                            observation.progress_signal.as_deref().unwrap_or("<none>")
+                        ),
+                        status: Some(state.to_string()),
+                        error: None,
+                    },
+                );
+            },
         )?;
-        let completed = client.wait_for_turn_completion(thread_id, &turn.id)?;
         let finished_turn = client
             .load_completed_turn_with_history(thread_id, &completed.id, Some(cwd), Some(model))?
             .ok_or_else(|| anyhow::anyhow!("turn `{}` not found after completion", completed.id))?;
