@@ -1781,7 +1781,7 @@ impl DaemonService {
         )?;
 
         let (branch_name, worktree_path) = if create_worktree {
-            let branch_name = format!("tt/{}/{}", project.slug, role_slug);
+            let branch_name = format!("tt/{role_slug}");
             let worktree_path = worktree_root.join(role_slug);
             ensure_role_worktree(repository, &worktree_path, &branch_name, base_branch)?;
             (Some(branch_name), Some(worktree_path))
@@ -4617,9 +4617,8 @@ fn managed_project_status_for_repo(repo_root: &Path) -> Result<(bool, Option<Str
     Ok((true, Some(state)))
 }
 
-fn default_worktree_root(repo_root: &Path, project_slug: &str) -> PathBuf {
-    let base = repo_root.parent().unwrap_or(repo_root);
-    base.join(".tt-worktrees").join(project_slug)
+fn default_worktree_root(repo_root: &Path, _project_slug: &str) -> PathBuf {
+    repo_root.join(".tt").join("worktrees")
 }
 
 fn sanitize_project_slug(raw: &str) -> String {
@@ -6096,7 +6095,7 @@ mod tests {
             .expect("dev role");
         assert_eq!(dev_role.model.as_deref(), Some("dev-model"));
         assert_eq!(dev_role.reasoning_effort.as_deref(), Some("medium"));
-        assert_eq!(dev_role.branch_name.as_deref(), Some("tt/alpha/dev"));
+        assert_eq!(dev_role.branch_name.as_deref(), Some("tt/dev"));
         assert!(
             dev_role
                 .worktree_path
@@ -6110,7 +6109,7 @@ mod tests {
             .iter()
             .find(|role| role.role == ThreadRole::Test)
             .expect("test role");
-        assert_eq!(test_role.branch_name.as_deref(), Some("tt/alpha/test"));
+        assert_eq!(test_role.branch_name.as_deref(), Some("tt/test"));
 
         let integration_role = bootstrap
             .roles
@@ -6119,7 +6118,7 @@ mod tests {
             .expect("integration role");
         assert_eq!(
             integration_role.branch_name.as_deref(),
-            Some("tt/alpha/integration")
+            Some("tt/integration")
         );
 
         let inspection = GitRepository::discover(&repo)
@@ -6250,7 +6249,7 @@ mod tests {
             model: Some("gpt-5.4".into()),
             reasoning_effort: Some("medium".into()),
             control_mode: ManagedProjectThreadControlMode::Director,
-            branch_name: Some("tt/alpha/dev".into()),
+            branch_name: Some("tt/dev".into()),
             worktree_path: Some(dir.path().join("worktree")),
             thread_id: Some("thread-1".into()),
             thread_name: Some("alpha-dev".into()),
@@ -6295,7 +6294,7 @@ mod tests {
             &project,
             dir.path(),
             "main",
-            &dir.path().join(".tt-worktrees/alpha"),
+            &dir.path().join(".tt/worktrees"),
             &project_config_path,
             &plan_path,
             &dir.path().join(".tt/contracts/worker-contract.md"),
@@ -6340,7 +6339,7 @@ mod tests {
             },
             repo_root: PathBuf::from("/repo"),
             base_branch: "main".into(),
-            worktree_root: PathBuf::from("/repo/.tt-worktrees/alpha"),
+            worktree_root: PathBuf::from("/repo/.tt/worktrees"),
             manifest_path: PathBuf::from("/repo/.tt/state.toml"),
             project_config_path: PathBuf::from("/repo/.tt/project.toml"),
             plan_path: PathBuf::from("/repo/.tt/plan.toml"),

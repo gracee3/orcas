@@ -1309,7 +1309,7 @@ mod tests {
             codex_thread_id: binding.codex_thread_id.clone(),
             repo_root: "/repo".to_string(),
             worktree_path: Some("/repo/.worktrees/a".to_string()),
-            branch_name: Some("tt/alpha".to_string()),
+            branch_name: Some("tt/a".to_string()),
             base_ref: Some("main".to_string()),
             base_commit: Some("abc123".to_string()),
             landing_target: Some("main".to_string()),

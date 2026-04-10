@@ -1,8 +1,7 @@
 schema = "tt-managed-project-plan-v1"
 status = "draft"
 objective = "Coordinate dev, test, and integration work for tt"
-updated_at = "2026-04-09T22:15:59.885056875+00:00"
-work_items = []
+updated_at = "2026-04-10T01:18:28.725954280+00:00"
 
 [[milestones]]
 id = "milestone-1"
@@ -30,6 +29,62 @@ success_criteria = [
     "Workers have clear ownership",
 ]
 evidence = []
+
+[[work_items]]
+id = "tt-director"
+title = "Director"
+owner_role = "director"
+phase = "plan"
+depends_on = []
+acceptance_criteria = [
+    "The handoff is explicit",
+    "Validation evidence is recorded",
+]
+validation_commands = ["cargo test"]
+commit_required = false
+status = "planned"
+
+[[work_items]]
+id = "tt-dev"
+title = "Developer"
+owner_role = "dev"
+phase = "develop"
+depends_on = ["tt-director"]
+acceptance_criteria = [
+    "The handoff is explicit",
+    "Validation evidence is recorded",
+]
+validation_commands = ["cargo test"]
+commit_required = true
+status = "planned"
+
+[[work_items]]
+id = "tt-test"
+title = "Test"
+owner_role = "test"
+phase = "test"
+depends_on = ["tt-dev"]
+acceptance_criteria = [
+    "The handoff is explicit",
+    "Validation evidence is recorded",
+]
+validation_commands = ["cargo test"]
+commit_required = true
+status = "planned"
+
+[[work_items]]
+id = "tt-integration"
+title = "Integration"
+owner_role = "integration"
+phase = "integrate"
+depends_on = ["tt-test"]
+acceptance_criteria = [
+    "The handoff is explicit",
+    "Validation evidence is recorded",
+]
+validation_commands = ["cargo test"]
+commit_required = true
+status = "planned"
 
 [notes]
 risks = []

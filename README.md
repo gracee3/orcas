@@ -24,6 +24,7 @@ This checkout keeps a reference managed-project scaffold in `.tt/`:
 - `.tt/project.toml` for repo-local policy and liveness defaults
 - `.tt/plan.toml` for the current director plan
 - `.tt/state.toml` for runtime bindings, control state, scenario progress, and checksums of the source files
+- `.tt/worktrees/` for role worktree checkouts such as `.tt/worktrees/dev/`
 - `.tt/settings.env` for repo-local env defaults in this checkout
 - `.tt/contracts/worker-contract.md` for the worker contract
 
