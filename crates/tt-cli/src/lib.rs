@@ -770,7 +770,7 @@ fn render_status_response(
         "runtime"
     };
     format!(
-        "status\nrepo_root: {}\nproject_initialized: {}\nproject_state: {}\n{}: {}\nprojects: {}\nwork-units: {}\nbound-threads: {}\nready-workspaces: {}\n",
+        "status\nrepo_root: {}\nproject_initialized: {}\nproject_state: {}\n{}: {}\n",
         status
             .repo_root
             .as_deref()
@@ -780,10 +780,6 @@ fn render_status_response(
         status.project_state.as_deref().unwrap_or("<none>"),
         runtime_key,
         runtime_label,
-        status.project_count,
-        status.work_unit_count,
-        status.bound_thread_count,
-        status.ready_workspace_count
     )
 }
 
@@ -1887,7 +1883,6 @@ mod tests {
         assert!(text.contains("project_initialized: true"));
         assert!(text.contains("project_state: attached (4/4)"));
         assert!(text.contains("runtime: ready"));
-        assert!(text.contains("projects: 2"));
     }
 
     #[test]
@@ -1925,7 +1920,6 @@ mod tests {
         assert!(text.contains("project_initialized: true"));
         assert!(text.contains("project_state: attached (4/4)"));
         assert!(text.contains("runtime: unreachable"));
-        assert!(text.contains("projects: 2"));
     }
 
     #[test]
