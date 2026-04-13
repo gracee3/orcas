@@ -111,10 +111,11 @@ Do not store auth tokens or device codes in `.tt/settings.env`.
 
 Default managed-project model roster:
 
-- `director`: `gpt-5.4` with `model_reasoning_effort = "medium"`
+- `director`: `gpt-5.4-mini` with `model_reasoning_effort = "medium"`
 - `dev`: `gpt-5.4-mini` with `model_reasoning_effort = "medium"`
 - `test`: `gpt-5.4-mini` with `model_reasoning_effort = "medium"`
 - `integration`: `gpt-5.4-mini` with `model_reasoning_effort = "medium"`
+All generated role configs use `approval_policy = "never"` and `sandbox_mode = "workspace-write"` so the agents can run commands freely inside the repo sandbox without approval prompts.
 
 Workers report only to the director.
 

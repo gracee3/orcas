@@ -1,5 +1,5 @@
 schema = "tt-managed-project-v1"
-project_id = "019d74f8-148f-7683-bc54-914a4e7d2373"
+project_id = "019d7df2-2099-7243-8a5d-e452a3a28d67"
 slug = "tt"
 title = "tt"
 objective = "Coordinate dev, test, and integration work for tt"
@@ -13,44 +13,78 @@ plan_sha256 = "68ff792b84951b6862520480bf7e08b7d7ec5759341eb1d4fee6a9a261f5609b"
 contract_path = "/home/emmy/openai/tt/.tt/contract.md"
 codex_config_path = "/home/emmy/openai/tt/.codex/config.toml"
 
+[startup]
+phase = "ready"
+updated_at = "2026-04-11T19:08:58.811842995Z"
+
+[startup.worker_reports.dev]
+status = "reported"
+updated_at = "2026-04-11T19:08:41.482224306Z"
+turn_id = "019d7df2-2b9b-7230-9e31-226309a6aef7"
+summary = "I’ll verify the project contract and plan, then return the required readiness JSON."
+
+[startup.worker_reports.integration]
+status = "reported"
+updated_at = "2026-04-11T19:08:50.228837045Z"
+turn_id = "019d7df2-51f5-70f3-96fc-82a6d892ac82"
+summary = "I’ll verify the contract and plan files, then report readiness in the requested JSON shape."
+
+[startup.worker_reports.test]
+status = "reported"
+updated_at = "2026-04-11T19:08:45.866344647Z"
+turn_id = "019d7df2-40db-7ee1-a0b6-bb29101402d2"
+summary = "Loaded the TT contract and plan, confirmed the assigned cwd/worktree/branch, and I’m ready for test assignments."
+
+[startup.director_ack]
+status = "ready"
+updated_at = "2026-04-11T19:08:58.811838872Z"
+turn_id = "019d7df2-6307-7462-97b2-9166ba78ad38"
+summary = "Validated dev, test, and integration startup reports against the TT contract and project/plan files; all required workers are ready and the project is ready for operator handoff."
+received_roles = [
+    "dev",
+    "test",
+    "integration",
+]
+missing_roles = []
+
 [roles.dev]
-work_unit_id = "019d74f8-14ce-7f43-80ec-1b3258d8aac7"
+work_unit_id = "019d7df2-20db-78b0-923e-b8a1e8732b68"
 agent_path = "/home/emmy/openai/tt/.codex/agents/dev.toml"
 model = "gpt-5.4-mini"
 reasoning_effort = "medium"
 control_mode = "director"
 branch_name = "tt/dev"
 worktree_path = "/home/emmy/openai/tt/.tt/worktrees/dev"
-thread_id = "019d74f9-ca28-7ed1-a3a8-b2fd2fe8ad2e"
+thread_id = "019d7df2-28ee-75a3-a1cf-e6b43964346e"
 workspace_binding_id = "tt:dev"
 
 [roles.director]
-work_unit_id = "019d74f8-14aa-70e1-9b6f-7663beafca88"
+work_unit_id = "019d7df2-20c0-7ff3-8968-c9326f7b4441"
 agent_path = "/home/emmy/openai/tt/.codex/agents/director.toml"
 model = "gpt-5.4"
 reasoning_effort = "medium"
 control_mode = "director"
-thread_id = "019d74f9-c993-7b11-8ed0-3e7cdd4c4566"
+thread_id = "019d7df2-2814-79f1-877a-581a55917f9f"
 workspace_binding_id = "tt:director"
 
 [roles.integration]
-work_unit_id = "019d74f8-153f-7530-b135-51f454c8aa0a"
+work_unit_id = "019d7df2-2139-7b21-a3a7-3a9fb2acae31"
 agent_path = "/home/emmy/openai/tt/.codex/agents/integration.toml"
 model = "gpt-5.4-mini"
 reasoning_effort = "medium"
 control_mode = "director"
 branch_name = "tt/integration"
 worktree_path = "/home/emmy/openai/tt/.tt/worktrees/integration"
-thread_id = "019d74f9-cb41-71e0-907b-7240040e0f08"
+thread_id = "019d7df2-2abd-7f73-8076-b77cfdf51367"
 workspace_binding_id = "tt:integration"
 
 [roles.test]
-work_unit_id = "019d74f8-1503-7d22-8206-1b41ebd9fee8"
+work_unit_id = "019d7df2-210b-7eb3-b891-5ce3081e0b0d"
 agent_path = "/home/emmy/openai/tt/.codex/agents/test.toml"
 model = "gpt-5.4-mini"
 reasoning_effort = "medium"
 control_mode = "director"
 branch_name = "tt/test"
 worktree_path = "/home/emmy/openai/tt/.tt/worktrees/test"
-thread_id = "019d74f9-cab3-7a03-bf8c-484b67b598e7"
+thread_id = "019d7df2-29cf-7313-a3ff-005faea968a9"
 workspace_binding_id = "tt:test"

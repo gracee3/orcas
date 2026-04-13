@@ -264,3 +264,78 @@ impl_from_str_for_kebab_case!(MergeExecutionStatus {
     Succeeded => "succeeded",
     Failed => "failed",
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn thread_role_accepts_aliases_and_whitespace() {
+        assert_eq!(ThreadRole::from_str(" dev "), Ok(ThreadRole::Develop));
+        assert_eq!(
+            ThreadRole::from_str("integration"),
+            Ok(ThreadRole::Integrate)
+        );
+        assert_eq!(ThreadRole::from_str("research"), Ok(ThreadRole::Learn));
+    }
+
+    #[test]
+    fn project_status_serializes_and_parses_as_kebab_case() {
+        let json =
+            serde_json::to_string(&ProjectStatus::Completed).expect("serialize project status");
+        assert_eq!(json, "\"completed\"");
+        assert_eq!(
+            serde_json::from_str::<ProjectStatus>(&json).expect("deserialize project status"),
+            ProjectStatus::Completed
+        );
+        assert_eq!(
+            ProjectStatus::from_str("blocked"),
+            Ok(ProjectStatus::Blocked)
+        );
+    }
+
+    #[test]
+    fn workspace_status_serializes_and_parses_as_kebab_case() {
+        let json = serde_json::to_string(&WorkspaceStatus::Conflicted)
+            .expect("serialize workspace status");
+        assert_eq!(json, "\"conflicted\"");
+        assert_eq!(
+            serde_json::from_str::<WorkspaceStatus>(&json).expect("deserialize workspace status"),
+            WorkspaceStatus::Conflicted
+        );
+        assert_eq!(
+            WorkspaceStatus::from_str("pruned"),
+            Ok(WorkspaceStatus::Pruned)
+        );
+    }
+
+    #[test]
+    fn merge_statuses_round_trip_through_serde() {
+        let cases = [
+            MergeReadiness::Unknown,
+            MergeReadiness::Ready,
+            MergeReadiness::Blocked,
+            MergeAuthorizationStatus::NotRequested,
+            MergeAuthorizationStatus::Authorized,
+            MergeAuthorizationStatus::Rejected,
+            MergeExecutionStatus::NotStarted,
+            MergeExecutionStatus::Running,
+            MergeExecutionStatus::Succeeded,
+            MergeExecutionStatus::Failed,
+        ];
+
+        for value in cases {
+            let json = serde_json::to_string(&value).expect("serialize merge enum");
+            let round_tripped = serde_json::from_str::<MergeReadiness>(&json)
+                .or_else(|_| {
+                    serde_json::from_str::<MergeAuthorizationStatus>(&json).map(Into::into)
+                })
+                .or_else(|_| serde_json::from_str::<MergeExecutionStatus>(&json).map(Into::into))
+                .unwrap_or_else(|_| panic!("failed to round-trip {json}"));
+            let expected = value.to_string();
+            assert_eq!(json, format!("\"{expected}\""));
+            assert_eq!(round_tripped.to_string(), expected);
+        }
+    }
+}

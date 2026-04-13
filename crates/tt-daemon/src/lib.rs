@@ -24,11 +24,10 @@ use codex_protocol::openai_models::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tt_codex::{
-    CodexHome, CodexRuntimeClient, CodexThreadRuntimeSnapshot, apply_repo_settings_env,
-    configured_app_server_listen_url, managed_project_auth_is_present,
+    CodexHome, CodexRuntimeClient, CodexThreadRuntimeSnapshot, TT_CODEX_APP_SERVER_PID_FILE,
+    apply_repo_settings_env, configured_app_server_listen_url, managed_project_auth_is_present,
     managed_project_auth_json_path, managed_project_codex_home, repo_env_var, repo_env_var_os,
     stop_managed_project_app_server, upsert_session_index_entry, validate_runtime_contract,
-    TT_CODEX_APP_SERVER_PID_FILE,
 };
 use tt_domain::{
     MergeAuthorizationStatus, MergeExecutionStatus, MergeReadiness, MergeRun, Project,
@@ -790,6 +789,8 @@ struct ManagedAgentFile {
     description: String,
     model: Option<String>,
     model_reasoning_effort: Option<String>,
+    #[serde(default)]
+    approval_policy: Option<String>,
     sandbox_mode: String,
     developer_instructions: String,
 }
@@ -1353,11 +1354,8 @@ impl DaemonService {
         removed += remove_if_exists(repo_root.join(".tt").join("state.toml"))?;
         removed += remove_if_exists(repo_root.join(".tt").join(TT_EVENTS_FILE_NAME))?;
         removed += remove_if_exists(repo_root.join(".tt").join(TT_DAEMON_SOCKET_NAME))?;
-        if stop_managed_project_app_server(
-            &repo_root,
-            &configured_app_server_listen_url(),
-        )
-        .unwrap_or(false)
+        if stop_managed_project_app_server(&repo_root, &configured_app_server_listen_url())
+            .unwrap_or(false)
         {
             removed += 1;
         }
@@ -1366,11 +1364,7 @@ impl DaemonService {
                 .join(".tt")
                 .join(TT_CODEX_APP_SERVER_LOG_FILE_NAME),
         )?;
-        removed += remove_if_exists(
-            repo_root
-                .join(".tt")
-                .join(TT_CODEX_APP_SERVER_PID_FILE),
-        )?;
+        removed += remove_if_exists(repo_root.join(".tt").join(TT_CODEX_APP_SERVER_PID_FILE))?;
         removed += remove_if_exists(repo_root.join(".tt").join("runtime"))?;
         removed += remove_if_exists(repo_root.join(".tt").join("contracts"))?;
         if force {
@@ -2501,20 +2495,13 @@ fn role_description(role: ThreadRole) -> &'static str {
 }
 
 fn role_sandbox_mode(role: ThreadRole) -> &'static str {
-    match role {
-        ThreadRole::Director | ThreadRole::Review | ThreadRole::Learn => "read-only",
-        ThreadRole::Test => "danger-full-access",
-        ThreadRole::Develop | ThreadRole::Integrate | ThreadRole::Handoff => "danger-full-access",
-        ThreadRole::Todo | ThreadRole::Chat | ThreadRole::Custom => "danger-full-access",
-    }
+    let _ = role;
+    "workspace-write"
 }
 
 fn role_default_model(role: ThreadRole) -> &'static str {
-    match role {
-        ThreadRole::Director => "gpt-5.4",
-        ThreadRole::Develop | ThreadRole::Test | ThreadRole::Integrate => "gpt-5.4-mini",
-        _ => "gpt-5.4-mini",
-    }
+    let _ = role;
+    "gpt-5.4-mini"
 }
 
 fn role_default_reasoning_effort(_role: ThreadRole) -> &'static str {
@@ -2694,6 +2681,7 @@ fn render_agent_file(
         "model_reasoning_effort = {:?}\n",
         reasoning_effort
     ));
+    output.push_str("approval_policy = \"never\"\n");
     output.push_str(&format!("sandbox_mode = {:?}\n", role_sandbox_mode(role)));
     output.push_str("developer_instructions = \"\"\"\n");
     output.push_str(&format!(
@@ -6025,7 +6013,8 @@ fn parse_bootstrap_director_ack(
         .and_then(normalize_worker_handoff_json_candidate)
         .or_else(|| normalize_worker_handoff_json_candidate(summary))
     {
-        if let Ok(ack) = serde_json::from_str::<ManagedProjectBootstrapDirectorAckPayload>(&candidate)
+        if let Ok(ack) =
+            serde_json::from_str::<ManagedProjectBootstrapDirectorAckPayload>(&candidate)
         {
             return Ok(ack);
         }
@@ -6071,7 +6060,8 @@ fn parse_plaintext_bootstrap_worker_report(
             .branch_name
             .clone()
             .unwrap_or_else(|| role_slug(role_bootstrap.role).to_string()),
-        contract_loaded: text.contains("contract") || !text.to_ascii_lowercase().contains("missing"),
+        contract_loaded: text.contains("contract")
+            || !text.to_ascii_lowercase().contains("missing"),
         plan_loaded: text.contains("plan") || !text.to_ascii_lowercase().contains("missing"),
         status: status.to_string(),
         blocker: if status == "blocked" {
@@ -6105,7 +6095,11 @@ fn parse_plaintext_bootstrap_director_ack(
             .collect()
     };
     ManagedProjectBootstrapDirectorAckPayload {
-        status: if ready { "ready".to_string() } else { "blocked".to_string() },
+        status: if ready {
+            "ready".to_string()
+        } else {
+            "blocked".to_string()
+        },
         received_roles,
         missing_roles,
         summary: summarize_plaintext_startup_response(text),
@@ -8196,7 +8190,7 @@ mod tests {
                 updated_at: ts(),
             },
             agent_path: dir.path().join(".codex/agents/dev.toml"),
-            model: Some("gpt-5.4".into()),
+            model: Some("gpt-5.4-mini".into()),
             reasoning_effort: Some("medium".into()),
             control_mode: ManagedProjectThreadControlMode::Director,
             branch_name: Some("tt/dev".into()),
@@ -8258,7 +8252,7 @@ mod tests {
         save_managed_project_manifest(&path, &manifest).expect("save manifest");
         let loaded = load_managed_project_manifest(&path).expect("load manifest");
         let loaded_role = loaded.roles.get("dev").expect("dev role");
-        assert_eq!(loaded_role.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(loaded_role.model.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(loaded_role.reasoning_effort.as_deref(), Some("medium"));
         assert_eq!(loaded_role.thread_id.as_deref(), Some("thread-1"));
         assert_eq!(loaded_role.thread_name.as_deref(), Some("alpha-dev"));
@@ -8472,8 +8466,13 @@ mod tests {
             source: WorkerHandoffSource::SeededFallback,
             parse_error: Some("not json".into()),
         };
-        let report = parse_bootstrap_worker_report("ready", &extraction, &role_bootstrap, Path::new("/repo"))
-            .expect("worker report");
+        let report = parse_bootstrap_worker_report(
+            "ready",
+            &extraction,
+            &role_bootstrap,
+            Path::new("/repo"),
+        )
+        .expect("worker report");
         assert_eq!(report.status, "ready");
         assert!(report.contract_loaded);
         assert!(report.plan_loaded);
@@ -8572,15 +8571,17 @@ mod tests {
         };
         let instructions = render_agent_file(
             ThreadRole::Director,
-            Some("gpt-5.4"),
+            Some("gpt-5.4-mini"),
             Some("medium"),
             "Alpha",
             "Ship the alpha slice",
             &project_config,
             &plan,
         );
-        assert!(instructions.contains("model = \"gpt-5.4\""));
+        assert!(instructions.contains("model = \"gpt-5.4-mini\""));
         assert!(instructions.contains("model_reasoning_effort = \"medium\""));
+        assert!(instructions.contains("approval_policy = \"never\""));
+        assert!(instructions.contains("sandbox_mode = \"workspace-write\""));
         assert!(instructions.contains("You are the director agent for Alpha."));
         assert!(instructions.contains("The operator talks to the director."));
         assert!(instructions.contains(

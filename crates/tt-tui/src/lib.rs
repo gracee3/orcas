@@ -33,7 +33,12 @@ pub fn load_snapshot(cwd: impl AsRef<Path>) -> Result<TuiSnapshot> {
 
 pub fn load_snapshot_from_cwd(cwd: impl AsRef<Path>) -> Result<TuiSnapshot> {
     let cwd = cwd.as_ref();
-    let status = match request_for_cwd(cwd, DaemonRequest::Status)? {
+    let status = match request_for_cwd(
+        cwd,
+        DaemonRequest::Status {
+            cwd: cwd.to_path_buf(),
+        },
+    )? {
         DaemonResponse::Status(status) => status,
         other => bail!("unexpected daemon response for status: {other:?}"),
     };
@@ -63,20 +68,26 @@ pub fn render_dashboard(snapshot: &TuiSnapshot) -> String {
     output.push_str("TT v2 dashboard\n");
     output.push_str("================\n\n");
 
-    if let Some(codex_home) = snapshot.status.codex_home.as_ref() {
-        output.push_str(&format!("Codex home: {}\n", codex_home.display()));
+    if let Some(repo_root) = snapshot.status.repo_root.as_ref() {
+        output.push_str(&format!("Repo root: {}\n", repo_root.display()));
     } else {
-        output.push_str("Codex home: not configured\n");
+        output.push_str("Repo root: not inside a managed project\n");
     }
-    if let Some(state_db) = snapshot.status.codex_state_db.as_ref() {
-        output.push_str(&format!("Codex state db: {}\n", state_db.display()));
+    output.push_str(&format!(
+        "Project initialized: {}\n",
+        if snapshot.status.project_initialized {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    if let Some(project_state) = snapshot.status.project_state.as_deref() {
+        output.push_str(&format!("Project state: {project_state}\n"));
     }
-    if let Some(session_index) = snapshot.status.codex_session_index.as_ref() {
-        output.push_str(&format!(
-            "Codex session index: {}\n",
-            session_index.display()
-        ));
-    }
+    output.push_str(&format!(
+        "Director state: {:?}\n",
+        snapshot.status.director_state
+    ));
 
     if let Some(repo) = snapshot.repository.as_ref() {
         output.push_str(&format!("Repository: {}\n", repo.repository_root));
@@ -139,18 +150,17 @@ fn render_status(status: &DaemonStatus) -> String {
     let mut output = String::new();
     output.push_str("TT status\n");
     output.push_str("=========\n");
-    if let Some(codex_home) = status.codex_home.as_ref() {
-        output.push_str(&format!("Codex home: {}\n", codex_home.display()));
+    if let Some(repo_root) = status.repo_root.as_ref() {
+        output.push_str(&format!("Repo root: {}\n", repo_root.display()));
     }
-    if let Some(codex_state_db) = status.codex_state_db.as_ref() {
-        output.push_str(&format!("Codex state db: {}\n", codex_state_db.display()));
+    output.push_str(&format!(
+        "Project initialized: {}\n",
+        if status.project_initialized { "yes" } else { "no" }
+    ));
+    if let Some(project_state) = status.project_state.as_deref() {
+        output.push_str(&format!("Project state: {project_state}\n"));
     }
-    if let Some(codex_session_index) = status.codex_session_index.as_ref() {
-        output.push_str(&format!(
-            "Codex session index: {}\n",
-            codex_session_index.display()
-        ));
-    }
+    output.push_str(&format!("Director state: {:?}\n", status.director_state));
     output.push_str(&format!("Projects: {}\n", status.project_count));
     output.push_str(&format!("Work units: {}\n", status.work_unit_count));
     output.push_str(&format!("Bound threads: {}\n", status.bound_thread_count));
@@ -287,7 +297,12 @@ fn handle_command(cwd: &Path, input: &str) -> Result<Option<String>> {
         "quit" | "exit" => Ok(None),
         "refresh" => Ok(Some(render_dashboard(&load_snapshot_from_cwd(cwd)?))),
         "status" => {
-            let response = request_for_cwd(cwd, DaemonRequest::Status)?;
+            let response = request_for_cwd(
+                cwd,
+                DaemonRequest::Status {
+                    cwd: cwd.to_path_buf(),
+                },
+            )?;
             match response {
                 DaemonResponse::Status(status) => Ok(Some(render_status(&status))),
                 other => bail!("unexpected daemon response for status: {other:?}"),
@@ -1127,9 +1142,10 @@ mod tests {
     fn renders_dashboard_without_repo_or_codex() {
         let snapshot = TuiSnapshot {
             status: DaemonStatus {
-                codex_home: None,
-                codex_state_db: None,
-                codex_session_index: None,
+                repo_root: None,
+                project_initialized: false,
+                project_state: None,
+                director_state: tt_daemon::ManagedProjectDirectorState::Missing,
                 project_count: 0,
                 work_unit_count: 0,
                 bound_thread_count: 0,
@@ -1146,7 +1162,7 @@ mod tests {
 
         let rendered = render_dashboard(&snapshot);
         assert!(rendered.contains("TT v2 dashboard"));
-        assert!(rendered.contains("Codex home: not configured"));
+        assert!(rendered.contains("Repo root: not inside a managed project"));
         assert!(rendered.contains("Projects: 1"));
         assert!(rendered.contains("Ready workspaces: 4"));
         assert!(rendered.contains("Quick commands"));

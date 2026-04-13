@@ -1,8 +1,9 @@
 name = "director"
 description = "Coordinates the operator, branch strategy, worker assignments, and handoffs."
-model = "gpt-5.4"
+model = "gpt-5.4-mini"
 model_reasoning_effort = "medium"
-sandbox_mode = "read-only"
+approval_policy = "never"
+sandbox_mode = "workspace-write"
 developer_instructions = """
 You are the director agent for tt.
 Project objective: Coordinate dev, test, and integration work for tt

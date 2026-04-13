@@ -1474,14 +1474,20 @@ fn start_codex_app_server_if_needed(
         .find(|ancestor| ancestor.join(".tt").is_dir())
         .unwrap_or(cwd);
     let log_path = repo_root.join(".tt").join("codex-app-server.log");
-    let legacy_log_path = repo_root.join(".tt").join("runtime").join("codex-app-server.log");
+    let legacy_log_path = repo_root
+        .join(".tt")
+        .join("runtime")
+        .join("codex-app-server.log");
     let pid_path = repo_root.join(".tt").join(TT_CODEX_APP_SERVER_PID_FILE);
     let codex_home = managed_project_codex_home(repo_root);
 
     if codex_app_server_is_reachable(listen_url)? {
         match running_app_server_status(listen_url, &pid_path, &codex_home)? {
             RunningAppServerStatus::Matches => return Ok(()),
-            RunningAppServerStatus::MismatchedOwned { pid, codex_home: actual } => {
+            RunningAppServerStatus::MismatchedOwned {
+                pid,
+                codex_home: actual,
+            } => {
                 stop_process(pid).with_context(|| {
                     format!(
                         "stop stale TT-owned Codex app-server pid={} using CODEX_HOME `{}`",
@@ -1491,7 +1497,10 @@ fn start_codex_app_server_if_needed(
                 })?;
                 let _ = fs::remove_file(&pid_path);
             }
-            RunningAppServerStatus::MismatchedExternal { pid, codex_home: actual } => {
+            RunningAppServerStatus::MismatchedExternal {
+                pid,
+                codex_home: actual,
+            } => {
                 anyhow::bail!(
                     "Codex app-server `{listen_url}` is already running in pid {} with CODEX_HOME `{}`; expected `{}`",
                     pid,
@@ -1669,7 +1678,9 @@ fn read_process_env_path(pid: u32, key: &str) -> Result<Option<PathBuf>> {
     };
     for entry in bytes.split(|byte| *byte == 0) {
         if let Some(value) = entry.strip_prefix(format!("{key}=").as_bytes()) {
-            return Ok(Some(PathBuf::from(String::from_utf8_lossy(value).to_string())));
+            return Ok(Some(PathBuf::from(
+                String::from_utf8_lossy(value).to_string(),
+            )));
         }
     }
     Ok(None)
@@ -1717,7 +1728,11 @@ fn pid_listening_on(listen_url: &str) -> Result<Option<u32>> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         if let Some(rest) = line.split("pid=").nth(1) {
-            if let Some(pid) = rest.split(',').next().and_then(|value| value.parse::<u32>().ok()) {
+            if let Some(pid) = rest
+                .split(',')
+                .next()
+                .and_then(|value| value.parse::<u32>().ok())
+            {
                 return Ok(Some(pid));
             }
         }

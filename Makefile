@@ -52,7 +52,7 @@ test-e2e-long:
 
 .PHONY: build
 build:
-	$(CARGO) build --workspace --release --target $(TARGET)
+	$(CARGO) build --workspace --target $(TARGET)
 
 .PHONY: check
 check:
